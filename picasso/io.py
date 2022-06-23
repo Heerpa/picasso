@@ -701,6 +701,372 @@ class ND2Movie(AbstractPicassoMovie):
         return _np.dtype(self.meta['Data Type'])
 
 
+class ND2readerMovie(AbstractPicassoMovie):
+    """Subclass of the AbstractPicassoMovie to implement reading Nikon nd2
+    files, using the package nd2reader.
+    """
+    def __init__(self, path, verbose=False):
+        super().__init__()
+        self.use_dask = False
+        if verbose:
+            print("Reading info from {}".format(path))
+        self.path = _ospath.abspath(path)
+        self.nd2file = ND2Reader(path)
+
+        sizes = {
+            'X': self.nd2file.metadata['width'],
+            'Y': self.nd2file.metadata['height'],
+            'T': self.nd2file.metadata['num_frames'],
+            'Z': len(self.nd2file.metadata['z_levels']),
+            'C': len(self.nd2file.metadata['channels'])
+        }
+        self.ndim = 0
+        self.sizes = {}
+        for k, v in sizes.items():
+            if v > 1:
+                self.sizes[k] = v
+                self.ndim += 1
+
+        required_dims = ['T', 'Y', 'X']  # exactly these, not more
+        for dim in required_dims:
+            if dim not in self.sizes.keys():
+                raise KeyError(
+                    'Required dimension {:s} not in file {:s}'.format(
+                        dim, self.path))
+        if self.ndim != len(required_dims):
+            raise KeyError(
+                'File {:s} has dimensions {:s} '.format(
+                    self.path, str(self.sizes.keys())) +
+                'but should have exactly {:s}.'.format(str(required_dims)))
+
+        self.meta = self.get_metadata()
+
+    def info(self):
+        return self.meta
+
+    def get_metadata(self):
+        """Brings the file metadata in a readable form, and preprocesses it
+        for easier downstream use.
+
+        Returns:
+            info : dict
+                the metadata
+        """
+        info = {
+            # "Byte Order": self._tif_byte_order,
+            "File": self.path,
+            "Height": self.nd2file.sizes['Y'],
+            "Width": self.nd2file.sizes['X'],
+            "Data Type": self.nd2file.dtype.name,
+            "Frames": self.nd2file.sizes['T'],
+        }
+        info['Acquisition Comments'] = ''
+
+        mm_info = self.metadata_to_dict()
+        camera_name = mm_info.get('description', {}).get(
+                'Metadata', {}).get('Camera Name', 'None')
+        info['Camera'] = camera_name
+
+        # simulate micro manager camera data for loading config values
+        # see picasso/gui/localize:680ff
+        # put into camera config
+        # 'Sensitivity Categories': ['PixelReadoutRate', 'ReadoutMode']
+        # 'Sensitivity':
+        #     '540 MHz':
+        #         'Rolling Shutter at 16-bit': sensitivityvalue  # or sensival directly behind 540 MHz?
+        # 'Channel Device':
+        #     'Name': 'Filter'
+        #     'Emission Wavelengths':
+        #         '2 (560)': 560
+        readout_rate = mm_info.get(
+                'description', {}).get('Metadata', {}).get(
+                'Camera Settings', {}).get('Readout Rate', 'None')
+        readout_mode = mm_info.get(
+                'description', {}).get('Metadata', {}).get(
+                'Camera Settings', {}).get('Readout Mode', 'None')
+        filter = mm_info.get(
+                'description', {}).get('Metadata', {}).get(
+                'Camera Settings', {}).get('Microscope Settings', {}).get(
+                'Nikon Ti2, FilterChanger(Turret-Lo)', 'None')
+
+        sensitivity_category = 'PixelReadoutRate'
+        info["Micro-Manager Metadata"] = {
+            camera_name+'-'+sensitivity_category: readout_rate,
+            'Filter': filter,
+            }
+        info["Picasso Metadata"] = {
+            'Camera': camera_name,
+            'PixelReadoutRate': readout_rate,
+            'ReadoutMode': readout_mode,
+            'Filter': filter,
+        }
+        info["nd2 Metadata"] = mm_info
+
+        return info
+
+    def metadata_to_dict(self):
+        """Extracts all types of metadata in the file and returns it in a dict.
+
+        Returns:
+            mmmeta : dict
+                all metadata
+        """
+        mmmeta = {}
+
+        text_info = self.nd2file.text_info
+        mmmeta['capturing'] = self.nikontext_to_dict(text_info['capturing'])
+        mmmeta['AcquisitionDate'] = text_info['date']
+        mmmeta['description'] = self.nikontext_to_dict(text_info['description'])
+        mmmeta['optics'] = self.nikontext_to_dict(text_info['optics'])
+
+        mmmeta['custom_data'] = self.nd2file.custom_data
+        mmmeta['attributes'] = self.nd2file.attributes._asdict()
+        mmmeta['metadata'] = self.nd2metadata_to_dict(self.nd2file.metadata)
+
+        return mmmeta
+
+    @classmethod
+    def nikontext_to_dict(cls, text):
+        """Some kinds of Nikon metadata are described with text, using
+        newlines and colons. This function restructures the text into
+        a dict.
+
+        Args:
+            text : str
+                nikon-style metadata description text
+        Returns:
+            out : dict
+                restructured text
+        """
+        out = {}
+        curr_keys = []
+        for i, item in enumerate(text.split('\r\n')):
+            itparts = item.split(':')
+            itparts = [it.strip() for it in itparts if it.strip()!='']
+            if len(itparts)==1:
+                curr_keys.append(itparts[0])
+                cls.set_nested_dict_entry(out, curr_keys, {})
+            elif len(itparts)==2:
+                cls.set_nested_dict_entry(
+                    out, curr_keys+[itparts[0]], itparts[1])
+            elif len(itparts)==3:
+                curr_keys.append(itparts[0])
+                cls.set_nested_dict_entry(out, curr_keys, {})
+                cls.set_nested_dict_entry(
+                    out, curr_keys+[itparts[1]], itparts[2])
+            elif len(itparts) > 3:
+                curr_keys.append(itparts[0])
+                cls.set_nested_dict_entry(out, curr_keys, {})
+                cls.set_nested_dict_entry(
+                    out, curr_keys+[itparts[1]], item)
+                # raise KeyError(
+                #     'Cannot parse three or more colons between newlines: ' +
+                #     item)
+        return out
+
+    @classmethod
+    def nd2metadata_to_dict(cls, meta):
+        """Restructure the 'metadata' field from the package nd2 into a dict
+        for independent use.
+        https://github.com/tlambert03/nd2/blob/main/src/nd2/structures.py
+
+        Args:
+            meta : nd2 metadata structure
+                the 'metadata' part of nd2 metadata
+        Returns:
+            out : dict
+                the content as a dict.
+        """
+        out = {}
+        out['contents'] = meta.contents.__dict__
+        chans = [{}] * len(meta.channels)
+        for i, chan in enumerate(meta.channels):
+            chans[i] = chan.__dict__
+            metachan = chan.__dict__['channel'].__dict__
+            chans[i]['channel'] = {}
+            for k, v in metachan.items():
+                chans[i]['channel'][str(k)] = str(v)
+            chans[i]['loops'] = chan.__dict__['loops'].__dict__
+            chans[i]['microscope'] = chan.__dict__['microscope'].__dict__
+            chans[i]['volume'] = chan.__dict__['volume'].__dict__
+            axints = chans[i]['volume']['axesInterpretation']
+            chans[i]['volume']['axesInterpretation'] = [None]*len(axints)
+            for j, axes_inter in enumerate(axints):
+                chans[i]['volume']['axesInterpretation'][j] = {}
+                for k, v in axes_inter.__dict__.items():
+                    chans[i]['volume']['axesInterpretation'][j][str(k)] = str(v)
+        out['channels'] = chans
+        return out
+
+    @classmethod
+    def set_nested_dict_entry(cls, dict, keys, val):
+        """Set a value (deep) in a nested dict.
+        Args:
+            dict : dict
+                the nested dict
+            keys : list
+                the keys leading to the entry to set
+            val : anything
+                the value to set
+        """
+        currlvl = dict
+        for i, key in enumerate(keys[:-1]):
+            try:
+                currlvl = currlvl[key]
+            except KeyError:
+                currlvl[key] = {}
+                currlvl = currlvl[key]
+        currlvl[keys[-1]] = val
+
+    def __enter__(self):
+        return self.nd2file
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def __getitem__(self, it):
+        return self.get_frame(it)
+
+    def __iter__(self):
+        for i in range(self.nd2file.sizes['T']):
+            yield self[i]
+
+    def __len__(self):
+        return self.nd2file.sizes['T']
+
+    @property
+    def shape(self):
+        return self.data.shape
+
+    def close(self):
+        self.nd2file.close()
+
+    def get_frame(self, index):
+        """Load one frame of the movie
+        Args:
+            index : int
+                the frame index to retrieve.
+        Returns:
+            frame : 2D array
+                the image data of the frame
+        """
+        return self.nd2file[index, ...]
+
+    def tofile(self, file_handle, byte_order=None):
+        raise NotImplementedError('Cannot write .nd2 file.')
+
+    def camera_parameters(self, config):
+        """get the camera specific parameters:
+            * gain
+            * quantum efficiency
+            * wavelength
+        These parameters depend on camera settings (as described in metadata)
+        but the values themselves are given in the config.yaml file.
+        Each filetype (nd2, ome-tiff, ..) has their own structure of metadata,
+        which needs to be matched in the config.yaml description, as detailed
+        in the specific child classes.
+
+        The config file for the corresponding camera should look like this:
+          Zyla 4.2:
+            Pixelsize: 130
+            Baseline: 100
+            Quantum Efficiency:
+              525: 0.7
+              595: 0.72
+              700: 0.64
+            Sensitivity Categories:
+              - PixelReadoutRate
+              - ReadoutMode
+            Sensitivity:
+              540 MHz:
+                Rolling Shutter at 16-bit: 7.18
+              200 MHz:
+                Rolling Shutter at 16-bit: 0.45
+            Filter Wavelengths:
+                1-R640: 700
+                2-G561: 595
+                3-B489: 525
+
+        Args:
+            config : dict
+                description of camera parameters (for all possible settings)
+        Returns:
+            parameters : dict of lists of str
+                keys: gain, qe, wavelength
+        """
+        parameters = {}
+        info = self.meta
+
+        try:
+            assert "Cameras" in config.keys() and "Camera" in info.keys()
+        except:
+            # return {'gain': [1], 'qe': [1], 'wavelength': [0], 'cam_index': 0}
+            raise KeyError("'camera' key not found in metadata or config.")
+
+        cameras = config['Cameras']
+        camera = info["Camera"]
+
+        try:
+            assert camera in cameras.keys()
+        except:
+            # return {'gain': [1], 'qe': [1], 'wavelength': [0], 'cam_index': 0}
+            raise KeyError('camera from metadata not found in config.')
+
+        index = sorted(list(cameras.keys())).index(camera)
+        parameters['cam_index'] = index
+        parameters['camera'] = camera
+
+        try:
+            assert "Picasso Metadata" in info
+        except:
+            return {'gain': [1], 'qe': [1], 'wavelength': [0], 'cam_index': 0}
+
+        pm_info = info["Picasso Metadata"]
+        cam_config = config["Cameras"][camera]
+        if "Gain Property Name" in cam_config:
+            raise NotImplementedError('extracting Gain from nd2 files is not implemented yet.')
+            gain_property_name = cam_config["Gain Property Name"]
+            gain = pm_info['gain']
+            if "EM Switch Property" in cam_config:
+                switch_property_name = cam_config[
+                    "EM Switch Property"
+                ]["Name"]
+                switch_property_value = mm_info[
+                    camera + "-" + switch_property_name
+                ]
+                if (
+                    switch_property_value
+                    == cam_config["EM Switch Property"][True]
+                ):
+                    parameters['gain'] = int(gain)
+        if 'gain' not in parameters.keys():
+            parameters['gain'] = [1]
+
+        parameters['Sensitivity'] = {}
+        if "Sensitivity Categories" in cam_config:
+            categories = cam_config["Sensitivity Categories"]
+            for i, category in enumerate(categories):
+                parameters['Sensitivity'][category] = pm_info[category]
+        if "Quantum Efficiency" in cam_config:
+            if "Filter Wavelengths" in cam_config:
+                channel = pm_info['Filter']
+                channels = cam_config["Filter Wavelengths"]
+                if channel in channels:
+                    wavelength = channels[channel]
+                    parameters['wavelength'] = str(wavelength)
+                    parameters['qe'] = cam_config["Quantum Efficiency"][
+                        wavelength]
+        if 'qe' not in parameters.keys():
+            parameters['qe'] = [1]
+        if 'wavelength' not in parameters.keys():
+            parameters['wavelength'] = [0]
+        return parameters
+
+    @property
+    def dtype(self):
+        return _np.dtype(self.nd2file.pixel_type)
+
+
 class TiffMap:
 
     TIFF_TYPES = {1: "B", 2: "c", 3: "H", 4: "L", 5: "RATIONAL"}
