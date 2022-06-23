@@ -20,8 +20,10 @@ from . import gaussmle as _gaussmle
 from . import io as _io
 from . import postprocess as _postprocess
 from . import __main__ as main
+from . import multiproc as _pmultip
 import os
 from datetime import datetime
+import time
 from sqlalchemy import create_engine
 import pandas as pd
 
@@ -117,18 +119,41 @@ def identify_in_image(image, minimum_ng, box):
 
 
 def identify_in_frame(frame, minimum_ng, box, roi=None):
+    # print('start identifying in frame')
     if roi is not None:
         frame = frame[roi[0][0]: roi[1][0], roi[0][1]: roi[1][1]]
     image = _np.float32(frame)  # otherwise numba goes crazy
+    # print('start identifying in image')
     y, x, net_gradient = identify_in_image(image, minimum_ng, box)
+    # print('done identifying in image')
     if roi is not None:
         y += roi[0][0]
         x += roi[0][1]
+    # print('done identifying in frame')
     return y, x, net_gradient
 
+def identify_frame(frame, minimum_ng, box, frame_number, roi=None, resultqueue=None):
+    # print('start identifying frame')
+    y, x, net_gradient = identify_in_frame(frame, minimum_ng, box, roi)
+    # print('got result of "in frame"')
+    # print('result x', x)
+    # print('len {:d}'.format(len(x)))
+    frame = frame_number * _np.ones(len(x))
+    # print('done identifying frame')
+    result = _np.rec.array(
+        (frame, x, y, net_gradient),
+        dtype=[("frame", "i"), ("x", "i"), ("y", "i"), ("net_gradient", "f4")],
+    )
+    if resultqueue is not None:
+        resultqueue.put(result)
+    return result
 
-def identify_by_frame_number(movie, minimum_ng, box, frame_number, roi=None):
-    frame = movie[frame_number]
+def identify_by_frame_number(movie, minimum_ng, box, frame_number, roi=None, lock=None):
+    if lock is not None:
+        with lock:
+            frame = movie[frame_number]
+    else:
+        frame = movie[frame_number]
     y, x, net_gradient = identify_in_frame(frame, minimum_ng, box, roi)
     frame = frame_number * _np.ones(len(x))
     return _np.rec.array(
@@ -147,17 +172,249 @@ def _identify_worker(movie, current, minimum_ng, box, roi, lock):
                 return identifications
             current[0] += 1
         identifications.append(
-            identify_by_frame_number(movie, minimum_ng, box, index, roi)
+            identify_by_frame_number(movie, minimum_ng, box, index, roi, lock)
         )
     return identifications
 
+def _identify_worker_directload(
+        framequeue, resultqueue, framerequestqueue, frameloadqueue,
+        framefinishedqueue,
+        minimum_ng, box, roi):
+    # innerlogger = _pmultip.worker_configurer(logqueue, worker_idx)
+    time_getfridx = 0
+    time_loadimg = 0
+    time_identify = 0
+    time_queues = 0
+    i = 0
+    while not framequeue.empty():
+        tic = time.time()
+        try:
+            frame_idx = framequeue.get(timeout=.5)
+        except:
+            print('frame queue is empty')
+            break
+            # resultqueue.put('done')
+            # return True
+        time_getfridx += time.time() - tic
+        tic = time.time()
+        framerequestqueue.put(frame_idx)
+        frame = frameloadqueue.get(timeout=5)
+        time_loadimg += time.time() - tic
+        tic = time.time()
+        # frame = movie[frame_idx]
+        result = identify_frame(frame, minimum_ng, box, frame_idx, roi)
+        time_identify += time.time() - tic
+        tic = time.time()
+        resultqueue.put(result)
+        framefinishedqueue.put(frame_idx)
+        # print('finished with frame', frame_idx)
+        time_queues += time.time() - tic
+        tic = time.time()
+        i += 1
+    # print('worker is done')
+    resultqueue.put('done')
+    totaltime = time_getfridx + time_loadimg + time_identify + time_queues
+    print('identification of {:d} imgs took {:.1f} %  getfridx, {:.1f}% loadimg, {:.1f}% identify, {:.1f}% queues'.format(
+        i, 100*time_getfridx/totaltime, 100*time_loadimg/totaltime,
+        100*time_identify/totaltime, 100*time_queues/totaltime
+    ))
+    return True
+
+def _identify_start_processes(movie, minimum_ng, box, roi, n_workers,
+        current, lock, debug_sglproc=False):
+    # innerlogger = _pmultip.worker_configurer(logqueue, worker_idx)
+
+    # create a queue from which processes can poll the next frame to work on.
+    n_frames = len(movie)
+    framequeue = _multiprocessing.Queue(maxsize=n_frames)
+    for idx in range(n_frames):
+        framequeue.put(idx)
+    framefinishedqueue = _multiprocessing.Queue()
+
+    # create processes
+    tic = time.time()
+    workprocesses = []
+    resultqueues = []
+    framerequestqueues = []
+    frameloadqueues = []
+    if debug_sglproc:
+        resultqueue = _multiprocessing.Queue()
+        _identify_worker_directload(movie, framequeue, resultqueue,
+              minimum_ng, box, roi)
+        print('identify worker ran through without multiprocessing')
+        workprocess = _multiprocessing.Process(target=_np.min, args=([3,4 ,5]))
+        workprocesses.append(workprocess)
+        print('created dummy workprocess')
+        resultqueues.append(resultqueue)
+    else:
+        for worker_idx in range(n_workers):
+            resultqueue = _multiprocessing.Queue()
+            framerequestqueue = _multiprocessing.Queue()
+            frameloadqueue = _multiprocessing.Queue()
+            workprocess = _multiprocessing.Process(
+                target=_identify_worker_directload,
+                args=(framequeue, resultqueue, framerequestqueue,
+                      frameloadqueue, framefinishedqueue,
+                      minimum_ng, box, roi))
+            workprocesses.append(workprocess)
+            # print('created workprocess in worker {:d}'.format(worker_idx))
+            resultqueues.append(resultqueue)
+            framerequestqueues.append(framerequestqueue)
+            frameloadqueues.append(frameloadqueue)
+
+    frameload_abortqueue = _multiprocessing.Queue()
+    frameloader_proc = _threading.Thread(
+        target=dask_movie_load_worker,
+        args=(movie, framerequestqueues, frameloadqueues, frameload_abortqueue)
+    )
+    frameloader_proc.start()
+    framemonitor_abortqueue = _multiprocessing.Queue()
+    framemonitor_thread = _threading.Thread(
+        target=monitor_framefinishing,
+        args=(framefinishedqueue, framemonitor_abortqueue, current, lock)
+    )
+    framemonitor_thread.start()
+
+    for worker_idx, workprocess in enumerate(workprocesses):
+        workprocess.start()
+        # print('started workprocess {:d}'.format(worker_idx))
+
+    return (workprocesses, resultqueues, frameload_abortqueue, frameloader_proc,
+            framemonitor_abortqueue, framemonitor_thread)
+
+def _identify_stop_processes(
+        workprocesses, resultqueues, frameload_abortqueue, frameloader_proc,
+        framemonitor_abortqueue, framemonitor_thread):
+    # identifications_dict = {}
+    identifications = []
+    for idx, (workprocess, resultqueue) in enumerate(
+            zip(workprocesses, resultqueues)):
+        # print('waiting for worker {:d} to finish.'.format(idx))
+        # print('collecting results.')
+        while True:  # not resultqueue.empty():
+            # frame, workresult = resultqueue.get().items()
+            # identifications_dict[frame] = workresult
+            try:
+                workresult = resultqueue.get(timeout=.1)
+                if not isinstance(workresult, str):
+                    identifications.append(workresult)
+                else:
+                    # print(workresult)  # says: 'done'
+                    break
+            except:
+                # print('Error getting result in worker {:d}'.format(idx))
+                # break
+                time.sleep(1)
+        # resultqueue.close()
+        workprocess.join()
+    # print('got all results, now frameloader')
+
+    # stop the frame loader
+    frameload_abortqueue.put('stop')
+    frameloader_proc.join()
+    # print('stopping framemonitor')
+    # stop the frame monitor
+    framemonitor_abortqueue.put('stop')
+    framemonitor_thread.join()
+
+    # identifications = []
+    # for i in range(n_frames):
+    #     identifications.append(identifications_dict[i])
+
+    return identifications
+
+def dask_movie_load_worker(movie, requestqueues, framequeues, abortqueue):
+    """load frames from a dask movie as a service running in a separate
+    Thread or Process, so the dask movie doesn't have to be transferred to
+    each process (which takes quite long)
+    Args:
+        movie : A PicassoMovie with use_dask==True (e.g. ND2Movie)
+            the source
+        requestqueues : list of queues
+            a list of queues, where other processes request frame numbers
+        framequeues : list of queues, same len as requestqueues
+            a list of queues, where this worker posts the frames loaded
+    """
+    while True:
+        for requestqueue, framequeue in zip(requestqueues, framequeues):
+            try:
+                frame_requested = requestqueue.get(timeout=.1)
+                if isinstance(frame_requested, int):
+                    frame = movie[frame_requested]
+                    framequeue.put(frame)
+            except:
+                pass
+        # check whether to end this worker
+        try:
+            abortresult = abortqueue.get(timeout=.1)
+            # print('frameloader abort queue got: ', abortresult)
+            return
+        except:
+            pass
+
+def monitor_framefinishing(framefinishedqueue, abortqueue, current, lock):
+    """Monitor how frames get finished
+    Args:
+        framefinishedqueue : queue
+            here, processes send frames that have been finished processing
+        abortqueue : queue
+            a queue where something is sent if this Thread should end
+        current : array, len 1
+            the current frame
+        lock : a threading lock
+            for writing current
+    """
+    while True:
+        try:
+            frame_finished = framefinishedqueue.get(timeout=.1)
+            if isinstance(frame_finished, int):
+                with lock:
+                    current[0] = current[0]+1  # frame_finished
+        except:
+            pass
+        # check whether to end this worker
+        try:
+            abortresult = abortqueue.get(timeout=.1)
+            # print('framemonitor abort queue got: ', abortresult)
+            return
+        except:
+            pass
+
 
 def identifications_from_futures(futures):
-    ids_list_of_lists = [_.result() for _ in futures]
+    if isinstance(futures, list):
+        ids_list_of_lists = [_.result() for _ in futures]
+    elif isinstance(futures, DaskFuture):
+        ids_list_of_lists = _identify_stop_processes(**futures.get_all())
     ids_list = list(_chain(*ids_list_of_lists))
     ids = _np.hstack(ids_list).view(_np.recarray)
     ids.sort(kind="mergesort", order="frame")
     return ids
+
+
+class DaskFuture:
+    """Data structure to hold queues etc for identifying dask arrays
+    """
+    def __init__(
+            self,
+            workprocesses, resultqueues, frameload_abortqueue, frameloader_proc,
+            framemonitor_abortqueue, framemonitor_thread):
+        self.workprocesses = workprocesses
+        self.resultqueues = resultqueues
+        self.frameload_abortqueue = frameload_abortqueue
+        self.frameloader_proc = frameloader_proc
+        self.framemonitor_abortqueue = framemonitor_abortqueue
+        self.framemonitor_thread = framemonitor_thread
+
+    def get_all(self):
+        return {
+            'workprocesses': self.workprocesses,
+            'resultqueues': self.resultqueues,
+            'frameload_abortqueue': self.frameload_abortqueue,
+            'frameloader_proc': self.frameloader_proc,
+            'framemonitor_abortqueue': self.framemonitor_abortqueue,
+            'framemonitor_thread': self.framemonitor_thread,
+            }
 
 
 def identify_async(movie, minimum_ng, box, roi=None):
@@ -178,20 +435,31 @@ def identify_async(movie, minimum_ng, box, roi=None):
 
     n_workers = max(1, int(cpu_utilization * _multiprocessing.cpu_count()))
 
-    current = [0]
-    executor = _ThreadPoolExecutor(n_workers)
+    # logqueue, listener = _pmultip.start_multiprocesslogging('identify.log')
     lock = _threading.Lock()
-    f = [
-        executor.submit(
-            _identify_worker, movie, current, minimum_ng, box, roi, lock
-        )
-        for _ in range(n_workers)
-    ]
-    executor.shutdown(wait=False)
+    current = [0]
+    if movie.use_dask:
+        (workprocesses, resultqueues, frameload_abortqueue, frameloader_proc,
+         framemonitor_abortqueue, framemonitor_thread
+         ) = _identify_start_processes(
+            movie, minimum_ng, box, roi, n_workers, current, lock)
+        f = DaskFuture(
+            workprocesses, resultqueues, frameload_abortqueue, frameloader_proc,
+            framemonitor_abortqueue, framemonitor_thread)
+    else:
+        executor = _ThreadPoolExecutor(n_workers)
+        f = [
+            executor.submit(
+                _identify_worker, movie, current, minimum_ng, box, roi, lock
+            )
+            for _ in range(n_workers)
+        ]
+        executor.shutdown(wait=False)
     return current, f
 
 
 def identify(movie, minimum_ng, box, threaded=True):
+    print('threaded', threaded)
     if threaded:
         current, futures = identify_async(movie, minimum_ng, box)
         identifications = [_.result() for _ in futures]
@@ -303,12 +571,12 @@ def _cut_spots_framebyframe(movie, ids_frame, ids_x, ids_y, box, spots):
 
 
 def _cut_spots(movie, ids, box):
+    N = len(ids.frame)
     if isinstance(movie, _np.ndarray):
         return _cut_spots_numba(movie, ids.frame, ids.x, ids.y, box)
     # elif isinstance(movie, _io.ND2Movie):
     elif movie.use_dask:
         """ Assumes that identifications are in order of frames! """
-        N = len(ids.frame)
         spots = _np.zeros((N, box, box), dtype=movie.dtype)
         spots = _da.apply_gufunc(
             _cut_spots_daskmov,
