@@ -741,13 +741,23 @@ class ND2readerMovie(AbstractPicassoMovie):
 
         self.meta = self.get_metadata()
 
+        self.nd2data = ND2Reader(self.path)
+        self._shape = [
+            self.nd2data.metadata['num_frames'],
+            self.nd2data.metadata['width'],
+            self.nd2data.metadata['height'],
+            ]
+
     def info(self):
         return self.meta
 
-    def get_metadata(self):
+    def get_metadata(self, nd2file):
         """Brings the file metadata in a readable form, and preprocesses it
         for easier downstream use.
 
+        Args:
+            nd2file : nd2.ND2File
+                the object holding the image incl metadata
         Returns:
             info : dict
                 the metadata
@@ -755,14 +765,14 @@ class ND2readerMovie(AbstractPicassoMovie):
         info = {
             # "Byte Order": self._tif_byte_order,
             "File": self.path,
-            "Height": self.nd2file.sizes['Y'],
-            "Width": self.nd2file.sizes['X'],
-            "Data Type": self.nd2file.dtype.name,
-            "Frames": self.nd2file.sizes['T'],
+            "Height": nd2file.sizes['Y'],
+            "Width": nd2file.sizes['X'],
+            "Data Type": nd2file.dtype.name,
+            "Frames": nd2file.sizes['T'],
         }
         info['Acquisition Comments'] = ''
 
-        mm_info = self.metadata_to_dict()
+        mm_info = self.metadata_to_dict(nd2file)
         camera_name = mm_info.get('description', {}).get(
                 'Metadata', {}).get('Camera Name', 'None')
         info['Camera'] = camera_name
@@ -804,24 +814,27 @@ class ND2readerMovie(AbstractPicassoMovie):
 
         return info
 
-    def metadata_to_dict(self):
+    def metadata_to_dict(self, nd2file):
         """Extracts all types of metadata in the file and returns it in a dict.
 
+        Args:
+            nd2file : nd2.ND2File
+                the object holding the image incl metadata
         Returns:
             mmmeta : dict
                 all metadata
         """
         mmmeta = {}
 
-        text_info = self.nd2file.text_info
+        text_info = nd2file.text_info
         mmmeta['capturing'] = self.nikontext_to_dict(text_info['capturing'])
         mmmeta['AcquisitionDate'] = text_info['date']
         mmmeta['description'] = self.nikontext_to_dict(text_info['description'])
         mmmeta['optics'] = self.nikontext_to_dict(text_info['optics'])
 
-        mmmeta['custom_data'] = self.nd2file.custom_data
-        mmmeta['attributes'] = self.nd2file.attributes._asdict()
-        mmmeta['metadata'] = self.nd2metadata_to_dict(self.nd2file.metadata)
+        mmmeta['custom_data'] = nd2file.custom_data
+        mmmeta['attributes'] = nd2file.attributes._asdict()
+        mmmeta['metadata'] = self.nd2metadata_to_dict(nd2file.metadata)
 
         return mmmeta
 
@@ -919,7 +932,7 @@ class ND2readerMovie(AbstractPicassoMovie):
         currlvl[keys[-1]] = val
 
     def __enter__(self):
-        return self.nd2file
+        return self.nd2data
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
@@ -928,18 +941,18 @@ class ND2readerMovie(AbstractPicassoMovie):
         return self.get_frame(it)
 
     def __iter__(self):
-        for i in range(self.nd2file.sizes['T']):
+        for i in range(self.sizes['T']):
             yield self[i]
 
     def __len__(self):
-        return self.nd2file.sizes['T']
+        return self.sizes['T']
 
     @property
     def shape(self):
-        return self.data.shape
+        return self._shape
 
     def close(self):
-        self.nd2file.close()
+        self.nd2data.close()
 
     def get_frame(self, index):
         """Load one frame of the movie
