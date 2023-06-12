@@ -25,7 +25,7 @@ def interpolate_nan(data):
     return data
 
 
-def calibrate_z(locs, info, d, magnification_factor, path=None):
+def calibrate_z(locs, info, d, magnification_factor, path=None, show=True):
     n_frames = info[0]["Frames"]
     range = (n_frames - 1) * d
     frame_range = _np.arange(n_frames)
@@ -150,7 +150,8 @@ def calibrate_z(locs, info, d, magnification_factor, path=None):
         dirname = path[0:-5]
         _plt.savefig(dirname + ".png", format="png", dpi=300)
 
-    _plt.show()
+    if show:
+        _plt.show()
 
     export = False
     # Export
@@ -173,7 +174,237 @@ def calibrate_z(locs, info, d, magnification_factor, path=None):
 
     return calibration
 
-def calibrate_z_tilt(locs, info, d, magnification_factor, path=None):
+
+def select_index_range(arr, axis, start, end):
+    # Create a tuple of slices to select the desired index range along the specified axis
+    slices = [slice(None)] * arr.ndim
+    slices[axis] = slice(start, end)
+    
+    # Use the tuple of slices to select the desired subarray
+    selected = arr[tuple(slices)]
+    
+    return selected
+
+
+def calc_shift_msqerr(arr, ref, rng, x_arr=None, x_ref=None, axis=0):
+    """
+    Args:
+        arr : 1 or 2D array
+            array to shift
+        ref : 1 or 2D array
+            reference data
+        rng : even int
+            range of shift evaluation
+        axis : int
+            the axis to shift over
+    """
+    msqerr = _np.zeros(rng)
+    if x_arr is not None and x_ref is not None:
+        if len(arr.shape) > 1:
+            arr_new = _np.zeros_like(ref)
+            for idx in range(arr.shape[1]):  # this 1 should be 'all but "axis"'
+                arr_new[:, idx] = _np.interp(x_ref, x_arr, arr[:, idx], left=_np.nan, right=_np.nan)
+            arr = arr_new
+        else:
+            arr = _np.interp(x_ref, x_arr, arr, left=_np.nan, right=_np.nan)
+    for i in range(rng):
+        msqerr[i] = _np.nanmean(
+            (select_index_range(ref, axis, i, -rng+i)
+             -select_index_range(arr, axis, int(rng/2), -int(rng/2)))**2)
+    return _np.argmin(msqerr)-int(rng/2)
+    
+
+def calibrate_z_groupedshift(locs, info, d, magnification_factor, path=None, show=True, xylock=True):
+    n_frames = info[0]["Frames"]
+    range = (n_frames - 1) * d
+    frame_range = _np.arange(n_frames)
+    z_range = -(frame_range * d - range / 2)  # negative so that the first frames of
+    # a bottom-to-up scan are positive z coordinates.
+
+    # shift the frames of groups to match the sx/sy curves best
+    import pandas as pd
+    locsdf = pd.DataFrame(locs)
+    # import matplotlib.pyplot as plt
+    # fig, ax = plt.subplots(ncols=2, nrows=2)
+    # for gidx, gdf in locsdf.groupby('group'):
+    #     ax[0, 0].plot(gdf['frame'].to_numpy(), gdf['sx'].to_numpy())
+    #     ax[0, 1].plot(gdf['frame'].to_numpy(), gdf['sy'].to_numpy())
+    if xylock:
+        # get reference
+        refid = locsdf.groupby('group').apply(lambda x: len(x.index)).idxmax()
+        # shift x and y together
+        shiftdf = locsdf.groupby('group').apply(lambda x: calc_shift_msqerr(
+            x[['sx', 'sy']].to_numpy(),
+            locsdf.loc[locsdf['group']==refid, ['sx', 'sy']].to_numpy(),
+            int(n_frames/2),
+            x_arr=x['frame'].to_numpy(),
+            x_ref=locsdf.loc[locsdf['group']==refid, 'frame'].to_numpy()))
+    else:
+        # shift x and y separately
+        raise NotImplementedError('Only shifting frames for now -> separate shifts in sx and sy don"t work')
+        shiftdf = locsdf.groupby('group').apply(lambda x: calc_shift_msqerr(
+            x[['sx']].to_numpy(),
+            locsdf.loc[locsdf['group']==0, ['sx']].to_numpy(),
+            int(n_frames/2)))
+        shiftdf = locsdf.groupby('group').apply(lambda x: calc_shift_msqerr(
+            x[['sy']].to_numpy(),
+            locsdf.loc[locsdf['group']==0, ['sy']].to_numpy(),
+            int(n_frames/2)))
+    locsdf['frame'] = locsdf.apply(lambda x: x['frame']+shiftdf[x['group']], axis=1).astype(_np.int32)
+    # filter
+    locsdf = locsdf.loc[locsdf['frame']>=0, :]
+    locsdf = locsdf.loc[locsdf['frame']<n_frames, :]
+    # for gidx, gdf in locsdf.groupby('group'):
+    #     ax[1, 0].plot(gdf['frame'].to_numpy(), gdf['sx'].to_numpy())
+    #     ax[1, 1].plot(gdf['frame'].to_numpy(), gdf['sy'].to_numpy())
+    # plt.show()
+    # insert back into locs
+    locs = locsdf.to_records(index=False)
+
+    mean_sx = _np.array([_np.mean(locs.sx[locs.frame == _]) for _ in frame_range])
+    mean_sy = _np.array([_np.mean(locs.sy[locs.frame == _]) for _ in frame_range])
+    var_sx = _np.array([_np.var(locs.sx[locs.frame == _]) for _ in frame_range])
+    var_sy = _np.array([_np.var(locs.sy[locs.frame == _]) for _ in frame_range])
+
+    keep_x = (locs.sx - mean_sx[locs.frame]) ** 2 < var_sx[locs.frame]
+    keep_y = (locs.sy - mean_sy[locs.frame]) ** 2 < var_sy[locs.frame]
+    keep = keep_x & keep_y
+    locs = locs[keep]
+
+    # Fits calibration curve to the mean of each frame
+    mean_sx = _np.array([_np.mean(locs.sx[locs.frame == _]) for _ in frame_range])
+    mean_sy = _np.array([_np.mean(locs.sy[locs.frame == _]) for _ in frame_range])
+
+    # Fix nan
+    mean_sx = interpolate_nan(mean_sx)
+    mean_sy = interpolate_nan(mean_sy)
+
+    cx = _np.polyfit(z_range, mean_sx, 6, full=False)
+    cy = _np.polyfit(z_range, mean_sy, 6, full=False)
+
+    # Fits calibration curve to each localization
+    # true_z = locs.frame * d - range / 2
+    # cx = _np.polyfit(true_z, locs.sx, 6, full=False)
+    # cy = _np.polyfit(true_z, locs.sy, 6, full=False)
+
+    calibration = {
+        "X Coefficients": [float(_) for _ in cx],
+        "Y Coefficients": [float(_) for _ in cy],
+    }
+    if path is not None:
+        with open(path, "w") as f:
+            _yaml.dump(calibration, f, default_flow_style=False)
+
+    locs = fit_z(locs, info, calibration, magnification_factor)
+    locs.z /= magnification_factor
+
+    _plt.figure(figsize=(18, 10))
+
+    _plt.subplot(231)
+    # Plot this if calibration curve is fitted to each localization
+    # _plt.plot(true_z, locs.sx, '.', label='x', alpha=0.2)
+    # _plt.plot(true_z, locs.sy, '.', label='y', alpha=0.2)
+    # _plt.plot(true_z, _np.polyval(cx, true_z), '0.3', lw=1.5, label='x fit')
+    # _plt.plot(true_z, _np.polyval(cy, true_z), '0.3', lw=1.5, label='y fit')
+    _plt.plot(z_range, mean_sx, ".-", label="x")
+    _plt.plot(z_range, mean_sy, ".-", label="y")
+    _plt.plot(z_range, _np.polyval(cx, z_range), "0.3", lw=1.5, label="x fit")
+    _plt.plot(z_range, _np.polyval(cy, z_range), "0.3", lw=1.5, label="y fit")
+    _plt.xlabel("Stage position")
+    _plt.ylabel("Mean spot width/height")
+    _plt.xlim(z_range.min(), z_range.max())
+    _plt.legend(loc="best")
+
+    ax = _plt.subplot(232)
+    _plt.scatter(locs.sx, locs.sy, c="k", lw=0, alpha=0.1)
+    _plt.plot(
+        _np.polyval(cx, z_range),
+        _np.polyval(cy, z_range),
+        lw=1.5,
+        label="calibration from fit of mean width/height",
+    )
+    _plt.plot()
+    ax.set_aspect("equal")
+    _plt.xlabel("Spot width")
+    _plt.ylabel("Spot height")
+    _plt.legend(loc="best")
+
+    _plt.subplot(233)
+    _plt.plot(locs.z, locs.sx, ".", label="x", alpha=0.2)
+    _plt.plot(locs.z, locs.sy, ".", label="y", alpha=0.2)
+    _plt.plot(z_range, _np.polyval(cx, z_range), "0.3", lw=1.5, label="calibration")
+    _plt.plot(z_range, _np.polyval(cy, z_range), "0.3", lw=1.5)
+    _plt.xlim(z_range.min(), z_range.max())
+    _plt.xlabel("Estimated z")
+    _plt.ylabel("Spot width/height")
+    _plt.legend(loc="best")
+
+    ax = _plt.subplot(234)
+    _plt.plot(z_range[locs.frame], locs.z, ".k", alpha=0.1)
+    _plt.plot(
+        [z_range.min(), z_range.max()],
+        [z_range.min(), z_range.max()],
+        lw=1.5,
+        label="identity",
+    )
+    _plt.xlim(z_range.min(), z_range.max())
+    _plt.ylim(z_range.min(), z_range.max())
+    ax.set_aspect("equal")
+    _plt.xlabel("Stage position")
+    _plt.ylabel("Estimated z")
+    _plt.legend(loc="best")
+
+    ax = _plt.subplot(235)
+    deviation = locs.z - z_range[locs.frame]
+    bins = _lib.calculate_optimal_bins(deviation, max_n_bins=1000)
+    _plt.hist(deviation, bins)
+    _plt.xlabel("Deviation to true position")
+    _plt.ylabel("Occurence")
+
+    ax = _plt.subplot(236)
+    square_deviation = deviation**2
+    mean_square_deviation_frame = [
+        _np.mean(square_deviation[locs.frame == _]) for _ in frame_range
+    ]
+    rmsd_frame = _np.sqrt(mean_square_deviation_frame)
+    _plt.plot(z_range, rmsd_frame, ".-", color="0.3")
+    _plt.xlim(z_range.min(), z_range.max())
+    _plt.gca().set_ylim(bottom=0)
+    _plt.xlabel("Stage position")
+    _plt.ylabel("Mean z precision")
+
+    _plt.tight_layout(pad=2)
+
+    if path is not None:
+        dirname = path[0:-5]
+        _plt.savefig(dirname + "_groupshifted.png", format="png", dpi=300)
+
+    if show:
+        _plt.show()
+
+    export = False
+    # Export
+    if export:
+        print("Exporting...")
+        _np.savetxt("mean_sx.txt", mean_sx, delimiter="/t")
+        _np.savetxt("mean_sy.txt", mean_sy, delimiter="/t")
+        _np.savetxt("locs_sx.txt", locs.sx, delimiter="/t")
+        _np.savetxt("locs_sy.txt", locs.sy, delimiter="/t")
+        _np.savetxt("cx.txt", cx, delimiter="/t")
+        _np.savetxt("cy.txt", cy, delimiter="/t")
+        _np.savetxt("z_range.txt", z_range, delimiter="/t")
+        _np.savetxt("locs_z.txt", locs.z, delimiter="/t")
+        _np.savetxt("z_range_locs_frame.txt", z_range[locs.frame], delimiter="/t")
+        _np.savetxt("rmsd_frame.txt", rmsd_frame, delimiter="/t")
+
+    # np.savetxt('test.out', x, delimiter=',')   # X is an array
+    # np.savetxt('test.out', (x,y,z))   # x,y,z equal sized 1D arrays
+    # np.savetxt('test.out', x, fmt='%1.4e')   # use exponential notation
+
+    return calibration, locs
+
+
+def calibrate_z_tilt(locs, info, d, magnification_factor, path=None, show=True):
     n_frames = info[0]["Frames"]
     range = (n_frames - 1) * d
     frame_range = _np.arange(n_frames)
@@ -438,7 +669,8 @@ def calibrate_z_tilt(locs, info, d, magnification_factor, path=None):
         dirname = path[0:-5]
         _plt.savefig(dirname + ".png", format='png', dpi=300)
 
-    _plt.show()
+    if show:
+        _plt.show()
 
     export = False
     # Export

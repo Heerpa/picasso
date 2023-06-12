@@ -153,15 +153,130 @@ def fit_spot(spot):
     return result[0]
 
 
-def fit_spots(spots):
-    theta = _np.empty((len(spots), 6), dtype=_np.float32)
+@_numba.jit(nopython=True, nogil=True)
+def _gaussian_2D_rot(A, bkg, mu, sigma, alpha, grid_box_x, grid_box_y, model):
+    """
+    Args:
+        A : float
+            amplitude
+        bkg : float
+            background
+        mu : tuple, len 2
+            center
+        sigma : tuple, len 2
+            widths of axis a and b
+        alpha : float, bounded [-pi/4 : pi/4]
+            angle between x axis and ellipse axis
+        grid_box_x : 2D int array, shape as spot box
+            x coordinates
+        grid_box_y : 2D int array, shape as spot box
+            y coordinates
+    """
+    norm = 0.1591549431 / sigma[0] / sigma[1]
+    a = (_np.cos(alpha)**2 / (2 * sigma[0]**2)
+         + _np.sin(alpha)**2 / (2 * sigma[1]**2))
+    b = (- _np.sin(2 * alpha) / (4 * sigma[0]**2)
+         + _np.sin(2 * alpha) / (4 * sigma[1]**2))
+    c = (_np.sin(alpha)**2 / (2 * sigma[0]**2)
+         + _np.cos(alpha)**2 / (2 * sigma[1]**2))
+
+    model[:, :] = bkg + A * norm * _np.exp(- (
+        a * (grid_box_x - mu[0])**2
+        + 2 * b * (grid_box_x - mu[0]) * (grid_box_y - mu[1])
+        + c * (grid_box_y - mu[1])**2))
+    return model
+
+
+@_numba.jit(nopython=True, nogil=True)
+def _compute_model_rot(theta, grid_box_x, grid_box_y, size, model):
+    model = _gaussian_2D_rot(
+        theta[2], theta[3], theta[:2], theta[4:6], theta[6],
+        grid_box_x, grid_box_y, model)
+    return model
+
+
+@_numba.jit(nopython=True, nogil=True)
+def _compute_residuals_rot(
+        theta, spot, grid_box_x, grid_box_y, size, model, residuals):
+    _compute_model_rot(theta, grid_box_x, grid_box_y, size, model)
+    residuals[:, :] = spot - model
+    return residuals.flatten()
+
+
+def fit_spot_rot(spot, bounded=True):
+    """fits a 2D gaussian to a spot, taking rotation alpha of the
+    elliptic axes with respect to x/y into account.
+    (sx, sy) = (sin alpha, cos alpha; cos alpha, -sin alpha) * (sa, sb)
+
+    For compability to non-rotation fitting, alpha shall be bounded to
+    the interval [-pi/4:pi/4]. Therefore, the axes sa, sb are approximately
+    sx, sy, and can vary between long and short axis.
+
+    Approach:
+     * first use fit_spot to find the approximate solution (using non-bounded
+        fitting)
+     * then use the result as initial values to fitting with the bounded alpha
+        and on a 2D model, as projections onto x/y are imprecise and grid
+        transformation on the rotated axes are computationally expensive
+
+    parameters:
+        0: x-position
+        1: y-position
+        2: amplitude (photons)
+        3: background
+        4: a width (approx x width)
+        5: b width (approx y width)
+        6: rotation angle [rad]
+    """
+    size = spot.shape[0]
+    size_half = int(size / 2)
+
+    # pars_nonrot = fit_spot(spot)
+    pars_nonrot = _initial_parameters(spot, size, size_half)
+
+    theta0 = _np.empty(7, dtype=_np.float32)
+    theta0[:-1] = pars_nonrot
+    theta0[-1] = 0
+
+    grid = _np.arange(-size_half, size_half + 1, dtype=_np.float32)
+    grid_box_x, grid_box_y = _np.meshgrid(grid, grid)
+    model = _np.empty((size, size), dtype=_np.float32)
+    residuals = _np.empty((size, size), dtype=_np.float32)
+    args = (spot, grid_box_x, grid_box_y, size, model, residuals)
+    # bounded=False
+    if bounded:
+        bounds_lo = [-size_half-1, -size_half-1, 0, -1E2, 0, 0, -_np.pi / 4]
+        bounds_hi = [size_half+1, size_half+1, 1E7, 1E3, size, size, _np.pi / 4]
+        # print('x0', theta0)
+        # print('bounds_lo', bounds_lo)
+        # print('bounds_hi', bounds_hi)
+        result = _optimize.least_squares(
+            _compute_residuals_rot, theta0, args=args, ftol=1e-5, xtol=1e-5,
+            bounds=(bounds_lo, bounds_hi)
+        )  # leastsq is much faster than least_squares
+        res = result.x
+    else:
+        result = _optimize.leastsq(
+            _compute_residuals_rot, theta0, args=args, ftol=1e-5, xtol=1e-5
+        )  # leastsq is much faster than least_squares
+        res = result[0]
+    # print('fit result', result)
+    return res
+
+
+def fit_spots(spots, fit_rot=False):
+    npars = 7 if fit_rot else 6
+    theta = _np.empty((len(spots), npars), dtype=_np.float32)
     theta.fill(_np.nan)
     for i, spot in enumerate(spots):
-        theta[i] = fit_spot(spot)
+        if fit_rot:
+            theta[i] = fit_spot_rot(spot)
+        else:
+            theta[i] = fit_spot(spot)
     return theta
 
 
-def fit_spots_parallel(spots, asynch=False):
+def fit_spots_parallel(spots, asynch=False, fit_rot=False):
     n_workers = min(
         60, max(1, int(0.75 * _multiprocessing.cpu_count()))
     ) # Python crashes when using >64 cores
@@ -175,7 +290,7 @@ def fit_spots_parallel(spots, asynch=False):
     fs = []
     executor = _futures.ProcessPoolExecutor(n_workers)
     for i, n_spots_task in zip(start_indices, spots_per_task):
-        fs.append(executor.submit(fit_spots, spots[i : i + n_spots_task]))
+        fs.append(executor.submit(fit_spots, spots[i : i + n_spots_task], fit_rot))
     if asynch:
         return fs
     with _tqdm(total=n_tasks, unit="task") as progress_bar:
@@ -210,6 +325,15 @@ def fits_from_futures(futures):
 
 
 def locs_from_fits(identifications, theta, box, em):
+    """
+        0: x-position
+        1: y-position
+        2: amplitude (photons)
+        3: background
+        4: a width (approx x width)
+        5: b width (approx y width)
+        6: rotation angle [rad]
+    """
     # box_offset = int(box/2)
     x = theta[:, 0] + identifications.x  # - box_offset
     y = theta[:, 1] + identifications.y  # - box_offset
@@ -222,68 +346,135 @@ def locs_from_fits(identifications, theta, box, em):
     a = _np.maximum(theta[:, 4], theta[:, 5])
     b = _np.minimum(theta[:, 4], theta[:, 5])
     ellipticity = (a - b) / a
+    fit_rot = theta.shape[1] == 7
 
     if hasattr(identifications, "n_id"):
-        locs = _np.rec.array(
-            (
-                identifications.frame,
-                x,
-                y,
-                theta[:, 2],
-                theta[:, 4],
-                theta[:, 5],
-                theta[:, 3],
-                lpx,
-                lpy,
-                ellipticity,
-                identifications.net_gradient,
-                identifications.n_id,
-            ),
-            dtype=[
-                ("frame", "u4"),
-                ("x", "f4"),
-                ("y", "f4"),
-                ("photons", "f4"),
-                ("sx", "f4"),
-                ("sy", "f4"),
-                ("bg", "f4"),
-                ("lpx", "f4"),
-                ("lpy", "f4"),
-                ("ellipticity", "f4"),
-                ("net_gradient", "f4"),
-                ("n_id", "u4"),
-            ],
-        )
+        if fit_rot:
+            locs = _np.rec.array(
+                (
+                    identifications.frame,
+                    x,
+                    y,
+                    theta[:, 2],
+                    theta[:, 4],
+                    theta[:, 5],
+                    theta[:, 3],
+                    lpx,
+                    lpy,
+                    ellipticity,
+                    theta[:, 6],
+                    identifications.net_gradient,
+                    identifications.n_id,
+                ),
+                dtype=[
+                    ("frame", "u4"),
+                    ("x", "f4"),
+                    ("y", "f4"),
+                    ("photons", "f4"),
+                    ("sx", "f4"),
+                    ("sy", "f4"),
+                    ("bg", "f4"),
+                    ("lpx", "f4"),
+                    ("lpy", "f4"),
+                    ("ellipticity", "f4"),
+                    ("alpha", "f4"),
+                    ("net_gradient", "f4"),
+                    ("n_id", "u4"),
+                ],
+            )
+        else:
+            locs = _np.rec.array(
+                (
+                    identifications.frame,
+                    x,
+                    y,
+                    theta[:, 2],
+                    theta[:, 4],
+                    theta[:, 5],
+                    theta[:, 3],
+                    lpx,
+                    lpy,
+                    ellipticity,
+                    identifications.net_gradient,
+                    identifications.n_id,
+                ),
+                dtype=[
+                    ("frame", "u4"),
+                    ("x", "f4"),
+                    ("y", "f4"),
+                    ("photons", "f4"),
+                    ("sx", "f4"),
+                    ("sy", "f4"),
+                    ("bg", "f4"),
+                    ("lpx", "f4"),
+                    ("lpy", "f4"),
+                    ("ellipticity", "f4"),
+                    ("net_gradient", "f4"),
+                    ("n_id", "u4"),
+                ],
+            )
         locs.sort(kind="mergesort", order="n_id")
     else:
-        locs = _np.rec.array(
-            (
-                identifications.frame,
-                x,
-                y,
-                theta[:, 2],
-                theta[:, 4],
-                theta[:, 5],
-                theta[:, 3],
-                lpx,
-                lpy,
-                ellipticity,
-                identifications.net_gradient,
-            ),
-            dtype=[
-                ("frame", "u4"),
-                ("x", "f4"),
-                ("y", "f4"),
-                ("photons", "f4"),
-                ("sx", "f4"),
-                ("sy", "f4"),
-                ("bg", "f4"),
-                ("lpx", "f4"),
-                ("lpy", "f4"),
-                ("ellipticity", "f4"),
-                ("net_gradient", "f4"),
-            ],
-        )
+        if fit_rot:
+            locs = _np.rec.array(
+                (
+                    identifications.frame,
+                    x,
+                    y,
+                    theta[:, 2],
+                    theta[:, 4],
+                    theta[:, 5],
+                    theta[:, 3],
+                    lpx,
+                    lpy,
+                    ellipticity,
+                    theta[:, 6],
+                    identifications.net_gradient,
+                ),
+                dtype=[
+                    ("frame", "u4"),
+                    ("x", "f4"),
+                    ("y", "f4"),
+                    ("photons", "f4"),
+                    ("sx", "f4"),
+                    ("sy", "f4"),
+                    ("bg", "f4"),
+                    ("lpx", "f4"),
+                    ("lpy", "f4"),
+                    ("ellipticity", "f4"),
+                    ("alpha", "f4"),
+                    ("net_gradient", "f4"),
+                ],
+            )
+        else:
+            locs = _np.rec.array(
+                (
+                    identifications.frame,
+                    x,
+                    y,
+                    theta[:, 2],
+                    theta[:, 4],
+                    theta[:, 5],
+                    theta[:, 3],
+                    lpx,
+                    lpy,
+                    ellipticity,
+                    identifications.net_gradient,
+                ),
+                dtype=[
+                    ("frame", "u4"),
+                    ("x", "f4"),
+                    ("y", "f4"),
+                    ("photons", "f4"),
+                    ("sx", "f4"),
+                    ("sy", "f4"),
+                    ("bg", "f4"),
+                    ("lpx", "f4"),
+                    ("lpy", "f4"),
+                    ("ellipticity", "f4"),
+                    ("net_gradient", "f4"),
+                ],
+            )
         locs.sort(kind="mergesort", order="frame")
     return locs
 
