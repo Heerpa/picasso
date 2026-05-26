@@ -2,6 +2,8 @@
 
 Last change: 26-MAY-2026 CEST
 
+- Affine transform calibration for astigmatic imaging
+
 ## 0.10.1
 
 This patch adds a number of new, useful features rather than simply fixing the bugs found in 0.10.0.
@@ -21,7 +23,6 @@ This patch adds a number of new, useful features rather than simply fixing the b
 - Efficient Filter: much lower RAM usage + faster filtering by histogram selection (1D/2D), especially for very large datasets
 - Fixed Gauss-fitting error when spot's sum is zero (zero division error)
 - Fixed NND plot reindexing after fitting (#665)
-- Affine transform calibration for astigmatic imaging
 
 ## 0.10.0
 

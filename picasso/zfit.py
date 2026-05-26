@@ -387,9 +387,14 @@ def _affine_estimate_2d(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     return np.array([[a, b, tx], [c, d, ty], [0.0, 0.0, 1.0]])
 
 
-def _affine_decompose(M: np.ndarray, pixelsize: float) -> dict:
+def _affine_decompose(M: np.ndarray, pixelsize: float | None = None) -> dict:
     """Decompose the 2x2 linear part of the affine matrix into
-    rotation, anisotropic scaling, and shear via QR factorisation."""
+    rotation, anisotropic scaling, and shear via QR factorisation.
+
+    Translations are always reported in pixels (``tx_px``, ``ty_px``).
+    If ``pixelsize`` is given, the nanometre equivalents (``tx_nm``,
+    ``ty_nm``) are added too.
+    """
     A = M[:2, :2]
     Q, R = np.linalg.qr(A)
     signs = np.sign(np.diag(R))
@@ -399,16 +404,18 @@ def _affine_decompose(M: np.ndarray, pixelsize: float) -> dict:
     scale_x = R[0, 0]
     scale_y = R[1, 1]
     shear_deg = np.degrees(np.arctan2(R[0, 1], R[1, 1]))
-    return {
+    out = {
         "scale_x": float(scale_x),
         "scale_y": float(scale_y),
         "rotation_deg": float(rot_deg),
         "shear_deg": float(shear_deg),
         "tx_px": float(M[0, 2]),
         "ty_px": float(M[1, 2]),
-        "tx_nm": float(M[0, 2] * pixelsize),
-        "ty_nm": float(M[1, 2] * pixelsize),
     }
+    if pixelsize is not None:
+        out["tx_nm"] = float(M[0, 2] * pixelsize)
+        out["ty_nm"] = float(M[1, 2] * pixelsize)
+    return out
 
 
 def _affine_apply(image: np.ndarray, M: np.ndarray) -> np.ndarray:
@@ -443,15 +450,20 @@ def _affine_plot_alignment(
     img_cor: np.ndarray,
     pairs_ref: np.ndarray,
     decomp: dict,
-    pixelsize: float,
     n_pairs: int,
-    save_path: str | None = None,
-    ref_path: str | None = None,
-    cyl_path: str | None = None,
+    pixelsize: float | None = None,
+    save_path: str = "",
+    ref_path: str = "",
+    cyl_path: str = "",
 ) -> None:
     """Four-panel QC figure: overlay before/after correction and mean
-    per-bead cross-correlation before/after correction."""
-    nm = pixelsize
+    per-bead cross-correlation before/after correction.
+
+    If ``pixelsize`` is None, axes are labelled in pixels; otherwise
+    they are scaled to nm and labelled accordingly.
+    """
+    nm = pixelsize if pixelsize is not None else 1.0
+    unit = "nm" if pixelsize is not None else "px"
 
     def norm(img):
         mn, mx = img.min(), img.max()
@@ -547,20 +559,23 @@ def _affine_plot_alignment(
     off_raw = np.hypot(dy_raw, dx_raw)
     off_cor = np.hypot(dy_cor, dx_cor)
 
-    fig = plt.figure(figsize=(19, 5))
+    fig = plt.figure(figsize=(11, 11))
+    if pixelsize is not None:
+        trans_str = f"Tx={decomp['tx_nm']:.1f} nm  Ty={decomp['ty_nm']:.1f} nm"
+    else:
+        trans_str = f"Tx={decomp['tx_px']:.3f} px  Ty={decomp['ty_px']:.3f} px"
     title = (
         f"Alignment check  |  {n_pairs} bead pairs  |  "
         f"Scale X={decomp['scale_x']:.5f}  Y={decomp['scale_y']:.5f}  "
-        f"Rot={decomp['rotation_deg']:.4f}°  "
-        f"Tx={decomp['tx_nm']:.1f} nm  Ty={decomp['ty_nm']:.1f} nm"
+        f"Rot={decomp['rotation_deg']:.4f}°  " + trans_str
     )
     if ref_path or cyl_path:
         title += (
-            f"\nref: {os.path.basename(ref_path or '')}   "
-            f"cyl: {os.path.basename(cyl_path or '')}"
+            f"\nref: {os.path.basename(ref_path)}   "
+            f"cyl: {os.path.basename(cyl_path)}"
         )
     fig.suptitle(title, fontsize=10, fontweight="bold")
-    gs = gridspec.GridSpec(1, 4, figure=fig, wspace=0.30)
+    gs = gridspec.GridSpec(2, 2, figure=fig, wspace=0.30, hspace=0.25)
 
     ext = [0, img_ref.shape[1] * nm, img_ref.shape[0] * nm, 0]
 
@@ -600,18 +615,19 @@ def _affine_plot_alignment(
         aspect="equal",
         interpolation="bilinear",
     )
+    ax.grid(False)
     ax.axhline(0, color="cyan", lw=1.0, ls="--", alpha=0.7)
     ax.axvline(0, color="cyan", lw=1.0, ls="--", alpha=0.7)
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set_title(
         f"Mean bead cross-corr  BEFORE\n"
-        f"peak ({dx_raw:.1f}, {dy_raw:.1f}) nm  "
-        f"|offset| = {off_raw:.1f} nm",
+        f"peak ({dx_raw:.1f}, {dy_raw:.1f}) {unit}  "
+        f"|offset| = {off_raw:.1f} {unit}",
         fontsize=9,
         fontweight="bold",
     )
-    ax.set_xlabel("Δx (nm)")
-    ax.set_ylabel("Δy (nm)")
+    ax.set_xlabel(f"Δx ({unit})")
+    ax.set_ylabel(f"Δy ({unit})")
 
     ax = fig.add_subplot(gs[3])
     im2 = ax.imshow(
@@ -623,34 +639,34 @@ def _affine_plot_alignment(
         aspect="equal",
         interpolation="bilinear",
     )
+    ax.grid(False)
     ax.axhline(0, color="cyan", lw=1.0, ls="--", alpha=0.7)
     ax.axvline(0, color="cyan", lw=1.0, ls="--", alpha=0.7)
     plt.colorbar(im2, ax=ax, fraction=0.046, pad=0.04)
     ax.set_title(
         f"Mean bead cross-corr  AFTER\n"
-        f"peak ({dx_cor:.1f}, {dy_cor:.1f}) nm  "
-        f"|offset| = {off_cor:.1f} nm",
+        f"peak ({dx_cor:.1f}, {dy_cor:.1f}) {unit}  "
+        f"|offset| = {off_cor:.1f} {unit}",
         fontsize=9,
         fontweight="bold",
     )
-    ax.set_xlabel("Δx (nm)")
-    ax.set_ylabel("Δy (nm)")
+    ax.set_xlabel(f"Δx ({unit})")
+    ax.set_ylabel(f"Δy ({unit})")
 
     fig.tight_layout()
-    if save_path is not None:
+    if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
 
 
 def calibrate_affine(
     movie_ref,
-    info_ref: list[dict],
     movie_cyl,
-    info_cyl: list[dict],
     calibration: dict,
-    ref_path: str | None = None,
-    cyl_path: str | None = None,
-    plot_path: str | None = None,
+    pixelsize: float | None = None,
+    ref_path: str = "",
+    cyl_path: str = "",
+    plot_path: str = "",
 ) -> dict:
     """Fit a 6-DOF affine transform that maps the cylindrical-lens bead
     image into the reference (no-lens) frame and append it to the given
@@ -661,7 +677,8 @@ def calibrate_affine(
     refined to sub-pixel accuracy by a 2D Gaussian fit, then matched
     between the two images by mutual nearest neighbour. The affine
     matrix is solved by 6-DOF linear least squares and decomposed into
-    rotation / anisotropic scale / shear via QR.
+    rotation / anisotropic scale / shear via QR.  TODO: might correct this
+    paragraph
 
     Parameters
     ----------
@@ -669,23 +686,25 @@ def calibrate_affine(
         In-focus bead movies without (reference) and with the
         cylindrical lens. If a movie has multiple frames they are
         averaged; a single-frame movie is used as-is.
-    info_ref, info_cyl : list of dicts
-        Movie metadata (as returned by ``io.load_movie``). Only
-        "Pixelsize" is consumed, and only for plot labels / decomposition.
     calibration : dict
         Existing 3D calibration; an "Affine transform" entry is appended.
+    pixelsize : float, optional
+        Camera pixel size in nm. If given, decomposition translations
+        and the diagnostic plot are converted from pixels to nm. If
+        None (default), values are reported in pixels. Default is None.
     ref_path, cyl_path : str, optional
         Paths to the source images, recorded in the calibration for
-        traceability and shown in the diagnostic plot title.
+        traceability and shown in the diagnostic plot title. Default
+        is "".
     plot_path : str, optional
         If given, the diagnostic figure is saved to this path. The
-        figure is always shown interactively.
+        figure is always shown interactively. Default is "".
 
     Returns
     -------
     calibration : dict
         The input calibration augmented with an "Affine transform" key.
-        Saving is the caller's responsibility (use ``io.save_calibration``).
+        Use ``io.save_calibration`` to save the result.
     """
     img_ref = _movie_to_image(movie_ref)
     img_cyl = _movie_to_image(movie_cyl)
@@ -704,8 +723,6 @@ def calibrate_affine(
         )
 
     M = _affine_estimate_2d(pairs_cyl, pairs_ref)
-
-    pixelsize = float(lib.get_from_metadata(info_ref, "Pixelsize") or 1.0)
     decomp = _affine_decompose(M, pixelsize)
 
     img_cor = _affine_apply(img_cyl, M)
@@ -715,22 +732,24 @@ def calibrate_affine(
         img_cor,
         pairs_ref,
         decomp,
-        pixelsize,
         n_pairs=len(pairs_ref),
+        pixelsize=pixelsize,
         save_path=plot_path,
         ref_path=ref_path,
         cyl_path=cyl_path,
     )
 
-    calibration["Affine transform"] = {
+    affine_entry = {
         "Matrix": [[float(v) for v in row] for row in M],
         "Direction": "cylindrical -> reference (x = col, y = row)",
         "Reference image": ref_path or "N/A",
         "Cylindrical image": cyl_path or "N/A",
-        "Pixelsize (nm)": pixelsize,
         "Bead pairs": int(len(pairs_ref)),
         "Decomposition": decomp,
     }
+    if pixelsize is not None:
+        affine_entry["Pixelsize (nm)"] = float(pixelsize)
+    calibration["Affine transform"] = affine_entry
     return calibration
 
 

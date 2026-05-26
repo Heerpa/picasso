@@ -2058,14 +2058,26 @@ class Window(QtWidgets.QMainWindow):
             )
             return
 
+        # get camera pixel size
+        pixelsize = lib.get_from_metadata(info_ref, "Pixelsize", default=None)
+        if pixelsize is None:
+            pixelsize, ok = QtWidgets.QInputDialog.getInt(
+                self,
+                "Camera pixel size (nm)",
+                "Enter camera pixel size in nm:",
+                130,
+                min=0,
+            )
+            if not ok:
+                return
+
         plot_path = os.path.splitext(calib_path)[0] + "_affine.png"
         try:
             calibration = zfit.calibrate_affine(
                 movie_ref,
-                info_ref,
                 movie_cyl,
-                info_cyl,
                 calibration,
+                pixelsize=pixelsize,
                 ref_path=ref_path,
                 cyl_path=cyl_path,
                 plot_path=plot_path,
@@ -2787,7 +2799,11 @@ class Window(QtWidgets.QMainWindow):
         locs: pd.DataFrame,
         elapsed_time: float,
     ) -> None:
-        """Handle the completion of the z fitting process."""
+        """Handle the completion of the z fitting process.
+
+        ``self.locs_display`` is left untouched so the on-screen
+        FitMarker overlays stay at their pre-z-fit, pre-affine
+        positions (mirroring the drift-correction pattern)."""
         self._active_worker = None
         self.abort_action.setEnabled(False)
         self.status_bar.showMessage(
@@ -2795,7 +2811,6 @@ class Window(QtWidgets.QMainWindow):
             "seconds."
         )
         self.locs = locs
-        self.locs_display = locs
         self.save_locs_after_fit()
         # sound notification
         if elapsed_time > lib.SOUND_NOTIFICATION_DURATION:
