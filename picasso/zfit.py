@@ -18,14 +18,13 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import Callable, Literal
 
 import numba
-import yaml
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.optimize import minimize_scalar
 
-from . import lib, gausslq, gaussmle, __version__
+from . import io, lib, gausslq, gaussmle, __version__
 
 
 plt.style.use("ggplot")
@@ -136,8 +135,7 @@ def calibrate_z(
         "Path": path if path is not None else "N/A",
     }
     if path is not None:
-        with open(path, "w") as f:
-            yaml.dump(calibration, f, default_flow_style=False)
+        io.save_calibration(path, calibration)
 
     # pixelsize does not matter here anyway
     locs = _fit_z(locs, info, calibration, magnification_factor, pixelsize=130)
@@ -226,6 +224,40 @@ def calibrate_z(
         plt.savefig(path + ".png", format="png", dpi=300)
 
     plt.show()
+    return calibration
+
+
+def calibrate_affine(
+    movie_ref,
+    info_ref: list[dict],
+    movie_cyl,
+    info_cyl: list[dict],
+    calibration: dict,
+) -> dict:
+    """Calibrate the affine transform between a reference bead image and
+    a cylindrical-lens bead image, and append the result to an existing
+    3D astigmatism calibration dict.
+
+    Parameters
+    ----------
+    movie_ref, movie_cyl : AbstractPicassoMovie
+        In-focus bead movies acquired without (reference) and with the
+        cylindrical lens in the optical pathway.
+    info_ref, info_cyl : list of dicts
+        Metadata for the two movies (as returned by ``io.load_movie``).
+    calibration : dict
+        Existing 3D astigmatism calibration (as returned by
+        ``io.load_calibration``). The affine transform is appended to it.
+
+    Returns
+    -------
+    calibration : dict
+        The input calibration augmented with affine-transform fields.
+        Saving is the caller's responsibility.
+    """
+    # TODO: detect / match beads in the two movies, fit an affine
+    # transform, and store its parameters in ``calibration`` under a
+    # dedicated key (e.g. "Affine transform").
     return calibration
 
 

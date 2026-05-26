@@ -246,6 +246,12 @@ def save_raw(path: str, movie: lib.IntArray3D, info: dict) -> None:
     save_info(info_path, info)
 
 
+def save_calibration(path: str, calibration: dict) -> None:
+    """Save calibration file to a .yaml path."""
+    with open(path, "w") as f:
+        yaml.dump(calibration, f, default_flow_style=False)
+
+
 def load_calibration(path: str) -> dict:
     """Load 3D astigmatic calibration data from a YAML file.
 

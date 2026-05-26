@@ -22,6 +22,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import imageio
+import yaml
 from .. import (
     aim,
     CONFIG,
@@ -2017,13 +2018,55 @@ class Window(QtWidgets.QMainWindow):
         self.localize(calibrate_z=True)
 
     def calibrate_affine(self) -> None:
-        """Open the affine-transform calibration dialog (astigmatism)."""
+        """Open the affine-transform calibration dialog (astigmatism),
+        fit the transform between the two bead movies, and append the
+        result to the given 3D calibration YAML."""
         dialog = CalibrateAffineDialog(self)
-        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            # TODO: processing — fit affine transform between the
-            # reference and cylindrical-lens images and append to
-            # dialog.calibration_path.
-            pass
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        ref_path = dialog.reference_path
+        cyl_path = dialog.cylindrical_path
+        calib_path = dialog.calibration_path
+        if not (ref_path and cyl_path and calib_path):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Calibrate affine transform",
+                "All three paths must be provided.",
+            )
+            return
+
+        def _prompt(path: str):
+            return (
+                self.prompt_channel
+                if path.endswith(".ims")
+                else self.prompt_info
+            )
+
+        try:
+            movie_ref, info_ref = io.load_movie(
+                ref_path, prompt_info=_prompt(ref_path)
+            )
+            movie_cyl, info_cyl = io.load_movie(
+                cyl_path, prompt_info=_prompt(cyl_path)
+            )
+            calibration = io.load_calibration(calib_path)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Calibrate affine transform",
+                f"Could not load inputs:\n{e}",
+            )
+            return
+
+        calibration = zfit.calibrate_affine(
+            movie_ref, info_ref, movie_cyl, info_cyl, calibration
+        )
+        io.save_calibration(calib_path, calibration)
+
+        self.status_bar.showMessage(
+            f"Affine calibration appended to {os.path.basename(calib_path)}."
+        )
 
     def show_metadata(self) -> None:
         """Open the metadata dialog."""
