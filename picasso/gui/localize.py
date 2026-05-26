@@ -44,6 +44,15 @@ except Exception:
     GPUFIT_INSTALLED = False
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
+IMAGE_FILTER = (
+    "All supported formats (*.raw *.tif *.nd2 *.ims *.tiff *.stk)"
+    ";;Raw files (*.raw)"
+    ";;Tif images (*.tif)"
+    ";;ImaRIS IMS (*.ims)"
+    ";;Nd2 files (*.nd2);;"
+    ";;Tiff images (*.tiff)"
+    ";;STK files (*.stk)"
+)
 
 
 class RubberBand(QtWidgets.QRubberBand):
@@ -600,6 +609,124 @@ class PromptChannelDialog(lib.Dialog):
         result = dialog.exec()
         channel = dialog.byte_order.currentText()
         return channel, result == QtWidgets.QDialog.DialogCode.Accepted
+
+
+class CalibrateAffineDialog(lib.Dialog):
+    """Select the inputs/output for affine-transform calibration
+    (astigmatism).
+
+    Provides three rows: a reference bead image (no cylindrical lens),
+    a cylindrical-lens bead image, and an output 3D-calibration YAML
+    file the affine transform will be appended to.
+    """
+
+    def __init__(self, window: QtWidgets.QWidget) -> None:
+        super().__init__(window)
+        self.window = window
+        self.setWindowTitle("Calibrate affine transform (astigmatism)")
+
+        vbox = QtWidgets.QVBoxLayout(self)
+        grid = QtWidgets.QGridLayout()
+
+        rows = [
+            (
+                "Reference image:",
+                "Image of in-focus beads WITHOUT a cylindrical lens in"
+                " the optical pathway",
+                self._browse_reference,
+            ),
+            (
+                "Cylindrical lens image:",
+                "Image of in-focus beads WITH a cylindrical lens in"
+                " the optical pathway",
+                self._browse_cylindrical,
+            ),
+            (
+                "Calibration:",
+                "Path to save the results to; select an"
+                " existing 3D calibration path to which the results will"
+                " be appended",
+                self._browse_calibration,
+            ),
+        ]
+        self.reference_edit = QtWidgets.QLineEdit()
+        self.cylindrical_edit = QtWidgets.QLineEdit()
+        self.calibration_edit = QtWidgets.QLineEdit()
+        edits = [
+            self.reference_edit,
+            self.cylindrical_edit,
+            self.calibration_edit,
+        ]
+        for row_idx, ((label_text, tooltip, slot), edit) in enumerate(
+            zip(rows, edits)
+        ):
+            label = QtWidgets.QLabel(label_text)
+            label.setToolTip(tooltip)
+            edit.setReadOnly(True)
+            edit.setToolTip(tooltip)
+            edit.setMinimumWidth(400)
+            button = QtWidgets.QPushButton("Browse")
+            button.clicked.connect(slot)
+            grid.addWidget(label, row_idx, 0)
+            grid.addWidget(edit, row_idx, 1)
+            grid.addWidget(button, row_idx, 2)
+        vbox.addLayout(grid)
+
+        self.buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            QtCore.Qt.Orientation.Horizontal,
+            self,
+        )
+        vbox.addWidget(self.buttons)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+    @property
+    def reference_path(self) -> str:
+        return self.reference_edit.text()
+
+    @property
+    def cylindrical_path(self) -> str:
+        return self.cylindrical_edit.text()
+
+    @property
+    def calibration_path(self) -> str:
+        return self.calibration_edit.text()
+
+    def _pick_file(
+        self,
+        edit: QtWidgets.QLineEdit,
+        title: str,
+        filter_str: str,
+    ) -> None:
+        current = edit.text()
+        directory = os.path.split(current)[0] if current else None
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            title,
+            directory=directory,
+            filter=filter_str,
+        )
+        if path:
+            edit.setText(path)
+
+    def _browse_reference(self) -> None:
+        self._pick_file(
+            self.reference_edit, "Select reference image", IMAGE_FILTER
+        )
+
+    def _browse_cylindrical(self) -> None:
+        self._pick_file(
+            self.cylindrical_edit,
+            "Select cylindrical lens image",
+            IMAGE_FILTER,
+        )
+
+    def _browse_calibration(self) -> None:
+        self._pick_file(
+            self.calibration_edit, "Select calibration file", "*.yaml"
+        )
 
 
 class ParametersDialog(lib.Dialog):
@@ -1866,6 +1993,11 @@ class Window(QtWidgets.QMainWindow):
         calibrate_z_action = threed_menu.addAction("Calibrate 3D")
         calibrate_z_action.triggered.connect(self.calibrate_z)
 
+        calibrate_affine_action = threed_menu.addAction(
+            "Calibrate affine transform (astigmatism)"
+        )
+        calibrate_affine_action.triggered.connect(self.calibrate_affine)
+
         self.plugin_menu = menu_bar.addMenu("Plugins")  # do not delete
 
     @property
@@ -1883,6 +2015,15 @@ class Window(QtWidgets.QMainWindow):
         """Use the loaded movie to obtain z-calibration data for 3D
         fitting using astigmatism."""
         self.localize(calibrate_z=True)
+
+    def calibrate_affine(self) -> None:
+        """Open the affine-transform calibration dialog (astigmatism)."""
+        dialog = CalibrateAffineDialog(self)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            # TODO: processing — fit affine transform between the
+            # reference and cylindrical-lens images and append to
+            # dialog.calibration_path.
+            pass
 
     def show_metadata(self) -> None:
         """Open the metadata dialog."""
@@ -1910,15 +2051,7 @@ class Window(QtWidgets.QMainWindow):
             self,
             "Open image sequence",
             directory=dir,
-            filter=(
-                "All supported formats (*.raw *.tif *.nd2 *.ims *.tiff *.stk)"
-                ";;Raw files (*.raw)"
-                ";;Tif images (*.tif)"
-                ";;ImaRIS IMS (*.ims)"
-                ";;Nd2 files (*.nd2);;"
-                ";;Tiff images (*.tiff)"
-                ";;STK files (*.stk)"
-            ),
+            filter=IMAGE_FILTER,
         )
         if path:
             self.pwd = path
