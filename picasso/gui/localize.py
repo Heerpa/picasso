@@ -22,7 +22,6 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import imageio
-import yaml
 from .. import (
     aim,
     CONFIG,
@@ -2059,14 +2058,29 @@ class Window(QtWidgets.QMainWindow):
             )
             return
 
-        calibration = zfit.calibrate_affine(
-            movie_ref, info_ref, movie_cyl, info_cyl, calibration
-        )
-        io.save_calibration(calib_path, calibration)
+        plot_path = os.path.splitext(calib_path)[0] + "_affine.png"
+        try:
+            calibration = zfit.calibrate_affine(
+                movie_ref,
+                info_ref,
+                movie_cyl,
+                info_cyl,
+                calibration,
+                ref_path=ref_path,
+                cyl_path=cyl_path,
+                plot_path=plot_path,
+            )
+            io.save_calibration(calib_path, calibration)
 
-        self.status_bar.showMessage(
-            f"Affine calibration appended to {os.path.basename(calib_path)}."
-        )
+            self.status_bar.showMessage(
+                f"Affine calibration appended to {os.path.basename(calib_path)}."
+            )
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Calibrate affine transform", str(e)
+            )
+            self.status_bar.showMessage("Affine calibration failed.")
+            return
 
     def show_metadata(self) -> None:
         """Open the metadata dialog."""
