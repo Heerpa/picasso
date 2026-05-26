@@ -861,6 +861,16 @@ def _fit_z(
         fitting_method,
     )
     locs["lpz"] = lpz
+
+    # Apply the cylindrical-lens -> reference affine transform to (x, y)
+    # in camera-pixel coordinates, if one was calibrated.
+    if "Affine transform" in calibration:
+        M = np.asarray(calibration["Affine transform"]["Matrix"])
+        x = locs["x"].to_numpy()
+        y = locs["y"].to_numpy()
+        locs["x"] = M[0, 0] * x + M[0, 1] * y + M[0, 2]
+        locs["y"] = M[1, 0] * x + M[1, 1] * y + M[1, 2]
+
     locs = lib.ensure_sanity(locs, info)
     return filter_z_fits(locs, filter)
 
