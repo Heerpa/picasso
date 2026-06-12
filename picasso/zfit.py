@@ -4,7 +4,7 @@ picasso.zfit
 
 Fitting z coordinates using astigmatism.
 
-:authors: Joerg Schnitzbauer, Rafal Kowalewski
+:authors: Joerg Schnitzbauer, Rafal Kowalewski, Thomas Kellerer
 :copyright: Copyright (c) 2016-2026 Jungmann Lab, MPI of Biochemistry
 """
 
