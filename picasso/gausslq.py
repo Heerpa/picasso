@@ -112,19 +112,6 @@ def _initial_parameters(
     return theta
 
 
-def initial_parameters_gpufit(
-    spots: lib.FloatArray3D, size: int
-) -> lib.FloatArray2D:
-    """Alias to _initial_parameters_gpufit, deprecated
-
-    TODO: remove in v0.11.0"""
-    lib.deprecation_warning(
-        "Deprecation warning: This function will become private in"
-        "v0.11.0. Use _initial_parameters_gpufit instead."
-    )
-    return _initial_parameters_gpufit(spots, size)
-
-
 def _initial_parameters_gpufit(
     spots: lib.FloatArray3D, size: int
 ) -> lib.FloatArray2D:
@@ -278,7 +265,7 @@ def fit_spots(
     theta.fill(np.nan)
     use_tqdm = progress_callback == "console"
     if use_tqdm:
-        iter_range = tqdm(len(spots), desc="Fitting...", unit="spot")
+        iter_range = tqdm(range(len(spots)), desc="Fitting...", unit="spot")
     else:
         iter_range = range(len(spots))
     for i in iter_range:

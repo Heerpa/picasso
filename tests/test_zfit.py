@@ -10,9 +10,6 @@ Covers the new (non-deprecated) API:
   (Kowalewski et al. 2026);
 - ``calibrate_z`` driven by synthetic bead-stack data.
 
-Deprecated functions (``fit_z``, ``fit_z_parallel``) are intentionally not
-exercised here.
-
 :author: Rafal Kowalewski, 2025-2026
 :copyright: Copyright (c) 2025-2026 Jungmann Lab, MPI of Biochemistry
 """
@@ -495,6 +492,502 @@ class TestCalibrateZ:
         assert loaded["Y Coefficients"] == calib["Y Coefficients"]
         assert loaded["Number of frames"] == calib["Number of frames"]
         assert loaded["Step size in nm"] == calib["Step size in nm"]
+
+
+class TestCalibrateZFrameBounds:
+    """``frame_bounds`` restricts which frames enter the calibration.
+    Bounds are inclusive on both ends, matching ``picasso.localize``."""
+
+    N_FRAMES = 50
+    D = 10.0  # nm step
+
+    @pytest.fixture(autouse=True)
+    def _no_show(self, monkeypatch):
+        monkeypatch.setattr("matplotlib.pyplot.show", lambda *a, **k: None)
+
+    @pytest.fixture
+    def bead_stack(self):
+        """Same synthetic bead stack as in ``TestCalibrateZ``: sx/sy
+        driven by known polynomials of stage z plus tiny noise."""
+        rng = np.random.default_rng(0)
+        rows = []
+        z_total = (self.N_FRAMES - 1) * self.D
+        for fi in range(self.N_FRAMES):
+            z = -(fi * self.D - z_total / 2)
+            sx_mean = 1.5 + 1e-3 * z + 1e-5 * z**2
+            sy_mean = 1.5 - 1e-3 * z + 1e-5 * z**2
+            for _ in range(40):
+                rows.append(
+                    {
+                        "frame": fi,
+                        "x": 16.0,
+                        "y": 16.0,
+                        "sx": sx_mean + rng.normal(0, 0.02),
+                        "sy": sy_mean + rng.normal(0, 0.02),
+                        "photons": 5000.0,
+                        "bg": 10.0,
+                        "lpx": 0.01,
+                        "lpy": 0.01,
+                    }
+                )
+        locs = pd.DataFrame(rows)
+        info = [
+            {
+                "Frames": self.N_FRAMES,
+                "Pixelsize": 130,
+                "Width": 32,
+                "Height": 32,
+            }
+        ]
+        return locs, info
+
+    def _polyfit_lengths(self, monkeypatch):
+        """Spy on ``np.polyfit`` to record how many frames enter each
+        calibration fit."""
+        lengths = []
+        orig = np.polyfit
+
+        def spy(x, y, deg, **kwargs):
+            lengths.append(len(x))
+            return orig(x, y, deg, **kwargs)
+
+        monkeypatch.setattr(np, "polyfit", spy)
+        return lengths
+
+    def test_none_and_none_none_equivalent(self, bead_stack):
+        """``frame_bounds=(None, None)`` must behave exactly like
+        ``frame_bounds=None`` (all frames used)."""
+        locs, info = bead_stack
+        calib_none = zfit.calibrate_z(
+            locs, info, self.D, magnification_factor=0.79, frame_bounds=None
+        )
+        calib_nn = zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=(None, None),
+        )
+        np.testing.assert_allclose(
+            calib_none["X Coefficients"], calib_nn["X Coefficients"]
+        )
+        np.testing.assert_allclose(
+            calib_none["Y Coefficients"], calib_nn["Y Coefficients"]
+        )
+
+    def test_full_range_bounds_equivalent_to_none(self, bead_stack):
+        """``(0, n_frames - 1)`` covers all frames, so it must match the
+        unbounded calibration."""
+        locs, info = bead_stack
+        calib_none = zfit.calibrate_z(
+            locs, info, self.D, magnification_factor=0.79
+        )
+        calib_full = zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=(0, self.N_FRAMES - 1),
+        )
+        np.testing.assert_allclose(
+            calib_none["X Coefficients"], calib_full["X Coefficients"]
+        )
+        np.testing.assert_allclose(
+            calib_none["Y Coefficients"], calib_full["Y Coefficients"]
+        )
+
+    def test_bounds_are_inclusive(self, bead_stack, monkeypatch):
+        """``(10, 39)`` keeps frames 10..39 inclusive -> 30 frames enter
+        every polynomial fit."""
+        locs, info = bead_stack
+        lengths = self._polyfit_lengths(monkeypatch)
+        zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=(10, 39),
+        )
+        assert lengths and all(n == 30 for n in lengths)
+
+    def test_multiple_segments(self, bead_stack, monkeypatch):
+        """A list of ``(min, max)`` segments keeps the union of the
+        (disjoint) ranges: ``[(10, 19), (30, 39)]`` -> 20 frames (z
+        positions) enter every polynomial fit."""
+        locs, info = bead_stack
+        lengths = self._polyfit_lengths(monkeypatch)
+        zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=[(10, 19), (30, 39)],
+        )
+        assert lengths and all(n == 20 for n in lengths)
+
+    def test_single_segment_matches_flat_tuple(self, bead_stack):
+        """A single-segment list behaves identically to the flat
+        ``(min, max)`` tuple form."""
+        locs, info = bead_stack
+        calib_flat = zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=(10, 39),
+        )
+        calib_list = zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=[(10, 39)],
+        )
+        np.testing.assert_allclose(
+            calib_flat["X Coefficients"], calib_list["X Coefficients"]
+        )
+        np.testing.assert_allclose(
+            calib_flat["Y Coefficients"], calib_list["Y Coefficients"]
+        )
+
+    def test_one_sided_bounds(self, bead_stack, monkeypatch):
+        """``(None, max)`` and ``(min, None)`` each leave the other side
+        unbounded."""
+        locs, info = bead_stack
+        lengths = self._polyfit_lengths(monkeypatch)
+        zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=(None, 29),  # frames 0..29
+        )
+        assert lengths and all(n == 30 for n in lengths)
+        lengths.clear()
+        zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=(20, None),  # frames 20..49
+        )
+        assert lengths and all(n == 30 for n in lengths)
+
+    def test_bounds_including_last_frame(self, bead_stack):
+        """Regression test: a nonzero minimum together with the last
+        frame as maximum used to raise IndexError (localizations'
+        frame numbers were used as indices into the sliced per-frame
+        arrays without offsetting)."""
+        locs, info = bead_stack
+        calib = zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=(10, self.N_FRAMES - 1),
+        )
+        assert len(calib["X Coefficients"]) == 7
+        assert len(calib["Y Coefficients"]) == 7
+
+    def test_locs_outside_bounds_are_ignored(self, bead_stack):
+        """Passing the full locs with bounds must equal passing locs
+        already restricted to those frames."""
+        locs, info = bead_stack
+        bounds = (10, 39)
+        pre_filtered = locs[
+            (locs["frame"] >= bounds[0]) & (locs["frame"] <= bounds[1])
+        ]
+        calib_full = zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=bounds,
+        )
+        calib_pre = zfit.calibrate_z(
+            pre_filtered,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=bounds,
+        )
+        np.testing.assert_allclose(
+            calib_full["X Coefficients"], calib_pre["X Coefficients"]
+        )
+        np.testing.assert_allclose(
+            calib_full["Y Coefficients"], calib_pre["Y Coefficients"]
+        )
+
+    def test_bounded_calibration_differs_from_unbounded(self, bead_stack):
+        """Restricting the frames must actually change the fit."""
+        locs, info = bead_stack
+        calib_none = zfit.calibrate_z(
+            locs, info, self.D, magnification_factor=0.79
+        )
+        calib_bounded = zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=(10, 39),
+        )
+        assert not np.allclose(
+            calib_none["X Coefficients"], calib_bounded["X Coefficients"]
+        )
+
+    def test_frame_bounds_stored_in_calibration(self, bead_stack):
+        locs, info = bead_stack
+        calib = zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frame_bounds=(10, 39),
+        )
+        assert calib["Frame bounds"] == (10, 39)
+        calib = zfit.calibrate_z(locs, info, self.D, magnification_factor=0.79)
+        assert calib["Frame bounds"] is None
+
+
+class TestCalibrateZFramesPerStep:
+    """``frames_per_step`` lets several frames be acquired at each z
+    (stage) position; ``frame_order`` describes how those frames are
+    laid out in the movie (``"fov"`` = consecutive frames share a z
+    position, ``"z"`` = the z stack is scanned then repeated).
+
+    The calibration groups localizations by z position, so it must be
+    invariant to how a fixed set of per-position localizations is spread
+    across frames — only the grouping matters.
+    """
+
+    N_STEPS = 20
+    D = 10.0  # nm step
+    PER_STEP = 40  # localizations per z position (divisible by 1, 4, 5)
+
+    @pytest.fixture(autouse=True)
+    def _no_show(self, monkeypatch):
+        monkeypatch.setattr("matplotlib.pyplot.show", lambda *a, **k: None)
+
+    def _make_stack(self, frames_per_step, order, seed=0):
+        """Build a synthetic bead stack with ``frames_per_step`` frames
+        per z position, laid out according to ``order``.
+
+        The per-position localizations are generated in a fixed loop
+        order (independent of ``frames_per_step`` / ``order``), so two
+        stacks built with the same seed share *identical* localizations
+        per z position and only differ in their ``frame`` numbers.
+        """
+        rng = np.random.default_rng(seed)
+        z_total = (self.N_STEPS - 1) * self.D
+        n_frames = self.N_STEPS * frames_per_step
+        rows = []
+        for s in range(self.N_STEPS):
+            z = -(s * self.D - z_total / 2)
+            sx_mean = 1.5 + 1e-3 * z + 1e-5 * z**2
+            sy_mean = 1.5 - 1e-3 * z + 1e-5 * z**2
+            for i in range(self.PER_STEP):
+                occ = i % frames_per_step  # which frame of this position
+                if order == "fov":
+                    frame = s * frames_per_step + occ
+                else:  # "z": full stack scanned then repeated
+                    frame = occ * self.N_STEPS + s
+                rows.append(
+                    {
+                        "frame": frame,
+                        "x": 16.0,
+                        "y": 16.0,
+                        "sx": sx_mean + rng.normal(0, 0.02),
+                        "sy": sy_mean + rng.normal(0, 0.02),
+                        "photons": 5000.0,
+                        "bg": 10.0,
+                        "lpx": 0.01,
+                        "lpy": 0.01,
+                    }
+                )
+        locs = pd.DataFrame(rows)
+        info = [
+            {
+                "Frames": n_frames,
+                "Pixelsize": 130,
+                "Width": 32,
+                "Height": 32,
+            }
+        ]
+        return locs, info, self.D
+
+    def _polyfit_lengths(self, monkeypatch):
+        """Spy on ``np.polyfit`` to record how many z positions enter
+        each calibration fit."""
+        lengths = []
+        orig = np.polyfit
+
+        def spy(x, y, deg, **kwargs):
+            lengths.append(len(x))
+            return orig(x, y, deg, **kwargs)
+
+        monkeypatch.setattr(np, "polyfit", spy)
+        return lengths
+
+    def test_stores_frames_per_step_and_order(self):
+        locs, info, d = self._make_stack(4, "fov")
+        calib = zfit.calibrate_z(
+            locs,
+            info,
+            d,
+            magnification_factor=0.79,
+            frames_per_step=4,
+            frame_order="fov",
+        )
+        assert calib["Frames per step"] == 4
+        assert calib["Frame order"] == "fov"
+
+    def test_default_is_single_frame_per_step(self):
+        """Omitting the new arguments must default to one frame per z
+        position and the 'fov' order, preserving the classic behavior."""
+        locs, info, d = self._make_stack(1, "fov")
+        calib = zfit.calibrate_z(locs, info, d, magnification_factor=0.79)
+        assert calib["Frames per step"] == 1
+        assert calib["Frame order"] == "fov"
+
+    def test_invariant_to_frame_distribution(self):
+        """A fixed set of per-position localizations must yield the same
+        calibration whether stored as one frame per position or spread
+        over several frames, in either acquisition order."""
+        base_locs, base_info, d = self._make_stack(1, "fov")
+        base = zfit.calibrate_z(base_locs, base_info, d, 0.79)
+
+        for frames_per_step in (4, 5):
+            for order in ("fov", "z"):
+                locs, info, _ = self._make_stack(frames_per_step, order)
+                calib = zfit.calibrate_z(
+                    locs,
+                    info,
+                    d,
+                    magnification_factor=0.79,
+                    frames_per_step=frames_per_step,
+                    frame_order=order,
+                )
+                np.testing.assert_allclose(
+                    base["X Coefficients"],
+                    calib["X Coefficients"],
+                    err_msg=f"N={frames_per_step} order={order}",
+                )
+                np.testing.assert_allclose(
+                    base["Y Coefficients"],
+                    calib["Y Coefficients"],
+                    err_msg=f"N={frames_per_step} order={order}",
+                )
+
+    def test_number_of_z_positions_drives_the_fit(self, monkeypatch):
+        """With ``frames_per_step`` frames per position, the polynomial
+        fit sees ``n_frames // frames_per_step`` z positions, not the
+        raw frame count."""
+        locs, info, d = self._make_stack(4, "z")
+        assert info[0]["Frames"] == self.N_STEPS * 4
+        lengths = self._polyfit_lengths(monkeypatch)
+        zfit.calibrate_z(
+            locs,
+            info,
+            d,
+            magnification_factor=0.79,
+            frames_per_step=4,
+            frame_order="z",
+        )
+        assert lengths and all(n == self.N_STEPS for n in lengths)
+
+    def test_recovers_polynomial_with_multiple_frames(self):
+        """The recovered spot-size at z=0 should still match the
+        synthetic polynomials (~1.5 px) when several frames per position
+        are used."""
+        locs, info, d = self._make_stack(5, "z")
+        calib = zfit.calibrate_z(
+            locs,
+            info,
+            d,
+            magnification_factor=0.79,
+            frames_per_step=5,
+            frame_order="z",
+        )
+        cx = np.array(calib["X Coefficients"])
+        cy = np.array(calib["Y Coefficients"])
+        assert zfit._get_calib_size(cx, 0.0) == pytest.approx(1.5, abs=0.1)
+        assert zfit._get_calib_size(cy, 0.0) == pytest.approx(1.5, abs=0.1)
+
+    def test_trailing_incomplete_step_is_ignored(self, monkeypatch):
+        """Frames that do not complete a final z position are dropped:
+        61 frames with 3 frames/position yields 20 positions, and the
+        leftover frame's localizations do not enter the fit."""
+        locs, info, d = self._make_stack(3, "fov")
+        # add a stray, incomplete trailing frame
+        info[0]["Frames"] = self.N_STEPS * 3 + 1
+        stray_frame = self.N_STEPS * 3  # frame index 60
+        stray = locs.iloc[:5].copy()
+        stray["frame"] = stray_frame
+        stray["sx"] = 99.0  # would wreck the fit if not ignored
+        stray["sy"] = 99.0
+        locs = pd.concat([locs, stray], ignore_index=True)
+
+        lengths = self._polyfit_lengths(monkeypatch)
+        calib = zfit.calibrate_z(
+            locs,
+            info,
+            d,
+            magnification_factor=0.79,
+            frames_per_step=3,
+            frame_order="fov",
+        )
+        assert lengths and all(n == self.N_STEPS for n in lengths)
+        # the stray sx=99 localizations must not have shifted the fit
+        assert zfit._get_calib_size(
+            np.array(calib["X Coefficients"]), 0.0
+        ) == pytest.approx(1.5, abs=0.1)
+
+    def test_frames_per_step_exceeding_frames_raises(self):
+        locs, info, d = self._make_stack(1, "fov")
+        info[0]["Frames"] = 5
+        with pytest.raises(ValueError):
+            zfit.calibrate_z(
+                locs,
+                info,
+                d,
+                magnification_factor=0.79,
+                frames_per_step=10,
+            )
+
+    def test_new_keys_roundtrip_through_yaml(self, tmp_path):
+        locs, info, d = self._make_stack(4, "z")
+        out_path = tmp_path / "calib.yaml"
+        calib = zfit.calibrate_z(
+            locs,
+            info,
+            d,
+            magnification_factor=0.79,
+            path=str(out_path),
+            frames_per_step=4,
+            frame_order="z",
+        )
+        with open(out_path) as f:
+            loaded = yaml.safe_load(f)
+        assert loaded["Frames per step"] == calib["Frames per step"] == 4
+        assert loaded["Frame order"] == calib["Frame order"] == "z"
+
+    def test_frames_per_step_combined_with_frame_bounds(self, monkeypatch):
+        """``frame_bounds`` still selects frames; positions whose frames
+        all fall outside the bounds drop out of the fit."""
+        locs, info, d = self._make_stack(4, "fov")
+        # fov order: position s occupies frames [4s, 4s+3]. Bounds
+        # (8, 47) cover positions 2..11 inclusive -> 10 positions.
+        lengths = self._polyfit_lengths(monkeypatch)
+        zfit.calibrate_z(
+            locs,
+            info,
+            d,
+            magnification_factor=0.79,
+            frames_per_step=4,
+            frame_order="fov",
+            frame_bounds=(8, 47),
+        )
+        assert lengths and all(n == 10 for n in lengths)
 
 
 # ---------------------------------------------------------------------------

@@ -70,6 +70,54 @@ Array3x3: TypeAlias = np.ndarray[
 ]
 
 
+def normalize_frame_bounds(frame_bounds, n_frames):
+    """Normalize ``frame_bounds`` to a list of concrete, inclusive,
+    0-indexed ``(lo, hi)`` segments.
+
+    Accepts either the legacy flat form ``(min, max)`` (where either bound
+    may be None for an open end) or a list of such segments. ``None``
+    bounds are resolved to ``0`` / ``n_frames``. Returns None when
+    ``frame_bounds`` is None (i.e., all frames are used).
+
+    Parameters
+    ----------
+    frame_bounds : tuple, list of tuples, or None
+        A single ``(min, max)`` tuple, a list of such tuples, or None.
+    n_frames : int
+        Number of frames in the movie, used to resolve open upper bounds.
+
+    Returns
+    -------
+    segments : list of tuple, or None
+        List of ``(lo, hi)`` inclusive 0-indexed segments, or None.
+    """
+    if frame_bounds is None:
+        return None
+    # detect the legacy flat (min, max) form: the first element is a
+    # scalar or None rather than a (lo, hi) segment
+    first = frame_bounds[0]
+    if first is None or np.isscalar(first):
+        segments = [frame_bounds]
+    else:
+        segments = frame_bounds
+    normalized = []
+    for lo, hi in segments:
+        lo = 0 if lo is None else lo
+        hi = n_frames if hi is None else hi
+        normalized.append((lo, hi))
+    return normalized
+
+
+def frame_in_bounds(frame_number, frame_bounds, n_frames):
+    """Return True if ``frame_number`` falls within any segment of
+    ``frame_bounds`` (or if ``frame_bounds`` is None, i.e., all frames are
+    used). Bounds are inclusive. See ``normalize_frame_bounds``."""
+    segments = normalize_frame_bounds(frame_bounds, n_frames)
+    if segments is None:
+        return True
+    return any(lo <= frame_number <= hi for lo, hi in segments)
+
+
 class Dialog(QtWidgets.QDialog):
     """Base class for dialogs without 'What's this?' help."""
 
@@ -1485,58 +1533,6 @@ def plot_trace(
         return fig
 
 
-def unpack_calibration(
-    calibration: dict,
-    pixelsize: float,
-) -> tuple[FloatArray2D, FloatArray1D, float]:
-    """Extract calibration file for 3D G5M. Return spot widths and
-    heights and the corresponding z values + magnification factor.
-
-    New in v0.10.0: the function is deprecated and will be removed in
-    Picasso 0.11.0.
-
-    Parameters
-    ----------
-    calibration : dict
-        Calibration dictionary with x and y coefficients, z step
-        size and the number of frames.
-    pixelsize : float
-        Camera pixel size in nm.
-
-    Returns
-    -------
-    spot_size : FloatArray2D
-        Spot width and height from the 3D calibration for each z
-        position.
-    z_range : FloatArray1D
-        Z values (in camera pixels) corresponding to the spot ratios.
-    mag_factor : float
-        Magnification factor for the 3D calibration.
-    """
-    deprecation_warning(
-        "The function 'unpack_calibration' is deprecated and will be"
-        " removed in Picasso 0.11.0. 3D G5M, for which this function"
-        " was originally implemented, only requires x and y"
-        " coefficients."
-    )
-    cx = calibration["X Coefficients"]
-    cy = calibration["Y Coefficients"]
-    z_step_size = calibration["Step size in nm"]
-    n_frames = calibration["Number of frames"]
-    mag_factor = calibration["Magnification factor"]
-
-    frame_range = np.arange(n_frames)
-    z_total_range = (n_frames - 1) * z_step_size
-    z_range = -(frame_range * z_step_size - z_total_range / 2)
-
-    spot_width = np.polyval(cx, z_range)
-    spot_height = np.polyval(cy, z_range)
-    spot_size = np.stack((spot_width, spot_height))
-
-    z_range /= pixelsize
-    return spot_size, z_range, mag_factor
-
-
 def calculate_optimal_bins(
     data: FloatArray1D | IntArray1D,
     max_n_bins: int | None = None,
@@ -1562,6 +1558,7 @@ def calculate_optimal_bins(
     bins : FloatArray1D
         Bins for display.
     """
+    data = np.asarray(data)  # positional indexing below; Series use labels
     n = len(data)
     if n == 0:
         return np.array([0.0, 1.0])
@@ -1878,6 +1875,46 @@ def locs_at(x: float, y: float, locs: pd.DataFrame, r: float) -> pd.DataFrame:
     is_picked = is_loc_at(x, y, locs, r)
     picked_locs = locs[is_picked]
     return picked_locs
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def is_loc_at_numba(
+    x: float,
+    y: float,
+    locs_xy: FloatArray2D,
+    r: float,
+) -> BoolArray1D:
+    """Numba implementation of ``locs_at``. Return the indices of
+    localizations at the given coordinates within radius ``r``."""
+    dx = locs_xy[0] - x
+    dy = locs_xy[1] - y
+    r2 = r**2
+    is_picked = dx**2 + dy**2 < r2
+    return is_picked
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def locs_at_numba(
+    x: float,
+    y: float,
+    locs_xy: FloatArray2D,
+    r: float,
+) -> FloatArray2D:
+    """Numba implementation of ``locs_at``. Return the localizations at
+    the given coordinates within radius ``r``."""
+    is_picked = is_loc_at_numba(x, y, locs_xy, r)
+    return locs_xy[:, is_picked]
+
+
+@numba.jit(nopython=True, nogil=True)
+def rmsd_at_com(locs_xy: FloatArray2D) -> float:
+    """Calculate the RMSD of the localizations at the center of mass
+    (COM) of the localizations."""
+    com_x = np.mean(locs_xy[0])
+    com_y = np.mean(locs_xy[1])
+    return np.sqrt(
+        np.mean((locs_xy[0] - com_x) ** 2 + (locs_xy[1] - com_y) ** 2)
+    )
 
 
 @numba.jit(nopython=True)
@@ -2410,6 +2447,9 @@ def plot_subclustering_check(
         Figure and axes if ``return_fig`` is True, otherwise
         (None, None).
     """
+    has_clustered = len(clustered_n_events) > 0
+    has_sparse = len(sparse_n_events) > 0
+
     m_clustered = clustered_n_events.mean()
     m_sparse = sparse_n_events.mean()
     s_clustered = clustered_n_events.std()
@@ -2417,54 +2457,73 @@ def plot_subclustering_check(
 
     # create the plot
     fig, ax1 = plt.subplots(1, figsize=(6, 4), constrained_layout=True)
-    min_bin, max_bin = np.percentile(clustered_n_events, [2.5, 97.5])
-    vals, counts = np.unique(clustered_n_events, return_counts=True)
-    if clustering_dist is not None:
-        label = (
-            f"Clustered (d < {clustering_dist:.1f} nm) "
-            f"{m_clustered:.1f} +/- {s_clustered:.1f}"
+    if has_clustered or has_sparse:
+        all_events = np.concatenate((sparse_n_events, clustered_n_events))
+        min_bin, max_bin = np.percentile(all_events, [2.5, 97.5])
+
+    if has_clustered:
+        vals, counts = np.unique(clustered_n_events, return_counts=True)
+        if clustering_dist is not None:
+            label = (
+                f"Clustered (d < {clustering_dist:.1f} nm) "
+                f"{m_clustered:.1f} +/- {s_clustered:.1f}"
+            )
+        else:
+            label = f"Clustered {m_clustered:.1f} +/- {s_clustered:.1f}"
+        ax1.bar(
+            vals,
+            counts,
+            width=0.8,
+            alpha=0.5,
+            label=label,
+            color="C0",
+        )
+        ax1.axvline(m_clustered, color="C0", linestyle="--")
+
+    if has_sparse:
+        vals, counts = np.unique(sparse_n_events, return_counts=True)
+        if sparse_dist is not None:
+            label = (
+                f"Sparse (d > {sparse_dist:.1f} nm) "
+                f"{m_sparse:.1f} +/- {s_sparse:.1f}"
+            )
+        else:
+            label = f"Sparse {m_sparse:.1f} +/- {s_sparse:.1f}"
+        ax1.bar(
+            vals,
+            counts,
+            width=0.8,
+            alpha=0.5,
+            label=label,
+            color="C1",
+        )
+        ax1.axvline(m_sparse, color="C1", linestyle="--")
+
+    if has_clustered or has_sparse:
+        ax1.set_xlabel("Number of events")
+        ax1.set_ylabel("Counts")
+        ax1.set_xlim(min_bin - 1, max_bin + 1)
+        ax1.legend()
+
+    if has_clustered and has_sparse:
+        stat, p_perm, p = permutation_test(clustered_n_events, sparse_n_events)
+        p_value_str = r"$p_{value}$"
+        title = (
+            f"KS test: stat={stat:.4f}\n"
+            f"permutation {p_value_str}={p_perm:.4f}\n"
+            f"theoretical {p_value_str}={p:.4f}"
+        )
+    elif has_clustered or has_sparse:
+        title = (
+            "Only one population found, no statistical test performed; "
+            "adjust distance parameters."
         )
     else:
-        label = f"Clustered {m_clustered:.1f} +/- {s_clustered:.1f}"
-    ax1.bar(
-        vals,
-        counts,
-        width=0.8,
-        alpha=0.5,
-        label=label,
-        color="C0",
-    )
-    ax1.axvline(m_clustered, color="C0", linestyle="--")
-    vals, counts = np.unique(sparse_n_events, return_counts=True)
-    if sparse_dist is not None:
-        label = (
-            f"Sparse (d > {sparse_dist:.1f} nm) "
-            f"{m_sparse:.1f} +/- {s_sparse:.1f}"
+        title = (
+            "No molecules found in either population, adjust distance"
+            " parameters."
         )
-    else:
-        label = f"Sparse {m_sparse:.1f} +/- {s_sparse:.1f}"
-    ax1.bar(
-        vals,
-        counts,
-        width=0.8,
-        alpha=0.5,
-        label=label,
-        color="C1",
-    )
-    ax1.axvline(m_sparse, color="C1", linestyle="--")
-    ax1.set_xlabel("Number of events")
-    ax1.set_ylabel("Counts")
-    ax1.set_xlim(min_bin - 1, max_bin + 1)
-    # add stat. tests in the title:
-    stat, p_perm, p = permutation_test(clustered_n_events, sparse_n_events)
-    p_value_str = r"$p_{value}$"
-    title = (
-        f"KS test: stat={stat:.4f}\n"
-        f"permutation {p_value_str}={p_perm:.4f}\n"
-        f"theoretical {p_value_str}={p:.4f}"
-    )
     ax1.set_title(title, fontsize=10)
-    ax1.legend()
     if len(plot_path):
         if isinstance(plot_path, str):
             plot_path = [plot_path]

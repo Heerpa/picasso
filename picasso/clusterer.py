@@ -295,8 +295,8 @@ def cluster(
     frame_analysis: bool,
     radius_z: float | None = None,
     pixelsize: float | None = None,
-    return_info: bool = None,  # TODO: change to true in v0.11.0 and remove in v0.12.0
-) -> pd.DataFrame:
+    return_info: bool = True,  # TODO: remove in v0.12.0
+) -> tuple[pd.DataFrame, dict] | pd.DataFrame:
     """Cluster localizations from single molecules (SMLM clusterer).
 
     The general workflow is as follows:
@@ -339,7 +339,8 @@ def cluster(
     return_info : bool, optional
         If True, returns a tuple of (locs, info), where locs is the
         clustered localizations and info is a dictionary containing
-        clustering information.
+        clustering information. Will be removed in v0.12.0 and both
+        locs and metadata will be returned.
 
     Returns
     -------
@@ -347,15 +348,14 @@ def cluster(
         Clusterered localizations, with column 'group' added, which
         specifies cluster label for each localization. Noise (label -1)
         is removed.
+    info : dict, optional
+        Dictionary containing clustering information, only returned if
+        return_info is True.
     """
-    if return_info is None:
-        return_info = False
+    if not return_info:
         lib.deprecation_warning(
-            "Deprecation warning: In v0.11.0, cluster will return both "
-            "locs and cluster info by default. You can change the "
-            "output already by setting return_info=True. In v0.12.0, "
-            "this will not be optional anymore and cluster will always "
-            "return both locs and cluster info."
+            "In v0.12.0, return_info will not be an argument and"
+            "cluster will always return both locs and cluster info."
         )
     locs = locs.copy()
     n_raw = len(locs)
@@ -449,7 +449,7 @@ def dbscan(
     min_locs: int = 10,
     pixelsize: float | None = None,
     radius_z: float | None = None,
-    return_info: bool = None,  # TODO: change to true in v0.11.0 and remove in v0.12.0
+    return_info: bool = True,  # TODO: remove in v0.12.0
 ) -> tuple[pd.DataFrame, dict] | pd.DataFrame:
     """Perform DBSCAN on localizations.
 
@@ -485,7 +485,8 @@ def dbscan(
     return_info : bool, optional
         If True, returns a tuple of (locs, info), where locs is the
         clustered localizations and info is a dictionary containing
-        clustering information.
+        clustering information. Will be removed in v0.12.0 and both
+        locs and metadata will be returned.
 
     Returns
     -------
@@ -497,14 +498,10 @@ def dbscan(
         Dictionary containing clustering information, only returned if
         return_info is True.
     """
-    if return_info is None:
-        return_info = False
+    if not return_info:
         lib.deprecation_warning(
-            "Deprecation warning: In v0.11.0, dbscan will return both "
-            "locs and cluster info by default. You can change the "
-            "output already by setting return_info=True. In v0.12.0, "
-            "this will not be optional anymore and dbscan will always "
-            "return both locs and cluster info."
+            "In v0.12.0, return_info will not be an argument and"
+            "dbscan will always return both locs and cluster info."
         )
     locs = locs.copy()
     n_raw = len(locs)
@@ -585,8 +582,8 @@ def hdbscan(
     min_samples: int,
     pixelsize: float | None = None,
     cluster_eps: float = 0.0,
-    return_info: bool = None,  # TODO: change to true in v0.11.0 and remove in v0.12.0
-) -> pd.DataFrame:
+    return_info: bool = True,  # TODO: remove in v0.12.0
+) -> tuple[pd.DataFrame, dict] | pd.DataFrame:
     """Perform HDBSCAN on localizations.
 
     See Campello, et al. PAKDD, 2013 (DOI: 10.1007/978-3-642-37456-2_14).
@@ -607,7 +604,8 @@ def hdbscan(
     return_info : bool, optional
         If True, returns a tuple of (locs, info), where locs is the
         clustered localizations and info is a dictionary containing
-        clustering information.
+        clustering information. Will be removed in v0.12.0 and both
+        locs and metadata will be returned.
 
     Returns
     -------
@@ -619,14 +617,10 @@ def hdbscan(
         Dictionary containing clustering information, only returned if
         return_info is True.
     """
-    if return_info is None:
-        return_info = False
+    if not return_info:
         lib.deprecation_warning(
-            "Deprecation warning: In v0.11.0, hdbscan will return both "
-            "locs and cluster info by default. You can change the "
-            "output already by setting return_info=True. In v0.12.0, "
-            "this will not be optional anymore and hdbscan will always "
-            "return both locs and cluster info."
+            "In v0.12.0, return_info will not be an argument and"
+            "cluster will always return both locs and cluster info."
         )
     locs = locs.copy()
     n_raw = len(locs)
@@ -688,13 +682,124 @@ def extract_valid_labels(
     return locs
 
 
+def _aggregate_cluster_stats(
+    locs: pd.DataFrame, has_z: bool
+) -> tuple[pd.core.groupby.DataFrameGroupBy, dict]:
+    """One vectorised pass for per-group means, stds and sizes.
+
+    Returns the underlying ``groupby`` object (for downstream use such
+    as ``group_input.first()``) and a dict of plain NumPy arrays, one
+    per statistic, indexed positionally by sorted group id."""
+    mean_cols = [
+        "frame",
+        "x",
+        "y",
+        "photons",
+        "sx",
+        "sy",
+        "bg",
+        "net_gradient",
+    ]
+    std_cols = ["frame", "x", "y"]
+    if has_z:
+        mean_cols.append("z")
+        std_cols.append("z")
+
+    gb = locs.groupby("group", sort=True)
+    means = gb[mean_cols].mean()
+    stds = gb[std_cols].std()
+
+    stats = {f"{c}_mean": means[c].to_numpy() for c in mean_cols}
+    stats.update({f"{c}_std": stds[c].to_numpy() for c in std_cols})
+    stats["n_locs"] = gb.size().to_numpy()
+    stats["unique_groups"] = means.index.to_numpy()
+    return gb, stats
+
+
+def _count_binding_events(
+    group_arr: lib.IntArray1D, frame_arr: lib.IntArray1D
+) -> tuple[lib.IntArray1D, lib.IntArray1D, lib.IntArray1D]:
+    """Number of binding events per cluster.
+
+    A new event starts whenever consecutive frames within a cluster are
+    more than 3 frames apart. Vectorised across all groups with one
+    stable sort + one diff pass.
+
+    Returns
+    -------
+    n_events : lib.IntArray1D
+        One value per sorted unique group.
+    order : lib.IntArray1D
+        Stable argsort by group id; reused for the convex hull pass.
+    group_s : lib.IntArray1D
+        ``group_arr`` reindexed by ``order``.
+    """
+    order = np.argsort(group_arr, kind="stable")
+    group_s = group_arr[order]
+    frame_s = frame_arr[order]
+    new_event = np.empty(len(frame_s), dtype=bool)
+    new_event[0] = True
+    new_event[1:] = (group_s[1:] != group_s[:-1]) | (
+        (frame_s[1:] - frame_s[:-1]) > 3
+    )
+    n_events = (
+        pd.Series(new_event).groupby(group_s, sort=True).sum().to_numpy()
+    )
+    return n_events, order, group_s
+
+
+def _cluster_convex_hulls(
+    locs: pd.DataFrame,
+    order: lib.IntArray1D,
+    group_s: lib.IntArray1D,
+    unique_groups: lib.IntArray1D,
+    has_z: bool,
+    pixelsize: float | None,
+) -> lib.FloatArray1D:
+    """Convex-hull area (2D) or volume (3D) per cluster.
+
+    The only per-cluster Python loop in ``find_cluster_centers``; runs
+    on raw NumPy slices of a group-sorted coordinate array.
+    """
+    coord_cols = ["x", "y", "z"] if has_z else ["x", "y"]
+    coords_sorted = (
+        locs[coord_cols].to_numpy()[order].astype(np.float64, copy=True)
+    )
+    if has_z:
+        coords_sorted[:, 2] /= pixelsize
+    group_offsets = np.searchsorted(group_s, unique_groups, side="left")
+    group_offsets = np.append(group_offsets, len(group_s))
+    convexhull = np.zeros(len(unique_groups), dtype=np.float64)
+    for i in range(len(unique_groups)):
+        X = coords_sorted[group_offsets[i] : group_offsets[i + 1]]
+        try:
+            convexhull[i] = ConvexHull(X).volume
+        except QhullError:
+            convexhull[i] = 0.0
+    return convexhull
+
+
+def _weighted_z_means(
+    locs: pd.DataFrame, group_arr: lib.IntArray1D
+) -> lib.FloatArray1D:
+    """Per-cluster z mean weighted by 1/(lpx + lpy)^2 (per-row weights)."""
+    w = 1.0 / (locs["lpx"].to_numpy() + locs["lpy"].to_numpy()) ** 2
+    wz = (
+        pd.Series(locs["z"].to_numpy() * w).groupby(group_arr, sort=True).sum()
+    )
+    ws = pd.Series(w).groupby(group_arr, sort=True).sum()
+    return (wz / ws).to_numpy()
+
+
 def find_cluster_centers(
     locs: pd.DataFrame,
     pixelsize: float | None = None,
 ) -> pd.DataFrame:
     """Calculate cluster centers.
 
-    Uses ``pandas.groupby`` to quickly run across all cluster ids.
+    Aggregations are computed in vectorised pandas/NumPy passes; the
+    only per-cluster Python loop is the convex hull, which operates on
+    raw NumPy slices.
 
     Parameters
     ----------
@@ -709,256 +814,78 @@ def find_cluster_centers(
     centers : pd.DataFrame
         Cluster centers saved in the format of localizations.
     """
-    # group locs by their cluster id (group)
-    grouplocs = locs.groupby(locs["group"])
-
-    # get cluster centers
-    res = grouplocs.apply(_cluster_center, pixelsize, include_groups=False)
-    centers_ = res.values
-
-    # convert to DataFrame and save
-    frame = np.array([_[0] for _ in centers_])
-    std_frame = np.array([_[1] for _ in centers_])
-    x = np.array([_[2] for _ in centers_])
-    y = np.array([_[3] for _ in centers_])
-    std_x = np.array([_[4] for _ in centers_])
-    std_y = np.array([_[5] for _ in centers_])
-    photons = np.array([_[6] for _ in centers_])
-    sx = np.array([_[7] for _ in centers_])
-    sy = np.array([_[8] for _ in centers_])
-    bg = np.array([_[9] for _ in centers_])
-    lpx = np.array([_[10] for _ in centers_])
-    lpy = np.array([_[11] for _ in centers_])
-    ellipticity = np.array([_[12] for _ in centers_])
-    net_gradient = np.array([_[13] for _ in centers_])
-    n = np.array([_[14] for _ in centers_])
-    n_events = np.array([_[15] for _ in centers_])  # number of locs in cluster
-
-    if "z" in locs.columns:
-        z = np.array([_[16] for _ in centers_])
-        std_z = np.array([_[17] for _ in centers_])
-        volume = np.array([_[18] for _ in centers_])
-        convexhull = np.array([_[19] for _ in centers_])
-        centers = pd.DataFrame(
-            {
-                "frame": frame.astype(np.float32),
-                "std_frame": std_frame.astype(np.float32),
-                "x": x.astype(np.float32),
-                "y": y.astype(np.float32),
-                "std_x": std_x.astype(np.float32),
-                "std_y": std_y.astype(np.float32),
-                "z": z.astype(np.float32),
-                "photons": photons.astype(np.float32),
-                "sx": sx.astype(np.float32),
-                "sy": sy.astype(np.float32),
-                "bg": bg.astype(np.float32),
-                "lpx": lpx.astype(np.float32),
-                "lpy": lpy.astype(np.float32),
-                "std_z": std_z.astype(np.float32),
-                "ellipticity": ellipticity.astype(np.float32),
-                "net_gradient": net_gradient.astype(np.float32),
-                "n_locs": n.astype(np.uint32),
-                "n_events": n_events.astype(np.int32),
-                "volume": volume.astype(np.float32),
-                "convexhull": convexhull.astype(np.float32),
-                "group": res.index.astype(np.int32),  # group id
-            }
+    has_z = "z" in locs.columns
+    if has_z and pixelsize is None:
+        raise ValueError(
+            "Camera pixel size must be specified as an integer for 3D"
+            " cluster centers calculation."
         )
-    else:
-        area = np.array([_[16] for _ in centers_])
-        convexhull = np.array([_[17] for _ in centers_])
-        centers = pd.DataFrame(
-            {
-                "frame": frame.astype(np.float32),
-                "std_frame": std_frame.astype(np.float32),
-                "x": x.astype(np.float32),
-                "y": y.astype(np.float32),
-                "std_x": std_x.astype(np.float32),
-                "std_y": std_y.astype(np.float32),
-                "photons": photons.astype(np.float32),
-                "sx": sx.astype(np.float32),
-                "sy": sy.astype(np.float32),
-                "bg": bg.astype(np.float32),
-                "lpx": lpx.astype(np.float32),
-                "lpy": lpy.astype(np.float32),
-                "ellipticity": ellipticity.astype(np.float32),
-                "net_gradient": net_gradient.astype(np.float32),
-                "n_locs": n.astype(np.uint32),
-                "n_events": n_events.astype(np.int32),
-                "area": area.astype(np.float32),
-                "convexhull": convexhull.astype(np.float32),
-                "group": res.index.astype(np.int32),  # group id
-            }
-        )
-    if "group_input" in locs.columns:
-        group_input = np.array([_[-1] for _ in centers_])
-        centers["group_input"] = group_input.astype(np.int32)
 
-    return centers
+    group_arr = locs["group"].to_numpy()
+    frame_arr = locs["frame"].to_numpy()
 
+    gb, s = _aggregate_cluster_stats(locs, has_z)
 
-def cluster_center(
-    grouplocs: pd.SeriesGroupBy,
-    pixelsize: float | None = None,
-    separate_lp: bool = False,
-) -> list:
-    """Alias for _cluster_center which will be a private function in the
-    future release. Kept for backward compatibility."""
-    lib.deprecation_warning(
-        "cluster_center is deprecated and will be removed in v0.11.0."
-        " Use _cluster_center instead."
+    lpx = s["x_std"] / np.sqrt(s["n_locs"])
+    lpy = s["y_std"] / np.sqrt(s["n_locs"])
+    ellipticity = s["sx_mean"] / s["sy_mean"]
+    n_events, order, group_s = _count_binding_events(group_arr, frame_arr)
+    convexhull = _cluster_convex_hulls(
+        locs, order, group_s, s["unique_groups"], has_z, pixelsize
     )
-    return _cluster_center(grouplocs, pixelsize, separate_lp)
 
-
-def _cluster_center(
-    grouplocs: pd.SeriesGroupBy,
-    pixelsize: float | None = None,
-    separate_lp: bool = False,
-) -> list:
-    """Find cluster centers and their attributes, such as mean number
-    of photons per localization, etc.
-
-    Assumes locs to be a ``pandas.SeriesGroupBy`` object, grouped by
-    cluster ids.
-
-    Parameters
-    ----------
-    grouplocs : pandas.SeriesGroupBy
-        Localizations grouped by cluster ids.
-    pixelsize : float, optional
-        Camera pixel size (used for finding volume and 3D convex hull).
-        Only required for 3D localizations.
-    separate_lp : bool, optional
-        If True, localization precision in x and y will be calculated
-        separately. Otherwise, the mean of the two is taken.
-
-    Returns
-    -------
-    results : list
-        Cluster center attributes. For each group, a list of values is
-        returned: x, y, (z, optional), etc.
-    """
-    # mean and std frame
-    frame = grouplocs.frame.mean()
-    std_frame = grouplocs.frame.std()
-    # average x and y, weighted by lpx, lpy
-    # x = np.average(grouplocs.x, weights=1/(grouplocs.lpx)**2)
-    # y = np.average(grouplocs.y, weights=1/(grouplocs.lpy)**2)
-    x = np.mean(grouplocs.x)
-    y = np.mean(grouplocs.y)
-    std_x = grouplocs.x.std()
-    std_y = grouplocs.y.std()
-    # mean values
-    photons = grouplocs.photons.mean()
-    sx = grouplocs.sx.mean()
-    sy = grouplocs.sy.mean()
-    bg = grouplocs.bg.mean()
-    # weighted mean loc precision
-    # lpx = np.sqrt(
-    #     error_sums_wtd(grouplocs.x, grouplocs.lpx)
-    #     / (len(grouplocs) - 1)
-    # )
-    # lpy = np.sqrt(
-    #     error_sums_wtd(grouplocs.y, grouplocs.lpy)
-    #     / (len(grouplocs) - 1)
-    # )
-    lpx = np.std(grouplocs.x) / len(grouplocs) ** 0.5
-    lpy = np.std(grouplocs.y) / len(grouplocs) ** 0.5
-    if not separate_lp:
-        lpx = (lpx + lpy) / 2
-        lpy = lpx
-    # other attributes
-    ellipticity = sx / sy
-    net_gradient = grouplocs.net_gradient.mean()
-    # n_locs in cluster
-    n = len(grouplocs)
-    # number of binding events
-    split_idx = np.where(np.diff(grouplocs.frame) > 3)[0] + 1  # split locs by
-    # consecutive frames
-    x_events = np.split(grouplocs.x.to_numpy(), split_idx)
-    n_events = len(x_events)  # number of binding events
-    if "z" in grouplocs.columns:
-        if pixelsize is None:
-            raise ValueError(
-                "Camera pixel size must be specified as an integer for 3D"
-                " cluster centers calculation."
-            )
-        z = np.average(
-            grouplocs.z,
-            weights=1 / ((grouplocs.lpx + grouplocs.lpy) ** 2),
-        )  # take lpz = 2 * mean(lpx, lpy)
-        std_z = grouplocs.z.std()
-        # lpz = std_z
+    columns = {
+        "frame": s["frame_mean"].astype(np.float32),
+        "std_frame": s["frame_std"].astype(np.float32),
+        "x": s["x_mean"].astype(np.float32),
+        "y": s["y_mean"].astype(np.float32),
+        "std_x": s["x_std"].astype(np.float32),
+        "std_y": s["y_std"].astype(np.float32),
+    }
+    if has_z:
+        columns["z"] = _weighted_z_means(locs, group_arr).astype(np.float32)
+    columns.update(
+        {
+            "photons": s["photons_mean"].astype(np.float32),
+            "sx": s["sx_mean"].astype(np.float32),
+            "sy": s["sy_mean"].astype(np.float32),
+            "bg": s["bg_mean"].astype(np.float32),
+            "lpx": lpx.astype(np.float32),
+            "lpy": lpy.astype(np.float32),
+        }
+    )
+    if has_z:
+        columns["lpz"] = (s["z_std"] / np.sqrt(s["n_locs"])).astype(np.float32)
+        columns["std_z"] = s["z_std"].astype(np.float32)
+    columns.update(
+        {
+            "ellipticity": ellipticity.astype(np.float32),
+            "net_gradient": s["net_gradient_mean"].astype(np.float32),
+            "n_locs": s["n_locs"].astype(np.uint32),
+            "n_events": n_events.astype(np.int32),
+        }
+    )
+    if has_z:
         volume = (
-            np.power((std_x + std_y + std_z / pixelsize) / 3 * 2, 3) * 4.18879
+            np.power(
+                (s["x_std"] + s["y_std"] + s["z_std"] / pixelsize) / 3 * 2, 3
+            )
+            * 4.18879
         )  # assume radius = 2 * std_xyz
-        try:
-            X = np.stack(
-                (grouplocs.x, grouplocs.y, grouplocs.z / pixelsize),
-                axis=0,
-            ).T
-            hull = ConvexHull(X)
-            convexhull = hull.volume
-        except QhullError:
-            convexhull = 0
-        result = [
-            frame,
-            std_frame,
-            x,
-            y,
-            std_x,
-            std_y,
-            photons,
-            sx,
-            sy,
-            bg,
-            lpx,
-            lpy,
-            ellipticity,
-            net_gradient,
-            n,
-            n_events,
-            z,
-            std_z,
-            # lpz,
-            volume,
-            convexhull,
-        ]
+        columns["volume"] = volume.astype(np.float32)
     else:
-        # assume radius = 2 * std_xyz
-        area = np.power(std_x + std_y, 2) * np.pi
-        try:
-            X = np.stack((grouplocs.x, grouplocs.y), axis=0).T
-            hull = ConvexHull(X)
-            convexhull = hull.volume
-        except QhullError:
-            convexhull = 0
-        result = [
-            frame,
-            std_frame,
-            x,
-            y,
-            std_x,
-            std_y,
-            photons,
-            sx,
-            sy,
-            bg,
-            lpx,
-            lpy,
-            ellipticity,
-            net_gradient,
-            n,
-            n_events,
-            area,
-            convexhull,
-        ]
+        # assume radius = 2 * std_xy
+        area = np.power(s["x_std"] + s["y_std"], 2) * np.pi
+        columns["area"] = area.astype(np.float32)
+    columns["convexhull"] = convexhull.astype(np.float32)
+    columns["group"] = s["unique_groups"].astype(np.int32)
 
-    if "group_input" in grouplocs.columns:
-        # assumes only one group input!
-        result.append(np.unique(grouplocs.group_input)[0])
-    return result
+    if "group_input" in locs.columns:
+        columns["group_input"] = (
+            gb["group_input"].first().to_numpy().astype(np.int32)
+        )
+
+    return pd.DataFrame(columns)
 
 
 def _cluster_area(X: lib.FloatArray2D, lp: float) -> float:

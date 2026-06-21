@@ -55,8 +55,8 @@ from ..lib import (
 )
 from .rotation import RotationWindow
 
-# PyImarisWrite works on windows only
-from ..ext.bitplane import IMSWRITER
+# Optional modules with external/hardware dependencies live in ext
+from ..ext.bitplane import IMSWRITER  # PyImarisWrite works on Windows only
 
 if IMSWRITER:
     from ..ext.bitplane import numpy_to_imaris
@@ -443,7 +443,6 @@ class DatasetDialog(lib.Dialog):
         self.builtin_cmap_stops = {}
         layout = QtWidgets.QGridLayout()
         self.setLayout(layout)
-        self.setMaximumHeight(1000)
 
         # add non-scrollable elements - left side
         self.legend = QtWidgets.QCheckBox("Show legend")
@@ -502,13 +501,16 @@ class DatasetDialog(lib.Dialog):
 
         # add scrollable area which will display all channels, below
         # the non-scrollable elements
-        scroll = QtWidgets.QScrollArea(self)
-        scroll.setWidgetResizable(True)
+        self._scroll = QtWidgets.QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.container = QtWidgets.QWidget()
-        scroll.setWidget(self.container)
+        self._scroll.setWidget(self.container)
         self.scroll_area = QtWidgets.QGridLayout(self.container)
         self.scroll_area.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
-        layout.addWidget(scroll, 4, 0, 1, 3)
+        layout.addWidget(self._scroll, 4, 0, 1, 3)
 
         self.checks = []
         self.title = []
@@ -677,9 +679,16 @@ class DatasetDialog(lib.Dialog):
         self.scroll_area.addWidget(intensity, currentline, 4)
         self.scroll_area.addWidget(p, currentline, 5)
 
-        # adjust the size of the dialog
-        hint = self.container.sizeHint()
-        lib.adjust_widget_size(self, hint, 45, 150)
+        self._fit_scroll_width()
+
+    def _fit_scroll_width(self) -> None:
+        """Ensure the dialog is wide enough that the scroll area's
+        contents fit horizontally without a scrollbar. Only ever grows
+        the minimum width; never shrinks the dialog."""
+        self.container.adjustSize()
+        needed = self.container.sizeHint().width()
+        frame = 2 * self._scroll.frameWidth()
+        self._scroll.setMinimumWidth(needed + frame)
 
     def update_colors(self) -> None:
         """Change colors in self.colordisp_all and updates the scene in
@@ -709,13 +718,11 @@ class DatasetDialog(lib.Dialog):
                     else:
                         self.checks[i].setText(new_title)
                     self.update_viewport()
-                    # change size of the dialog
-                    hint = self.scroll_area.sizeHint()
-                    lib.adjust_widget_size(self, hint, 45, 150)
                     # change name in the fast render dialog
                     self.window.fast_render_dialog.channel.setItemText(
                         i + 1, new_title
                     )
+                    self._fit_scroll_width()
                 break
 
     def _close_one_channel(self, i: int, render_=True) -> None:
@@ -799,9 +806,7 @@ class DatasetDialog(lib.Dialog):
         # remove the channel from test clustering dialog
         self.window.test_clusterer_dialog.channels.removeItem(i)
 
-        # adjust the size of the dialog
-        hint = self.scroll_area.sizeHint()
-        lib.adjust_widget_size(self, hint, 45, 150)
+        self._fit_scroll_width()
 
     def close_file(self, i: int | str, render=True) -> None:
         """Close a given channel (defined by its index of name) and
@@ -1000,7 +1005,7 @@ class DatasetDialog(lib.Dialog):
             self.update_colors()
 
     def sizeHint(self) -> QtCore.QSize:
-        return QtCore.QSize(600, 350)
+        return QtCore.QSize(700, 500)
 
 
 class CustomColormapDialog(lib.Dialog):
@@ -2315,17 +2320,21 @@ class DbscanDialog(lib.Dialog):
         Contains epsilon (nm) for DBSCAN (see scikit-learn).
     radius_z : QDoubleSpinBox
         Contains epsilon in the z direction (nm) for anisotropic 3D
-        DBSCAN. Ignored for 2D data.
+        DBSCAN. Shown only if 3D data is present.
     save_areas : QCheckBox
         Whether to save cluster areas as .csv file.
     save_centers : QCheckBox
         Whether to save cluster centers.
     """
 
-    def __init__(self, window: QtWidgets.QMainWindow) -> None:
+    def __init__(
+        self,
+        window: QtWidgets.QMainWindow,
+        flag_3D: bool = False,
+    ) -> None:
         super().__init__(window)
         self.window = window
-        self.setWindowTitle("Enter parameters")
+        self.setWindowTitle(f"Enter parameters ({'3D' if flag_3D else '2D'})")
         vbox = QtWidgets.QVBoxLayout(self)
         grid = QtWidgets.QGridLayout()
         radius_label = QtWidgets.QLabel("Radius (nm):")
@@ -2340,21 +2349,22 @@ class DbscanDialog(lib.Dialog):
         self.radius.setDecimals(2)
         self.radius.setSingleStep(0.1)
         grid.addWidget(self.radius, 0, 1)
-        radius_z_label = QtWidgets.QLabel("Radius z (3D only, nm):")
-        radius_z_label.setToolTip(
-            "DBSCAN epsilon in the z direction. Only used for 3D data.\n"
-            "Scales z coordinates so the neighborhood is an ellipsoid\n"
-            "with semi-axes (radius, radius, radius z).\n"
-            "Anisotropic DBSCAN approach inspired by Lörzing, Schake,\n"
-            "and Schlierf, Journal of Phys Chem B, 2024."
-        )
-        grid.addWidget(radius_z_label, 1, 0)
         self.radius_z = QtWidgets.QDoubleSpinBox()
         self.radius_z.setRange(0.01, 1e6)
         self.radius_z.setValue(25)
         self.radius_z.setDecimals(2)
         self.radius_z.setSingleStep(0.1)
-        grid.addWidget(self.radius_z, 1, 1)
+        if flag_3D:
+            radius_z_label = QtWidgets.QLabel("Radius z (nm):")
+            radius_z_label.setToolTip(
+                "DBSCAN epsilon in the z direction. Scales z coordinates\n"
+                "so the neighborhood is an ellipsoid with semi-axes\n"
+                "(radius, radius, radius z).\n"
+                "Anisotropic DBSCAN approach inspired by Lörzing, Schake,\n"
+                "and Schlierf, Journal of Phys Chem B, 2024."
+            )
+            grid.addWidget(radius_z_label, 1, 0)
+            grid.addWidget(self.radius_z, 1, 1)
         min_samples_label = QtWidgets.QLabel("Min. samples:")
         min_samples_label.setToolTip(
             "Minimum number of samples in a neighborhood for a point to be\n"
@@ -2407,10 +2417,11 @@ class DbscanDialog(lib.Dialog):
     @staticmethod
     def getParams(
         parent: QtWidgets.QMainWindow | None = None,
+        flag_3D: bool = False,
     ) -> tuple[dict, bool]:
         """Create the dialog and return the requested values for
         DBSCAN."""
-        dialog = DbscanDialog(parent)
+        dialog = DbscanDialog(parent, flag_3D=flag_3D)
         result = dialog.exec()
         return {
             "radius": dialog.radius.value(),
@@ -3244,6 +3255,7 @@ class TestClustererDialog(lib.Dialog):
         # parameters - channel
         self.channels = QtWidgets.QComboBox()
         self.channels.setToolTip("Select the channel to test clustering on.")
+        self.channels.currentIndexChanged.connect(self._update_3d_visibility)
         parameters_grid.addWidget(self.channels, 0, 0, 1, 2)
 
         # parameters - choose clusterer
@@ -3376,6 +3388,21 @@ class TestClustererDialog(lib.Dialog):
         zoomout_action.triggered.connect(self.view.zoom_out)
         self.addAction(zoomout_action)
 
+    def _update_3d_visibility(self) -> None:
+        """Show or hide Z-specific widgets based on whether the selected
+        channel has a `z` column."""
+        idx = self.channels.currentIndex()
+        if idx < 0 or idx >= len(self.window.view.locs):
+            is_3d = False
+        else:
+            is_3d = "z" in self.window.view.locs[idx].columns
+        self.test_dbscan_params.set_3d(is_3d)
+        self.test_smlm_params.set_3d(is_3d)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        self._update_3d_visibility()
+        super().showEvent(event)
+
     def on_xy_proj(self) -> None:
         self.view.ang = None
         self.view.update_scene()
@@ -3415,13 +3442,13 @@ class TestClustererDialog(lib.Dialog):
         params["pixelsize"] = pixelsize
         clusterer_name = self.clusterer_name.currentText()
         if clusterer_name == "DBSCAN":
-            locs = clusterer.dbscan(locs, **params)
+            locs, _ = clusterer.dbscan(locs, **params)
         elif clusterer_name == "HDBSCAN":
-            locs = clusterer.hdbscan(locs, **params)
+            locs, _ = clusterer.hdbscan(locs, **params)
         elif clusterer_name == "SMLM":
-            locs = clusterer.cluster(locs, **params)
+            locs, _ = clusterer.cluster(locs, **params)
         elif clusterer_name == "G5M":
-            locs = clusterer.dbscan(locs, **params["DBSCAN"])
+            locs, _ = clusterer.dbscan(locs, **params["DBSCAN"])
             # in g5m, the info parameter is only for getting the pixel
             # size
             centers, locs, _ = g5m.g5m(
@@ -3630,7 +3657,7 @@ class TestClustererDialog(lib.Dialog):
             params["DBSCAN"]["radius"] *= pixelsize
             params["G5M"]["callback_parent"] = self.window
             params["G5M"]["asynch"] = True
-            locs = clusterer.dbscan(locs, **params["DBSCAN"])
+            locs, _ = clusterer.dbscan(locs, **params["DBSCAN"])
             centers, clustered_locs, new_info = g5m.g5m(
                 locs, [{"Pixelsize": pixelsize}], **params["G5M"]
             )
@@ -3660,19 +3687,21 @@ class TestDBSCANParams(QtWidgets.QWidget):
         self.radius.setSingleStep(0.1)
         grid.addWidget(self.radius, 0, 1)
 
-        radius_z_label = QtWidgets.QLabel("Radius z (3D only, nm):")
-        radius_z_label.setToolTip(
-            "DBSCAN epsilon in the z direction. Only used for 3D data.\n"
-            "Scales z coordinates so the neighborhood is an ellipsoid\n"
-            "with semi-axes (radius xy, radius xy, radius z)."
+        self.radius_z_label = QtWidgets.QLabel("Radius z (nm):")
+        self.radius_z_label.setToolTip(
+            "DBSCAN epsilon in the z direction. Scales z coordinates so\n"
+            "the neighborhood is an ellipsoid with semi-axes\n"
+            "(radius xy, radius xy, radius z)."
         )
-        grid.addWidget(radius_z_label, 1, 0)
+        grid.addWidget(self.radius_z_label, 1, 0)
         self.radius_z = QtWidgets.QDoubleSpinBox()
         self.radius_z.setRange(0.01, 1e6)
         self.radius_z.setValue(25)
         self.radius_z.setDecimals(2)
         self.radius_z.setSingleStep(0.1)
         grid.addWidget(self.radius_z, 1, 1)
+        self.radius_z_label.setVisible(False)
+        self.radius_z.setVisible(False)
 
         min_samples_label = QtWidgets.QLabel("Min. samples:")
         min_samples_label.setToolTip(
@@ -3698,6 +3727,11 @@ class TestDBSCANParams(QtWidgets.QWidget):
         self.min_locs.setSingleStep(1)
         grid.addWidget(self.min_locs, 3, 1)
         grid.setRowStretch(4, 1)
+
+    def set_3d(self, is_3d: bool) -> None:
+        """Show or hide the Z radius widget."""
+        self.radius_z_label.setVisible(is_3d)
+        self.radius_z.setVisible(is_3d)
 
 
 class TestHDBSCANParams(QtWidgets.QWidget):
@@ -3767,18 +3801,20 @@ class TestSMLMParams(QtWidgets.QWidget):
         self.radius_xy.setDecimals(2)
         grid.addWidget(self.radius_xy, 0, 1)
 
-        radius_z_label = QtWidgets.QLabel("Radius z (3D only):")
-        radius_z_label.setToolTip(
+        self.radius_z_label = QtWidgets.QLabel("Radius z (nm):")
+        self.radius_z_label.setToolTip(
             "Radius in which localizations are considered part of the\n"
-            "same cluster. Applied in z direction (3D only)."
+            "same cluster. Applied in z direction."
         )
-        grid.addWidget(radius_z_label, 1, 0)
+        grid.addWidget(self.radius_z_label, 1, 0)
         self.radius_z = QtWidgets.QDoubleSpinBox()
         self.radius_z.setValue(25)
         self.radius_z.setRange(0.01, 1e6)
         self.radius_z.setSingleStep(0.1)
         self.radius_z.setDecimals(2)
         grid.addWidget(self.radius_z, 1, 1)
+        self.radius_z_label.setVisible(False)
+        self.radius_z.setVisible(False)
 
         min_locs_label = QtWidgets.QLabel("Min. no. of locs")
         min_locs_label.setToolTip(
@@ -3797,6 +3833,11 @@ class TestSMLMParams(QtWidgets.QWidget):
         self.fa.setChecked(True)
         grid.addWidget(self.fa, 3, 0, 1, 2)
         grid.setRowStretch(4, 1)
+
+    def set_3d(self, is_3d: bool) -> None:
+        """Show or hide the Z radius widget."""
+        self.radius_z_label.setVisible(is_3d)
+        self.radius_z.setVisible(is_3d)
 
 
 class TestG5MParams(QtWidgets.QWidget):
@@ -4233,6 +4274,7 @@ class ChangeFOV(lib.Dialog):
         self.y_box.setValue(y)
         self.w_box.setValue(w)
         self.h_box.setValue(h)
+        self.window.resize_view_to_fov(w, h)
         self.update_scene()
 
     def update_scene(self) -> None:
@@ -5346,8 +5388,8 @@ class MaskSettingsDialog(lib.Dialog):
         """Mask localizations given a mask."""
         locs_in, locs_out = masking.mask_locs(
             locs,
+            self.infos[self.channel],
             self.mask,
-            info=self.infos[self.channel],
         )
         self.index_locs.append(locs_in)  # locs in the mask
         self.index_locs_out.append(locs_out)  # locs outside the mask
@@ -5545,11 +5587,6 @@ class MaskSettingsDialog(lib.Dialog):
         image = render.apply_colormap(image, cmap)
         # create a 4 channel (rgb, alpha) array
         qimage = render.rgb_to_qimage(image)
-        qimage = qimage.scaled(
-            300,
-            300,
-            QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-        )
         pixmap = QtGui.QPixmap.fromImage(qimage)
         return pixmap
 
@@ -6909,8 +6946,17 @@ class View(QtWidgets.QLabel):
     _pixmap : QPixMap
         Pixmap currently displayed.
     _points : list
-        Contains the coordinates of points to measure distances
-        between them.
+        Coordinates of the points of the measurement set currently
+        being drawn (connected by lines with live distances).
+    _point_sets : list
+        Finalized measurement sets, each a list of point coordinates.
+        Kept separate so lines and distances are only drawn within a
+        set, not across sets.
+    _measure_following : bool
+        True while the cursor is followed live and left clicks extend
+        the current set. Set to False (frozen) by the first right click
+        so a new set can be started; a further right click then deletes
+        the last finalized set.
     qimage : QImage
         Current image of rendered locs, picks and other drawings.
     qimage_no_picks : QImage
@@ -6939,9 +6985,6 @@ class View(QtWidgets.QLabel):
     x_locs : list of pd.DataFrames
         Contains pd.DataFrames with locs to be rendered by property; one
         per color.
-    x_render_cache : list of dicts
-        Contains dictionaries with caches for storing info about locs
-        rendered by a property.
     x_render_state : bool
         Indicates if rendering by property is used.
     """
@@ -6971,12 +7014,16 @@ class View(QtWidgets.QLabel):
         self.n_locs = 0
         self._picks = []
         self._points = []
+        self._point_sets = []  # finalized measurement sets
+        self._measure_following = True  # cursor followed live while True
+        self._measure_cursor = None  # live cursor position in Measure mode
+        # track the cursor without a pressed button for live measuring
+        self.setMouseTracking(True)
         self.index_blocks = []
         self.render_index = []
         self._drift = []
         self._driftfiles = []
         self.currentdrift = []
-        self.x_render_cache = []
         self.x_render_state = False
 
     def _load_locs(self, path: str) -> tuple[pd.DataFrame, list[dict]]:
@@ -7329,7 +7376,12 @@ class View(QtWidgets.QLabel):
         channel = self.get_channel_all_seq("DBSCAN")
 
         # get DBSCAN parameters
-        params, ok = DbscanDialog.getParams()
+        if channel is None or channel == len(self.locs_paths):
+            # no channel selected or "apply to all"
+            flag_3D = any("z" in _.columns for _ in self.locs)
+        else:
+            flag_3D = "z" in self.locs[channel].columns
+        params, ok = DbscanDialog.getParams(flag_3D=flag_3D)
         if ok:
             if channel == len(self.locs_paths):  # apply to all channels
                 # get saving name suffix
@@ -7425,7 +7477,6 @@ class View(QtWidgets.QLabel):
             pixelsize=pixelsize,
             min_locs=min_locs,
             radius_z=radius_z_px,
-            return_info=True,
         )
         io.save_locs(path, locs, self.infos[channel] + [dbscan_info])
         status.close()
@@ -7575,10 +7626,11 @@ class View(QtWidgets.QLabel):
 
         # get clustering parameters
         pixelsize = self.pixelsize
-        if any(["z" in _.columns for _ in self.locs]):
-            flag_3D = True
+        if channel is None or channel == len(self.locs_paths):
+            # no channel selected or "apply to all"
+            flag_3D = any("z" in _.columns for _ in self.locs)
         else:
-            flag_3D = False
+            flag_3D = "z" in self.locs[channel].columns
         params, ok = SMLMDialog.getParams(flag_3D=flag_3D)
         # convert to camera pixels
         params["radius_xy"] = params["radius_xy"] / pixelsize
@@ -8018,12 +8070,29 @@ class View(QtWidgets.QLabel):
             if not self.window.dataset_dialog.wbackground.isChecked()
             else QtGui.QColor("red")
         )
+        # draw all finalized measurement sets (static, no live cursor)
+        for point_set in self._point_sets:
+            image = render.draw_points(
+                image=image,
+                viewport=self.viewport,
+                points=point_set,
+                pixelsize=self.pixelsize,
+                color=color,
+            )
+        # draw the active set; show the live cursor cross and running
+        # distance only in Measure mode while the cursor is followed
+        cursor = (
+            self._measure_cursor
+            if self._mode == "Measure" and self._measure_following
+            else None
+        )
         return render.draw_points(
             image=image,
             viewport=self.viewport,
             points=self._points,
             pixelsize=self.pixelsize,
             color=color,
+            cursor=cursor,
         )
 
     def draw_scalebar(self, image: QtGui.QImage) -> QtGui.QImage:
@@ -8597,6 +8666,7 @@ class View(QtWidgets.QLabel):
         FOV."""
         (x, y, w, h) = fov
         if w > 0 and h > 0:
+            self.window.resize_view_to_fov(w, h)
             viewport = [(y, x), (y + h, x + w)]
             self.update_scene(viewport=viewport)
             self.window.info_dialog.xy_label.setText(f"{x:.2f} / {y:.2f} ")
@@ -8800,6 +8870,19 @@ class View(QtWidgets.QLabel):
                     self.rectangle_pick_current_x = event.pos().x()
                     self.rectangle_pick_current_y = event.pos().y()
                     self.update_scene(picks_only=True)
+        # live update of the measuring cross and distance
+        elif self._mode == "Measure" and self._measure_following:
+            self._measure_cursor = self.map_to_movie(event.pos())
+            self.update_scene(picks_only=True)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        """Hide the live measuring cross when the cursor leaves the
+        canvas."""
+        if self._mode == "Measure" and self._measure_cursor is not None:
+            self._measure_cursor = None
+            if len(self.locs):
+                self.update_scene(picks_only=True)
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event: QtCore.QEvent) -> None:
         """Start drawing a zoom-in rectangle, start padding, start
@@ -8906,17 +8989,25 @@ class View(QtWidgets.QLabel):
                 self.remove_polygon_point()
 
     def _mouse_release_measure(self, event: QtCore.QEvent) -> None:
-        """Adds a measure point on left click, removes the last one on
-        right click."""
+        """Add a measure point on left click. The first right click
+        freezes the current set so a new one can be started; a further
+        right click then deletes the last finalized set."""
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            # start a new set if the previous one was frozen
+            if not self._measure_following:
+                self._measure_following = True
+                self.update_cursor()
             # add measure point
             x, y = self.map_to_movie(event.pos())
             self.add_point((x, y))
             event.accept()
         elif event.button() == QtCore.Qt.MouseButton.RightButton:
-            # remove measure points
-            x, y = self.map_to_movie(event.pos())
-            self.remove_points()
+            if self._measure_following:
+                # freeze the current selection (stop following)
+                self.finalize_measure_set()
+            else:
+                # delete the last finalized set of measurements
+                self.remove_last_measure_set()
             event.accept()
         else:
             event.ignore()
@@ -9179,8 +9270,10 @@ class View(QtWidgets.QLabel):
                     + "."
                 )
                 if locs_.size:
-                    fig.axes[0].set_ylim(yvec[yvec > 0].min(), yvec.max())
-                    fig.axes[1].set_ylim(yvec[yvec > 0].min(), yvec.max())
+                    for ax, col in zip(fig.axes[:2], ("x", "y")):
+                        lo, hi = locs_[col].min(), locs_[col].max()
+                        if lo != hi:
+                            ax.set_ylim(lo, hi)
                 plt.setp(fig.axes[0].get_xticklabels(), visible=False)
                 plt.setp(fig.axes[1].get_xticklabels(), visible=False)
 
@@ -9736,7 +9829,7 @@ class View(QtWidgets.QLabel):
                 index_blocks[6],
                 index_blocks[7],
             )
-            pick_locs_xy = postprocess.locs_at_numba(x, y, block_locs_xy, r)
+            pick_locs_xy = lib.locs_at_numba(x, y, block_locs_xy, r)
             loccount[i] = pick_locs_xy.shape[1]
             progress.set_value(i)
         progress.close()
@@ -10208,9 +10301,31 @@ class View(QtWidgets.QLabel):
             self.update_scene(picks_only=True)
 
     def remove_points(self) -> None:
-        """Remove all distance measurement points."""
+        """Remove all distance measurement points and sets."""
         self._points = []
+        self._point_sets = []
+        self._measure_following = True
+        self._measure_cursor = None
+        self.update_cursor()
         self.update_scene()
+
+    def finalize_measure_set(self) -> None:
+        """Freeze the current measurement set so a new one can be
+        started. The cursor is no longer followed until the next left
+        click."""
+        if self._points:
+            self._point_sets.append(self._points)
+            self._points = []
+        self._measure_following = False
+        self._measure_cursor = None
+        self.update_cursor()
+        self.update_scene()
+
+    def remove_last_measure_set(self) -> None:
+        """Delete the most recently finalized measurement set."""
+        if self._point_sets:
+            self._point_sets.pop()
+            self.update_scene()
 
     def render_scene(
         self,
@@ -10294,7 +10409,6 @@ class View(QtWidgets.QLabel):
         if cache:
             self.n_locs = n_locs
             self.image = raw_image
-
         self.window.display_settings_dlg.silent_minimum_update(vmin)
         self.window.display_settings_dlg.silent_maximum_update(vmax)
 
@@ -10307,9 +10421,8 @@ class View(QtWidgets.QLabel):
         rendering.
 
         Each returned entry is a ``(256, 3)`` float32 LUT. Solid colors
-        become black→color linear ramps (math-equivalent to the
-        original "intensity × rgb" multichannel blend). Matplotlib
-        colormaps and user-defined custom colormaps are also LUTs.
+        become black→color linear ramps. Matplotlib colormaps and
+        user-defined custom colormaps are also LUTs.
 
         If multiple channels are loaded, ensure that only the ones
         which are checked in the Dataset Dialog are rendered in their
@@ -10563,11 +10676,6 @@ class View(QtWidgets.QLabel):
         # save picked locs with .yaml
         if locs is not None:
             pick_info = self._build_base_pick_info()
-            # correct for the total area for certain shapes
-            if self._pick_shape in ["Circle", "Square"]:
-                pick_info["Area (um^2)"] = pick_info["Area (um^2)"] * len(
-                    self._picks
-                )
             self._add_shape_specific_info(pick_info)
             io.save_locs(path, locs, self.infos[channel] + [pick_info])
 
@@ -10787,45 +10895,13 @@ class View(QtWidgets.QLabel):
             n_colors = self.window.display_settings_dlg.color_step.value()
             min_val = self.window.display_settings_dlg.minimum_render.value()
             max_val = self.window.display_settings_dlg.maximum_render.value()
-
-            x_locs = []
-
-            # attempt using cached data
-            for cached_entry in self.x_render_cache:
-                if cached_entry["parameter"] == parameter:
-                    if cached_entry["colors"] == n_colors:
-                        if (cached_entry["min_val"] == min_val) & (
-                            cached_entry["max_val"] == max_val
-                        ):
-                            x_locs = cached_entry["locs"]
-                        break
-
-            # if no cached data found
-            if x_locs == []:
-                x_locs = render.split_locs_by_property(
-                    locs=self._display_locs(0),
-                    property_name=parameter,
-                    n_colors=n_colors,
-                    min_value=min_val,
-                    max_value=max_val,
-                )
-
-                # cache
-                entry = {}
-                entry["parameter"] = parameter
-                entry["colors"] = n_colors
-                entry["locs"] = x_locs
-                entry["min_val"] = min_val
-                entry["max_val"] = max_val
-
-                # Do not store too many datasets in cache
-                if len(self.x_render_cache) < 10:
-                    self.x_render_cache.append(entry)
-                else:
-                    self.x_render_cache.insert(0, entry)
-                    del self.x_render_cache[-1]
-
-            self.x_locs = x_locs
+            self.x_locs = render.split_locs_by_property(
+                locs=self._display_locs(0),
+                property_name=parameter,
+                n_colors=n_colors,
+                min_value=min_val,
+                max_value=max_val,
+            )
         else:
             self.x_render_state = False
         self.update_scene()
@@ -10988,14 +11064,6 @@ class View(QtWidgets.QLabel):
                 self.plot_window = DriftPlotWindow(self)
                 self.plot_window.plot(drift)
                 self.plot_window.show()
-
-    def sync_groups(self) -> None:
-        """Remove localizations whose group field is not found in all
-        channels."""
-        if len(self.locs_paths) < 2:
-            return
-        self.locs = lib.sync_groups(self.locs)
-        self.update_scene(resample_locs=True)
 
     def undrift_aim(self) -> None:
         """Undrift with Adaptive Intersection Maximization (AIM).
@@ -11246,6 +11314,14 @@ class View(QtWidgets.QLabel):
         self.render_index[channel] = None
         self.update_scene(resample_locs=True)
 
+    def sync_groups(self) -> None:
+        """Remove localizations whose group field is not found in all
+        channels."""
+        if len(self.locs_paths) < 2:
+            return
+        self.locs = lib.sync_groups(self.locs)
+        self.update_scene(resample_locs=True)
+
     def unfold_groups_square(self) -> None:
         """Shifts grouped localizations onto a square grid with a chosen
         number of columns and spacing. Localizations can be grouped, for
@@ -11385,8 +11461,15 @@ class View(QtWidgets.QLabel):
 
     def update_cursor(self) -> None:
         """Change cursor according to self._mode."""
-        if self._mode == "Zoom" or self._mode == "Measure":
+        if self._mode == "Zoom":
             self.unsetCursor()  # normal cursor
+        elif self._mode == "Measure":
+            if self._measure_following:
+                # hide the OS cursor; the drawn cross marks the position
+                self.setCursor(QtCore.Qt.CursorShape.BlankCursor)
+            else:
+                # selection frozen, show the normal cursor again
+                self.unsetCursor()
         elif self._mode == "Pick":
             if self._pick_shape == "Circle":  # circle
                 self._update_cursor_circle()
@@ -11989,6 +12072,7 @@ class Window(QtWidgets.QMainWindow):
 
         # menu bar - Postprocess
         postprocess_menu = self.menu_bar.addMenu("Postprocess")
+
         undrift_aim_action = postprocess_menu.addAction("Undrift by AIM")
         undrift_aim_action.setShortcut("Ctrl+U")
         undrift_aim_action.triggered.connect(self.view.undrift_aim)
@@ -12005,6 +12089,7 @@ class Window(QtWidgets.QMainWindow):
         undrift_from_picked2d_action.triggered.connect(
             self.view.undrift_from_picked2d
         )
+
         undrift_action = postprocess_menu.addAction("Undrift by RCC")
         undrift_action.triggered.connect(self.view.undrift_rcc)
         drift_action = postprocess_menu.addAction("Undo drift")
@@ -12588,7 +12673,7 @@ class Window(QtWidgets.QMainWindow):
                         pixelsize,
                     )
                 else:
-                    n, image = render.render_hist(
+                    n, image = render._render_hist(
                         locs,
                         oversampling,
                         y_min,
@@ -12823,10 +12908,51 @@ class Window(QtWidgets.QMainWindow):
                     self.tools_settings_dialog.pick_side_length.setValue(
                         self.view.infos[0][-1]["Pick size (nm)"]
                     )
-                self.window_rot.view_rot.angx = self.view.infos[0][-1]["angx"]
-                self.window_rot.view_rot.angy = self.view.infos[0][-1]["angy"]
-                self.window_rot.view_rot.angz = self.view.infos[0][-1]["angz"]
+                self.window_rot.view_rot.load_saved_rotation(
+                    self.view.infos[0][-1]
+                )
                 self.rot_win()
+
+    def resize_view_to_fov(self, w: float, h: float) -> None:
+        """Resize the main window so that ``view`` has aspect ratio w/h.
+
+        Only triggers a resize when the current view aspect differs from
+        the target. The longer of the current view dimensions is
+        preserved; the other is recomputed from the target aspect, then
+        both are clipped to the available screen geometry.
+        """
+        if w <= 0 or h <= 0:
+            return
+        view_w = self.view.width()
+        view_h = self.view.height()
+        if view_w <= 0 or view_h <= 0:
+            return
+        target_aspect = w / h
+        current_aspect = view_w / view_h
+        if abs(current_aspect - target_aspect) < 1e-3:
+            return
+
+        if target_aspect >= 1.0:
+            new_view_w = max(view_w, view_h)
+            new_view_h = new_view_w / target_aspect
+        else:
+            new_view_h = max(view_w, view_h)
+            new_view_w = new_view_h * target_aspect
+
+        screen = self.screen() or QtWidgets.QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        chrome_w = self.width() - view_w
+        chrome_h = self.height() - view_h
+        max_view_w = max(1, avail.width() - chrome_w)
+        max_view_h = max(1, avail.height() - chrome_h)
+        scale = min(1.0, max_view_w / new_view_w, max_view_h / new_view_h)
+        new_view_w *= scale
+        new_view_h *= scale
+
+        self.resize(
+            int(round(new_view_w + chrome_w)),
+            int(round(new_view_h + chrome_h)),
+        )
 
     def resizeEvent(self, even: QtGui.QResizeEvent) -> None:
         """Update window size."""

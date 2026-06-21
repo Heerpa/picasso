@@ -1,28 +1,95 @@
 # Changelog
 
-Last change: 26-MAY-2026 CEST
+Last change: 21-JUN-2026 CEST
+
+## 0.11.0
+
+### **General updates:**
+- Localization metadata is now embedded directly in the `.hdf5` file (under the `/metadata` dataset, as a JSON string), making the file self-contained even if moved or renamed without its `.yaml` sidecar. When loading, Picasso looks for the metadata in the `.yaml` file first, then falls back to the embedded copy. Writing the `.yaml` sidecar is still on by default but can be disabled via the new user setting `Save metadata in .yaml` in `~/.picasso/settings.yaml` (also available via any module under File > Picasso settings). See [file formats documentation](https://picassosr.readthedocs.io/en/latest/files.html) for more info.
+
+#### Localize
+- Picasso relies on package `tifffile` for processing `.tif` files and many other grayscale movie formats, see [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html). **Note:** this is an experimental feature, do not hesitate to let us know if you detect bugs/unexpected behavior or would like to see more file formats in Picasso, see our [GitHub page](https://github.com/jungmannlab/picasso/issues) for contact information.
+- Added support for Zeiss `.czi` and Leica `.lif` movies in Localize (open dialog, drag-and-drop and batch CLI). These read via the optional `czifile` and `liffile` libraries (Python ≥ 3.12); install with `pip install picassosr[czi,lif]`. Multi-channel files prompt for a channel, and a `.lif` file with several acquisitions uses the one with the most frames.
+- Accept multiple frame bounds
+- Accept multiple rectangular ROIs
+- Remove a ROI by double-clicking it in the preview
+- Loading a movie with corrupted metadata lets the user specify the most important ones without errors
+- 3D calibration allows for multiple FOVs per z position (thanks to Aditya Ajay Chhatre for the suggestion)
+- Slight adjustments to some status bar messages
+- Fixed a gap of roughly one box size in the identified spots along the borders between adjacent (e.g. overlapping) ROIs
+- Fixed handling abortions during identification
+
+#### Render
+- Improved measure tool
+
+#### SPINNA
+- Fixed verbose for batch analysis
+- Batch analysis allows for specifying fitting mode (brute force/coarse to fine/bayesian)
+
+#### *Other improvements:*
+- Removed folder `distribution` from the repository; `create_linux_shortcuts.py` was moved to `release`
+
+### **Backward incompatible changes:**
+- All the functions deprecated in v0.10 were removed, see section 0.10.0 below
+- `picasso.clusterer.cluster_center` removed (the functionality provided by `find_cluster_centers`)
+- `render.render` only keyword arguments except `locs` and `info`
+- Nanotron accepts `disp_px_size` instead of `oversampling` for easier user interaction
+
+#### *Deprecation warnings:*
+- `picasso.localize.identify` and `picasso.localize.localize` will always return metadata in v0.12.0, `return_info` will no longer be accepted
+
+## 0.10.3
+- Fixed total pick area in the .yamls for circular and square picks (Render)
+- Fixed plotting x and y in "Select picks (trace) in Render"
+
+## 0.10.2
+- Rotations use quaterions for unambiguous workflow, fixing bugs [#673](https://github.com/jungmannlab/picasso/issues/673), [#674](https://github.com/jungmannlab/picasso/issues/674) and [#675](https://github.com/jungmannlab/picasso/issues/675)
+- All 3 angles in "Rotate by angle" in the 3D rotation window are accumulated into a single widget
+- Render by property fixed for large files ([#677](https://github.com/jungmannlab/picasso/issues/677)), possibly related to [#672](https://github.com/jungmannlab/picasso/issues/672)
+- Fixed "Best fitting combination" button in SPINNA ([#676](https://github.com/jungmannlab/picasso/issues/676))
+- Fixed 3D calibration when frame range is user-specified
+- Fixed redoing 3D calibration when identification parameters change
 
 - Affine transform calibration for astigmatic imaging
 
 ## 0.10.1
 
-This patch adds a number of new, useful features rather than simply fixing the bugs found in 0.10.0.
+#### Localize
+- Fixed Gauss-fitting error when spot's sum is zero (zero division error)
 
+#### Render
 - Faster rendering through improvements for all blur methods and multi-level spatial indexing for quick zoomed-in rendering
 - Multichannel rendering supports colormaps, not only a single RGB color
+- Anisotripic DBSCAN (with faster implementation) [DOI: 10.1021/acs.jpcb.4c02030](https://doi.org/10.1021/acs.jpcb.4c02030)
+- Faster cluster centers calculation for SMLM clusterer, DBSCAN and HDBSCAN + `lpz` is saved if applicable
+- Load FOV keeps the aspect ratio of the input .txt file
+- Files dialog resizing fixed
+- Show 3D clustering widgets only when 3D data is loaded
 - Fixed linking saving `lpz`
-- Anisotripic DBSCAN (faster implementation) [DOI: 10.1021/acs.jpcb.4c02030](https://doi.org/10.1021/acs.jpcb.4c02030)
-- Improved docstrings for 3D SMLM clusterer
-- SPINNA: comparing models uses fitting modes and has cleaner progress dialog
-- SPINNA: convenient fitting of LE
-- Batch analysis in SPINNA for LE fitting
+- Fixed high-resolution display of mask in Render (#666)
+- Removed render property cache since it did not provide any significant speed improvement
+
+#### SPINNA
+- Comparing models uses fitting modes (Bayesian, etc) and has a cleaner progress dialog
+- Convenient fitting of LE
+- Area/volume button removed (deduced automatically from densities and number of molecules in the exp. data)
+- Show 3D masking widgets only if 3D mask is selected
+- Batch analysis for LE fitting
 - Batch analysis does not require area input (if found in metadata)
-- Batch analysis: clear instructions on what columns are required
-- SPINNA: area/volume button removed (deduced automatically from densities and number of molecules in the exp. data)
-- Flake8 clean-up
-- Efficient Filter: much lower RAM usage + faster filtering by histogram selection (1D/2D), especially for very large datasets
-- Fixed Gauss-fitting error when spot's sum is zero (zero division error)
+- Batch analysis has clear instructions on what columns are required via CLI and the docs update
 - Fixed NND plot reindexing after fitting (#665)
+
+#### Filter
+- Efficient Filter: much lower RAM usage + faster filtering by histogram selection (1D/2D), especially for very large datasets
+
+#### Others
+- Expanded the scope of the sample notebooks
+- Improved docstrings for 3D SMLM clusterer
+- Flake8 clean-up
+- Installers are distributed with readme.txt files (previously .rst)
+- Minor changes to documentation
+- Fixed subcluster check plot when one of the two populations is empty (#667)
+- Fixed 2D fitting with console printout and no multiprocessing
 
 ## 0.10.0
 
