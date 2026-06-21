@@ -45,12 +45,17 @@ except Exception:
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
 IMAGE_FILTER = (
-    "All supported formats (*.raw *.tif *.nd2 *.ims *.tiff *.stk)"
+    "All supported formats ("
+    + " ".join("*" + e for e in io.MOVIE_EXTENSIONS)
+    + ")"
     ";;Raw files (*.raw)"
-    ";;Tif images (*.tif)"
+    ";;Tif images (*.tif *.tiff)"
+    ";;BigTiff (*.btf *.tf8 *.tf2)"
+    ";;Zeiss LSM (*.lsm)"
+    ";;Zeiss CZI (*.czi)"
+    ";;Leica LIF (*.lif)"
     ";;ImaRIS IMS (*.ims)"
-    ";;Nd2 files (*.nd2);;"
-    ";;Tiff images (*.tiff)"
+    ";;Nd2 files (*.nd2)"
     ";;STK files (*.stk)"
 )
 
@@ -2513,7 +2518,7 @@ class Window(QtWidgets.QMainWindow):
 
         plot_path = os.path.splitext(calib_path)[0] + "_affine.png"
         try:
-            calibration = zfit.calibrate_affine(
+            calibration = localize.calibrate_affine_transform(
                 movie_ref,
                 movie_cyl,
                 calibration,
@@ -2560,20 +2565,7 @@ class Window(QtWidgets.QMainWindow):
             self,
             "Open image sequence",
             directory=dir,
-            filter=(
-                "All supported formats ("
-                + " ".join("*" + e for e in io.MOVIE_EXTENSIONS)
-                + ")"
-                ";;Raw files (*.raw)"
-                ";;Tif images (*.tif *.tiff)"
-                ";;BigTiff (*.btf *.tf8 *.tf2)"
-                ";;Zeiss LSM (*.lsm)"
-                ";;Zeiss CZI (*.czi)"
-                ";;Leica LIF (*.lif)"
-                ";;ImaRIS IMS (*.ims)"
-                ";;Nd2 files (*.nd2)"
-                ";;STK files (*.stk)"
-            ),
+            filter=IMAGE_FILTER,
         )
         if path:
             self.pwd = path

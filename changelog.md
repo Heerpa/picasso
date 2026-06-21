@@ -10,6 +10,7 @@ Last change: 21-JUN-2026 CEST
 #### Localize
 - Picasso relies on package `tifffile` for processing `.tif` files and many other grayscale movie formats, see [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html). **Note:** this is an experimental feature, do not hesitate to let us know if you detect bugs/unexpected behavior or would like to see more file formats in Picasso, see our [GitHub page](https://github.com/jungmannlab/picasso/issues) for contact information.
 - Added support for Zeiss `.czi` and Leica `.lif` movies in Localize (open dialog, drag-and-drop and batch CLI). These read via the optional `czifile` and `liffile` libraries (Python ≥ 3.12); install with `pip install picassosr[czi,lif]`. Multi-channel files prompt for a channel, and a `.lif` file with several acquisitions uses the one with the most frames.
+- Affine transform calibration for astigmatic imaging and chromatic abberation corrections
 - Accept multiple frame bounds
 - Accept multiple rectangular ROIs
 - Remove a ROI by double-clicking it in the preview
@@ -49,8 +50,6 @@ Last change: 21-JUN-2026 CEST
 - Fixed "Best fitting combination" button in SPINNA ([#676](https://github.com/jungmannlab/picasso/issues/676))
 - Fixed 3D calibration when frame range is user-specified
 - Fixed redoing 3D calibration when identification parameters change
-
-- Affine transform calibration for astigmatic imaging
 
 ## 0.10.1
 
