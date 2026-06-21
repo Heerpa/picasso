@@ -983,6 +983,7 @@ class CalibrateAffineDialog(lib.Dialog):
         super().__init__(window)
         self.window = window
         self.setWindowTitle("Calibrate affine transform (astigmatism)")
+        self.setModal(False)
 
         vbox = QtWidgets.QVBoxLayout(self)
         grid = QtWidgets.QGridLayout()
@@ -993,12 +994,14 @@ class CalibrateAffineDialog(lib.Dialog):
                 "Image of in-focus beads WITHOUT a cylindrical lens in"
                 " the optical pathway",
                 self._browse_reference,
+                self._show_reference,
             ),
             (
                 "Cylindrical lens image:",
                 "Image of in-focus beads WITH a cylindrical lens in"
                 " the optical pathway",
                 self._browse_cylindrical,
+                self._show_cylindrical,
             ),
             (
                 "Calibration:",
@@ -1006,6 +1009,7 @@ class CalibrateAffineDialog(lib.Dialog):
                 " existing 3D calibration path to which the results will"
                 " be appended",
                 self._browse_calibration,
+                None,
             ),
         ]
         self.reference_edit = QtWidgets.QLineEdit()
@@ -1016,9 +1020,10 @@ class CalibrateAffineDialog(lib.Dialog):
             self.cylindrical_edit,
             self.calibration_edit,
         ]
-        for row_idx, ((label_text, tooltip, slot), edit) in enumerate(
-            zip(rows, edits)
-        ):
+        for row_idx, (
+            (label_text, tooltip, slot, show_slot),
+            edit,
+        ) in enumerate(zip(rows, edits)):
             label = QtWidgets.QLabel(label_text)
             label.setToolTip(tooltip)
             edit.setReadOnly(True)
@@ -1029,6 +1034,16 @@ class CalibrateAffineDialog(lib.Dialog):
             grid.addWidget(label, row_idx, 0)
             grid.addWidget(edit, row_idx, 1)
             grid.addWidget(button, row_idx, 2)
+            if show_slot is not None:
+                show_button = QtWidgets.QPushButton("Show")
+                show_button.setToolTip(
+                    "Load this image in the main window and open the"
+                    " parameters dialog to tune the identification"
+                    " parameters (box size, min. net gradient) with a"
+                    " live preview."
+                )
+                show_button.clicked.connect(show_slot)
+                grid.addWidget(show_button, row_idx, 3)
         vbox.addLayout(grid)
 
         # If a movie is already loaded in the main window, use it as the
@@ -1091,6 +1106,28 @@ class CalibrateAffineDialog(lib.Dialog):
         self._pick_file(
             self.calibration_edit, "Select calibration file", "*.yaml"
         )
+
+    def _show(self, edit: QtWidgets.QLineEdit) -> None:
+        """Load the image in ``edit`` into the main window and open the
+        parameters dialog with preview enabled, so the user can tune the
+        identification parameters before running the calibration."""
+        path = edit.text()
+        if not path:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Show image",
+                "Select an image first.",
+            )
+            return
+        self.window.open(path)
+        if self.window.movie is None:
+            return
+
+    def _show_reference(self) -> None:
+        self._show(self.reference_edit)
+
+    def _show_cylindrical(self) -> None:
+        self._show(self.cylindrical_edit)
 
 
 class ParametersDialog(lib.Dialog):
@@ -2467,13 +2504,28 @@ class Window(QtWidgets.QMainWindow):
         self.localize(calibrate_z=True)
 
     def calibrate_affine(self) -> None:
-        """Open the affine-transform calibration dialog (astigmatism),
-        fit the transform between the two bead movies, and append the
-        result to the given 3D calibration YAML."""
-        dialog = CalibrateAffineDialog(self)
-        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
+        """Open the affine-transform calibration dialog (astigmatism).
 
+        The dialog is non-modal so the user can keep interacting with the
+        main window and the parameters dialog (e.g. via "Show") while it
+        is open. The transform is fitted once the dialog is accepted.
+        """
+        # Reuse an existing dialog if it is already open, otherwise create
+        # one and run the calibration when it is accepted.
+        dialog = getattr(self, "_affine_dialog", None)
+        if dialog is None:
+            dialog = CalibrateAffineDialog(self)
+            dialog.accepted.connect(self._run_calibrate_affine)
+            self._affine_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _run_calibrate_affine(self) -> None:
+        """Fit the affine transform between the two bead movies and append
+        the result to the given 3D calibration YAML. Called when the
+        affine-transform calibration dialog is accepted."""
+        dialog = self._affine_dialog
         ref_path = dialog.reference_path
         cyl_path = dialog.cylindrical_path
         calib_path = dialog.calibration_path
