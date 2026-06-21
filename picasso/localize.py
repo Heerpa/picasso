@@ -31,12 +31,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from sqlalchemy import create_engine
 import matplotlib.gridspec as gridspec
-from scipy.ndimage import (
-    affine_transform as _ndi_affine_transform,
-    center_of_mass as _ndi_center_of_mass,
-    gaussian_filter as _ndi_gaussian_filter,
-    maximum_filter as _ndi_maximum_filter,
-)
+from scipy.ndimage import affine_transform
 from scipy.optimize import curve_fit
 from scipy.signal import fftconvolve
 from scipy.spatial.distance import cdist
@@ -90,9 +85,6 @@ SET_COLS = [
     "Pixelsize",
 ]
 # Default bead-detection / matching parameters for `calibrate_affine_transform`.
-_AFFINE_BEAD_MIN_DISTANCE = 15  # px between two peaks
-_AFFINE_BEAD_THRESHOLD_REL = 0.25  # relative intensity threshold (0-1)
-_AFFINE_BEAD_FIT_RADIUS = 6  # half-width of Gaussian fit patch
 _AFFINE_MATCH_MAX_DIST_PX = 40.0  # max distance between matched pair
 _AFFINE_XCORR_HALF_WIDTH = 18  # half-width of bead crop for xcorr
 
@@ -2209,100 +2201,91 @@ def add_file_to_db(
 
 
 def _movie_to_image(movie) -> np.ndarray:
-    """Collapse a picasso movie to a single 2D float32 image normalised
-    to [0, 1]. Multi-frame movies are averaged; single-frame movies are
-    passed through. Frames are read one-at-a-time so the lazy-loading
-    movie classes in ``picasso.io`` don't have to materialise the full
-    stack at once."""
+    """Collapse a picasso movie to a single 2D float32 image on the
+    original intensity (raw-count) scale. Multi-frame movies are
+    averaged; single-frame movies are passed through. Keeping the raw
+    scale means the net gradient computed during bead detection is
+    comparable to the "Min. Net Gradient" used for normal localization.
+    Frames are read one-at-a-time so the lazy-loading movie classes in
+    ``picasso.io`` don't have to materialise the full stack at once."""
     n = len(movie)
     if n == 0:
         raise ValueError("Movie has zero frames.")
     if n == 1:
-        img = np.asarray(movie[0], dtype=np.float32)
-    else:
-        acc = np.zeros(np.asarray(movie[0]).shape, dtype=np.float64)
-        for i in range(n):
-            acc += np.asarray(movie[i], dtype=np.float64)
-        img = (acc / n).astype(np.float32)
-    mn, mx = float(img.min()), float(img.max())
-    return (img - mn) / (mx - mn + 1e-12)
+        return np.asarray(movie[0], dtype=np.float32)
+    acc = np.zeros(np.asarray(movie[0]).shape, dtype=np.float64)
+    for i in range(n):
+        acc += np.asarray(movie[i], dtype=np.float64)
+    return (acc / n).astype(np.float32)
 
 
-def _affine_detect_beads(image: np.ndarray) -> np.ndarray:
-    """Detect bead candidates via Gaussian blur + local-maximum filter.
-    Returns (N, 2) array of [row, col] integer coordinates."""
-    blurred = _ndi_gaussian_filter(image, sigma=1.5)
-    size = 2 * _AFFINE_BEAD_MIN_DISTANCE + 1
-    abs_thresh = (
-        _AFFINE_BEAD_THRESHOLD_REL * (blurred.max() - blurred.min())
-        + blurred.min()
-    )
-    is_peak = (_ndi_maximum_filter(blurred, size=size) == blurred) & (
-        blurred > abs_thresh
-    )
-    border = max(5, _AFFINE_BEAD_MIN_DISTANCE // 2)
-    is_peak[:border] = False
-    is_peak[-border:] = False
-    is_peak[:, :border] = False
-    is_peak[:, -border:] = False
-    return np.column_stack(np.where(is_peak))
+def _affine_detect_beads(
+    image: np.ndarray, box: int, minimum_ng: float
+) -> np.ndarray:
+    """Detect bead candidates using the standard spot identification
+    (local maxima above a minimum net gradient).
 
+    Parameters
+    ----------
+    image : np.ndarray
+        2D image to detect beads in.
+    box : int
+        Box size used by ``identify_in_image`` (also sets the minimum
+        distance between two detected beads). Should be an odd integer.
+    minimum_ng : float
+        Minimum net gradient for a local maximum to be kept.
 
-def _affine_fit_gaussian_2d(patch: np.ndarray):
-    """Fit an elliptical 2D Gaussian to a small image patch. Returns
-    (x0, y0, sx, sy, amp, bg) or None on failure."""
-    ny, nx = patch.shape
-    y0g, x0g = np.unravel_index(np.argmax(patch), patch.shape)
-    bg = np.percentile(patch, 15)
-    amp = patch.max() - bg
-
-    def model(xy, x0, y0, sx, sy, amp, bg):
-        x, y = xy
-        return bg + amp * np.exp(
-            -((x - x0) ** 2 / (2 * sx**2) + (y - y0) ** 2 / (2 * sy**2))
-        )
-
-    xg, yg = np.meshgrid(np.arange(nx), np.arange(ny))
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            popt, _ = curve_fit(
-                model,
-                (xg.ravel(), yg.ravel()),
-                patch.ravel(),
-                p0=[x0g, y0g, 2.0, 2.0, amp, bg],
-                bounds=(
-                    [0, 0, 0.3, 0.3, 0, -np.inf],
-                    [nx, ny, nx, ny, np.inf, np.inf],
-                ),
-                maxfev=400,
-            )
-        return popt
-    except Exception:
-        return None
+    Returns
+    -------
+    np.ndarray
+        (N, 2) array of [row, col] integer coordinates.
+    """
+    y, x, _ = identify_in_image(image, minimum_ng, box)
+    return np.column_stack((y, x))
 
 
 def _affine_refine_bead_positions(
-    image: np.ndarray, coarse: np.ndarray
+    image: np.ndarray, coarse: np.ndarray, box: int
 ) -> np.ndarray:
-    """Refine coarse bead positions to sub-pixel accuracy via 2D Gaussian
-    fits. Returns (N, 2) array of refined [row, col] coordinates."""
-    ny, nx = image.shape
-    r = _AFFINE_BEAD_FIT_RADIUS
-    refined = []
-    for ry, rx in coarse:
-        y0 = max(0, ry - r)
-        y1 = min(ny, ry + r + 1)
-        x0 = max(0, rx - r)
-        x1 = min(nx, rx + r + 1)
-        patch = image[y0:y1, x0:x1]
-        popt = _affine_fit_gaussian_2d(patch) if patch.size > 0 else None
-        if popt is not None:
-            refined.append([popt[1] + y0, popt[0] + x0])
-        else:
-            cy, cx = _ndi_center_of_mass(patch) if patch.size > 0 else (ry, rx)
-            refined.append([cy + y0, cx + x0])
-    return np.array(refined)
+    """Refine coarse bead positions to sub-pixel accuracy using the
+    standard ``gausslq`` 2D Gaussian least-squares spot fitting (the same
+    routine used by ``fit2D``).
+
+    Parameters
+    ----------
+    image : np.ndarray
+        2D image the beads were detected in.
+    coarse : np.ndarray
+        (N, 2) array of integer [row, col] bead positions.
+    box : int
+        Box size cut out around each bead for fitting. Should match the
+        detection box so every spot lies fully inside the image.
+
+    Returns
+    -------
+    np.ndarray
+        (M, 2) array of refined [row, col] coordinates (M <= N; spots
+        whose fit did not converge to a finite position are dropped).
+    """
+    if len(coarse) == 0:
+        return np.empty((0, 2))
+    ids = pd.DataFrame(
+        {
+            "frame": np.zeros(len(coarse), dtype=np.int32),
+            "x": coarse[:, 1].astype(np.int32),
+            "y": coarse[:, 0].astype(np.int32),
+            "net_gradient": np.ones(len(coarse), dtype=np.float32),
+        }
+    )
+    # Treat the single image as a one-frame movie; an identity camera
+    # leaves the pixel values unchanged (the fit only needs relative
+    # intensities to localize each bead).
+    camera_info = {"Baseline": 0, "Sensitivity": 1.0, "Gain": 1}
+    spots = get_spots(image[np.newaxis], ids, box, camera_info)
+    theta = gausslq.fit_spots(spots)
+    locs = gausslq.locs_from_fits(ids, theta, box, em=False)
+    refined = np.column_stack((locs["y"].to_numpy(), locs["x"].to_numpy()))
+    return refined[np.isfinite(refined).all(axis=1)]
 
 
 def _affine_match_bead_pairs(
@@ -2396,7 +2379,7 @@ def _affine_apply(image: np.ndarray, M: np.ndarray) -> np.ndarray:
     M_rc_inv = np.linalg.inv(M_rc)
     A = M_rc_inv[:2, :2]
     offset = M_rc_inv[:2, 2]
-    return _ndi_affine_transform(
+    return affine_transform(
         image,
         A,
         offset=offset,
@@ -2626,6 +2609,8 @@ def calibrate_affine_transform(
     movie_ref,
     movie_cyl,
     calibration: dict,
+    box: int,
+    minimum_ng: float,
     pixelsize: float | None = None,
     ref_path: str = "",
     cyl_path: str = "",
@@ -2651,6 +2636,11 @@ def calibrate_affine_transform(
         averaged; a single-frame movie is used as-is.
     calibration : dict
         Existing 3D calibration; an "Affine transform" entry is appended.
+    box : int
+        Box size used to identify bead candidates (also sets the minimum
+        distance between two detected beads). Should be an odd integer.
+    minimum_ng : float
+        Minimum net gradient for a bead candidate to be kept.
     pixelsize : float, optional
         Camera pixel size in nm. If given, decomposition translations
         and the diagnostic plot are converted from pixels to nm. If
@@ -2672,10 +2662,10 @@ def calibrate_affine_transform(
     img_ref = _movie_to_image(movie_ref)
     img_cyl = _movie_to_image(movie_cyl)
 
-    coarse_ref = _affine_detect_beads(img_ref)
-    coarse_cyl = _affine_detect_beads(img_cyl)
-    refined_ref = _affine_refine_bead_positions(img_ref, coarse_ref)
-    refined_cyl = _affine_refine_bead_positions(img_cyl, coarse_cyl)
+    coarse_ref = _affine_detect_beads(img_ref, box, minimum_ng)
+    coarse_cyl = _affine_detect_beads(img_cyl, box, minimum_ng)
+    refined_ref = _affine_refine_bead_positions(img_ref, coarse_ref, box)
+    refined_cyl = _affine_refine_bead_positions(img_cyl, coarse_cyl, box)
     pairs_ref, pairs_cyl = _affine_match_bead_pairs(refined_ref, refined_cyl)
 
     if len(pairs_ref) < 3:

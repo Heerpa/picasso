@@ -2522,6 +2522,8 @@ class Window(QtWidgets.QMainWindow):
                 movie_ref,
                 movie_cyl,
                 calibration,
+                box=self.parameters["Box Size"],
+                minimum_ng=self.parameters["Min. Net Gradient"],
                 pixelsize=pixelsize,
                 ref_path=ref_path,
                 cyl_path=cyl_path,
