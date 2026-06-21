@@ -1031,6 +1031,11 @@ class CalibrateAffineDialog(lib.Dialog):
             grid.addWidget(button, row_idx, 2)
         vbox.addLayout(grid)
 
+        # If a movie is already loaded in the main window, use it as the
+        # reference image by default.
+        if window.movie_path:
+            self.reference_edit.setText(window.movie_path)
+
         self.buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
