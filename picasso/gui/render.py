@@ -2232,6 +2232,8 @@ class COMETDialog(QtWidgets.QDialog):
         Use -1 to disable downsampling.
     """
 
+    DOCS_URL = "https://picassosr.readthedocs.io/en/latest/render.html#comet-drift-correction"  # noqa: E501
+
     def __init__(self, window: QtWidgets.QMainWindow) -> None:
         super().__init__(window)
         self.window = window
@@ -2240,39 +2242,46 @@ class COMETDialog(QtWidgets.QDialog):
         vbox = QtWidgets.QVBoxLayout(self)
         grid = QtWidgets.QGridLayout()
 
+        grid.addWidget(
+            lib.HelpButton(self.DOCS_URL),
+            0,
+            0,
+            alignment=QtCore.Qt.AlignmentFlag.AlignLeft,
+        )
+
         frames_label = QtWidgets.QLabel("Frames per segment:")
         frames_label.setToolTip(
             "Number of frames used to form each temporal segment."
         )
-        grid.addWidget(frames_label, 0, 0)
+        grid.addWidget(frames_label, 1, 0)
         self.frames_per_segment = QtWidgets.QSpinBox()
         self.frames_per_segment.setRange(1, int(1e6))
         self.frames_per_segment.setValue(100)
-        grid.addWidget(self.frames_per_segment, 0, 1)
+        grid.addWidget(self.frames_per_segment, 1, 1)
 
         max_drift_label = QtWidgets.QLabel("Maximum drift (nm):")
         max_drift_label.setToolTip(
             "Maximum expected drift over the dataset. "
             "Used for pairing and optimization bounds."
         )
-        grid.addWidget(max_drift_label, 1, 0)
+        grid.addWidget(max_drift_label, 2, 0)
         self.max_drift_nm = QtWidgets.QDoubleSpinBox()
         self.max_drift_nm.setRange(0.1, 1e6)
         self.max_drift_nm.setValue(200.0)
         self.max_drift_nm.setDecimals(1)
         self.max_drift_nm.setSingleStep(1.0)
-        grid.addWidget(self.max_drift_nm, 1, 1)
+        grid.addWidget(self.max_drift_nm, 2, 1)
 
         downsample_label = QtWidgets.QLabel("Max. localizations per segment:")
         downsample_label.setToolTip(
             "Optional downsampling cap per segment. "
             "Set to -1 to keep all localizations."
         )
-        grid.addWidget(downsample_label, 2, 0)
+        grid.addWidget(downsample_label, 3, 0)
         self.max_locs_per_segment = QtWidgets.QSpinBox()
         self.max_locs_per_segment.setRange(-1, int(1e6))
         self.max_locs_per_segment.setValue(-1)
-        grid.addWidget(self.max_locs_per_segment, 2, 1)
+        grid.addWidget(self.max_locs_per_segment, 3, 1)
 
         vbox.addLayout(grid)
 
