@@ -1,5 +1,6 @@
 import math
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -14,8 +15,14 @@ from .. import lib, __version__
 
 try:
     from numba import cuda as _cuda
+    from numba.core.errors import NumbaPerformanceWarning
 
     _CUDA_AVAILABLE = _cuda.is_available()
+    # The cost-function kernel is launched per chunk; the final (or only)
+    # chunk can be small enough to use a grid size of 1, which triggers a
+    # NumbaPerformanceWarning about GPU under-utilization. This is expected
+    # and harmless here, so silence that specific warning.
+    warnings.filterwarnings("ignore", category=NumbaPerformanceWarning)
 except Exception:
     _cuda = None
     _CUDA_AVAILABLE = False
@@ -35,7 +42,7 @@ def comet(
     interpolation_method: str = "cubic",
     mode: str = "cuda",
     display: bool = False,
-    progress=None,  # currently unused
+    progress=None,
 ) -> tuple[pd.DataFrame, list[dict], pd.DataFrame]:
     """Apply COMET undrifting to the localizations.
 
@@ -70,7 +77,9 @@ def comet(
     display : bool, optional
         Whether to show diagnostic plots.
     progress : optional
-        Placeholder for API compatibility with AIM.
+        Optional progress handle (e.g. ``picasso.lib.ProgressDialog``) used
+        to report optimization progress. Must expose ``set_value`` and
+        ``setMaximum``. If None, no progress is reported.
 
     Returns
     -------
@@ -141,6 +150,7 @@ def comet(
         interpolation_method=interpolation_method,
         mode=mode,
         min_max_frames=(int(frame0.min()), int(frame0.max())),
+        progress=progress,
     )
 
     # drift_nm_with_frame columns: dx_nm, dy_nm, dz_nm, frame0
@@ -210,6 +220,7 @@ def comet_run_kd(
     pair_indices_safety_check=False,
     mapped_memory_threshold_bytes=None,
     device_mem_fraction=0.5,
+    progress=None,
 ):
     """
     Run COMET drift correction end-to-end.
@@ -303,6 +314,7 @@ def comet_run_kd(
         mode=mode,
         mapped_memory_threshold_bytes=mapped_memory_threshold_bytes,
         device_mem_fraction=device_mem_fraction,
+        progress=progress,
     )
     elapsed = time.time() - t0
 
@@ -391,6 +403,7 @@ def optimize_3d_chunked_better_moving_avg_kd(
     return_calc_time=False,
     mapped_memory_threshold_bytes=None,
     device_mem_fraction=0.5,
+    progress=None,
 ):
     """
     Estimate per-segment drift (mu) by minimizing the negative Gaussian-overlap cost
@@ -521,6 +534,21 @@ def optimize_3d_chunked_better_moving_avg_kd(
     itr_counter = 0
     start_time = time.time()
 
+    # Estimate the number of optimization steps from the coarse-to-fine
+    # sigma schedule (sigma is divided by 1.5 each successful step until it
+    # reaches target_sigma_nm) to drive a progress bar. This is an estimate:
+    # the final convergence check and any failed steps may add iterations.
+    est_steps = 1
+    if sigma_nm > target_sigma_nm > 0:
+        est_steps = (
+            int(np.ceil(math.log(sigma_nm / target_sigma_nm) / math.log(1.5)))
+            + 1
+        )
+    est_steps = max(1, est_steps)
+    if progress is not None:
+        progress.setMaximum(est_steps)
+        progress.set_value(0)
+
     while not done:
         # Apply boxcar smoothing to current estimate
         tmp = drift_est.reshape((-1, 3))
@@ -556,6 +584,10 @@ def optimize_3d_chunked_better_moving_avg_kd(
             },
         )
         itr_counter += 1
+        # Advance the progress bar, but keep it just below the maximum until
+        # the loop actually converges (the step count is only an estimate).
+        if progress is not None:
+            progress.set_value(min(itr_counter, est_steps - 1))
         print(
             f"Iteration {itr_counter}: status = {result.status}, success = {result.success}"
         )
@@ -586,6 +618,9 @@ def optimize_3d_chunked_better_moving_avg_kd(
                 raise RuntimeError(
                     "L-BFGS-B Optimization failed after multiple retries"
                 )
+
+    if progress is not None:
+        progress.set_value(est_steps)
 
     if return_calc_time:
         return drift_est, time.time() - start_time, itr_counter

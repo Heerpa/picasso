@@ -11203,15 +11203,23 @@ class View(QtWidgets.QLabel):
 
             params, ok = COMETDialog.getParams(self.window)
             if ok:
-                status = lib.StatusDialog("Undrifting by COMET", self.window)
+                # The optimizer sets the real maximum (estimated from the
+                # sigma schedule) via progress.setMaximum once it starts; the
+                # placeholder max of 1 keeps the bar at 0 % during the initial
+                # segmentation and pairing step.
+                progress = lib.ProgressDialog(
+                    "Undrifting by COMET", 0, 1, self.window
+                )
+                progress.set_value(0)
                 try:
                     locs, new_info, drift = comet.comet(
                         locs,
                         info,
+                        progress=progress,
                         **params,
                     )
                 except RuntimeError as e:
-                    status.close()
+                    progress.close()
                     QtWidgets.QMessageBox.warning(
                         self.window,
                         "COMET not available",
@@ -11222,7 +11230,7 @@ class View(QtWidgets.QLabel):
                         ),
                     )
                     return
-                status.close()
+                progress.close()
 
                 locs = lib.ensure_sanity(locs, info)
                 self.locs[channel] = locs
