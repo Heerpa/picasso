@@ -3,6 +3,7 @@
 Last change: 25-JUN-2026 CEST
 
 - Drift correction by COMET ([DOI: 10.64898/2026.03.27.714864](https://doi.org/10.64898/2026.03.27.714864)) integrated (#671), big thanks to [@LREIN663](https://github.com/LREIN663)Last change: 24-JUN-2026 CEST
+- New function `imageprocess.quick_fiducials_check` for rough counting of fiducials in localizations
 
 ## 0.11.0
 

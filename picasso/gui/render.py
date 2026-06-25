@@ -11156,18 +11156,34 @@ class View(QtWidgets.QLabel):
             locs = self.locs[channel]
             info = self.infos[channel]
 
+            # collect reasons COMET may run slowly so the user can decide
+            # whether to continue or fix them first
+            warnings = []
+            # linked localizations contain the "len" column and run much
+            # faster in COMET
             if "len" not in locs.columns:
+                warnings.append(
+                    "We recommend to use COMET with linked localizations to "
+                    "drastically improve the speed. Use Postprocess -> Link "
+                    "localizations."
+                )
+            # gold particles and other bright fiducials are present in
+            # nearly every frame and can also slow COMET down considerably
+            n_fiducials = imageprocess.quick_fiducials_check(locs, info)
+            if n_fiducials > 0:
+                warnings.append(
+                    f"Detected {n_fiducials} region(s) that look like "
+                    "fiducial markers (e.g. gold particles). These are "
+                    "present in most frames and can slow COMET down "
+                    "considerably; consider removing them first."
+                )
+
+            if warnings:
                 confirm = QtWidgets.QMessageBox.question(
                     self.window,
-                    "Localizations not linked",
-                    (
-                        "We recommend to use COMET with linked localizations "
-                        "to drastically improve the speed. Use Postprocess -> "
-                        "Link localizations.\n\n"
-                        "Note: gold particles or other bright fiducials in the "
-                        "sample can also slow down COMET considerably.\n\n"
-                        "Do you want to continue anyway?"
-                    ),
+                    "COMET performance warning",
+                    "\n\n".join(warnings)
+                    + "\n\nDo you want to continue anyway?",
                     QtWidgets.QMessageBox.StandardButton.Yes
                     | QtWidgets.QMessageBox.StandardButton.No,
                 )
