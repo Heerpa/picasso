@@ -55,6 +55,7 @@ from .rotation import RotationWindow
 
 # Optional modules with external/hardware dependencies live in ext
 from ..ext.bitplane import IMSWRITER  # PyImarisWrite works on Windows only
+from ..ext import comet
 
 if IMSWRITER:
     from ..ext.bitplane import numpy_to_imaris
@@ -2257,7 +2258,7 @@ class COMETDialog(QtWidgets.QDialog):
         grid.addWidget(max_drift_label, 1, 0)
         self.max_drift_nm = QtWidgets.QDoubleSpinBox()
         self.max_drift_nm.setRange(0.1, 1e6)
-        self.max_drift_nm.setValue(60.0)
+        self.max_drift_nm.setValue(200.0)
         self.max_drift_nm.setDecimals(1)
         self.max_drift_nm.setSingleStep(1.0)
         grid.addWidget(self.max_drift_nm, 1, 1)
@@ -11146,6 +11147,65 @@ class View(QtWidgets.QLabel):
                 self.plot_window.plot(drift)
                 self.plot_window.show()
 
+    def undrift_comet(self) -> None:
+        """Undrift with COMET. See https://comet.smlm.tools and
+        Reinkensmeier L., Aufmkolk S., Farabella I., Egner A., and
+        Bates M. biorxiv, 2026."""
+        channel = self.get_channel("Undrift by COMET")
+        if channel is not None:
+            locs = self.locs[channel]
+            info = self.infos[channel]
+
+            if "len" not in locs.columns:
+                confirm = QtWidgets.QMessageBox.question(
+                    self.window,
+                    "Localizations not linked",
+                    (
+                        "We recommend to use COMET with linked localizations "
+                        "to drastically improve the speed. Use Postprocess -> "
+                        "Link localizations.\n\n"
+                        "Note: gold particles or other bright fiducials in the "
+                        "sample can also slow down COMET considerably.\n\n"
+                        "Do you want to continue anyway?"
+                    ),
+                    QtWidgets.QMessageBox.StandardButton.Yes
+                    | QtWidgets.QMessageBox.StandardButton.No,
+                )
+                if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
+
+            params, ok = COMETDialog.getParams(self.window)
+            if ok:
+                status = lib.StatusDialog("Undrifting by COMET", self.window)
+                try:
+                    locs, new_info, drift = comet.comet(
+                        locs,
+                        info,
+                        **params,
+                    )
+                except RuntimeError as e:
+                    status.close()
+                    QtWidgets.QMessageBox.warning(
+                        self.window,
+                        "COMET not available",
+                        (
+                            f"{e}\n\n"
+                            "Please use a different drift-correction method, "
+                            "such as Undrift by AIM or Undrift by RCC."
+                        ),
+                    )
+                    return
+                status.close()
+
+                locs = lib.ensure_sanity(locs, info)
+                self.locs[channel] = locs
+                self.infos[channel] = new_info
+                self.index_blocks[channel] = None
+                self.render_index[channel] = None
+                self.add_drift(channel, drift)
+                self.update_scene(resample_locs=True)
+                self.show_drift()
+
     def undrift_aim(self) -> None:
         """Undrift with Adaptive Intersection Maximization (AIM).
 
@@ -12170,6 +12230,10 @@ class Window(QtWidgets.QMainWindow):
         undrift_from_picked2d_action.triggered.connect(
             self.view.undrift_from_picked2d
         )
+        undrift_comet_action = postprocess_menu.addAction("Undrift by COMET")
+        undrift_comet_action.triggered.connect(self.view.undrift_comet)
+        if not comet._CUDA_AVAILABLE:
+            undrift_comet_action.setVisible(False)
 
         undrift_action = postprocess_menu.addAction("Undrift by RCC")
         undrift_action.triggered.connect(self.view.undrift_rcc)
