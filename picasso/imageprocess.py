@@ -284,7 +284,7 @@ def quick_fiducials_check(
     locs: pd.DataFrame,
     info: list[dict],
     fraction: float = 0.8,
-    region_size: float = 2000.0,
+    region_size: float = 1000.0,
 ) -> int:
     """Quickly estimate whether fiducial markers are likely present.
 
@@ -310,7 +310,7 @@ def quick_fiducials_check(
         localization count) to be flagged as a likely fiducial. Default
         is 0.8.
     region_size : float, optional
-        Approximate bin size in nm. Default is 2,000 nm.
+        Approximate bin size in nm. Default is 1,000 nm.
 
     Returns
     -------

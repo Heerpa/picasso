@@ -11169,7 +11169,9 @@ class View(QtWidgets.QLabel):
                 )
             # gold particles and other bright fiducials are present in
             # nearly every frame and can also slow COMET down considerably
-            n_fiducials = imageprocess.quick_fiducials_check(locs, info)
+            n_fiducials = imageprocess.quick_fiducials_check(
+                locs, info, fraction=0.1
+            )
             if n_fiducials > 0:
                 warnings.append(
                     f"Detected {n_fiducials} region(s) that look like "
