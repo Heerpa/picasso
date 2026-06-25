@@ -426,7 +426,7 @@ class TestCometNoCuda:
             comet.comet(
                 minimal_locs_df,
                 minimal_info,
-                locs_per_segment=100,
+                frames_per_segment=100,
                 max_drift_nm=200,
             )
 
@@ -441,7 +441,7 @@ class TestCometNoCuda:
             comet.comet(
                 minimal_locs_df,
                 minimal_info,
-                locs_per_segment=100,
+                frames_per_segment=100,
                 max_drift_nm=200,
             )
 
@@ -459,7 +459,7 @@ class TestCometNoCuda:
             comet.comet(
                 minimal_locs_structured,
                 minimal_info,
-                locs_per_segment=100,
+                frames_per_segment=100,
                 max_drift_nm=200,
             )
 
@@ -473,7 +473,7 @@ class TestCometNoCuda:
         # No 'y' column — should raise KeyError from the column check
         with pytest.raises((KeyError, RuntimeError)):
             comet.comet(
-                bad_locs, minimal_info, locs_per_segment=5, max_drift_nm=100
+                bad_locs, minimal_info, frames_per_segment=5, max_drift_nm=100
             )
 
     def test_z_column_accepted(self, minimal_locs_df, minimal_info):
@@ -486,7 +486,7 @@ class TestCometNoCuda:
         df["z"] = np.zeros(len(df), dtype=np.float32)
         with pytest.raises(RuntimeError, match="CUDA"):
             comet.comet(
-                df, minimal_info, locs_per_segment=100, max_drift_nm=200
+                df, minimal_info, frames_per_segment=100, max_drift_nm=200
             )
 
     def test_missing_pixelsize_raises_on_gpu(self, minimal_locs_df):
@@ -499,7 +499,7 @@ class TestCometNoCuda:
             comet.comet(
                 minimal_locs_df,
                 bad_info,
-                locs_per_segment=100,
+                frames_per_segment=100,
                 max_drift_nm=200,
             )
 
@@ -520,7 +520,7 @@ class TestCometFullPipeline:
         undrifted, new_info, drift = comet.comet(
             minimal_locs_df,
             minimal_info,
-            locs_per_segment=100,
+            frames_per_segment=100,
             max_drift_nm=300,
             target_sigma_nm=50,
         )
@@ -533,7 +533,7 @@ class TestCometFullPipeline:
         _, _, drift = comet.comet(
             minimal_locs_df,
             minimal_info,
-            locs_per_segment=100,
+            frames_per_segment=100,
             max_drift_nm=300,
             target_sigma_nm=50,
         )
@@ -543,7 +543,7 @@ class TestCometFullPipeline:
         _, new_info, _ = comet.comet(
             minimal_locs_df,
             minimal_info,
-            locs_per_segment=100,
+            frames_per_segment=100,
             max_drift_nm=300,
             target_sigma_nm=50,
         )
@@ -556,14 +556,14 @@ class TestCometFullPipeline:
         locs_df, _, drift_df = comet.comet(
             minimal_locs_df,
             minimal_info,
-            locs_per_segment=100,
+            frames_per_segment=100,
             max_drift_nm=300,
             target_sigma_nm=50,
         )
         locs_arr, _, drift_arr = comet.comet(
             minimal_locs_structured,
             minimal_info,
-            locs_per_segment=100,
+            frames_per_segment=100,
             max_drift_nm=300,
             target_sigma_nm=50,
         )

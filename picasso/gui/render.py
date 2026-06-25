@@ -2225,8 +2225,8 @@ class COMETDialog(QtWidgets.QDialog):
 
     Attributes
     ----------
-    locs_per_segment : QSpinBox
-        Target number of localizations per temporal segment.
+    frames_per_segment : QSpinBox
+        Number of frames per temporal segment.
     max_drift_nm : QDoubleSpinBox
         Maximum expected drift in nm.
     max_locs_per_segment : QSpinBox
@@ -2242,15 +2242,15 @@ class COMETDialog(QtWidgets.QDialog):
         vbox = QtWidgets.QVBoxLayout(self)
         grid = QtWidgets.QGridLayout()
 
-        locs_label = QtWidgets.QLabel("Localizations per segment:")
-        locs_label.setToolTip(
-            "Target number of localizations used to form each temporal segment."
+        frames_label = QtWidgets.QLabel("Frames per segment:")
+        frames_label.setToolTip(
+            "Number of frames used to form each temporal segment."
         )
-        grid.addWidget(locs_label, 0, 0)
-        self.locs_per_segment = QtWidgets.QSpinBox()
-        self.locs_per_segment.setRange(1, int(1e6))
-        self.locs_per_segment.setValue(500)
-        grid.addWidget(self.locs_per_segment, 0, 1)
+        grid.addWidget(frames_label, 0, 0)
+        self.frames_per_segment = QtWidgets.QSpinBox()
+        self.frames_per_segment.setRange(1, int(1e6))
+        self.frames_per_segment.setValue(100)
+        grid.addWidget(self.frames_per_segment, 0, 1)
 
         max_drift_label = QtWidgets.QLabel("Maximum drift (nm):")
         max_drift_label.setToolTip(
@@ -2296,7 +2296,7 @@ class COMETDialog(QtWidgets.QDialog):
         dialog = COMETDialog(parent)
         result = dialog.exec()
         params = {
-            "locs_per_segment": dialog.locs_per_segment.value(),
+            "frames_per_segment": dialog.frames_per_segment.value(),
             "max_drift_nm": dialog.max_drift_nm.value(),
             "max_locs_per_segment": dialog.max_locs_per_segment.value(),
         }
