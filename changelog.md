@@ -2,7 +2,7 @@
 
 Last change: 25-JUN-2026 CEST
 
-- COMET ([DOI: 10.64898/2026.03.27.714864](https://doi.org/10.64898/2026.03.27.714864)) integrated (#671), big thanks to @LREIN663
+- Drift correction by COMET ([DOI: 10.64898/2026.03.27.714864](https://doi.org/10.64898/2026.03.27.714864)) integrated (#671), big thanks to [@LREIN663](https://github.com/LREIN663)
 
 ## 0.10.1
 
