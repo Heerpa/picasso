@@ -321,7 +321,6 @@ def quick_fiducials_check(
     if len(locs) == 0:
         return 0
     n_frames = lib.get_from_metadata(info, "Frames", raise_error=True)
-
     pixelsize = lib.get_from_metadata(info, "Pixelsize", raise_error=True)
     bin_px = region_size / pixelsize
 
