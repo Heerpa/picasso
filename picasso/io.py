@@ -3434,3 +3434,270 @@ def import_ts(path: str, pixelsize: float) -> tuple[pd.DataFrame, list[dict]]:
     out_path = base + "_locs.hdf5"
     save_locs(out_path, locs, [img_info])
     return locs, [img_info]
+
+
+# SMAP (https://github.com/jries/SMAP) stores localizations in a
+# proprietary ``_sml.mat`` MATLAB file. The localization data lives in
+# the ``saveloc.loc`` struct of column arrays (fields such as ``xnm``,
+# ``ynm``, ``znm``, ``frame``, ``phot``, ``bg``, ``locprecnm``,
+# ``locprecznm``, ``PSFxnm``). Coordinates and precisions are in nm and
+# frames are 1-based. The unit mapping below mirrors SMAP's own
+# Picasso exporter (``export_picasso_hdf5.m`` / ``savepicasso.m``).
+_SMAP_SPLIT_MSG = (
+    "This appears to be a SMAP split '_sml_p*.mat' file. Please re-save "
+    "it in SMAP as a single file (not split into parts) and try again."
+)
+
+
+def _read_smap_loc_hdf5(path: str) -> dict:
+    """Read the ``saveloc.loc`` struct from a MATLAB v7.3 (HDF5) SMAP
+    file using h5py (scipy cannot read v7.3 files)."""
+    with h5py.File(path, "r") as f:
+        if any(key in f for key in ("lds", "partnames", "S")):
+            raise ValueError(_SMAP_SPLIT_MSG)
+        if "saveloc" in f and "loc" in f["saveloc"]:
+            loc_group = f["saveloc"]["loc"]
+        elif "loc" in f:
+            loc_group = f["loc"]
+        else:
+            raise ValueError(
+                f"Could not find SMAP localizations ('saveloc.loc') in "
+                f"{path}. Is this a SMAP _sml.mat file?"
+            )
+        loc = {}
+        for field in loc_group.keys():
+            dataset = loc_group[field]
+            if not isinstance(dataset, h5py.Dataset):
+                continue
+            value = np.atleast_1d(np.asarray(dataset).ravel())
+            # Skip non-numeric fields (e.g. cell arrays stored as
+            # HDF5 object references).
+            if value.dtype.kind not in "fiu":
+                continue
+            loc[field] = value
+    return loc
+
+
+def _read_smap_loc(path: str) -> dict:
+    """Read the localization struct (``saveloc.loc``) from a SMAP
+    ``_sml.mat`` file as a dictionary mapping field names to 1-D numpy
+    arrays.
+
+    Supports both MATLAB v7/v5 (read with scipy) and v7.3/HDF5 (read
+    with h5py) single-file saves. SMAP's split ``_sml_p*.mat`` parts
+    format is detected and rejected with a clear message.
+
+    Parameters
+    ----------
+    path : str
+        Path to the SMAP ``_sml.mat`` file.
+
+    Returns
+    -------
+    loc : dict
+        Mapping of SMAP field name (e.g. ``"xnm"``) to a 1-D array.
+    """
+    from scipy.io import loadmat
+
+    # MATLAB v7.3 files are HDF5-based (with an HDF5 user block) and must
+    # be read with h5py; v7/v5 files are read with scipy.
+    if h5py.is_hdf5(path):
+        return _read_smap_loc_hdf5(path)
+
+    mat = loadmat(path, struct_as_record=False, squeeze_me=True)
+    if any(key in mat for key in ("lds", "partnames", "S")):
+        raise ValueError(_SMAP_SPLIT_MSG)
+    if "saveloc" in mat:
+        loc_struct = getattr(mat["saveloc"], "loc", None)
+    elif "loc" in mat:
+        loc_struct = mat["loc"]
+    else:
+        loc_struct = None
+    if loc_struct is None or not hasattr(loc_struct, "_fieldnames"):
+        raise ValueError(
+            f"Could not find SMAP localizations ('saveloc.loc') in "
+            f"{path}. Is this a SMAP _sml.mat file?"
+        )
+    loc = {}
+    for field in loc_struct._fieldnames:
+        value = np.atleast_1d(np.asarray(getattr(loc_struct, field)).ravel())
+        if value.dtype.kind not in "fiu":
+            continue
+        loc[field] = value
+    return loc
+
+
+def import_smap(
+    path: str, pixelsize: float
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Import localization data from a SMAP ``_sml.mat`` file.
+
+    Parameters
+    ----------
+    path : str
+        The path to the SMAP ``_sml.mat`` file.
+    pixelsize : float
+        Camera pixel size in nm. Picasso saves xy coordinates in units
+        of camera pixels, while SMAP stores them in nm.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        The localization data imported from the file.
+    info : list of dicts
+        Minimal metadata information.
+    """
+    loc = _read_smap_loc(path)
+    missing = [c for c in ("xnm", "ynm", "frame") if c not in loc]
+    if missing:
+        raise ValueError(
+            f"SMAP file {path} is missing required fields: {missing}. "
+            f"Found fields: {list(loc.keys())}."
+        )
+    n = len(loc["xnm"])
+
+    # SMAP frames are 1-based; make them start at zero (robust to any
+    # offset, mirroring import_ts).
+    frames = loc["frame"].astype(np.int64)
+    frames = frames - np.min(frames)
+    x = loc["xnm"] / pixelsize
+    y = loc["ynm"] / pixelsize
+
+    data = {
+        "frame": frames.astype(np.uint32),
+        "x": x.astype(np.float32),
+        "y": y.astype(np.float32),
+    }
+    # z is stored in nm in both SMAP and Picasso.
+    if "znm" in loc:
+        data["z"] = loc["znm"].astype(np.float32)
+
+    photons = loc["phot"] if "phot" in loc else np.ones(n)
+    data["photons"] = np.broadcast_to(photons, (n,)).astype(np.float32)
+
+    # PSF widths (nm -> px); use a neutral 1 px default when absent.
+    if "PSFxnm" in loc:
+        sx = loc["PSFxnm"] / pixelsize
+    else:
+        sx = np.ones(n)
+    if "PSFynm" in loc:
+        sy = loc["PSFynm"] / pixelsize
+    elif "PSFxnm" in loc:
+        sy = sx
+    else:
+        sy = np.ones(n)
+    data["sx"] = np.asarray(sx, dtype=np.float32)
+    data["sy"] = np.asarray(sy, dtype=np.float32)
+
+    bg = loc["bg"] if "bg" in loc else np.zeros(n)
+    data["bg"] = np.broadcast_to(bg, (n,)).astype(np.float32)
+
+    # Localization precision (nm -> px). SMAP stores a single combined
+    # value (locprecnm); some files use separate locprecxnm/locprecynm.
+    if "locprecnm" in loc:
+        lpx = loc["locprecnm"] / pixelsize
+        lpy = loc["locprecnm"] / pixelsize
+    elif "locprecxnm" in loc:
+        lpx = loc["locprecxnm"] / pixelsize
+        lpy = loc.get("locprecynm", loc["locprecxnm"]) / pixelsize
+    else:
+        lpx = np.zeros(n)
+        lpy = np.zeros(n)
+    data["lpx"] = np.asarray(lpx, dtype=np.float32)
+    data["lpy"] = np.asarray(lpy, dtype=np.float32)
+
+    if "znm" in loc and "locprecznm" in loc:
+        data["lpz"] = loc["locprecznm"].astype(np.float32)
+
+    locs = pd.DataFrame(data)
+    locs.sort_values(kind="quicksort", by="frame", inplace=True)
+
+    img_info = {}
+    img_info["Generated by"] = f"Picasso v{__version__} smap2hdf"
+    img_info["Frames"] = int(np.max(frames)) + 1
+    img_info["Height"] = int(np.ceil(np.max(y)))
+    img_info["Width"] = int(np.ceil(np.max(x)))
+    img_info["Pixelsize"] = float(pixelsize)
+
+    base, ext = os.path.splitext(path)
+    out_path = base + "_locs.hdf5"
+    save_locs(out_path, locs, [img_info])
+    return locs, [img_info]
+
+
+def export_smap(path: str, locs: pd.DataFrame, info: list[dict]) -> None:
+    """Export localizations as a SMAP ``_sml.mat`` file.
+
+    The file is written as a MATLAB-5 (``-v7``-compatible) file that
+    SMAP's loader reads natively: it contains the top-level ``saveloc``
+    struct (with ``loc`` and ``info`` sub-structs) and a ``fileformat``
+    struct. SMAP recognizes the file as localizations via the ``_sml``
+    suffix, which is enforced here.
+
+    Parameters
+    ----------
+    path : str
+        The path where the .mat file will be saved. The ``_sml.mat``
+        suffix is enforced.
+    locs : pd.DataFrame
+        The localization data to be exported.
+    info : list of dicts
+        Metadata dictionaries.
+    """
+    from scipy.io import savemat
+
+    pixelsize = lib.get_from_metadata(info, "Pixelsize", raise_error=True)
+
+    # SMAP recognizes a localization file by the '_sml' suffix.
+    base, ext = os.path.splitext(path)
+    if not base.endswith("_sml"):
+        base = base + "_sml"
+    path = base + ".mat"
+
+    n = len(locs)
+
+    def column(name: str, default: float = 0.0) -> np.ndarray:
+        """Return a (N, 1) float64 column for a Picasso field, or a
+        default-filled column if the field is absent."""
+        if name in locs.columns:
+            values = locs[name].to_numpy(dtype=np.float64)
+        else:
+            values = np.full(n, default, dtype=np.float64)
+        return values.reshape(-1, 1)
+
+    loc = {
+        # SMAP frames are 1-based.
+        "frame": column("frame") + 1,
+        "xnm": column("x") * pixelsize,
+        "ynm": column("y") * pixelsize,
+        "phot": column("photons"),
+        "bg": column("bg"),
+        "locprecnm": (column("lpx") + column("lpy")) / 2 * pixelsize,
+        "PSFxnm": column("sx") * pixelsize,
+        "PSFynm": column("sy") * pixelsize,
+        "channel": np.zeros((n, 1)),
+    }
+    if "z" in locs.columns:
+        loc["znm"] = column("z")  # already in nm
+        if "lpz" in locs.columns:
+            loc["locprecznm"] = column("lpz")  # already in nm
+
+    width = lib.get_from_metadata(info, "Width")
+    height = lib.get_from_metadata(info, "Height")
+    if width is None:
+        width = int(np.ceil(locs["x"].max()))
+    if height is None:
+        height = int(np.ceil(locs["y"].max()))
+    px_um = float(pixelsize) / 1000.0
+    smap_info = {
+        "Width": float(width),
+        "Height": float(height),
+        "roi": np.array([[0.0, 0.0, float(width), float(height)]]),
+        "cam_pixelsize_um": np.array([[px_um, px_um]]),
+    }
+
+    out = {
+        "saveloc": {"loc": loc, "info": smap_info},
+        "fileformat": {"name": "sml"},
+    }
+    savemat(path, out, do_compression=True)

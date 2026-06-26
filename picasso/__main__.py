@@ -190,6 +190,51 @@ def _hdf2visp(path: str) -> None:
     print("Complete.")
 
 
+def _smap2hdf(path: str, pixelsize: float) -> None:
+    """Convert SMAP _sml.mat localization files to HDF5 format.
+
+    Parameters
+    ----------
+    path : str
+        Path (unix style pattern) to the SMAP _sml.mat files.
+    pixelsize : float
+        Camera pixel size in nanometers.
+    """
+    from glob import glob
+    from tqdm import tqdm as _tqdm
+
+    paths = glob(path)
+    if paths:
+        from .io import import_smap
+
+        for path in _tqdm(paths, desc="Converting from SMAP"):
+            import_smap(path, pixelsize)
+    print("Complete.")
+
+
+def _hdf2smap(path: str) -> None:
+    """Convert HDF5 localization files to SMAP _sml.mat format."""
+    from glob import glob
+    from os.path import isdir
+
+    if isdir(path):
+        paths = glob(path + "/*.hdf5")
+    else:
+        paths = glob(path)
+    if paths:
+        import os.path
+        from .io import load_locs, export_smap
+
+        for path in paths:
+            base, ext = os.path.splitext(path)
+            if ext == ".hdf5":
+                print(f"Converting {path}")
+                out_path = base + "_sml.mat"
+                locs, info = load_locs(path)
+                export_smap(out_path, locs, info)
+    print("Complete.")
+
+
 def _link(files: str, d_max: float, tolerance: float) -> None:
     """Link localizations in HDF5 files, see ``postprocess.link`` for
     details."""
@@ -3176,6 +3221,25 @@ def main():  # noqa: C901
     )
     hdf2visp_parser.add_argument("files", help="one or multiple hdf5 files")
 
+    smap2hdf_parser = subparsers.add_parser(
+        "smap2hdf", help="convert SMAP _sml.mat to hdf5 format"
+    )
+    smap2hdf_parser.add_argument(
+        "files", help="one or multiple _sml.mat files"
+    )
+    smap2hdf_parser.add_argument(
+        "-p",
+        "--pixelsize",
+        help="camera pixel size in nm",
+        type=float,
+        required=True,
+    )
+
+    hdf2smap_parser = subparsers.add_parser(
+        "hdf2smap", help="convert hdf5 to SMAP _sml.mat format"
+    )
+    hdf2smap_parser.add_argument("files", help="one or multiple hdf5 files")
+
     cluster_combine_parser = subparsers.add_parser(
         "cluster_combine",
         help=(
@@ -3385,6 +3449,10 @@ def main():  # noqa: C901
             _hdf2chimera(args.files)
         elif args.command == "hdf2visp":
             _hdf2visp(args.files)
+        elif args.command == "smap2hdf":
+            _smap2hdf(args.files, args.pixelsize)
+        elif args.command == "hdf2smap":
+            _hdf2smap(args.files)
         elif args.command == "cluster_combine":
             _cluster_combine(args.files)
         elif args.command == "cluster_combine_dist":

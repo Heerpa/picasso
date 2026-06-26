@@ -7026,7 +7026,7 @@ class View(QtWidgets.QLabel):
 
     def _load_locs(self, path: str) -> tuple[pd.DataFrame, list[dict]]:
         """Load localizations and metadata from a given path, either
-        Picasso or ThunderSTORM format."""
+        Picasso (.hdf5), ThunderSTORM (.csv) or SMAP (_sml.mat) format."""
         if path.endswith(".hdf5"):  # standard Picasso localization file
             # read .hdf5 and .yaml files
             try:
@@ -7046,9 +7046,23 @@ class View(QtWidgets.QLabel):
             if not ok:
                 return None, None
             locs, info = io.import_ts(path, pixelsize)
+        elif path.endswith(".mat"):  # SMAP localization file
+            pixelsize, ok = QtWidgets.QInputDialog.getDouble(
+                self,
+                "Camera pixel size",
+                "Enter camera pixel size in nm:",
+                value=100,
+                min=0.01,
+                max=10000,
+                decimals=2,
+            )
+            if not ok:
+                return None, None
+            locs, info = io.import_smap(path, pixelsize)
         else:
             raise ValueError(
-                "Unsupported file format. Please load a .hdf5 or .csv file."
+                "Unsupported file format. Please load a .hdf5 (Picasso), "
+                ".csv (ThunderSTORM) or _sml.mat (SMAP) file."
             )
         return locs, info
 
@@ -7068,6 +7082,7 @@ class View(QtWidgets.QLabel):
         .yaml metadata file.
 
         New in v0.10.0: Can read a ThunderSTORM .csv file.
+        New in v0.11.0: Can read a SMAP _sml.mat file.
 
         Parameters
         ----------
@@ -8330,6 +8345,8 @@ class View(QtWidgets.QLabel):
                 ]:
                     self.load_picks(paths[0])
         if extensions == [".csv"]:  # just one csv dropped, thunderstorm
+            self.add_multiple(paths)
+        elif extensions == [".mat"]:  # just one mat dropped, SMAP
             self.add_multiple(paths)
         else:
             paths = [
@@ -11861,6 +11878,8 @@ class Window(QtWidgets.QMainWindow):
         open_rot_action = file_menu.addAction("Open rotated localizations")
         open_rot_action.setShortcut("Ctrl+Shift+O")
         open_rot_action.triggered.connect(self.open_rotated_locs)
+        import_smap_action = file_menu.addAction("Import SMAP localizations")
+        import_smap_action.triggered.connect(self.import_smap_dialog)
         save_action = file_menu.addAction("Save localizations")
         save_action.setShortcut("Ctrl+S")
         save_action.triggered.connect(self.save_locs)
@@ -12524,6 +12543,7 @@ class Window(QtWidgets.QMainWindow):
             ".xyz for Chimera",
             ".3d for ViSP",
             ".csv for ThunderSTORM",
+            ".mat for SMAP",
         ]
         item, ok = QtWidgets.QInputDialog.getItem(
             self, "Select Export", "Formats", items, 0, False
@@ -12574,6 +12594,8 @@ class Window(QtWidgets.QMainWindow):
             io.export_3d_visp(path, locs, info)
         elif item == ".csv for ThunderSTORM":
             io.export_thunderstorm(path, locs, info)
+        elif item == ".mat for SMAP":
+            io.export_smap(path, locs, info)
 
     def export_fov_ims(self) -> None:  # noqa: C901
         """Exports current FOV to .ims"""
@@ -12881,18 +12903,33 @@ class Window(QtWidgets.QMainWindow):
             self.view.update_scene()
 
     def open_file_dialog(self) -> None:
-        """Open localizations .hdf5 file(s)."""
+        """Open localizations file(s): Picasso (.hdf5), ThunderSTORM
+        (.csv) or SMAP (_sml.mat)."""
+        file_filter = "Localizations (*.hdf5 *.csv *.mat)"
         if self.pwd == []:
             paths, ext = QtWidgets.QFileDialog.getOpenFileNames(
-                self, "Add localizations", filter="*.hdf5"
+                self, "Add localizations", filter=file_filter
             )
         else:
             paths, ext = QtWidgets.QFileDialog.getOpenFileNames(
-                self, "Add localizations", directory=self.pwd, filter="*.hdf5"
+                self,
+                "Add localizations",
+                directory=self.pwd,
+                filter=file_filter,
             )
         if paths:
             self.pwd = paths[0]
             self.view.add_multiple(paths)
+
+    def import_smap_dialog(self) -> None:
+        """Import SMAP localizations from a _sml.mat file."""
+        directory = self.pwd if self.pwd != [] else ""
+        path, ext = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Import SMAP localizations", directory, filter="*.mat"
+        )
+        if path:
+            self.pwd = path
+            self.view.add_multiple([path])
 
     def open_rotated_locs(self) -> None:
         """Open rotated localizations .hdf5 file(s). In addition to

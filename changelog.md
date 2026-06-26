@@ -30,6 +30,7 @@ Last change: 26-JUN-2026 CEST
 - Faster AIM through smarter implementation
 - Faster and more memory efficient (especially for large datasets) SMLM clusterer + progress bar added
 - Progress bar for finding cluster centers
+- SMAP i/o, see "Other improvements" below
 - Rotation dialog allows for rotations around the localizations or the world (see [3D documentation](https://picassosr.readthedocs.io/en/latest/render.html#d-rotation-window))
 - Fixed removed plugins menu after removing all localizations
 
@@ -40,6 +41,7 @@ Last change: 26-JUN-2026 CEST
 - Removed the obsolete line of code in `_fill3d` ([#682](https://github.com/jungmannlab/picasso/issues/682)). This should not affect standard functionality of 3D masks; only the usage of `render_hist3d_anisotropic` directly might be affected 
 
 #### *Other improvements:*
+- Added import and export of [SMAP](https://github.com/jries/SMAP) localizations (`_sml.mat`). Available in Render and as batch CLI converters `picasso smap2hdf` and `picasso hdf2smap`. Reads single-file MATLAB `-v7` and `-v7.3` saves.
 - Removed folder `distribution` from the repository; `create_linux_shortcuts.py` was moved to `release`
 
 ### **Backward incompatible changes:**

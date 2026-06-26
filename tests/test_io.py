@@ -467,6 +467,156 @@ class TestThunderstormRoundtrip:
 
 
 # ---------------------------------------------------------------------------
+# SMAP round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestSMAPRoundtrip:
+    def _locs_2d(self):
+        return pd.DataFrame(
+            {
+                "frame": np.array([0, 1, 2], dtype=np.uint32),
+                "x": np.array([5.0, 10.0, 15.0], dtype=np.float32),
+                "y": np.array([6.0, 11.0, 16.0], dtype=np.float32),
+                "sx": np.array([1.1, 1.2, 1.3], dtype=np.float32),
+                "sy": np.array([1.4, 1.5, 1.6], dtype=np.float32),
+                "photons": np.array(
+                    [1000.0, 2000.0, 3000.0], dtype=np.float32
+                ),
+                "bg": np.array([10.0, 20.0, 30.0], dtype=np.float32),
+                "lpx": np.array([0.05, 0.06, 0.07], dtype=np.float32),
+                "lpy": np.array([0.07, 0.08, 0.09], dtype=np.float32),
+            }
+        )
+
+    def _info(self):
+        return [
+            {"Pixelsize": PIXELSIZE, "Width": 64, "Height": 64, "Frames": 3}
+        ]
+
+    def test_export_import_2d(self, tmp_path):
+        locs = self._locs_2d()
+        info = self._info()
+        path = tmp_path / "data_sml.mat"
+        io.export_smap(str(path), locs, info)
+        assert path.exists()
+
+        out_locs, out_info = io.import_smap(str(path), pixelsize=PIXELSIZE)
+        np.testing.assert_allclose(
+            out_locs["x"].to_numpy(), locs["x"].to_numpy(), atol=1e-3
+        )
+        np.testing.assert_allclose(
+            out_locs["y"].to_numpy(), locs["y"].to_numpy(), atol=1e-3
+        )
+        # SMAP frames are 1-based on disk; import re-zeroes them.
+        np.testing.assert_array_equal(
+            out_locs["frame"].to_numpy(), locs["frame"].to_numpy()
+        )
+        np.testing.assert_allclose(
+            out_locs["photons"].to_numpy(),
+            locs["photons"].to_numpy(),
+            atol=1e-3,
+        )
+        # lpx and lpy collapse to the combined locprecnm on export, so
+        # both come back as the average of the original lpx/lpy.
+        expected_lp = (locs["lpx"].to_numpy() + locs["lpy"].to_numpy()) / 2
+        np.testing.assert_allclose(
+            out_locs["lpx"].to_numpy(), expected_lp, atol=1e-3
+        )
+        np.testing.assert_allclose(
+            out_locs["lpy"].to_numpy(), expected_lp, atol=1e-3
+        )
+        assert out_info[0]["Frames"] == 3
+
+    def test_export_import_3d(self, tmp_path):
+        locs = self._locs_2d()
+        locs["z"] = np.array([-100.0, 0.0, 100.0], dtype=np.float32)
+        locs["lpz"] = np.array([3.0, 4.0, 5.0], dtype=np.float32)
+        info = self._info()
+        path = tmp_path / "data3d_sml.mat"
+        io.export_smap(str(path), locs, info)
+
+        out_locs, _ = io.import_smap(str(path), pixelsize=PIXELSIZE)
+        # z and lpz are kept in nm in both formats.
+        np.testing.assert_allclose(
+            out_locs["z"].to_numpy(), locs["z"].to_numpy(), atol=1e-3
+        )
+        np.testing.assert_allclose(
+            out_locs["lpz"].to_numpy(), locs["lpz"].to_numpy(), atol=1e-3
+        )
+
+    def test_export_enforces_sml_suffix(self, tmp_path):
+        # SMAP recognizes localizations by the '_sml' suffix; export
+        # appends it when missing.
+        locs = self._locs_2d()
+        info = self._info()
+        io.export_smap(str(tmp_path / "plain.mat"), locs, info)
+        assert (tmp_path / "plain_sml.mat").exists()
+
+    def test_export_writes_smap_structure(self, tmp_path):
+        from scipy.io import loadmat
+
+        locs = self._locs_2d()
+        info = self._info()
+        path = tmp_path / "struct_sml.mat"
+        io.export_smap(str(path), locs, info)
+
+        mat = loadmat(str(path), struct_as_record=False, squeeze_me=True)
+        assert "saveloc" in mat
+        assert "fileformat" in mat
+        assert mat["fileformat"].name == "sml"
+        assert hasattr(mat["saveloc"].loc, "xnm")
+        assert hasattr(mat["saveloc"], "info")
+
+    def test_split_parts_raises(self, tmp_path):
+        # A SMAP split '_sml_p*.mat' file carries 'lds'/'partnames'
+        # variables; import should reject it with a clear message.
+        from scipy.io import savemat
+
+        path = tmp_path / "split_sml.mat"
+        savemat(
+            str(path),
+            {"lds": np.zeros((1, 1)), "partnames": np.zeros((1, 1))},
+        )
+        with pytest.raises(ValueError, match="split"):
+            io.import_smap(str(path), pixelsize=PIXELSIZE)
+
+    def test_import_v73_hdf5(self, tmp_path):
+        # MATLAB v7.3 files are HDF5-based and read via the h5py path.
+        # SMAP stores column vectors transposed, so each loc field is a
+        # (1, N) dataset under /saveloc/loc.
+        n = 10
+        path = tmp_path / "v73_sml.mat"
+        with h5py.File(str(path), "w") as f:
+            loc = f.create_group("saveloc").create_group("loc")
+            loc.create_dataset(
+                "xnm", data=np.linspace(130, 1300, n).reshape(1, n)
+            )
+            loc.create_dataset(
+                "ynm", data=np.linspace(260, 2600, n).reshape(1, n)
+            )
+            loc.create_dataset(
+                "frame", data=np.arange(1, n + 1, dtype=float).reshape(1, n)
+            )
+            loc.create_dataset("phot", data=np.full((1, n), 500.0))
+            loc.create_dataset("bg", data=np.full((1, n), 12.0))
+            loc.create_dataset("locprecnm", data=np.full((1, n), 13.0))
+
+        locs, info = io.import_smap(str(path), pixelsize=PIXELSIZE)
+        assert len(locs) == n
+        # SMAP frames are 1-based; import re-zeroes them.
+        assert int(locs["frame"].min()) == 0
+        np.testing.assert_allclose(
+            locs["x"].to_numpy(),
+            np.linspace(130, 1300, n) / PIXELSIZE,
+            atol=1e-3,
+        )
+        np.testing.assert_allclose(
+            locs["lpx"].to_numpy(), 13.0 / PIXELSIZE, atol=1e-3
+        )
+
+
+# ---------------------------------------------------------------------------
 # TIFF loading — TiffMap / TiffMultiMap / load_tif / to_raw
 #
 # Picasso reads TIFFs via ``tifffile`` (see picasso.io.TiffMap). Real
