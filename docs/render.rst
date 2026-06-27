@@ -190,7 +190,7 @@ File
 
 Open [Ctrl+O]
 ^^^^^^^^^^^^^
-Open an .hdf5 file to open in render.
+Open a localization file in render. Picasso ``.hdf5`` files are loaded directly; ThunderSTORM ``.csv`` and SMAP ``_sml.mat`` files are imported (you will be asked for the camera pixel size in nm). Localization files can also be imported by dragging and dropping them onto the render window.
 
 Open rotated localizations [Ctrl+Shift+O]
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -258,6 +258,12 @@ Export as .txt file to be used for Chimera import.
 Export as .3d for ViSP
 ++++++++++++++++++++++
 Export as .3d file to be used ViSP.
+
+Export as .mat for SMAP
++++++++++++++++++++++++
+Export the dataset as a SMAP (`https://github.com/jries/SMAP <https://github.com/jries/SMAP>`_) ``_sml.mat`` file that can be loaded in SMAP via File > Load. The output is named ``<file>_sml.mat`` (the ``_sml`` suffix is required for SMAP to recognize the file).
+
+Coordinates and localization precision are converted from camera pixels to nm using the pixel size set in Display Settings; z and its precision (``lpz``) are written in nm; frames are made 1-based (SMAP convention). ``lpx`` and ``lpy`` are combined into SMAP's single ``locprecnm`` field as their mean.
 
 Remove all localizations
 ^^^^^^^^^^^^^^^^^^^^^^^^

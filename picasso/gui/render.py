@@ -11878,8 +11878,6 @@ class Window(QtWidgets.QMainWindow):
         open_rot_action = file_menu.addAction("Open rotated localizations")
         open_rot_action.setShortcut("Ctrl+Shift+O")
         open_rot_action.triggered.connect(self.open_rotated_locs)
-        import_smap_action = file_menu.addAction("Import SMAP localizations")
-        import_smap_action.triggered.connect(self.import_smap_dialog)
         save_action = file_menu.addAction("Save localizations")
         save_action.setShortcut("Ctrl+S")
         save_action.triggered.connect(self.save_locs)
@@ -12920,16 +12918,6 @@ class Window(QtWidgets.QMainWindow):
         if paths:
             self.pwd = paths[0]
             self.view.add_multiple(paths)
-
-    def import_smap_dialog(self) -> None:
-        """Import SMAP localizations from a _sml.mat file."""
-        directory = self.pwd if self.pwd != [] else ""
-        path, ext = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Import SMAP localizations", directory, filter="*.mat"
-        )
-        if path:
-            self.pwd = path
-            self.view.add_multiple([path])
 
     def open_rotated_locs(self) -> None:
         """Open rotated localizations .hdf5 file(s). In addition to
