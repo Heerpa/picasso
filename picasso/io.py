@@ -3619,9 +3619,6 @@ def import_smap(
     img_info["Width"] = int(np.ceil(np.max(x)))
     img_info["Pixelsize"] = float(pixelsize)
 
-    base, ext = os.path.splitext(path)
-    out_path = base + "_locs.hdf5"
-    save_locs(out_path, locs, [img_info])
     return locs, [img_info]
 
 

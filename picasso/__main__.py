@@ -205,10 +205,13 @@ def _smap2hdf(path: str, pixelsize: float) -> None:
 
     paths = glob(path)
     if paths:
-        from .io import import_smap
+        import os.path
+        from .io import import_smap, save_locs
 
         for path in _tqdm(paths, desc="Converting from SMAP"):
-            import_smap(path, pixelsize)
+            locs, info = import_smap(path, pixelsize)
+            base, ext = os.path.splitext(path)
+            save_locs(base + "_locs.hdf5", locs, info)
     print("Complete.")
 
 
