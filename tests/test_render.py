@@ -1254,6 +1254,85 @@ class TestRenderScene:
         assert isinstance(qimage, QtGui.QImage)
         assert n_locs == 0
 
+    def test_background_color_none_equals_black(self, locs, info):
+        """``background_color=None`` and an explicit black background must
+        be byte-for-byte identical (black is the no-op default)."""
+        kwargs = dict(
+            disp_px_size=PIXELSIZE,
+            viewport=FULL_VIEWPORT,
+            colors=[(1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+        )
+        q_none, _ = render.render_scene(
+            [locs, locs], [info, info], **kwargs, background_color=None
+        )
+        q_black, _ = render.render_scene(
+            [locs, locs],
+            [info, info],
+            **kwargs,
+            background_color=(0.0, 0.0, 0.0),
+        )
+        assert np.array_equal(
+            _qimage_to_array(q_none), _qimage_to_array(q_black)
+        )
+
+    def test_background_color_fills_empty_pixels(self, locs, info):
+        """With a white background, pixels with no localizations become
+        white while pixels containing localizations do not."""
+        qimage, _, raw = render.render_scene(
+            [locs, locs],
+            [info, info],
+            disp_px_size=PIXELSIZE,
+            viewport=FULL_VIEWPORT,
+            colors=[(1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            background_color=(1.0, 1.0, 1.0),
+            return_raw_image=True,
+        )
+        bgra = _qimage_to_array(qimage)
+        empty = raw.sum(axis=0) == 0  # (H, W) mask of pixels with no locs
+        assert empty.any(), "Sparse test data should leave empty pixels"
+        # every empty pixel is fully white
+        assert (bgra[empty][:, :3] == 255).all()
+        # at least one occupied pixel keeps its channel color (not white)
+        occupied = ~empty
+        assert occupied.any()
+        assert not (bgra[occupied][:, :3] == 255).all()
+
+    def test_background_color_composite_exact(self, locs, info):
+        """Exact compositing on a synthetic cache: a saturated channel
+        pixel keeps its pure color, an empty pixel shows the background."""
+        # channel 0 saturated at (0, 0); everything else empty
+        raw = np.zeros((2, 3, 3), dtype=np.float32)
+        raw[0, 0, 0] = 1.0
+        colors = [
+            render.solid_to_lut((1.0, 0.0, 0.0)),
+            render.solid_to_lut((0.0, 1.0, 0.0)),
+        ]
+        qimage, _ = render.render_scene(
+            [locs, locs],
+            [info, info],
+            disp_px_size=PIXELSIZE,
+            viewport=FULL_VIEWPORT,
+            colors=colors,
+            contrast=(0.0, 1.0),
+            background_color=(0.2, 0.4, 0.6),
+            raw_image_cache=raw,
+        )
+        bgra = _qimage_to_array(qimage)  # B, G, R, A
+        # saturated channel-0 pixel stays pure red (background fully masked)
+        assert tuple(int(v) for v in bgra[0, 0, :3]) == (0, 0, 255)
+        # empty pixel shows the background color (0.2, 0.4, 0.6) -> bytes
+        assert bgra[2, 2, 2] == pytest.approx(round(0.2 * 255), abs=1)  # R
+        assert bgra[2, 2, 1] == pytest.approx(round(0.4 * 255), abs=1)  # G
+        assert bgra[2, 2, 0] == pytest.approx(round(0.6 * 255), abs=1)  # B
+
+    def test_background_color_default_is_none(self):
+        """The public render_scene signature defaults background_color to
+        None so existing callers are unaffected."""
+        import inspect
+
+        sig = inspect.signature(render.render_scene)
+        assert sig.parameters["background_color"].default is None
+
 
 # ---------------------------------------------------------------------------
 # Rectangle pick polygon (pure geometry)

@@ -32,6 +32,7 @@ Last change: 27-JUN-2026 CEST
 - Progress bar for finding cluster centers
 - SMAP i/o, see "Other improvements" below
 - Rotation dialog allows for rotations around the localizations or the world (see [3D documentation](https://picassosr.readthedocs.io/en/latest/render.html#d-rotation-window))
+- Background color for multichannel data can be adjusted
 - Fixed removed plugins menu after removing all localizations
 
 #### SPINNA

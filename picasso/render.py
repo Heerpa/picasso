@@ -2606,6 +2606,7 @@ def render_scene(
     single_channel_colormap: str | lib.FloatArray2D = "magma",
     colors: list | None = None,
     relative_intensities: list[float] | None = None,
+    background_color: tuple[float, float, float] | None = None,
     raw_image_cache: lib.FloatArray2D | lib.FloatArray3D | None = None,
     return_contrast_limits: bool = False,
     return_raw_image: bool = False,
@@ -2701,6 +2702,13 @@ def render_scene(
         List of relative intensities for each channel. Only needs to be
         specified for multi-channel data. Default is None, in which
         case all channels are rendered with the same intensity.
+    background_color : tuple of float, optional
+        ``(r, g, b)`` background color with values between 0 and 1 that
+        the additively-blended channels are composited over (multi-channel
+        data only). The background shows through where there are few/no
+        localizations, while bright regions keep their true channel
+        colors. Default is None (equivalent to a black background, i.e.
+        the image is left unchanged).
     raw_image_cache: lib.FloatArray2D or lib.FloatArray3D, optional
         If provided, this raw grayscale image of localizations, i.e.,
         obtained with ``render.render`` (2D array for single-channel
@@ -2772,6 +2780,7 @@ def render_scene(
             contrast=contrast,
             relative_intensities=relative_intensities,
             invert_colors=invert_colors,
+            background_color=background_color,
             raw_image_cache=raw_image_cache,
         )
     qimage = rgb_to_qimage(rgb)
@@ -2800,6 +2809,7 @@ def _render_multi_channel(
     contrast: tuple[float, float] | None = None,
     relative_intensities: list[float] | None = None,
     invert_colors: bool = False,
+    background_color: tuple[float, float, float] | None = None,
     raw_image_cache: lib.FloatArray3D | None = None,
 ) -> tuple[int, lib.IntArray3D, tuple[float, float], lib.FloatArray3D]:
     """Render multi-channel localizations into an RGB 8bit image
@@ -2809,8 +2819,7 @@ def _render_multi_channel(
     behaviour: each channel rendered as ``intensity × rgb``, additive
     blend) or a list of ``(256, 3)`` LUTs (each channel indexed into
     its LUT before additive blending — supports per-channel
-    matplotlib colormaps and user-defined colormaps from the GUI).
-    """
+    matplotlib colormaps and user-defined colormaps from the GUI)."""
     if raw_image_cache is not None:
         assert raw_image_cache.ndim == 3, "raw_image_cache must be a 3D array."
         raw_image = raw_image_cache
@@ -2859,6 +2868,15 @@ def _render_multi_channel(
             rgb += colors_arr[c][idx[c]]
     # clip to max value of 1 (preserves relative brightness)
     np.minimum(rgb, 1.0, out=rgb)
+    # composite over a background color (default black = no change). The
+    # background shows through where there are few/no localizations,
+    # while bright regions keep their true channel colors. Alpha is the
+    # total per-pixel coverage summed across channels.
+    if background_color is not None and any(c > 0 for c in background_color):
+        bg = np.asarray(background_color, dtype=np.float32)
+        alpha = np.clip(images_f32.sum(axis=0), 0.0, 1.0)[..., None]
+        rgb = rgb + bg * (1.0 - alpha)
+        np.minimum(rgb, 1.0, out=rgb)
     rgb = to_8bit(rgb)
     if invert_colors:
         rgb = 255 - rgb

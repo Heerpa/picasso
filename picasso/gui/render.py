@@ -463,6 +463,25 @@ class DatasetDialog(lib.Dialog):
         )
         self.wbackground.stateChanged.connect(self.update_viewport)
         layout.addWidget(self.wbackground, 2, 0)
+        # background color for multichannel rendering (default black)
+        self.background_color = (0.0, 0.0, 0.0)
+        bg_layout = QtWidgets.QHBoxLayout()
+        self.background_button = QtWidgets.QPushButton("Background color")
+        self.background_button.setToolTip(
+            "Background color for multichannel rendering.\n"
+            "The background shows through where there are few or no\n"
+            "localizations. Default is black."
+        )
+        self.background_button.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.background_button.clicked.connect(self.select_background_color)
+        bg_layout.addWidget(self.background_button)
+        self.background_swatch = QtWidgets.QLabel()
+        self.background_swatch.setFixedSize(40, 14)
+        self.background_swatch.setFrameShape(QtWidgets.QFrame.Shape.Box)
+        self._update_background_swatch()
+        bg_layout.addWidget(self.background_swatch)
+        bg_layout.addStretch()
+        layout.addLayout(bg_layout, 2, 1)
         self.auto_colors = QtWidgets.QCheckBox("Automatic coloring")
         self.auto_colors.setToolTip(
             "Automatically assign colors to each channel (using hsv colormap)?"
@@ -825,6 +844,31 @@ class DatasetDialog(lib.Dialog):
         if self.auto_display.isChecked():
             if self.window.view.viewport:
                 self.window.view.update_scene()
+
+    def select_background_color(self) -> None:
+        """Open a color picker to choose the multichannel background
+        color and refresh the scene."""
+        initial = QtGui.QColor.fromRgbF(*self.background_color, 1.0)
+        chosen = QtWidgets.QColorDialog.getColor(
+            initial, self, "Pick background color"
+        )
+        if not chosen.isValid():
+            return
+        self.background_color = (
+            chosen.redF(),
+            chosen.greenF(),
+            chosen.blueF(),
+        )
+        self._update_background_swatch()
+        self.update_viewport()
+
+    def _update_background_swatch(self) -> None:
+        """Refresh the small swatch showing the current background
+        color."""
+        r, g, b = (int(round(255 * c)) for c in self.background_color)
+        self.background_swatch.setStyleSheet(
+            f"background-color: rgb({r}, {g}, {b}); border: 1px solid gray;"
+        )
 
     def set_color(self, n: int | str) -> None:
         """Resolve the current channel selection to a (256, 3) LUT,
@@ -10424,6 +10468,7 @@ class View(QtWidgets.QLabel):
             **kwargs,
             contrast=contrast,
             invert_colors=self.window.dataset_dialog.wbackground.isChecked(),
+            background_color=self.window.dataset_dialog.background_color,
             single_channel_colormap=cmap,
             colors=self.read_colors(),
             relative_intensities=self.read_relative_intensities(),
