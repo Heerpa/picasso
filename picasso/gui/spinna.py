@@ -4235,9 +4235,18 @@ class SimulationsTab(lib.Dialog):
             distances_input=distances_input,
         )
 
-        # run a single simulation and display the simulated/experimental NNDs
+        # run a single simulation and display the simulated/experimental
+        # NNDs
         for spin in self.le_spins:
             spin.setValue(100)
+        n_total = {
+            target: int(len(self.exp_data[target]) / (le_spin.value() / 100))
+            for target, le_spin in zip(self.targets, self.le_spins)
+        }
+        self.n_total = deepcopy(n_total)
+        self.N_structures_fit = spinna.generate_N_structures(
+            deepcopy(self.structures), n_total, self.granularity
+        )
         self.mixer = self.setup_mixer(mode="single_sim")
         self.sim_and_plot_NND()
 

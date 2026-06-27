@@ -35,6 +35,7 @@ Last change: 27-JUN-2026 CEST
 - Fixed removed plugins menu after removing all localizations
 
 #### SPINNA
+- Fixed incorrect density of plotted molecules when using LE fitting
 - Fixed verbose for batch analysis
 - Batch analysis allows for specifying fitting mode (brute force/coarse to fine/bayesian)
 - Batch analysis closes unused plots to save RAM
