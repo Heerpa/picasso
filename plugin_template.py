@@ -1,5 +1,5 @@
 """Template for creating a Picasso plugin. Save your plugin as a .py file in
-~/.picasso/plugins/ (use Plugins -> Open plugins folder... in any Picasso app
+~/.picasso/plugins/ (use Plugins -> Open plugins folder in any Picasso app
 to find it).
 
 For more details, see https://picassosr.readthedocs.io/en/latest/plugins.html
