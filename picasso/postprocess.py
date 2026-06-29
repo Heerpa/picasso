@@ -508,8 +508,8 @@ def pick_similar(
     max_rmsd = mean_rmsd + std_range * std_rmsd
 
     # x, y coordinates of found regions:
-    x_similar = np.array([_[0] for _ in picks])
-    y_similar = np.array([_[1] for _ in picks])
+    x_similar = np.array([_[0] for _ in picks], dtype=np.float64)
+    y_similar = np.array([_[1] for _ in picks], dtype=np.float64)
 
     # preparations for grid search
     x_range = np.arange(d / 2, info[0]["Width"], np.sqrt(3) * d / 2)

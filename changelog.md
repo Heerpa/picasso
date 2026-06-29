@@ -36,6 +36,7 @@ Last change: 29-JUN-2026 CEST
 - Rotation dialog allows for rotations around the localizations or the world (see [3D documentation](https://picassosr.readthedocs.io/en/latest/render.html#d-rotation-window))
 - Background color for multichannel data can be adjusted
 - Fixed removed plugins menu after removing all localizations
+- Fixed pick similar numba error [#684](https://github.com/jungmannlab/picasso/issues/684)
 
 #### SPINNA
 - Fixed incorrect density of plotted molecules when using LE fitting
