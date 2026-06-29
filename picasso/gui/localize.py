@@ -12,9 +12,11 @@ Graphical user interface for localizing single molecules.
 from __future__ import annotations
 
 import os.path
+import re
 import sys
 import time
 from collections import UserDict
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -42,6 +44,43 @@ except Exception:
     GPUFIT_INSTALLED = False
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
+
+
+@dataclass
+class Channel:
+    """Per-channel state for multichannel localization.
+
+    Localize keeps all loaded channels in ``Window.channels`` and mirrors
+    the *active* channel into the flat ``Window`` attributes (``movie``,
+    ``info``, ``identifications`` ...) so the existing single-movie
+    identify/fit/save/draw code keeps operating on the active channel
+    unchanged. Switching channels snapshots the flat state (plus the
+    Parameters/Contrast dialog values) into the old ``Channel`` and
+    restores the new one.
+
+    All channels' ``movie`` objects stay live simultaneously, so a future
+    across-channel fitting algorithm can read every channel at once.
+    """
+
+    movie: object = None
+    info: list = field(default_factory=list)
+    path: str = ""
+    name: str = "Channel 0"
+    identifications: object = None
+    locs: object = None
+    locs_display: object = None
+    ready_for_fit: bool = False
+    last_identification_info: dict | None = None
+    extra_info: list = field(default_factory=list)
+    frame_range: object = None
+    curr_frame_number: int = 0
+    params: dict = field(default_factory=dict)
+    contrast: dict | None = None
+
+
+def _sanitize_filename(name: str) -> str:
+    """Turn a channel name into a filename-safe suffix."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "channel"
 
 
 class RubberBand(QtWidgets.QRubberBand):
@@ -2034,6 +2073,13 @@ class Window(QtWidgets.QMainWindow):
         Camera information, such as gain, sensitivity, etc.
     contrast_dialog : ContrastDialog
         The dialog for adjusting display contrast.
+    channels : list of Channel
+        Per-channel state for multichannel data. The active channel
+        (``current_channel``) is mirrored into the flat attributes
+        (``movie``, ``info``, ``movie_path`` ...). A single movie is held
+        as a one-element list.
+    current_channel : int
+        Index of the active channel within ``channels``.
     extra_info : list of dict
         Movie metadata in a format of a dictionary, with Localize info.
     identifications : pd.DataFrame
@@ -2047,9 +2093,10 @@ class Window(QtWidgets.QMainWindow):
         Movie metadata in a format of a dictionary, without Localize
         info, see self.extra_info.
     movie : np.memmap or None
-        Loaded movie (frame, y, x).
-    movie_path : list[str]
-        List of paths to the movie files.
+        Loaded movie (frame, y, x) of the active channel.
+    movie_path : str or list
+        Path to the active channel's movie file (empty list when nothing
+        is loaded).
     parameters_dialog : ParametersDialog
         The dialog for adjusting parameters.
     ready_for_fit : bool
@@ -2106,10 +2153,17 @@ class Window(QtWidgets.QMainWindow):
             """
         )
         self.frame_slider.valueChanged.connect(self.on_frame_slider_changed)
+        # Channel selector (hidden unless several channels are loaded).
+        self.channel_combo = QtWidgets.QComboBox()
+        self.channel_combo.setVisible(False)
+        self.channel_combo.currentIndexChanged.connect(
+            self.on_channel_combo_changed
+        )
         central_widget = QtWidgets.QWidget()
         central_layout = QtWidgets.QVBoxLayout(central_widget)
         central_layout.setContentsMargins(0, 0, 0, 0)
         central_layout.setSpacing(0)
+        central_layout.addWidget(self.channel_combo)
         central_layout.addWidget(self.view)
         central_layout.addWidget(self.frame_slider)
         self.setCentralWidget(central_widget)
@@ -2137,6 +2191,15 @@ class Window(QtWidgets.QMainWindow):
         self.info = []
         self.extra_info = []
         self._active_worker = None
+        # Multichannel state. ``self.channels[self.current_channel]`` is
+        # the active channel, mirrored into the flat attributes above.
+        # Single movies are stored as a one-element list.
+        self.channels = []
+        self.current_channel = 0
+        # Guards the parameter/contrast handlers while restoring a
+        # channel's dialog values, so they don't wipe the channel's
+        # locs/markers.
+        self._switching_channel = False
 
         self.load_user_settings()
 
@@ -2192,6 +2255,21 @@ class Window(QtWidgets.QMainWindow):
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self.open_file_dialog)
         file_menu.addAction(open_action)
+        open_multichannel_action = file_menu.addAction(
+            "Open one multichannel movie"
+        )
+        open_multichannel_action.setShortcut("Ctrl+Shift+O")
+        open_multichannel_action.triggered.connect(
+            self.open_multichannel_file_dialog
+        )
+        file_menu.addAction(open_multichannel_action)
+        open_channels_action = file_menu.addAction(
+            "Open channels from several movies"
+        )
+        open_channels_action.triggered.connect(
+            self.open_channels_from_files_dialog
+        )
+        file_menu.addAction(open_channels_action)
         save_identifications_action = file_menu.addAction(
             "Save identifications"
         )
@@ -2381,9 +2459,7 @@ class Window(QtWidgets.QMainWindow):
             )
             return
         infos = self.extra_info if self.extra_info else self.info
-        label = (
-            os.path.basename(self.movie_path[0]) if self.movie_path else None
-        )
+        label = os.path.basename(self.movie_path) if self.movie_path else None
         self.metadata_dialog.set_infos(infos, labels=label)
         self.metadata_dialog.show()
         self.metadata_dialog.raise_()
@@ -2418,48 +2494,343 @@ class Window(QtWidgets.QMainWindow):
             self.pwd = path
             self.open(path)
 
-    def open(self, path: str) -> None:
-        """Open a movie file."""
-        t0 = time.time()
-
+    def _prompt_for_path(self, path: str):
+        """Return the metadata prompt callback appropriate for ``path``."""
         if path.lower().endswith((".ims", ".czi", ".lif")):
             # Multi-channel .ims/.czi/.lif files prompt for a channel.
-            prompt_info = self.prompt_channel
+            return self.prompt_channel
         elif path.lower().endswith(io.TIFF_EXTENSIONS + (".stk", ".nd2")):
             # For these formats the metadata may fail to parse; prompt the
             # user to enter it manually as a fallback.
-            prompt_info = self.prompt_movie_info
-        else:
-            prompt_info = self.prompt_info
+            return self.prompt_movie_info
+        return self.prompt_info
 
-        result = io.load_movie(path, prompt_info=prompt_info)
+    def open(self, path: str) -> None:
+        """Open a single movie file as one channel."""
+        t0 = time.time()
+        result = io.load_movie(path, prompt_info=self._prompt_for_path(path))
+        if result is None:
+            return
+        movie, info = result
+        name = self._channel_name(info, path, 0)
+        self._set_channels([movie], [info], [path], [name])
+        dt = time.time() - t0
+        self.status_bar.showMessage(f"Opened movie in {dt:.2f} seconds.")
 
-        if result is not None:
-            self.movie, self.info = result
-            dt = time.time() - t0
-            self.movie_path = path
-            self.identifications = None
-            self.locs = None
-            self.locs_display = None
-            self.ready_for_fit = False
-            self.frame_slider.setEnabled(True)
-            self.frame_slider.setMaximum(
-                lib.get_from_metadata(self.info, "Frames") - 1
-            )
-            self.set_frame(0)
-            self.fit_in_view()
-            self.parameters_dialog.set_camera_parameters(self.info[0])
-            self.status_bar.showMessage(f"Opened movie in {dt:.2f} seconds.")
-
-            if "Pixelsize" in self.info[0]:
-                self.parameters_dialog.pixelsize.setValue(
-                    int(self.info[0]["Pixelsize"])
-                )
-
-        self.setWindowTitle(
-            f"Picasso v{__version__}: Localize. File: {os.path.basename(path)}"
+    def open_multichannel_file_dialog(self) -> None:
+        """Open a single file and load *all* of its channels."""
+        dir = None if self.pwd == [] else self.pwd
+        path, exe = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open multichannel file",
+            directory=dir,
+            filter="Multichannel files (*.ims *.czi *.lif *.nd2)",
         )
+        if path:
+            self.pwd = path
+            self.open_multichannel_file(path)
+
+    def open_multichannel_file(self, path: str) -> None:
+        """Load every channel of a single multichannel file."""
+        t0 = time.time()
+        try:
+            result = io.load_movie_all(
+                path, prompt_info=self.prompt_movie_info
+            )
+        except ImportError as e:
+            QtWidgets.QMessageBox.warning(self, "Could not load file", str(e))
+            return
+        if result is None:
+            return
+        movies, infos = result
+        if not movies:
+            return
+        paths = [path] * len(movies)
+        names = [
+            self._channel_name(infos[i], path, i) for i in range(len(movies))
+        ]
+        self._set_channels(movies, infos, paths, names)
+        dt = time.time() - t0
+        self.status_bar.showMessage(
+            f"Opened {len(movies)} channel(s) in {dt:.2f} seconds."
+        )
+
+    def open_channels_from_files_dialog(self) -> None:
+        """Open several movie files, each loaded as one channel."""
+        dir = None if self.pwd == [] else self.pwd
+        paths, exe = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Open channels from files",
+            directory=dir,
+            filter=(
+                "All supported formats ("
+                + " ".join("*" + e for e in io.MOVIE_EXTENSIONS)
+                + ")"
+            ),
+        )
+        if paths:
+            self.pwd = paths[0]
+            self.open_channels_from_files(paths)
+
+    def open_channels_from_files(self, paths: list[str]) -> None:
+        """Load several movie files as channels (one file per channel)."""
+        t0 = time.time()
+        movies, infos, names, loaded_paths = [], [], [], []
+        for path in paths:
+            result = io.load_movie(
+                path, prompt_info=self._prompt_for_path(path)
+            )
+            if result is None:
+                continue
+            movie, info = result
+            movies.append(movie)
+            infos.append(info)
+            loaded_paths.append(path)
+            names.append(
+                self._channel_name(info, path, len(names), multi_file=True)
+            )
+        if not movies:
+            return
+        self._set_channels(movies, infos, loaded_paths, names)
+        dt = time.time() - t0
+        self.status_bar.showMessage(
+            f"Opened {len(movies)} channel(s) in {dt:.2f} seconds."
+        )
+
+    def _channel_name(
+        self,
+        info: list,
+        path: str,
+        idx: int,
+        multi_file: bool = False,
+    ) -> str:
+        """Pick a display name for a channel: the metadata ``"Channel"``
+        key if present, else the filename stem (separate files), else
+        ``"Channel N"``."""
+        try:
+            channel = info[0].get("Channel")
+        except (AttributeError, IndexError, TypeError):
+            channel = None
+        if channel:
+            return str(channel)
+        if multi_file:
+            return os.path.splitext(os.path.basename(path))[0]
+        return f"Channel {idx}"
+
+    def _set_channels(
+        self,
+        movies: list,
+        infos: list,
+        paths: list,
+        names: list,
+    ) -> None:
+        """Build the channel list from loaded movies and activate the
+        first one. The single funnel used by every load path."""
+        if not movies:
+            return
+        # Build channels and seed each channel's parameter/contrast
+        # snapshot from the current dialog state, applying any camera /
+        # pixel-size hints from that channel's metadata. Guarded so the
+        # value changes don't wipe localizations.
+        self._switching_channel = True
+        try:
+            self.channels = []
+            for movie, info, path, name in zip(movies, infos, paths, names):
+                channel = Channel(movie=movie, info=info, path=path, name=name)
+                self.parameters_dialog.set_camera_parameters(info[0])
+                if "Pixelsize" in info[0]:
+                    self.parameters_dialog.pixelsize.setValue(
+                        int(info[0]["Pixelsize"])
+                    )
+                channel.params = self._capture_params()
+                channel.contrast = self._capture_contrast()
+                self.channels.append(channel)
+            self.current_channel = 0
+        finally:
+            self._switching_channel = False
+        self._populate_channel_combo()
+        self.frame_slider.setEnabled(True)
+        self._restore_current_channel()
         self.parameters_dialog.reset_quality_check()
+
+    def _populate_channel_combo(self) -> None:
+        """Refresh the channel selector; hidden unless several channels."""
+        self.channel_combo.blockSignals(True)
+        self.channel_combo.clear()
+        self.channel_combo.addItems([c.name for c in self.channels])
+        self.channel_combo.setCurrentIndex(self.current_channel)
+        self.channel_combo.blockSignals(False)
+        self.channel_combo.setVisible(len(self.channels) > 1)
+
+    def on_channel_combo_changed(self, index: int) -> None:
+        """Switch the active channel from the selector."""
+        self.set_current_channel(index)
+
+    def set_current_channel(self, index: int) -> None:
+        """Make channel ``index`` the active one, swapping the flat state
+        and the Parameters/Contrast dialog values."""
+        if (
+            index == self.current_channel
+            or index < 0
+            or index >= len(self.channels)
+        ):
+            return
+        self._snapshot_current_channel()
+        self.current_channel = index
+        self._restore_current_channel()
+        self.parameters_dialog.reset_quality_check()
+
+    def _snapshot_current_channel(self) -> None:
+        """Store the active flat state + dialog values into its Channel."""
+        if not self.channels:
+            return
+        channel = self.channels[self.current_channel]
+        channel.movie = self.movie
+        channel.info = self.info
+        channel.path = self.movie_path
+        channel.identifications = self.identifications
+        channel.locs = self.locs
+        channel.locs_display = self.locs_display
+        channel.ready_for_fit = self.ready_for_fit
+        channel.last_identification_info = self.last_identification_info
+        channel.extra_info = self.extra_info
+        channel.frame_range = self.frame_range
+        channel.curr_frame_number = getattr(self, "curr_frame_number", 0)
+        channel.params = self._capture_params()
+        channel.contrast = self._capture_contrast()
+
+    def _restore_current_channel(self) -> None:
+        """Load the active Channel's state into the flat attrs + dialogs."""
+        channel = self.channels[self.current_channel]
+        self._switching_channel = True
+        try:
+            self.movie = channel.movie
+            self.info = channel.info
+            self.movie_path = channel.path
+            self.identifications = channel.identifications
+            self.locs = channel.locs
+            self.locs_display = channel.locs_display
+            self.ready_for_fit = channel.ready_for_fit
+            self.last_identification_info = channel.last_identification_info
+            self.extra_info = channel.extra_info
+            self.frame_range = channel.frame_range
+            self._apply_params(channel.params)
+            self._apply_contrast(channel.contrast)
+        finally:
+            self._switching_channel = False
+        self._apply_channel_to_ui(channel.curr_frame_number)
+
+    def _apply_channel_to_ui(self, frame_number: int = 0) -> None:
+        """Sync the frame slider, displayed frame, zoom and title to the
+        active channel."""
+        last_frame = lib.get_from_metadata(self.info, "Frames") - 1
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setMaximum(max(0, last_frame))
+        self.frame_slider.blockSignals(False)
+        frame_number = min(max(0, frame_number), max(0, last_frame))
+        self.set_frame(frame_number)
+        self.fit_in_view()
+        base = os.path.basename(self.movie_path) if self.movie_path else ""
+        title = f"Picasso v{__version__}: Localize. File: {base}"
+        if len(self.channels) > 1:
+            title += f" [{self.channels[self.current_channel].name}]"
+        self.setWindowTitle(title)
+
+    def _capture_params(self) -> dict:
+        """Snapshot the analysis-relevant Parameters dialog values."""
+        pd = self.parameters_dialog
+        params = {
+            "box": pd.box_spinbox.value(),
+            "mng": pd.mng_slider.value(),
+            "mng_min": pd.mng_min_spinbox.value(),
+            "mng_max": pd.mng_max_spinbox.value(),
+            "fit_method": pd.fit_method.currentIndex(),
+            "baseline": pd.baseline.value(),
+            "gain": pd.gain.value(),
+            "sensitivity": pd.sensitivity.value(),
+            "qe": pd.qe.value(),
+            "pixelsize": pd.pixelsize.value(),
+            "convergence": pd.convergence_criterion.value(),
+            "max_it": pd.max_it.value(),
+            "magnification": pd.magnification_factor.value(),
+            "fit_z": pd.fit_z_checkbox.isChecked(),
+            "fit_z_enabled": pd.fit_z_checkbox.isEnabled(),
+            "z_calibration": pd.z_calibration,
+            "z_calibration_path": pd.z_calibration_path,
+            "z_calib_label": pd.z_calib_label.text(),
+            "gpufit": pd.gpufit_checkbox.isChecked(),
+            "frames_edit": pd.frames_edit.text(),
+        }
+        if hasattr(pd, "camera"):
+            params["camera"] = pd.camera.currentIndex()
+        return params
+
+    def _apply_params(self, params: dict) -> None:
+        """Restore a channel's analysis parameters into the dialog. Caller
+        sets ``self._switching_channel`` to suppress side effects."""
+        if not params:
+            return
+        pd = self.parameters_dialog
+        # Camera selection first: its cascade fills baseline/gain/pixelsize
+        # from the config, which we then override with the channel's values.
+        if hasattr(pd, "camera") and "camera" in params:
+            pd.camera.setCurrentIndex(params["camera"])
+        pd.box_spinbox.setValue(params["box"])
+        pd.mng_min_spinbox.setValue(params["mng_min"])
+        pd.mng_max_spinbox.setValue(params["mng_max"])
+        pd.mng_slider.setValue(params["mng"])
+        pd.mng_spinbox.setValue(params["mng"])
+        pd.fit_method.setCurrentIndex(params["fit_method"])
+        pd.baseline.setValue(params["baseline"])
+        pd.gain.setValue(params["gain"])
+        pd.sensitivity.setValue(params["sensitivity"])
+        pd.qe.setValue(params["qe"])
+        pd.pixelsize.setValue(params["pixelsize"])
+        pd.convergence_criterion.setValue(params["convergence"])
+        pd.max_it.setValue(params["max_it"])
+        pd.magnification_factor.setValue(params["magnification"])
+        pd.z_calibration = params["z_calibration"]
+        pd.z_calibration_path = params["z_calibration_path"]
+        pd.z_calib_label.setText(params["z_calib_label"])
+        pd.fit_z_checkbox.setEnabled(params["fit_z_enabled"])
+        pd.fit_z_checkbox.setChecked(params["fit_z"])
+        pd.gpufit_checkbox.setChecked(params["gpufit"])
+        pd.frames_edit.setText(params["frames_edit"])
+
+    def _capture_contrast(self) -> dict:
+        """Snapshot the contrast dialog state."""
+        cd = self.contrast_dialog
+        return {
+            "black": cd.black_spinbox.value(),
+            "white": cd.white_spinbox.value(),
+            "auto": cd.auto_checkbox.isChecked(),
+        }
+
+    def _apply_contrast(self, contrast: dict | None) -> None:
+        """Restore a channel's contrast settings into the dialog."""
+        if not contrast:
+            return
+        cd = self.contrast_dialog
+        cd.auto_checkbox.blockSignals(True)
+        cd.auto_checkbox.setChecked(contrast["auto"])
+        cd.auto_checkbox.blockSignals(False)
+        cd.change_contrast_silently(contrast["black"], contrast["white"])
+
+    def _channels_share_file(self) -> bool:
+        """True when several channels were loaded from one file (so their
+        output names need a channel suffix to avoid overwriting)."""
+        return len(self.channels) > 1 and all(
+            c.path == self.channels[0].path for c in self.channels
+        )
+
+    def channel_output_base(self) -> str:
+        """Base path (no extension) for the active channel's output files,
+        suffixed with the channel name when channels share one file."""
+        base, _ = os.path.splitext(self.movie_path)
+        if self._channels_share_file():
+            name = self.channels[self.current_channel].name
+            base = base + "_" + _sanitize_filename(name)
+        return base
 
     def open_picks(self) -> None:
         """Open a file dialog to select a picks (from Picasso: Render)
@@ -2881,6 +3252,11 @@ class Window(QtWidgets.QMainWindow):
 
     def on_parameters_changed(self) -> None:
         """Reset ``self.locs`` and draw frame."""
+        # Ignore the value changes emitted while restoring a channel's
+        # stored parameters - otherwise switching channels would wipe the
+        # channel's localizations and fit markers.
+        if self._switching_channel:
+            return
         self.locs = None
         self.locs_display = None
         self.ready_for_fit = False
@@ -3088,14 +3464,14 @@ class Window(QtWidgets.QMainWindow):
             sound_path = lib.get_sound_notification_path()
             if sound_path is not None:
                 playsound(sound_path, block=False)
-        base, ext = os.path.splitext(self.movie_path)
+        base = self.channel_output_base()
         if calibrate_z:
             self.parameters_dialog.gpufit_checkbox.setDisabled(False)
             step, frames_per_step, frame_order, ok = (
                 Calibrate3DDialog.getCalibrationSpecs(self)
             )
             if ok:
-                base, ext = os.path.splitext(self.movie_path)
+                base = self.channel_output_base()
                 out_path = base + "_3d_calib.yaml"
                 path, exe = lib.get_save_filename_ext_dialog(
                     self, "Save 3D calibration", out_path, filter="*.yaml"
@@ -3154,7 +3530,7 @@ class Window(QtWidgets.QMainWindow):
 
     def save_locs_after_fit(self) -> None:
         """Save localizations after fitting to an .hdf5 file."""
-        base, ext = os.path.splitext(self.movie_path)
+        base = self.channel_output_base()
         self.save_locs(base + "_locs.hdf5")
 
         if not self.parameters_dialog.quality_check.isEnabled():
@@ -3202,7 +3578,7 @@ class Window(QtWidgets.QMainWindow):
             if len(fiducial_picks) == 0:
                 if drift is not None:
                     # save the AIM drift-corrected localizations
-                    base, ext = os.path.splitext(self.movie_path)
+                    base = self.channel_output_base()
                     self.save_locs(base + "_locs_undrifted.hdf5")
                     # save txt drift file
                     np.savetxt(base + "_locs_drift.txt", drift, newline="\r\n")
@@ -3240,7 +3616,7 @@ class Window(QtWidgets.QMainWindow):
                 "Fiducial-based drift correction finished."
             )
         # save the drift-corrected localizations
-        base, ext = os.path.splitext(self.movie_path)
+        base = self.channel_output_base()
         self.save_locs(base + "_locs_undrifted.hdf5")
         # save txt drift file
         np.savetxt(base + "_locs_drift.txt", drift, newline="\r\n")
@@ -3318,7 +3694,7 @@ class Window(QtWidgets.QMainWindow):
     def save_spots_dialog(self) -> None:
         """Get the path for saving identified spots."""
         if self.movie_path != []:
-            base, ext = os.path.splitext(self.movie_path)
+            base = self.channel_output_base()
             path = base + "_spots.tif"
             path, exe = lib.get_save_filename_ext_dialog(
                 self,
@@ -3333,7 +3709,7 @@ class Window(QtWidgets.QMainWindow):
     def export_current(self) -> None:
         """Export current view as .png or .tif."""
         try:
-            base, ext = os.path.splitext(self.movie_path)
+            base = self.channel_output_base()
         except AttributeError:
             return
         out_path = base + "_view.png"
@@ -3387,7 +3763,7 @@ class Window(QtWidgets.QMainWindow):
     def save_locs_dialog(self) -> None:
         """Get the path to save localizations."""
         if self.movie_path != []:
-            base, ext = os.path.splitext(self.movie_path)
+            base = self.channel_output_base()
             locs_path = base + "_locs.hdf5"
             path, exe = lib.get_save_filename_ext_dialog(
                 self,
@@ -3419,7 +3795,7 @@ class Window(QtWidgets.QMainWindow):
             )
             return
         if self.movie_path != []:
-            base, ext = os.path.splitext(self.movie_path)
+            base = self.channel_output_base()
             ids_path = base + "_identifications.hdf5"
             path, exe = lib.get_save_filename_ext_dialog(
                 self,

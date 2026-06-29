@@ -523,6 +523,50 @@ def load_nd2(
     return movie, [info]
 
 
+def load_nd2_all(
+    path: str,
+    prompt_info: Callable[[dict], tuple[dict, bool]] | None = None,
+) -> tuple[list[ND2Movie], list[list[dict]]] | None:
+    """Load all channels of a Nikon ND2 movie file and their metadata.
+
+    Each channel is returned as an independent ``ND2Movie`` so all
+    channels can be read at the same time. Single-channel files yield a
+    one-element list (identical to ``load_nd2``).
+
+    Parameters
+    ----------
+    path : str
+        The path to the ND2 movie file.
+    prompt_info : Callable, optional
+        Called with the readable movie dimensions if the embedded metadata
+        cannot be parsed, so the user can enter it manually. Must return
+        ``(info, save)`` or None if cancelled.
+
+    Returns
+    -------
+    movies : list of ND2Movie
+        One movie object per channel.
+    infos : list of lists of dicts
+        Per-channel metadata, each carrying a ``"Channel"`` key.
+
+    Returns None if the metadata could not be read and the user cancelled
+    the manual-metadata fallback dialog.
+    """
+    probe = ND2Movie(path)
+    n_channels = probe.n_channels
+    probe.close()
+    movies = []
+    infos = []
+    for i in range(n_channels):
+        movie = ND2Movie(path, channel=i)
+        info = _movie_info_or_prompt(movie, path, prompt_info)
+        if info is None:
+            return None
+        movies.append(movie)
+        infos.append([info])
+    return movies, infos
+
+
 def load_stk(
     path: str,
     prompt_info: Callable[[dict], tuple[dict, bool]] | None = None,
@@ -594,6 +638,44 @@ def load_czi(
     return movie, [movie.info()]
 
 
+def load_czi_all(path: str) -> tuple[list[CZIMovie], list[list[dict]]]:
+    """Load all channels of a Zeiss CZI movie file and their metadata.
+
+    Each channel is returned as an independent ``CZIMovie`` so all
+    channels can be read at the same time (e.g. for across-channel
+    fitting). The file is reopened once per channel; CZI readers are lazy,
+    so this is cheap for the handful of channels typical in SMLM.
+
+    Parameters
+    ----------
+    path : str
+        The path to the CZI movie file.
+
+    Returns
+    -------
+    movies : list of CZIMovie
+        One movie object per channel.
+    infos : list of lists of dicts
+        Per-channel metadata, each carrying a ``"Channel"`` key.
+    """
+    if czifile is None:
+        raise ImportError(
+            "Reading .czi files requires the optional 'czifile' package "
+            "(needs Python >= 3.12). Install it with: "
+            "pip install picassosr[czi]"
+        )
+    probe = CZIMovie(path)
+    channels = list(probe.channels)
+    probe.close()
+    movies = []
+    infos = []
+    for i in range(len(channels)):
+        movie = CZIMovie(path, channel=i)
+        movies.append(movie)
+        infos.append([movie.info()])
+    return movies, infos
+
+
 def load_lif(
     path: str,
     prompt_info: Callable[[list[str]], str] | None = None,
@@ -627,6 +709,44 @@ def load_lif(
         )
     movie = LIFMovie(path, prompt_info=prompt_info)
     return movie, [movie.info()]
+
+
+def load_lif_all(path: str) -> tuple[list[LIFMovie], list[list[dict]]]:
+    """Load all channels of a Leica LIF movie file and their metadata.
+
+    Each channel is returned as an independent ``LIFMovie`` (the image
+    series with the most time frames is used, as in ``load_lif``) so all
+    channels can be read at the same time. The file is reopened once per
+    channel; LIF readers are lazy, so this is cheap.
+
+    Parameters
+    ----------
+    path : str
+        The path to the LIF movie file.
+
+    Returns
+    -------
+    movies : list of LIFMovie
+        One movie object per channel.
+    infos : list of lists of dicts
+        Per-channel metadata, each carrying a ``"Channel"`` key.
+    """
+    if liffile is None:
+        raise ImportError(
+            "Reading .lif files requires the optional 'liffile' package "
+            "(needs Python >= 3.12). Install it with: "
+            "pip install picassosr[lif]"
+        )
+    probe = LIFMovie(path)
+    channels = list(probe.channels)
+    probe.close()
+    movies = []
+    infos = []
+    for i in range(len(channels)):
+        movie = LIFMovie(path, channel=i)
+        movies.append(movie)
+        infos.append([movie.info()])
+    return movies, infos
 
 
 def load_movie(
@@ -683,6 +803,57 @@ def load_movie(
             f"Unsupported movie format: {ext}. Supported formats are"
             f" {MOVIE_EXTENSIONS}."
         )
+
+
+def load_movie_all(
+    path: str,
+    prompt_info=None,
+    progress=None,
+) -> tuple[list[AbstractPicassoMovie], list[list[dict]]] | None:
+    """Load every channel of a movie file as independent movies.
+
+    Mirrors ``load_movie`` but returns parallel lists - one entry per
+    channel. Multi-channel formats (.ims, .czi, .lif, .nd2) expose all of
+    their channels; single-channel formats return one-element lists. Each
+    ``info[0]`` carries a ``"Channel"`` key identifying the channel.
+
+    Parameters
+    ----------
+    path : str
+        The path to the movie file.
+    prompt_info : Callable, optional
+        Manual-metadata fallback callback, forwarded to the formats that
+        may need it (.nd2 and the single-channel formats). Channel
+        selection is never prompted here - all channels are loaded.
+    progress : None
+        Placeholder for progress tracking, not used.
+
+    Returns
+    -------
+    movies : list of AbstractPicassoMovie
+        One movie object per channel.
+    infos : list of lists of dicts
+        Per-channel metadata.
+
+    Returns None if metadata could not be read and the user cancelled the
+    manual-metadata fallback dialog.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".ims":
+        return load_ims_all(path)
+    elif ext == ".czi":
+        return load_czi_all(path)
+    elif ext == ".lif":
+        return load_lif_all(path)
+    elif ext == ".nd2":
+        return load_nd2_all(path, prompt_info=prompt_info)
+    else:
+        # Single-channel formats: wrap load_movie into one-element lists.
+        result = load_movie(path, prompt_info=prompt_info, progress=progress)
+        if result is None:
+            return None
+        movie, info = result
+        return [movie], [info]
 
 
 def load_info(
@@ -1103,7 +1274,7 @@ class ND2Movie(AbstractPicassoMovie):
 
     This class implements a version which uses only ``nd2``."""
 
-    def __init__(self, path: str, verbose: bool = False):
+    def __init__(self, path: str, verbose: bool = False, channel: int = 0):
         super().__init__()
         if verbose:
             print("Reading info from {}".format(path))
@@ -1112,7 +1283,7 @@ class ND2Movie(AbstractPicassoMovie):
         self.dask = self.nd2file.to_dask()
         self.sizes = self.nd2file.sizes
 
-        required_dims = ["T", "Y", "X"]  # exactly these, not more
+        required_dims = ["T", "Y", "X"]  # always required
         for dim in required_dims:
             if dim not in self.nd2file.sizes.keys():
                 raise KeyError(
@@ -1120,13 +1291,29 @@ class ND2Movie(AbstractPicassoMovie):
                         dim, self.path
                     )
                 )
-        if self.nd2file.ndim != len(required_dims):
+        # Allow an optional channel (C) axis; reject any other extra
+        # dimension (e.g. Z, P), as before.
+        allowed_dims = set(required_dims) | {"C"}
+        extra_dims = set(self.nd2file.sizes.keys()) - allowed_dims
+        if extra_dims:
             raise KeyError(
-                "File {:s} has dimensions {:s} ".format(
-                    self.path, str(self.nd2file.sizes.keys())
+                "File {:s} has unsupported dimensions {:s}; only T, Y, X "
+                "and C are supported.".format(
+                    self.path, str(sorted(extra_dims))
                 )
-                + "but should have exactly {:s}.".format(str(required_dims))
             )
+
+        # Channel selection. Single-channel files default to channel 0, so
+        # their behaviour is unchanged.
+        self.n_channels = int(self.nd2file.sizes.get("C", 1))
+        self._channel = channel if 0 <= channel < self.n_channels else 0
+        self.channels = [f"Channel {i}" for i in range(self.n_channels)]
+        try:
+            names = [c.channel.name for c in self.nd2file.metadata.channels]
+            if len(names) == self.n_channels and all(names):
+                self.channels = [str(n) for n in names]
+        except Exception:
+            pass
 
         # Pixel access only needs the dimensions checked above; parsing
         # the (often vendor-specific) metadata may still fail. Keep that
@@ -1143,7 +1330,11 @@ class ND2Movie(AbstractPicassoMovie):
         ]
 
     def info(self) -> dict:
-        return self.meta
+        if self.meta is None:
+            return None
+        info = dict(self.meta)
+        info["Channel"] = self.channels[self._channel]
+        return info
 
     def get_metadata(self, nd2file: nd2.ND2File) -> dict:
         """Bring the file metadata in a readable form, and preprocesses
@@ -1402,7 +1593,7 @@ class ND2Movie(AbstractPicassoMovie):
         self.nd2file.close()
 
     def get_frame(self, index: int) -> lib.IntArray2D:
-        """Load one frame of the movie.
+        """Load one frame of the movie at the selected channel.
 
         Parameters
         ----------
@@ -1414,7 +1605,17 @@ class ND2Movie(AbstractPicassoMovie):
         frame : lib.IntArray2D
             2D array representing the image data of the frame
         """
-        return self.dask[index].compute()
+        # Index the dask array along each axis in its native order. For a
+        # plain (T, Y, X) file this reduces to ``self.dask[index]``.
+        selection = []
+        for dim in self.sizes:
+            if dim == "T":
+                selection.append(index)
+            elif dim == "C":
+                selection.append(self._channel)
+            else:  # Y, X
+                selection.append(slice(None))
+        return np.squeeze(self.dask[tuple(selection)].compute())
 
     def tofile(self, file_handle, byte_order=None):
         raise NotImplementedError("Cannot write .nd2 file.")
@@ -1551,15 +1752,21 @@ class _MultiDimMovie(AbstractPicassoMovie):
         self,
         channels: list[str],
         prompt_info: Callable[[list[str]], str] | None,
+        channel: int | None = None,
     ) -> None:
         """Store the available channels and pick one.
 
-        Defaults to the first channel when there is only one or when no
-        prompt is supplied (e.g. command-line batch processing), matching
+        When ``channel`` is given (an index), it is pinned directly and no
+        prompt is shown - used to load every channel as an independent
+        movie (see ``load_czi_all`` / ``load_lif_all``). Otherwise defaults
+        to the first channel when there is only one or when no prompt is
+        supplied (e.g. command-line batch processing), matching
         ``load_ims``.
         """
         self.channels = list(channels) if channels else ["Channel 0"]
-        if len(self.channels) > 1 and prompt_info is not None:
+        if channel is not None:
+            self._channel = channel if 0 <= channel < len(self.channels) else 0
+        elif len(self.channels) > 1 and prompt_info is not None:
             choice = prompt_info(self.channels)
             if choice in self.channels:
                 self._channel = self.channels.index(choice)
@@ -1644,6 +1851,7 @@ class CZIMovie(_MultiDimMovie):
         self,
         path: str,
         prompt_info: Callable[[list[str]], str] | None = None,
+        channel: int | None = None,
     ):
         super().__init__()
         self.path = os.path.abspath(path)
@@ -1678,7 +1886,7 @@ class CZIMovie(_MultiDimMovie):
                 channels = [str(n) for n in names]
         except Exception:
             pass
-        self._select_channel(channels, prompt_info)
+        self._select_channel(channels, prompt_info, channel)
 
     def _read_plane(self, index: int) -> np.ndarray:
         # Pin every non-spatial axis to a single coordinate so asarray
@@ -1729,6 +1937,7 @@ class LIFMovie(_MultiDimMovie):
         self,
         path: str,
         prompt_info: Callable[[list[str]], str] | None = None,
+        channel: int | None = None,
     ):
         super().__init__()
         self.path = os.path.abspath(path)
@@ -1771,7 +1980,7 @@ class LIFMovie(_MultiDimMovie):
                 channels = [str(n) for n in list(names)]
         except Exception:
             pass
-        self._select_channel(channels, prompt_info)
+        self._select_channel(channels, prompt_info, channel)
 
     def _read_plane(self, index: int) -> np.ndarray:
         indices = {}
