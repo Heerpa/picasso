@@ -323,9 +323,9 @@ class View(QtWidgets.QGraphicsView):
         event.accept()
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
-        """Zoom in/out with the mouse wheel."""
+        """Zoom in/out with the mouse wheel, centered on the cursor."""
         scale = 1.008 ** (-event.angleDelta().y())
-        self.window.zoom(scale)
+        self.window.zoom(scale, anchor=event.position().toPoint())
 
     def on_scroll(self) -> None:
         """Redraw the frame if scale bar is shown."""
@@ -3813,8 +3813,10 @@ class Window(QtWidgets.QMainWindow):
         """Zoom out the view."""
         self.zoom(7 / 10)
 
-    def zoom(self, factor: float) -> None:
-        """Zoom in or out the view by a specific factor."""
+    def zoom(self, factor: float, anchor: QtCore.QPoint | None = None) -> None:
+        """Zoom in or out the view by a specific factor. Anchor can
+        specify the cursor position, otherwise zooms to/from the
+        viewport's center."""
         if not hasattr(self, "movie") or self.movie is None:
             return
         # do not allow zooming out too much
@@ -3824,17 +3826,20 @@ class Window(QtWidgets.QMainWindow):
             if visible_scene_rect.width() / factor > self.movie.shape[2]:
                 self.fit_in_view()
                 return
-        # get the center of the current visible viewport in scene coordinates
-        viewport_rect = self.view.viewport().rect()
-        viewport_center = QtCore.QPointF(
-            viewport_rect.x() + viewport_rect.width() / 2.0,
-            viewport_rect.y() + viewport_rect.height() / 2.0,
+        # fall back to the viewport center if no anchor is given
+        # (e.g. zoom in/out from the menu or keyboard shortcuts)
+        if anchor is None:
+            anchor = self.view.viewport().rect().center()
+        # adjust the transform directly so the scene point under the
+        # anchor stays fixed (NoAnchor avoids scrollbar rounding drift)
+        self.view.setTransformationAnchor(
+            QtWidgets.QGraphicsView.ViewportAnchor.NoAnchor
         )
-        scene_center = self.view.mapToScene(viewport_center.toPoint())
-        # apply the zoom
+        old_scene_pos = self.view.mapToScene(anchor)
         self.view.scale(factor, factor)
-        # re-center the view on the same scene point
-        self.view.centerOn(scene_center)
+        new_scene_pos = self.view.mapToScene(anchor)
+        delta = new_scene_pos - old_scene_pos
+        self.view.translate(delta.x(), delta.y())
 
         self.draw_frame()
 
