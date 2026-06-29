@@ -12164,7 +12164,6 @@ class Window(QtWidgets.QMainWindow):
         undrift_from_picked2d_action.triggered.connect(
             self.view.undrift_from_picked2d
         )
-
         undrift_action = postprocess_menu.addAction("Undrift by RCC")
         undrift_action.triggered.connect(self.view.undrift_rcc)
         drift_action = postprocess_menu.addAction("Undo drift")

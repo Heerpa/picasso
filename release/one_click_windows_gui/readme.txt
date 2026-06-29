@@ -22,6 +22,10 @@ Creating your own installer
 
 You can create the exe file yourself by cloning our GitHub repo and running the script picasso/release/one_click_windows_gui/create_installer_windows.bat from the Command Prompt. Note that you must have conda installed on your computer.
 
+There are two editions of the installer:
+- create_installer_windows.bat builds the standard (CPU) installer (Picasso-Windows-64bit-<version>.exe, installs to C:\Picasso).
+- create_installer_windows_gpu.bat builds the GPU edition (Picasso-Windows-64bit-GPU-<version>.exe, installs to C:\Picasso-GPU). It additionally bundles the CUDA runtime (numba-cuda[cu12]) so GPU-accelerated (numba.cuda) code can run. It requires an NVIDIA (CUDA-capable) GPU and produces a noticeably larger installer. The two editions install to separate folders and can coexist.
+
 Adding camera configuration and plugins
 ---------------------------------------
 

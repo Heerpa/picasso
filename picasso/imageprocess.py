@@ -280,6 +280,59 @@ def find_fiducials(
     return picks, box
 
 
+def quick_fiducials_check(
+    locs: pd.DataFrame,
+    info: list[dict],
+    fraction: float = 0.8,
+    region_size: float = 1000.0,
+) -> int:
+    """Quickly estimate whether fiducial markers are likely present.
+
+    Unlike ``find_fiducials``, this does not render an image or run spot
+    identification. It bins localizations onto a coarse 2D grid (one bin
+    per ``region_size`` nm) and counts the bins that contain more than
+    ``fraction * n_frames`` localizations. Such dense, persistent regions
+    are characteristic of fiducial markers (e.g. gold beads), which are
+    present in nearly every frame, whereas blinking emitters are not.
+
+    This is a cheap heuristic intended as a fast pre-check. It may miss
+    fiducials split across bin boundaries; use ``find_fiducials`` for an
+    accurate localization of the markers.
+
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations.
+    info : list of dicts
+        Localizations' metadata (from the corresponding .yaml file).
+    fraction : float, optional
+        Fraction of the total number of frames a region must exceed (in
+        localization count) to be flagged as a likely fiducial. Default
+        is 0.8.
+    region_size : float, optional
+        Approximate bin size in nm. Default is 1,000 nm.
+
+    Returns
+    -------
+    n_regions : int
+        Number of grid regions flagged as likely fiducial markers. A
+        value greater than zero suggests fiducials are present.
+    """
+    if len(locs) == 0:
+        return 0
+    n_frames = lib.get_from_metadata(info, "Frames", raise_error=True)
+    pixelsize = lib.get_from_metadata(info, "Pixelsize", raise_error=True)
+    bin_px = region_size / pixelsize
+
+    x = np.asarray(locs["x"])
+    y = np.asarray(locs["y"])
+    n_bins_x = max(1, int(np.ceil((x.max() - x.min()) / bin_px)))
+    n_bins_y = max(1, int(np.ceil((y.max() - y.min()) / bin_px)))
+
+    hist, _, _ = np.histogram2d(x, y, bins=[n_bins_x, n_bins_y])
+    return int(np.count_nonzero(hist > fraction * n_frames))
+
+
 def radial_sum(image: lib.FloatArray2D) -> lib.FloatArray1D:
     """Compute the radial projection of the sum of pixel values.
 
