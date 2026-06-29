@@ -14,6 +14,7 @@ from __future__ import annotations
 import os.path
 import re
 import sys
+import threading
 import time
 from collections import UserDict
 from dataclasses import dataclass, field
@@ -81,6 +82,74 @@ class Channel:
 def _sanitize_filename(name: str) -> str:
     """Turn a channel name into a filename-safe suffix."""
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "channel"
+
+
+class MovieLoadWorker(QtCore.QObject):
+    """Load several movie files off the GUI thread, one file per channel.
+
+    Loading large movies on the main thread blocks Qt's event loop, so the
+    window stops repainting and responding while several files are read.
+    This worker runs ``io.load_movie`` for each path on a background
+    thread instead.
+
+    The ``prompt_info`` callbacks show modal dialogs and therefore *must*
+    run on the GUI thread. When a loader needs one, the worker emits
+    ``prompt_requested`` (delivered to the main thread via a queued
+    connection) and blocks on a ``threading.Event`` until the main thread
+    has filled the answer into the shared ``holder`` dict and released it.
+    """
+
+    progress = QtCore.pyqtSignal(int, str)  # index, filename
+    # callback, (args, kwargs), holder dict for the return value
+    prompt_requested = QtCore.pyqtSignal(object, object, object)
+    finished = QtCore.pyqtSignal(list, list, list)  # movies, infos, paths
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, paths: list[str], prompt_for_path) -> None:
+        super().__init__()
+        self.paths = paths
+        self._prompt_for_path = prompt_for_path
+        self._prompt_event = threading.Event()
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Request cancellation; takes effect before the next file."""
+        self._cancelled = True
+        # Release the worker if it is currently blocked on a prompt.
+        self._prompt_event.set()
+
+    def _proxy_prompt(self, callback):
+        """Wrap a GUI prompt callback so the dialog runs on the main
+        thread while the worker thread blocks for the result."""
+
+        def wrapper(*args, **kwargs):
+            holder = {}
+            self._prompt_event.clear()
+            self.prompt_requested.emit(callback, (args, kwargs), holder)
+            self._prompt_event.wait()
+            return holder.get("result")
+
+        return wrapper
+
+    def run(self) -> None:
+        movies, infos, paths = [], [], []
+        try:
+            for i, path in enumerate(self.paths):
+                if self._cancelled:
+                    break
+                self.progress.emit(i, os.path.basename(path))
+                prompt = self._proxy_prompt(self._prompt_for_path(path))
+                result = io.load_movie(path, prompt_info=prompt)
+                if result is None:
+                    continue
+                movie, info = result
+                movies.append(movie)
+                infos.append(info)
+                paths.append(path)
+        except Exception as e:  # noqa: BLE001 - reported to the GUI
+            self.failed.emit(str(e))
+            return
+        self.finished.emit(movies, infos, paths)
 
 
 class RubberBand(QtWidgets.QRubberBand):
@@ -2201,6 +2270,12 @@ class Window(QtWidgets.QMainWindow):
         # locs/markers.
         self._switching_channel = False
 
+        # Background movie-loading worker state (see open_channels_from_files).
+        self._load_thread = None
+        self._load_worker = None
+        self._load_progress = None
+        self._load_t0 = 0.0
+
         self.load_user_settings()
 
     def load_user_settings(self) -> None:
@@ -2573,29 +2648,96 @@ class Window(QtWidgets.QMainWindow):
             self.open_channels_from_files(paths)
 
     def open_channels_from_files(self, paths: list[str]) -> None:
-        """Load several movie files as channels (one file per channel)."""
-        t0 = time.time()
-        movies, infos, names, loaded_paths = [], [], [], []
-        for path in paths:
-            result = io.load_movie(
-                path, prompt_info=self._prompt_for_path(path)
-            )
-            if result is None:
-                continue
-            movie, info = result
-            movies.append(movie)
-            infos.append(info)
-            loaded_paths.append(path)
-            names.append(
-                self._channel_name(info, path, len(names), multi_file=True)
-            )
+        """Load several movie files as channels (one file per channel).
+
+        Loading runs on a background thread (see ``MovieLoadWorker``) so the
+        GUI keeps repainting and responding while the files are read.
+        """
+        if getattr(self, "_load_thread", None) is not None:
+            # A load is already in progress; ignore re-entrant requests.
+            return
+
+        self._load_t0 = time.time()
+        progress = QtWidgets.QProgressDialog(
+            "Loading channels...", "Cancel", 0, len(paths), self
+        )
+        progress.setWindowTitle("Opening channels")
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        self._load_progress = progress
+
+        thread = QtCore.QThread(self)
+        worker = MovieLoadWorker(paths, self._prompt_for_path)
+        worker.moveToThread(thread)
+        self._load_thread = thread
+        self._load_worker = worker
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_load_progress)
+        worker.prompt_requested.connect(self._on_load_prompt_requested)
+        worker.finished.connect(self._on_load_finished)
+        worker.failed.connect(self._on_load_failed)
+        # Direct connection so the flag is set from the GUI thread
+        # immediately; the worker thread is busy in run() and would not
+        # service a queued slot until the current file finished.
+        progress.canceled.connect(
+            worker.cancel, QtCore.Qt.ConnectionType.DirectConnection
+        )
+        thread.start()
+
+    def _on_load_progress(self, index: int, filename: str) -> None:
+        """Update the progress dialog as each file starts loading."""
+        if self._load_progress is not None:
+            self._load_progress.setLabelText(f"Loading {filename}...")
+            self._load_progress.setValue(index)
+
+    def _on_load_prompt_requested(
+        self, callback, args_kwargs, holder: dict
+    ) -> None:
+        """Run a worker-requested metadata prompt on the GUI thread and
+        hand the result back, then unblock the worker."""
+        args, kwargs = args_kwargs
+        try:
+            holder["result"] = callback(*args, **kwargs)
+        finally:
+            self._load_worker._prompt_event.set()
+
+    def _finish_load(self) -> None:
+        """Tear down the worker thread and progress dialog."""
+        if self._load_progress is not None:
+            self._load_progress.close()
+            self._load_progress = None
+        if self._load_thread is not None:
+            self._load_thread.quit()
+            self._load_thread.wait()
+            self._load_thread.deleteLater()
+            self._load_thread = None
+        if self._load_worker is not None:
+            self._load_worker.deleteLater()
+            self._load_worker = None
+
+    def _on_load_finished(
+        self, movies: list, infos: list, paths: list
+    ) -> None:
+        """Activate the loaded channels once the worker is done."""
+        self._finish_load()
         if not movies:
             return
-        self._set_channels(movies, infos, loaded_paths, names)
-        dt = time.time() - t0
+        names = [
+            self._channel_name(infos[i], paths[i], i, multi_file=True)
+            for i in range(len(movies))
+        ]
+        self._set_channels(movies, infos, paths, names)
+        dt = time.time() - self._load_t0
         self.status_bar.showMessage(
             f"Opened {len(movies)} channel(s) in {dt:.2f} seconds."
         )
+
+    def _on_load_failed(self, message: str) -> None:
+        """Report a load error and tear down the worker."""
+        self._finish_load()
+        QtWidgets.QMessageBox.warning(self, "Could not load file", message)
 
     def _channel_name(
         self,
