@@ -295,9 +295,9 @@ def quick_fiducials_check(
     are characteristic of fiducial markers (e.g. gold beads), which are
     present in nearly every frame, whereas blinking emitters are not.
 
-    This is a cheap heuristic intended as a fast pre-check (e.g. before
-    COMET undrifting). It may miss fiducials split across bin boundaries;
-    use ``find_fiducials`` for an accurate localization of the markers.
+    This is a cheap heuristic intended as a fast pre-check. It may miss
+    fiducials split across bin boundaries; use ``find_fiducials`` for an
+    accurate localization of the markers.
 
     Parameters
     ----------

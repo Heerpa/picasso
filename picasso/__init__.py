@@ -13,8 +13,8 @@ from .version import __version__  # noqa: F401
 
 # In frozen (PyInstaller) builds the numba-cuda redirect (a site-packages .pth)
 # never runs, so "from numba import cuda" would fall back to Numba's built-in
-# CUDA stub and GPU features (e.g. COMET) silently vanish. Install the redirect
-# here, before anything imports numba.cuda. No-op outside frozen builds.
+# CUDA stub and GPU-accelerated (numba.cuda) code silently vanishes. Install the
+# redirect here, before anything imports numba.cuda. No-op outside frozen builds.
 from . import _numba_cuda_compat as _numba_cuda_compat
 
 _numba_cuda_compat.install()

@@ -14,7 +14,7 @@ Opening Files
 
 Drift Correction
 ----------------
-Picasso offers four procedures to correct for drift: AIM (Ma, H., et al. Science Advances. 2024., option A), use of specific structures in the image as drift markers (option B), an RCC algorithm (option C) and COMET (Reinkensmeier, L., et al. bioRxiv, 2026., option D). AIM is precise, robust, quick, requires no user interaction or fiducial markers (although adding them will may improve performance).  Although RCC does not require any additional sample preparation, option B depends on the presence of either fiducial markers or inherently clustered structures in the image. On the other hand, option B often supports more precise drift estimation and thus allows for higher image resolution. To achieve the highest possible resolution (ultra-resolution), we recommend AIM or consecutive applications of option C and multiple rounds of option B. The drift markers for option B can be features of the image itself (e.g., protein complexes or DNA origami) or intentionally included markers (e.g., DNA origami or gold nanoparticles). When using DNA origami as drift markers, the correction is typically applied in two rounds: first, with whole DNA origami structures as markers, and, second, using single DNA-PAINT binding sites as markers. In both cases, the precision of drift correction strongly depends on the number of selected drift markers.
+Picasso offers three procedures to correct for drift: AIM (Ma, H., et al. Science Advances. 2024., option A), use of specific structures in the image as drift markers (option B) and an RCC algorithm (option C). AIM is precise, robust, quick, requires no user interaction or fiducial markers (although adding them will may improve performance).  Although RCC does not require any additional sample preparation, option B depends on the presence of either fiducial markers or inherently clustered structures in the image. On the other hand, option B often supports more precise drift estimation and thus allows for higher image resolution. To achieve the highest possible resolution (ultra-resolution), we recommend AIM or consecutive applications of option C and multiple rounds of option B. The drift markers for option B can be features of the image itself (e.g., protein complexes or DNA origami) or intentionally included markers (e.g., DNA origami or gold nanoparticles). When using DNA origami as drift markers, the correction is typically applied in two rounds: first, with whole DNA origami structures as markers, and, second, using single DNA-PAINT binding sites as markers. In both cases, the precision of drift correction strongly depends on the number of selected drift markers.
 
 Adaptive Intersection Maximization (AIM) drift correction
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -40,19 +40,6 @@ Redundant cross-correlation drift correction
 1. In ``Picasso: Render``, select ``Postprocess > Undrift by RCC``.
 2. A dialog will appear asking for the segmentation parameter. Although the default value, 1,000 frames, is a sensible choice for most movies, it might be necessary to adjust the segmentation parameter of the algorithm, depending on the total number of frames in the movie and the number of localizations per frame. A smaller segment size results in better temporal drift resolution but requires a movie with more localizations per frame.
 3. After the algorithm finishes, the estimated drift will be displayed in a pop-up window, and the display will show the drift-corrected image.
-
-COMET drift correction
-~~~~~~~~~~~~~~~~~~~~~~~
-
-COMET (Reinkensmeier, L., et al. bioRxiv, 2026.; see also https://comet.smlm.tools) estimates drift directly from the localizations by optimizing the relative shifts between temporal segments. It is fast and requires no fiducial markers, but runs on the GPU, so the option is only available when a CUDA-capable GPU is detected.
-
-1. In ``Picasso: Render``, select ``Postprocess > Undrift by COMET``.
-2. Before the parameter dialog appears, Picasso checks whether the localizations are linked and whether bright fiducial-like regions are present. COMET runs *much* faster on linked localizations, so if your data is not linked yet, a warning will recommend linking first via ``Postprocess > Link localizations``. Likewise, gold particles or other bright fiducials are flagged because they are present in nearly every frame and slow the computation down considerably; consider removing them (``Tools > Pick fiducials`` followed by ``Tools > Remove localizations in picks``). You can choose to continue regardless or cancel and fix these first.
-3. The dialog asks the user to select:
-  a. ``Frames per segment`` - the number of frames used to form each temporal segment. Fewer frames per segment give better temporal resolution of the drift but increase the computational cost.
-  b. ``Maximum drift (nm)`` - the maximum expected drift over the whole dataset, used to bound the pairing and optimization.
-  c. ``Max. localizations per segment`` - an optional downsampling cap applied per segment to reduce memory and runtime. Set to ``-1`` to keep all localizations.
-4. After the algorithm finishes, the estimated drift will be displayed in a pop-up window, and the display will show the drift-corrected image.
 
 
 Picking of regions of interest
@@ -478,10 +465,6 @@ Performs drift correction using the picked localizations as fiducials. Does not 
 Undrift by RCC
 ^^^^^^^^^^^^^^
 Performs drift correction by redundant cross-correlation.
-
-Undrift by COMET
-^^^^^^^^^^^^^^^^
-Performs drift correction using COMET (GPU-based, no fiducials required). Only available when a CUDA-capable GPU is detected. See **COMET drift correction** above.
 
 Undo drift (2D)
 ^^^^^^^^^^^^^^^

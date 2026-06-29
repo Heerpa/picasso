@@ -55,7 +55,6 @@ from .rotation import RotationWindow
 
 # Optional modules with external/hardware dependencies live in ext
 from ..ext.bitplane import IMSWRITER  # PyImarisWrite works on Windows only
-from ..ext import comet
 
 if IMSWRITER:
     from ..ext.bitplane import numpy_to_imaris
@@ -2216,98 +2215,6 @@ class ClsDlg2D(lib.Dialog):
             l_locs,
             clustered_locs,
         )
-
-
-class COMETDialog(QtWidgets.QDialog):
-    """Dialog to choose parameters for COMET undrifting.
-
-    Attributes
-    ----------
-    frames_per_segment : QSpinBox
-        Number of frames per temporal segment.
-    max_drift_nm : QDoubleSpinBox
-        Maximum expected drift in nm.
-    max_locs_per_segment : QSpinBox
-        Optional cap for downsampling localizations per segment.
-        Use -1 to disable downsampling.
-    """
-
-    DOCS_URL = "https://picassosr.readthedocs.io/en/latest/render.html#comet-drift-correction"  # noqa: E501
-
-    def __init__(self, window: QtWidgets.QMainWindow) -> None:
-        super().__init__(window)
-        self.window = window
-        self.setWindowTitle("COMET undrifting")
-
-        vbox = QtWidgets.QVBoxLayout(self)
-        grid = QtWidgets.QGridLayout()
-
-        grid.addWidget(
-            lib.HelpButton(self.DOCS_URL),
-            0,
-            0,
-            alignment=QtCore.Qt.AlignmentFlag.AlignLeft,
-        )
-
-        frames_label = QtWidgets.QLabel("Frames per segment:")
-        frames_label.setToolTip(
-            "Number of frames used to form each temporal segment."
-        )
-        grid.addWidget(frames_label, 1, 0)
-        self.frames_per_segment = QtWidgets.QSpinBox()
-        self.frames_per_segment.setRange(1, int(1e6))
-        self.frames_per_segment.setValue(100)
-        grid.addWidget(self.frames_per_segment, 1, 1)
-
-        max_drift_label = QtWidgets.QLabel("Maximum drift (nm):")
-        max_drift_label.setToolTip(
-            "Maximum expected drift over the dataset. "
-            "Used for pairing and optimization bounds."
-        )
-        grid.addWidget(max_drift_label, 2, 0)
-        self.max_drift_nm = QtWidgets.QDoubleSpinBox()
-        self.max_drift_nm.setRange(0.1, 1e6)
-        self.max_drift_nm.setValue(200.0)
-        self.max_drift_nm.setDecimals(1)
-        self.max_drift_nm.setSingleStep(1.0)
-        grid.addWidget(self.max_drift_nm, 2, 1)
-
-        downsample_label = QtWidgets.QLabel("Max. localizations per segment:")
-        downsample_label.setToolTip(
-            "Optional downsampling cap per segment. "
-            "Set to -1 to keep all localizations."
-        )
-        grid.addWidget(downsample_label, 3, 0)
-        self.max_locs_per_segment = QtWidgets.QSpinBox()
-        self.max_locs_per_segment.setRange(-1, int(1e6))
-        self.max_locs_per_segment.setValue(-1)
-        grid.addWidget(self.max_locs_per_segment, 3, 1)
-
-        vbox.addLayout(grid)
-
-        self.buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
-            QtCore.Qt.Orientation.Horizontal,
-            self,
-        )
-        vbox.addWidget(self.buttons)
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-
-    @staticmethod
-    def getParams(
-        parent: QtWidgets.QMainWindow | None = None,
-    ) -> tuple[dict, bool]:
-        """Create the dialog and return the requested COMET parameters."""
-        dialog = COMETDialog(parent)
-        result = dialog.exec()
-        params = {
-            "frames_per_segment": dialog.frames_per_segment.value(),
-            "max_drift_nm": dialog.max_drift_nm.value(),
-            "max_locs_per_segment": dialog.max_locs_per_segment.value(),
-        }
-        return params, result == QtWidgets.QDialog.DialogCode.Accepted
 
 
 class AIMDialog(lib.Dialog):
@@ -11156,91 +11063,6 @@ class View(QtWidgets.QLabel):
                 self.plot_window.plot(drift)
                 self.plot_window.show()
 
-    def undrift_comet(self) -> None:
-        """Undrift with COMET. See https://comet.smlm.tools and
-        Reinkensmeier L., Aufmkolk S., Farabella I., Egner A., and
-        Bates M. biorxiv, 2026."""
-        channel = self.get_channel("Undrift by COMET")
-        if channel is not None:
-            locs = self.locs[channel]
-            info = self.infos[channel]
-
-            # collect reasons COMET may run slowly so the user can decide
-            # whether to continue or fix them first
-            warnings = []
-            # linked localizations contain the "len" column and run much
-            # faster in COMET
-            if "len" not in locs.columns:
-                warnings.append(
-                    "We recommend to use COMET with linked localizations to "
-                    "drastically improve the speed. Use Postprocess -> Link "
-                    "localizations."
-                )
-            # gold particles and other bright fiducials are present in
-            # nearly every frame and can also slow COMET down considerably
-            n_fiducials = imageprocess.quick_fiducials_check(
-                locs, info, fraction=0.1
-            )
-            if n_fiducials > 0:
-                warnings.append(
-                    f"Detected {n_fiducials} region(s) that look like "
-                    "fiducial markers (e.g. gold particles). These are "
-                    "present in most frames and can slow COMET down "
-                    "considerably; consider removing them first."
-                )
-
-            if warnings:
-                confirm = QtWidgets.QMessageBox.question(
-                    self.window,
-                    "COMET performance warning",
-                    "\n\n".join(warnings)
-                    + "\n\nDo you want to continue anyway?",
-                    QtWidgets.QMessageBox.StandardButton.Yes
-                    | QtWidgets.QMessageBox.StandardButton.No,
-                )
-                if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
-                    return
-
-            params, ok = COMETDialog.getParams(self.window)
-            if ok:
-                # The optimizer sets the real maximum (estimated from the
-                # sigma schedule) via progress.setMaximum once it starts; the
-                # placeholder max of 1 keeps the bar at 0 % during the initial
-                # segmentation and pairing step.
-                progress = lib.ProgressDialog(
-                    "Undrifting by COMET", 0, 1, self.window
-                )
-                progress.set_value(0)
-                try:
-                    locs, new_info, drift = comet.comet(
-                        locs,
-                        info,
-                        progress=progress,
-                        **params,
-                    )
-                except RuntimeError as e:
-                    progress.close()
-                    QtWidgets.QMessageBox.warning(
-                        self.window,
-                        "COMET not available",
-                        (
-                            f"{e}\n\n"
-                            "Please use a different drift-correction method, "
-                            "such as Undrift by AIM or Undrift by RCC."
-                        ),
-                    )
-                    return
-                progress.close()
-
-                locs = lib.ensure_sanity(locs, info)
-                self.locs[channel] = locs
-                self.infos[channel] = new_info
-                self.index_blocks[channel] = None
-                self.render_index[channel] = None
-                self.add_drift(channel, drift)
-                self.update_scene(resample_locs=True)
-                self.show_drift()
-
     def undrift_aim(self) -> None:
         """Undrift with Adaptive Intersection Maximization (AIM).
 
@@ -12265,11 +12087,6 @@ class Window(QtWidgets.QMainWindow):
         undrift_from_picked2d_action.triggered.connect(
             self.view.undrift_from_picked2d
         )
-        undrift_comet_action = postprocess_menu.addAction("Undrift by COMET")
-        undrift_comet_action.triggered.connect(self.view.undrift_comet)
-        if not comet._CUDA_AVAILABLE:
-            undrift_comet_action.setVisible(False)
-
         undrift_action = postprocess_menu.addAction("Undrift by RCC")
         undrift_action.triggered.connect(self.view.undrift_rcc)
         drift_action = postprocess_menu.addAction("Undo drift")

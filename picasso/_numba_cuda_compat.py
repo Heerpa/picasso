@@ -15,8 +15,8 @@ That mechanism is lost in a frozen (PyInstaller) build:
      ignoring that path, so it keeps returning Numba's built-in ``numba.cuda``.
 
 The net effect is that ``numba.cuda.is_available()`` returns False inside the
-frozen app even when the GPU and CUDA runtime are fine, so GPU-only features
-(e.g. COMET drift correction in Render) silently disappear.
+frozen app even when the GPU and CUDA runtime are fine, so any GPU-accelerated
+(numba.cuda) code paths silently fall back to CPU or disappear.
 
 This module reinstalls the redirect with a finder that, for every
 ``numba.cuda`` / ``numba.cuda.*`` import, asks :class:`PathFinder` to load the

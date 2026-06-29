@@ -1,7 +1,8 @@
 """PyInstaller hook: bundle NVIDIA ``cuda.core``'s compiled Cython extensions.
 
-COMET's GPU path imports ``cuda.core`` (via numba-cuda). ``cuda.core``'s actual
-functionality lives in compiled Cython extensions (``.pyd``) under a
+GPU-accelerated (numba.cuda) code imports ``cuda.core`` (via numba-cuda).
+``cuda.core``'s actual functionality lives in compiled Cython extensions
+(``.pyd``) under a
 version-specific subpackage -- ``cuda/core/cu12`` for CUDA 12 -- which it selects
 at import time and merges into ``cuda.core`` itself by rewriting ``cuda.core``'s
 ``__path__``. That runtime ``__path__`` merge is why ``cuda.core._utils.cuda_utils``

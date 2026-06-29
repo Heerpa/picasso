@@ -12,7 +12,7 @@ call python -m build
 
 for /f %%i in ('python -c "exec(open('picasso/version.py').read()); print(__version__)"') do set PICASSO_VERSION=%%i
 REM installer_gpu adds numba-cuda[cu12], which pulls the nvidia-*-cu12 CUDA
-REM runtime wheels needed for GPU features such as COMET.
+REM runtime wheels needed to run numba.cuda (GPU-accelerated) code.
 call pip install "dist/picassosr-%PICASSO_VERSION%-py3-none-any.whl[installer_gpu]"
 call cd release/one_click_windows_gui
 
@@ -34,10 +34,10 @@ REM                              via __path__; --collect-all drops those .pyd, s
 REM                              hook-cuda.core.py copies them to their real path.
 REM Note: numba-cuda redirects "numba.cuda" to its own target via a
 REM site-packages .pth file that PyInstaller does not run, so the frozen app
-REM would keep Numba's built-in CUDA stub and GPU features such as COMET would
-REM vanish. picasso/_numba_cuda_compat.py reinstalls that redirect at import
-REM time (shipped via --collect-all picasso), so no extra PyInstaller flag is
-REM needed here.
+REM would keep Numba's built-in CUDA stub and GPU-accelerated (numba.cuda) code
+REM would fall back to CPU or vanish. picasso/_numba_cuda_compat.py reinstalls
+REM that redirect at import time (shipped via --collect-all picasso), so no extra
+REM PyInstaller flag is needed here.
 call pyinstaller "../pyinstaller/picasso_pyinstaller.py" ^
     --onedir ^
     --collect-all picasso ^

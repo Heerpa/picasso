@@ -24,7 +24,7 @@ You can create the exe file yourself by cloning our GitHub repo and running the 
 
 There are two editions of the installer:
 - create_installer_windows.bat builds the standard (CPU) installer (Picasso-Windows-64bit-<version>.exe, installs to C:\Picasso).
-- create_installer_windows_gpu.bat builds the GPU edition (Picasso-Windows-64bit-GPU-<version>.exe, installs to C:\Picasso-GPU). It additionally bundles the CUDA runtime (numba-cuda[cu12]) so GPU-accelerated features such as COMET drift correction are available. It requires an NVIDIA (CUDA-capable) GPU and produces a noticeably larger installer. The two editions install to separate folders and can coexist.
+- create_installer_windows_gpu.bat builds the GPU edition (Picasso-Windows-64bit-GPU-<version>.exe, installs to C:\Picasso-GPU). It additionally bundles the CUDA runtime (numba-cuda[cu12]) so GPU-accelerated (numba.cuda) code can run. It requires an NVIDIA (CUDA-capable) GPU and produces a noticeably larger installer. The two editions install to separate folders and can coexist.
 
 Adding camera configuration and plugins
 ---------------------------------------
