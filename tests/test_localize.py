@@ -11,14 +11,17 @@ Tests for ``gausslq``, ``gaussmle`` and ``zfit`` live in their own files
 
 from __future__ import annotations
 
+import sys
 import time
 
 import h5py
 import numpy as np
 import pandas as pd
 import pytest
+from PyQt6 import QtWidgets
 
 from picasso import io, localize
+from picasso.gui import localize as localize_gui
 
 from tests.conftest import BOX, CALIB_3D, CAMERA_INFO, MIN_NG, PIXELSIZE
 
@@ -1209,3 +1212,179 @@ class TestLocalize3D:
             assert col in locs.columns
         assert np.all(np.isfinite(locs["z"].to_numpy()))
         assert (locs["lpz"] > 0).all()
+
+
+# ---------------------------------------------------------------------------
+# MovieLoadWorker — background loader for Picasso: Localize
+#
+# The GUI opens movies on a background QThread so the window stays
+# responsive (see picasso.gui.localize.MovieLoadWorker). These tests drive
+# the worker's run() directly with monkeypatched io loaders — no QThread is
+# started, so signals delivered to same-thread receivers fire synchronously
+# (Qt DirectConnection), which is exactly what we rely on to observe them.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _qt_app():
+    """A QApplication must exist before any QObject (the worker) is built."""
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        app = QtWidgets.QApplication(sys.argv)
+    yield app
+
+
+class _Collector:
+    """Records the worker's terminal signals for assertions."""
+
+    def __init__(self, worker):
+        self.finished = None
+        self.failed = None
+        self.progress = []
+        worker.finished.connect(self._on_finished)
+        worker.failed.connect(self._on_failed)
+        worker.progress.connect(
+            lambda i, name: self.progress.append((i, name))
+        )
+
+    def _on_finished(self, movies, infos, paths):
+        self.finished = (movies, infos, paths)
+
+    def _on_failed(self, message):
+        self.failed = message
+
+
+def _info(name="Channel 0"):
+    return [{"Frames": 1, "Height": 4, "Width": 4, "Channel": name}]
+
+
+class TestMovieLoadWorker:
+    def test_load_movie_per_file(self, monkeypatch):
+        """load_all=False loads one channel per path via io.load_movie."""
+        loaded = {}
+
+        def fake_load_movie(path, prompt_info=None, progress=None):
+            loaded[path] = prompt_info
+            return f"movie::{path}", _info(path)
+
+        monkeypatch.setattr(io, "load_movie", fake_load_movie)
+        worker = localize_gui.MovieLoadWorker(
+            ["a.tif", "b.tif"], prompt_for_path=lambda p: None
+        )
+        out = _Collector(worker)
+        worker.run()
+
+        movies, infos, paths = out.finished
+        assert movies == ["movie::a.tif", "movie::b.tif"]
+        assert paths == ["a.tif", "b.tif"]
+        assert infos[1][0]["Channel"] == "b.tif"
+        assert out.failed is None
+        # One progress tick per file, in order.
+        assert [i for i, _ in out.progress] == [0, 1]
+
+    def test_load_all_expands_channels(self, monkeypatch):
+        """load_all=True reads every channel of each file via
+        io.load_movie_all; each returned movie maps back to its path."""
+
+        def fake_load_movie_all(path, prompt_info=None, progress=None):
+            return ["m0", "m1", "m2"], [_info("c0"), _info("c1"), _info("c2")]
+
+        monkeypatch.setattr(io, "load_movie_all", fake_load_movie_all)
+        worker = localize_gui.MovieLoadWorker(
+            ["multi.lif"], prompt_for_path=lambda p: None, load_all=True
+        )
+        out = _Collector(worker)
+        worker.run()
+
+        movies, infos, paths = out.finished
+        assert movies == ["m0", "m1", "m2"]
+        # Every channel is attributed to the one source file.
+        assert paths == ["multi.lif", "multi.lif", "multi.lif"]
+        assert len(infos) == 3
+
+    def test_none_result_is_skipped(self, monkeypatch):
+        """A loader returning None (e.g. a cancelled prompt) drops that
+        file without aborting the rest of the batch."""
+
+        def fake_load_movie(path, prompt_info=None, progress=None):
+            if path == "skip.tif":
+                return None
+            return f"movie::{path}", _info(path)
+
+        monkeypatch.setattr(io, "load_movie", fake_load_movie)
+        worker = localize_gui.MovieLoadWorker(
+            ["skip.tif", "keep.tif"], prompt_for_path=lambda p: None
+        )
+        out = _Collector(worker)
+        worker.run()
+
+        movies, _, paths = out.finished
+        assert movies == ["movie::keep.tif"]
+        assert paths == ["keep.tif"]
+
+    def test_prompt_is_proxied_and_result_returned(self, monkeypatch):
+        """A loader that calls prompt_info gets the value the GUI handler
+        supplies: the worker emits prompt_requested, the (same-thread)
+        handler fills the holder and releases the worker's event."""
+
+        def fake_load_movie(path, prompt_info=None, progress=None):
+            chosen = prompt_info(["DAPI", "GFP"])
+            return f"movie::{chosen}", _info(chosen)
+
+        monkeypatch.setattr(io, "load_movie", fake_load_movie)
+        worker = localize_gui.MovieLoadWorker(
+            ["m.czi"], prompt_for_path=lambda p: (lambda chans: "GFP")
+        )
+
+        seen = {}
+
+        def handle_prompt(callback, args_kwargs, holder):
+            args, kwargs = args_kwargs
+            seen["channels"] = args[0]
+            holder["result"] = callback(*args, **kwargs)
+            worker._prompt_event.set()
+
+        worker.prompt_requested.connect(handle_prompt)
+        out = _Collector(worker)
+        worker.run()
+
+        assert seen["channels"] == ["DAPI", "GFP"]
+        assert out.finished[0] == ["movie::GFP"]
+
+    def test_exception_emits_failed(self, monkeypatch):
+        """A loader error is reported through the failed signal rather than
+        propagating out of run() (which runs on a worker thread)."""
+
+        def boom(path, prompt_info=None, progress=None):
+            raise RuntimeError("bad file")
+
+        monkeypatch.setattr(io, "load_movie", boom)
+        worker = localize_gui.MovieLoadWorker(
+            ["x.tif"], prompt_for_path=lambda p: None
+        )
+        out = _Collector(worker)
+        worker.run()
+
+        assert out.finished is None
+        assert "bad file" in out.failed
+
+    def test_cancel_stops_before_next_file(self, monkeypatch):
+        """cancel() set during a load stops the loop before the next
+        file, so the batch ends with only the files read so far."""
+        seen = []
+
+        def fake_load_movie(path, prompt_info=None, progress=None):
+            seen.append(path)
+            worker.cancel()  # cancel while the first file is "loading"
+            return f"movie::{path}", _info(path)
+
+        worker = localize_gui.MovieLoadWorker(
+            ["first.tif", "second.tif"], prompt_for_path=lambda p: None
+        )
+        monkeypatch.setattr(io, "load_movie", fake_load_movie)
+        out = _Collector(worker)
+        worker.run()
+
+        # Only the first file was loaded; the second was never attempted.
+        assert seen == ["first.tif"]
+        assert out.finished[2] == ["first.tif"]
