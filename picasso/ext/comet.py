@@ -23,7 +23,7 @@ try:
     # NumbaPerformanceWarning about GPU under-utilization. This is expected
     # and harmless here, so silence that specific warning.
     warnings.filterwarnings("ignore", category=NumbaPerformanceWarning)
-except Exception:
+except Exception:  # pragma: no cover - depends on the runtime CUDA stack
     _cuda = None
     _CUDA_AVAILABLE = False
 
