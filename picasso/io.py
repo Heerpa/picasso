@@ -186,7 +186,6 @@ def load_ims(
             channel = "Channel 0"
         else:
             channel = prompt_info(file.channels)
-        print(f"Setting channel to {channel}")
         file.set_channel(channel)
 
     else:
@@ -1774,7 +1773,6 @@ class _MultiDimMovie(AbstractPicassoMovie):
                 self._channel = 0
         else:
             self._channel = 0
-        print(f"Setting channel to {self.channels[self._channel]}")
 
     def _read_plane(self, index: int) -> np.ndarray:
         """Return the raw 2D image of time point ``index`` at the selected

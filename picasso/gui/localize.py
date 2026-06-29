@@ -105,10 +105,16 @@ class MovieLoadWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(list, list, list)  # movies, infos, paths
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, paths: list[str], prompt_for_path) -> None:
+    def __init__(
+        self, paths: list[str], prompt_for_path, load_all: bool = False
+    ) -> None:
         super().__init__()
         self.paths = paths
         self._prompt_for_path = prompt_for_path
+        # When True, each path is read with ``io.load_movie_all`` (every
+        # channel of one multichannel file); otherwise ``io.load_movie``
+        # loads one channel per file.
+        self.load_all = load_all
         self._prompt_event = threading.Event()
         self._cancelled = False
 
@@ -139,13 +145,23 @@ class MovieLoadWorker(QtCore.QObject):
                     break
                 self.progress.emit(i, os.path.basename(path))
                 prompt = self._proxy_prompt(self._prompt_for_path(path))
-                result = io.load_movie(path, prompt_info=prompt)
-                if result is None:
-                    continue
-                movie, info = result
-                movies.append(movie)
-                infos.append(info)
-                paths.append(path)
+                if self.load_all:
+                    result = io.load_movie_all(path, prompt_info=prompt)
+                    if result is None:
+                        continue
+                    file_movies, file_infos = result
+                    for movie, info in zip(file_movies, file_infos):
+                        movies.append(movie)
+                        infos.append(info)
+                        paths.append(path)
+                else:
+                    result = io.load_movie(path, prompt_info=prompt)
+                    if result is None:
+                        continue
+                    movie, info = result
+                    movies.append(movie)
+                    infos.append(info)
+                    paths.append(path)
         except Exception as e:  # noqa: BLE001 - reported to the GUI
             self.failed.emit(str(e))
             return
@@ -2275,6 +2291,14 @@ class Window(QtWidgets.QMainWindow):
         self._load_worker = None
         self._load_progress = None
         self._load_t0 = 0.0
+        self._load_multi_file = False
+        # Make sure a running loader thread is stopped before the
+        # QApplication is destroyed; destroying a live QThread aborts the
+        # process. ``aboutToQuit`` fires on every quit path (including
+        # sys.exit through the event loop), unlike ``closeEvent``.
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._stop_movie_load)
 
         self.load_user_settings()
 
@@ -2302,6 +2326,7 @@ class Window(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         """Close the application, save user settings."""
+        self._stop_movie_load()
         settings = io.load_user_settings()
         if self.movie_path != []:
             settings["Localize"]["PWD"] = os.path.dirname(self.movie_path)
@@ -2582,15 +2607,7 @@ class Window(QtWidgets.QMainWindow):
 
     def open(self, path: str) -> None:
         """Open a single movie file as one channel."""
-        t0 = time.time()
-        result = io.load_movie(path, prompt_info=self._prompt_for_path(path))
-        if result is None:
-            return
-        movie, info = result
-        name = self._channel_name(info, path, 0)
-        self._set_channels([movie], [info], [path], [name])
-        dt = time.time() - t0
-        self.status_bar.showMessage(f"Opened movie in {dt:.2f} seconds.")
+        self._start_movie_load([path], self._prompt_for_path)
 
     def open_multichannel_file_dialog(self) -> None:
         """Open a single file and load *all* of its channels."""
@@ -2607,27 +2624,8 @@ class Window(QtWidgets.QMainWindow):
 
     def open_multichannel_file(self, path: str) -> None:
         """Load every channel of a single multichannel file."""
-        t0 = time.time()
-        try:
-            result = io.load_movie_all(
-                path, prompt_info=self.prompt_movie_info
-            )
-        except ImportError as e:
-            QtWidgets.QMessageBox.warning(self, "Could not load file", str(e))
-            return
-        if result is None:
-            return
-        movies, infos = result
-        if not movies:
-            return
-        paths = [path] * len(movies)
-        names = [
-            self._channel_name(infos[i], path, i) for i in range(len(movies))
-        ]
-        self._set_channels(movies, infos, paths, names)
-        dt = time.time() - t0
-        self.status_bar.showMessage(
-            f"Opened {len(movies)} channel(s) in {dt:.2f} seconds."
+        self._start_movie_load(
+            [path], lambda _p: self.prompt_movie_info, load_all=True
         )
 
     def open_channels_from_files_dialog(self) -> None:
@@ -2648,27 +2646,40 @@ class Window(QtWidgets.QMainWindow):
             self.open_channels_from_files(paths)
 
     def open_channels_from_files(self, paths: list[str]) -> None:
-        """Load several movie files as channels (one file per channel).
+        """Load several movie files as channels (one file per channel)."""
+        self._start_movie_load(paths, self._prompt_for_path, multi_file=True)
 
-        Loading runs on a background thread (see ``MovieLoadWorker``) so the
-        GUI keeps repainting and responding while the files are read.
+    def _start_movie_load(
+        self,
+        paths: list[str],
+        prompt_for_path,
+        load_all: bool = False,
+        multi_file: bool = False,
+    ) -> None:
+        """Load movies on a background thread (see ``MovieLoadWorker``) so
+        the GUI keeps repainting and responding while files are read.
+
+        ``load_all`` reads every channel of each file (single multichannel
+        file); otherwise one channel is loaded per file. ``multi_file``
+        controls channel naming when several separate files are loaded.
         """
-        if getattr(self, "_load_thread", None) is not None:
+        if self._load_thread is not None:
             # A load is already in progress; ignore re-entrant requests.
             return
 
         self._load_t0 = time.time()
+        self._load_multi_file = multi_file
         progress = QtWidgets.QProgressDialog(
-            "Loading channels...", "Cancel", 0, len(paths), self
+            "Loading movie...", "Cancel", 0, len(paths), self
         )
-        progress.setWindowTitle("Opening channels")
+        progress.setWindowTitle("Opening movie")
         progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
         self._load_progress = progress
 
         thread = QtCore.QThread(self)
-        worker = MovieLoadWorker(paths, self._prompt_for_path)
+        worker = MovieLoadWorker(paths, prompt_for_path, load_all=load_all)
         worker.moveToThread(thread)
         self._load_thread = thread
         self._load_worker = worker
@@ -2703,6 +2714,16 @@ class Window(QtWidgets.QMainWindow):
         finally:
             self._load_worker._prompt_event.set()
 
+    def _stop_movie_load(self) -> None:
+        """Cancel any in-progress load and block until the worker thread
+        has stopped. Called before the window/app is destroyed, because
+        destroying a still-running QThread aborts the process."""
+        if self._load_worker is not None:
+            self._load_worker.cancel()
+        if self._load_thread is not None:
+            self._load_thread.quit()
+            self._load_thread.wait()
+
     def _finish_load(self) -> None:
         """Tear down the worker thread and progress dialog."""
         if self._load_progress is not None:
@@ -2725,14 +2746,19 @@ class Window(QtWidgets.QMainWindow):
         if not movies:
             return
         names = [
-            self._channel_name(infos[i], paths[i], i, multi_file=True)
+            self._channel_name(
+                infos[i], paths[i], i, multi_file=self._load_multi_file
+            )
             for i in range(len(movies))
         ]
         self._set_channels(movies, infos, paths, names)
         dt = time.time() - self._load_t0
-        self.status_bar.showMessage(
-            f"Opened {len(movies)} channel(s) in {dt:.2f} seconds."
-        )
+        if len(movies) == 1:
+            self.status_bar.showMessage(f"Opened movie in {dt:.2f} seconds.")
+        else:
+            self.status_bar.showMessage(
+                f"Opened {len(movies)} channel(s) in {dt:.2f} seconds."
+            )
 
     def _on_load_failed(self, message: str) -> None:
         """Report a load error and tear down the worker."""
