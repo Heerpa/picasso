@@ -25,6 +25,7 @@ Last change: 29-JUN-2026 CEST
 - Faster spot identification on network storage: `.tif`/`.ome.tif` and `.stk` movies are now read through a private file handle per worker thread instead of one shared, lock-serialized handle, so frame reads overlap and per-frame network latency is hidden
 - Faster spot cutting (`get_spots`) on network storage (see above)
 - Improved zooming in/out via scroll wheel
+- Contrast spin boxes use logarithmic scaling
 - Fixed a gap of roughly one box size in the identified spots along the borders between adjacent (e.g. overlapping) ROIs
 - Fixed handling abortions during identification
 - GPU-accelerated fitting (GPUfit) now documented for Linux: the `libGpufit.so` is not shipped (only the Windows `Gpufit.dll` is), so Linux users must build it themselves. Added build/install instructions to the [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html#gpu-fitting-on-linux), the readme and a README in `picasso/ext/pygpufit/`.
