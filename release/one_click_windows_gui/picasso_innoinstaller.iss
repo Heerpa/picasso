@@ -5,6 +5,13 @@
   #define VARIANT ""
 #endif
 
+; DISTDIR is the PyInstaller output folder to package. The GPU build writes to
+; a separate "dist_gpu" tree (passed via /DDISTDIR=dist_gpu) so it does not
+; clash with the CPU build's "dist". Defaults to "dist" for the CPU installer.
+#ifndef DISTDIR
+  #define DISTDIR "dist"
+#endif
+
 [Setup]
 AppName=Picasso{#VARIANT}
 AppPublisher=Jungmann Lab, Max Planck Institute of Biochemistry
@@ -16,7 +23,7 @@ ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 
 [Files]
-Source: "dist\picasso\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
+Source: "{#DISTDIR}\picasso\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
 
 [Types]
 Name: "full"; Description: "Full installation"
