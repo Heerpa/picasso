@@ -62,7 +62,7 @@ call pyinstaller "../pyinstaller/picasso_pyinstaller.py" ^
     --copy-metadata streamlit ^
     --copy-metadata imageio ^
     --name picasso ^
-    --icon "../logos/localize.ico" ^
+    --icon "../../logos/localize.ico" ^
     --noconfirm
 call pyinstaller "../pyinstaller/picasso_pyinstaller.py" ^
     --onedir ^
@@ -86,7 +86,7 @@ call pyinstaller "../pyinstaller/picasso_pyinstaller.py" ^
     --copy-metadata streamlit ^
     --copy-metadata imageio ^
     --name picassow ^
-    --icon "../logos/localize.ico" ^
+    --icon "../../logos/localize.ico" ^
     --noconfirm
 
 REM Spec files were written to build_gpu (via --specpath); they are removed with
