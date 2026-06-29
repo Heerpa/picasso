@@ -62,6 +62,11 @@ Via PyPI
 5. To update Picasso (you should get a notification about available updates since v0.10.0) run ``pip install --upgrade picassosr``.
 6. You can optionally install dependencies for .czi and .lif formats by passing ``pip install picassosr[czi]`` or ``pip install picassosr[lif]``.
 
+GPU fitting (optional)
+^^^^^^^^^^^^^^^^^^^^^^^
+
+Picasso: Localize can accelerate several of its fitting algorithms on a CUDA-capable NVIDIA GPU via `Gpufit <https://github.com/gpufit/Gpufit>`__. On **Windows** the pre-compiled library is bundled with Picasso and works out of the box. On **Linux** there is no pre-compiled binary, so you have to build ``libGpufit.so`` yourself and copy it into ``picasso/ext/pygpufit/``; see the `GPU fitting on Linux <https://picassosr.readthedocs.io/en/latest/localize.html#gpu-fitting-on-linux>`__ section of the documentation for step-by-step instructions. Without the GPU library, Picasso transparently uses the native fitting algorithms (LQ, MLE Gaussian 2D elliptical fitting)
+
 For Developers (local, editable installation)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
