@@ -40,6 +40,8 @@ Last change: 30-JUN-2026 CEST
 - Background color for multichannel data can be adjusted
 - Fixed removed plugins menu after removing all localizations
 - Fixed pick similar numba error [#684](https://github.com/jungmannlab/picasso/issues/684)
+- Fixed "Combine all channels" when saving localizations only saving the first channel when channels had differing columns
+- Fixed combined saving of multiple channels with different columns
 
 #### SPINNA
 - Fixed incorrect density of plotted molecules when using LE fitting

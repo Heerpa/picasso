@@ -182,6 +182,31 @@ class TestSaveLoadLocs:
             loaded["x"].to_numpy(), locs["x"].to_numpy()
         )
 
+    def test_combine_channels_inner_join_preserves_all_rows(
+        self, tmp_path, locs, info
+    ):
+        # Regression test for "Combine all channels" only saving the first
+        # channel. The GUI combines channels with
+        # ``pd.concat(..., join="inner")``. If an outer join were used,
+        # columns missing from some channels would become NaN and
+        # io.save_locs -> lib.ensure_sanity (dropna how="any") would drop
+        # every row from those channels, silently discarding all but one.
+        ch0 = locs.copy()
+        # Second channel lacks a column present in the first (e.g. "z").
+        extra_col = "z" if "z" in ch0.columns else ch0.columns[-1]
+        ch1 = locs.copy().drop(columns=[extra_col])
+
+        combined = pd.concat([ch0, ch1], ignore_index=True, join="inner")
+        # No NaN-introducing columns survive, so no rows are dropped.
+        assert extra_col not in combined.columns
+        assert len(combined) == len(ch0) + len(ch1)
+
+        path = tmp_path / "combined.hdf5"
+        io.save_locs(str(path), combined, info)
+        loaded, _ = io.load_locs(str(path))
+        # Both channels' localizations are preserved after the round-trip.
+        assert len(loaded) == len(ch0) + len(ch1)
+
     def test_csv_extension_raises(self, tmp_path):
         # ThunderSTORM .csv files must go through import_ts, not load_locs
         path = tmp_path / "locs.csv"

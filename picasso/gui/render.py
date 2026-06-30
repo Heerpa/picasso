@@ -13120,7 +13120,9 @@ class Window(QtWidgets.QMainWindow):
                 )
                 if path:
                     # combine locs from all channels
-                    all_locs = pd.concat(self.view.locs, ignore_index=True)
+                    all_locs = pd.concat(
+                        self.view.locs, ignore_index=True, join="inner"
+                    )
                     all_locs.sort_values(
                         kind="quicksort",
                         by="frame",
