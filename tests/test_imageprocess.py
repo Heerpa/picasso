@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use("Agg")  # noqa: E402  must precede pyplot/picasso imports
 
 import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 
 from picasso import imageprocess  # noqa: E402
@@ -183,6 +184,73 @@ class TestFindFiducials:
         for x, y in picks:
             assert 0 <= x <= width
             assert 0 <= y <= height
+
+    def test_recovers_planted_fiducial_positions(self):
+        """find_fiducials must return picks *at* the planted fiducials.
+
+        Regression test for the coordinate-scaling bug where the image
+        was rendered at ``disp_px_size=100`` while the maxima were used
+        as camera-pixel coordinates without dividing by the resulting
+        ``oversampling = Pixelsize / disp_px_size``. With Pixelsize != 100
+        every detected pick was offset by that factor, so the markers
+        were missed. The earlier shape-only tests did not catch this
+        because the offset picks were still in-bounds integers.
+
+        Pixelsize is deliberately 130 (!= the old hard-coded 100) so the
+        scaling factor is non-trivial.
+        """
+        fov = 64
+        n_frames = 200
+        centers = [(12.0, 12.0), (12.0, 48.0), (48.0, 12.0), (48.0, 48.0)]
+        info = [
+            {
+                "Width": fov,
+                "Height": fov,
+                "Frames": n_frames,
+                "Pixelsize": 130,
+            }
+        ]
+
+        rng = np.random.default_rng(0)
+        # one dense, persistent localization per frame per fiducial
+        n_per = n_frames * len(centers)
+        x = np.repeat([c[0] for c in centers], n_frames) + rng.normal(
+            0, 0.05, n_per
+        )
+        y = np.repeat([c[1] for c in centers], n_frames) + rng.normal(
+            0, 0.05, n_per
+        )
+        locs = pd.DataFrame(
+            {
+                "frame": np.tile(np.arange(n_frames), len(centers)).astype(
+                    np.int32
+                ),
+                "x": x,
+                "y": y,
+                "photons": np.full(n_per, 1000.0),
+                "sx": np.full(n_per, 1.0),
+                "sy": np.full(n_per, 1.0),
+                "bg": np.full(n_per, 10.0),
+                "lpx": np.full(n_per, 0.01),
+                "lpy": np.full(n_per, 0.01),
+            }
+        )
+
+        picks, box = imageprocess.find_fiducials(locs, info)
+
+        # every planted fiducial must be matched by a returned pick, and
+        # every returned pick must be near a planted fiducial (no spurious
+        # offset picks) — within half a box of the true position
+        tol = box / 2
+        for cx, cy in centers:
+            assert any(
+                abs(px - cx) <= tol and abs(py - cy) <= tol for px, py in picks
+            ), f"planted fiducial ({cx}, {cy}) not recovered; got {picks}"
+        for px, py in picks:
+            assert any(
+                abs(px - cx) <= tol and abs(py - cy) <= tol
+                for cx, cy in centers
+            ), f"spurious/offset pick ({px}, {py}); centers={centers}"
 
 
 # ---------------------------------------------------------------------------
