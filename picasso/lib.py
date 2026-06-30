@@ -842,7 +842,7 @@ def get_sound_notification_path() -> str | None:
 
 def get_available_sound_notifications() -> list[str | None]:
     """Get a list of file names of the available sound notifications in
-    the folder ``gui/notification_sounds``.
+    the folder ``~/.picasso/notification_sounds``.
 
     Returns
     -------
@@ -879,11 +879,16 @@ def set_sound_notification(action: QtGui.QAction) -> None:
 
 
 def _sound_notification_dir() -> str:
-    """Return the path to the sound notification folder."""
-    return os.path.join(
-        os.path.dirname(os.path.realpath(__file__)),
-        "gui",
-        "notification_sounds",
+    """Return the path to the user sound notification folder
+    (``~/.picasso/notification_sounds``)."""
+    return io.notification_sounds_directory()
+
+
+def open_sound_notifications_folder() -> None:
+    """Open the user sound notification folder
+    (``~/.picasso/notification_sounds``) in the system file browser."""
+    QtGui.QDesktopServices.openUrl(
+        QtCore.QUrl.fromLocalFile(_sound_notification_dir())
     )
 
 

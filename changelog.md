@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 29-JUN-2026 CEST
+Last change: 30-JUN-2026 CEST
 
 ## 0.11.0
 
@@ -51,6 +51,7 @@ Last change: 29-JUN-2026 CEST
 #### *Other improvements:*
 - Added import and export of [SMAP](https://github.com/jries/SMAP) localizations (`_sml.mat`). Available in Render and as batch CLI converters `picasso smap2hdf` and `picasso hdf2smap`. Reads single-file MATLAB `-v7` and `-v7.3` saves.
 - Removed folder `distribution` from the repository; `create_linux_shortcuts.py` was moved to `release`
+- Removed `notification_sounds` folder, the users can add their notification sounds in the `.picasso` folder
 
 ### **Backward incompatible changes:**
 - All the functions deprecated in v0.10 were removed, see section 0.10.0 below

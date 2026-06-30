@@ -5048,6 +5048,13 @@ class Window(QtWidgets.QMainWindow):
                 action.setChecked(True)
             sounds_menu.addAction(action)
         sounds_actiongroup.triggered.connect(lib.set_sound_notification)
+        sounds_menu.addSeparator()
+        open_sounds_action = sounds_menu.addAction(
+            "Open notification sounds folder..."
+        )
+        open_sounds_action.triggered.connect(
+            lib.open_sound_notifications_folder
+        )
         picasso_settings_action = file_menu.addAction("Picasso settings")
         picasso_settings_action.triggered.connect(
             self.user_settings_dialog.show

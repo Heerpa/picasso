@@ -107,6 +107,21 @@ def plugins_directory() -> str:
     return directory
 
 
+def notification_sounds_directory() -> str:
+    """Return the user notification sounds directory
+    (``~/.picasso/notification_sounds``).
+
+    The directory is created (empty) if it does not yet exist. It sits
+    next to ``~/.picasso/settings.yaml`` and ``~/.picasso/plugins`` so
+    that every install type (one-click installer, PyPI, source) shares
+    one stable, user-writable location that survives uninstalling
+    Picasso. Users add their own ``.mp3`` or ``.wav`` files here."""
+    home = os.path.expanduser("~")
+    directory = os.path.join(home, ".picasso", "notification_sounds")
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+
 def load_raw(
     path: str,
     prompt_info: Callable[[None], tuple[dict, bool]] | None = None,
