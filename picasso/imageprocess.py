@@ -244,10 +244,15 @@ def find_fiducials(
         Size of the box used for the fiducial marker identification.
         Can be set as the pick diameter in pixels for undrifting.
     """
+    # render at one display pixel per camera pixel (oversampling = 1) so
+    # that the pick coordinates returned by ``identify_in_image`` are in
+    # camera pixels and the box (computed in camera pixels) matches the
+    # image resolution
+    pixelsize = lib.get_from_metadata(info, "Pixelsize", default=130)
     image = render.render(
         locs=locs,
         info=info,
-        disp_px_size=100,
+        disp_px_size=pixelsize,
         viewport=None,
         blur_method="smooth",
     )[1]
@@ -255,7 +260,6 @@ def find_fiducials(
     threshold = np.percentile(image.flatten(), 99)
     # box size should be an odd number, corresponding to approximately
     # 900 nm
-    pixelsize = lib.get_from_metadata(info, "Pixelsize", default=130)
     box = int(np.round(900 / pixelsize))
     box = box + 1 if box % 2 == 0 else box
 
