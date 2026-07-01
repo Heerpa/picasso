@@ -343,6 +343,14 @@ class ApplyDialog(lib.Dialog):
         layout.addWidget(exp_label, 2, 1)
         self.cmd = QtWidgets.QLineEdit()
         layout.addWidget(self.cmd, 2, 2)
+        # Apply to all channels sequentially
+        self.apply_to_all = QtWidgets.QCheckBox("Apply to all channels")
+        self.apply_to_all.setToolTip(
+            "Apply the expression to every channel sequentially,\n"
+            "ignoring the channel selected above."
+        )
+        self.apply_to_all.toggled.connect(self.channel.setDisabled)
+        layout.addWidget(self.apply_to_all, 3, 2)
         # OK and Cancel buttons
         self.buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
@@ -357,14 +365,20 @@ class ApplyDialog(lib.Dialog):
     @staticmethod
     def getCmd(
         parent: QtWidgets.QWidget | None = None,
-    ) -> tuple[str, int, bool]:
+    ) -> tuple[str, int, bool, bool]:
         """Obtain the expression as a string and the channel to be
         manipulated."""
         dialog = ApplyDialog(parent)
         result = dialog.exec()
         cmd = dialog.cmd.text()
         channel = dialog.channel.currentIndex()
-        return (cmd, channel, result == QtWidgets.QDialog.DialogCode.Accepted)
+        all_channels = dialog.apply_to_all.isChecked()
+        return (
+            cmd,
+            channel,
+            result == QtWidgets.QDialog.DialogCode.Accepted,
+            all_channels,
+        )
 
     def update_vars(self, index: int) -> None:
         """Update the variables that can be manipulated and show them in
@@ -11839,10 +11853,12 @@ class Window(QtWidgets.QMainWindow):
         Instance of the class for displaying rendered localizations.
     window_rot : RotationWindow
         Instance of the class for displaying 3D data with rotation.
-    x_spiral : np.array
-        x coordinates before the last spiral action in ``ApplyDialog``.
-    y_spiral : np.array
-        y coordinates before the last spiral action in ``ApplyDialog``.
+    x_spiral : dict[int, np.array]
+        x coordinates before the last spiral action in ``ApplyDialog``,
+        keyed by channel index.
+    y_spiral : dict[int, np.array]
+        y coordinates before the last spiral action in ``ApplyDialog``,
+        keyed by channel index.
     """
 
     DOCS_URL = "https://picassosr.readthedocs.io/en/latest/render.html#"
@@ -11874,6 +11890,9 @@ class Window(QtWidgets.QMainWindow):
         # [position, R, G, B] stops in [0, 1]. Populated from
         # ~/.picasso/settings.yaml in load_user_settings.
         self.custom_colormaps_stops: dict[str, list[list[float]]] = {}
+        # x/y coordinates before the last spiral action, keyed by channel
+        self.x_spiral: dict[int, np.ndarray] = {}
+        self.y_spiral: dict[int, np.ndarray] = {}
 
         # set up dialogs
         self.display_settings_dlg = DisplaySettingsDialog(self)
@@ -12877,79 +12896,84 @@ class Window(QtWidgets.QMainWindow):
 
     def open_apply_dialog(self) -> None:
         """Load expression and apply it to locs."""
-        cmd, channel, ok = ApplyDialog.getCmd(self)
+        cmd, channel, ok, all_channels = ApplyDialog.getCmd(self)
         if ok:
-            input = cmd.split()
-            if input[0] == "flip" and len(input) == 3:
-                # Distinguish flipping in xy and z
-                if "z" in input:
-                    var_1 = input[1]
-                    var_2 = input[2]
-                    if var_1 == "z":
-                        var_2 = "z"
-                        var_1 = input[2]
-                    pixelsize = self.view.pixelsize
-                    templocs = self.view.locs[channel][var_1].copy()
-                    movie_height, movie_width = self.view.movie_size()
-                    if var_1 == "x":
-                        dist = movie_width
-                    else:
-                        dist = movie_height
-
-                    self.view.locs[channel][var_1] = (
-                        self.view.locs[channel][var_2] / pixelsize + dist / 2
-                    )  # exchange w. info
-                    self.view.locs[channel][var_2] = templocs * pixelsize
-                else:
-                    var_1 = input[1]
-                    var_2 = input[2]
-                    templocs = self.view.locs[channel][var_1].copy()
-                    self.view.locs[channel][var_1] = self.view.locs[channel][
-                        var_2
-                    ]
-                    self.view.locs[channel][var_2] = templocs
-
-            elif input[0] == "spiral" and len(input) == 3:
-                # spiral uses radius and turns
-                radius = float(input[1])
-                turns = int(input[2])
-                maxframe = self.view.infos[channel][0]["Frames"]
-
-                self.x_spiral = self.view.locs[channel]["x"].copy()
-                self.y_spiral = self.view.locs[channel]["y"].copy()
-
-                scale_time = maxframe / (turns * 2 * np.pi)
-                scale_x = turns * 2 * np.pi
-
-                x = self.view.locs[channel]["frame"] / scale_time
-
-                self.view.locs[channel]["x"] = (
-                    x * np.cos(x)
-                ) / scale_x * radius + self.view.locs[channel]["x"]
-
-                self.view.locs[channel]["y"] = (
-                    x * np.sin(x)
-                ) / scale_x * radius + self.view.locs[channel]["y"]
-
-            elif input[0] == "uspiral":
-                try:
-                    self.view.locs[channel]["x"] = self.x_spiral
-                    self.view.locs[channel]["y"] = self.y_spiral
-                    self.display_settings_dlg.render_check.setChecked(False)
-                except Exception:
-                    QtWidgets.QMessageBox.information(
-                        self,
-                        "Uspiral error",
-                        "Localizations have not been spiraled yet.",
-                    )
+            if all_channels:
+                channels = range(len(self.view.locs_paths))
             else:
-                vars = self.view.locs[channel].columns.to_list()
-                exec(cmd, {k: self.view.locs[channel][k] for k in vars})
-            lib.ensure_sanity(
-                self.view.locs[channel], self.view.infos[channel]
-            )
-            self.view.index_blocks[channel] = None
-            self.view.update_scene()
+                channels = [channel]
+            for channel in channels:
+                self._apply_cmd(cmd, channel)
+
+    def _apply_cmd(self, cmd: str, channel: int) -> None:
+        """Apply the expression ``cmd`` to the given ``channel``."""
+        input = cmd.split()
+        if input[0] == "flip" and len(input) == 3:
+            # Distinguish flipping in xy and z
+            if "z" in input:
+                var_1 = input[1]
+                var_2 = input[2]
+                if var_1 == "z":
+                    var_2 = "z"
+                    var_1 = input[2]
+                pixelsize = self.view.pixelsize
+                templocs = self.view.locs[channel][var_1].copy()
+                movie_height, movie_width = self.view.movie_size()
+                if var_1 == "x":
+                    dist = movie_width
+                else:
+                    dist = movie_height
+
+                self.view.locs[channel][var_1] = (
+                    self.view.locs[channel][var_2] / pixelsize + dist / 2
+                )  # exchange w. info
+                self.view.locs[channel][var_2] = templocs * pixelsize
+            else:
+                var_1 = input[1]
+                var_2 = input[2]
+                templocs = self.view.locs[channel][var_1].copy()
+                self.view.locs[channel][var_1] = self.view.locs[channel][var_2]
+                self.view.locs[channel][var_2] = templocs
+
+        elif input[0] == "spiral" and len(input) == 3:
+            # spiral uses radius and turns
+            radius = float(input[1])
+            turns = int(input[2])
+            maxframe = self.view.infos[channel][0]["Frames"]
+
+            self.x_spiral[channel] = self.view.locs[channel]["x"].copy()
+            self.y_spiral[channel] = self.view.locs[channel]["y"].copy()
+
+            scale_time = maxframe / (turns * 2 * np.pi)
+            scale_x = turns * 2 * np.pi
+
+            x = self.view.locs[channel]["frame"] / scale_time
+
+            self.view.locs[channel]["x"] = (
+                x * np.cos(x)
+            ) / scale_x * radius + self.view.locs[channel]["x"]
+
+            self.view.locs[channel]["y"] = (
+                x * np.sin(x)
+            ) / scale_x * radius + self.view.locs[channel]["y"]
+
+        elif input[0] == "uspiral":
+            try:
+                self.view.locs[channel]["x"] = self.x_spiral[channel]
+                self.view.locs[channel]["y"] = self.y_spiral[channel]
+                self.display_settings_dlg.render_check.setChecked(False)
+            except KeyError:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Uspiral error",
+                    "Localizations have not been spiraled yet.",
+                )
+        else:
+            vars = self.view.locs[channel].columns.to_list()
+            exec(cmd, {k: self.view.locs[channel][k] for k in vars})
+        lib.ensure_sanity(self.view.locs[channel], self.view.infos[channel])
+        self.view.index_blocks[channel] = None
+        self.view.update_scene()
 
     def open_file_dialog(self) -> None:
         """Open localizations file(s): Picasso (.hdf5), ThunderSTORM
