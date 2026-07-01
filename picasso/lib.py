@@ -1784,6 +1784,38 @@ def _merge_locs(
     return locs
 
 
+def append_group(
+    locs: pd.DataFrame,
+    group: int | SeriesOrIntArray1D,
+) -> pd.DataFrame:
+    """Assign the ``group`` column of ``locs``, preserving any existing
+    grouping. If ``group`` already exists, its contents are moved to
+    ``group_input`` to preserve information.
+
+    The DataFrame is modified in place and returned for convenience.
+
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations to assign the group column to.
+    group : int or array-like of int
+        New group id(s). A scalar is broadcast to all localizations; an
+        array-like must have the same length as ``locs`` and is assigned
+        positionally.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        Localizations with the ``group`` column set. If a ``group``
+        column was already present, its previous values are stored in
+        the ``"group_input"`` column.
+    """
+    if "group" in locs.columns:
+        locs["group_input"] = locs["group"].to_numpy()
+    locs["group"] = group if np.isscalar(group) else np.asarray(group)
+    return locs
+
+
 def ensure_sanity(locs: pd.DataFrame, info: list[dict]) -> pd.DataFrame:
     """Ensure that localizations are within the image dimensions
     and have positive localization precisions and other parameters.

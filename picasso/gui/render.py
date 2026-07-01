@@ -7546,12 +7546,7 @@ class View(QtWidgets.QLabel):
         status = lib.StatusDialog(
             "Applying DBSCAN. This may take a while.", self
         )
-        # keep group info if already present
-        if "group" in self.locs[channel].columns:
-            locs = self.locs[channel].copy()
-            locs["group_input"] = self.locs[channel].group
-        else:
-            locs = self.locs[channel]
+        locs = self.locs[channel]
         pixelsize = self.pixelsize
 
         # Only pass radius_z for 3D data; convert nm -> camera pixels.
@@ -7670,12 +7665,7 @@ class View(QtWidgets.QLabel):
         status = lib.StatusDialog(
             "Applying HDBSCAN. This may take a while.", self
         )
-        # keep group info if already present
-        if "group" in self.locs[channel].columns:
-            locs = self.locs[channel].copy()
-            locs["group_input"] = self.locs[channel].group
-        else:
-            locs = self.locs[channel]
+        locs = self.locs[channel]
         pixelsize = self.pixelsize
 
         locs, hdbscan_info = clusterer.hdbscan(
@@ -7798,12 +7788,7 @@ class View(QtWidgets.QLabel):
         # for converting z coordinates
         pixelsize = self.pixelsize
 
-        # keep group info if already present
-        if "group" in self.locs[channel].columns:
-            locs = self.locs[channel].copy()
-            locs["group_input"] = self.locs[channel].group
-        else:
-            locs = self.locs[channel]
+        locs = self.locs[channel]
 
         progress = lib.ProgressDialog(
             "Clustering localizations", 0, len(locs), self

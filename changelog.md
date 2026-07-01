@@ -40,6 +40,7 @@ Last change: 01-JUL-2026 CEST
 - Background color for multichannel data can be adjusted
 - "Apply to all sequentially" available in Apply expression to localizations
 - G5M accepts `group_input` as the cluster id columns (useful if `group` is overwritten after clustering)
+- Re-grouping localizations (picking, DBSCAN/HDBSCAN/SMLM clustering) now preserves the previous grouping in the `group_input` column instead of discarding it, so the original cluster ids remain available (e.g. for G5M)
 - Updated G5M documentation - drift correction importance
 - Fixed removed plugins menu after removing all localizations
 - Fixed pick similar numba error [#684](https://github.com/jungmannlab/picasso/issues/684)
