@@ -2977,6 +2977,23 @@ class G5MDialog(lib.Dialog):
         self.min_locs.setValue(MIN_LOCS_G5M)
         first_row.addWidget(self.min_locs)
 
+        # column used to group localizations into clusters; "group_input"
+        # is offered when present (e.g. when "group" was overwritten)
+        self.group_column = QtWidgets.QComboBox()
+        self.group_column.setToolTip(
+            "Column used to group localizations into clusters.\n"
+            "Choose 'group_input' if the 'group' column was overwritten\n"
+            "but the original cluster ids are kept in 'group_input'."
+        )
+        self.group_column.addItem("group")
+        if all(
+            "group_input" in locs.columns for locs in self.window.view.locs
+        ):
+            self.group_column.addItem("group_input")
+        group_column_label = QtWidgets.QLabel("Group column:")
+        grid.addWidget(group_column_label, grid.rowCount(), 0)
+        grid.addWidget(self.group_column, grid.rowCount() - 1, 1)
+
         # loc precision handling - local values or absolute sigma bounds
         self.loc_prec_handling = QtWidgets.QComboBox()
         self.loc_prec_handling.setToolTip(
@@ -3118,6 +3135,7 @@ class G5MDialog(lib.Dialog):
             )
         params = {
             "min_locs": dialog.min_locs.value(),
+            "group_column": dialog.group_column.currentText(),
             "loc_prec_handle": loc_prec_handle,
             "sigma_bounds": sigma_bounds,
             "bootstrap_check": dialog.bootstrap_check.isChecked(),
@@ -7880,9 +7898,11 @@ class View(QtWidgets.QLabel):
             range(len(self.locs)) if channel == len(self.locs) else [channel]
         )
         for i in channels:
-            if not self.check_group(i):
+            if not self.check_group(i, params["group_column"]):
                 return
-            max_locs_per_channel.append(self.check_max_locs(i))
+            max_locs_per_channel.append(
+                self.check_max_locs(i, params["group_column"])
+            )
         params["max_locs_per_cluster"] = max_locs_per_channel
 
         # for subcluster check plots
@@ -7998,27 +8018,28 @@ class View(QtWidgets.QLabel):
             postprocess=params["postprocess_check"],
             max_locs_per_cluster=params["max_locs_per_cluster"][channel],
             asynch=params["multiprocessing_check"],
+            group_column=params["group_column"],
             callback_parent=self.window,
         )
         return centers, clustered_locs, info
 
-    def check_group(self, channel: int) -> bool:
+    def check_group(self, channel: int, group_column: str = "group") -> bool:
         """Check whether the data has been grouped (clustered) in
-        channel i."""
+        channel i using the given group column."""
         locs = self.locs[channel]
-        if "group" in locs.columns:
+        if group_column in locs.columns:
             return True
         else:
             message = (
                 f"Channel #{channel+1} ("
                 f"{self.window.dataset_dialog.checks[channel].text()})"
-                " does not contain group information. Please run DBSCAN (or"
-                " similar) to group the localizations first."
+                f" does not contain the '{group_column}' column. Please run"
+                " DBSCAN (or similar) to group the localizations first."
             )
             QtWidgets.QMessageBox.information(self.window, "Warning", message)
             return False
 
-    def check_max_locs(self, channel: int) -> int:
+    def check_max_locs(self, channel: int, group_column: str = "group") -> int:
         """Check whether the data contains clusters with more localizations
         than the maximum allowed for G5M."""
         locs = self.locs[channel]
@@ -8026,7 +8047,7 @@ class View(QtWidgets.QLabel):
         channel_name = self.window.dataset_dialog.checks[channel].text()
         n_frames = lib.get_from_metadata(info, "Frames", raise_error=True)
         max_locs = int(0.4 * n_frames)
-        _, n_locs = np.unique(locs["group"], return_counts=True)
+        _, n_locs = np.unique(locs[group_column], return_counts=True)
         if any(n_locs > max_locs):
             qm = QtWidgets.QMessageBox()
             message = (

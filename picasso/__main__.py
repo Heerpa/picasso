@@ -2412,6 +2412,7 @@ def _g5m(
     postprocess: bool = True,
     max_locs: int = 100000,
     asynch: bool = True,
+    group_column: Literal["group", "group_input"] = "group",
 ) -> None:
     """G5M analysis of clustered localizations. See ``picasso.g5m.g5m``
     for details on the parameters."""
@@ -2451,6 +2452,7 @@ def _g5m(
             postprocess=postprocess,
             max_locs_per_cluster=max_locs,
             asynch=asynch,
+            group_column=group_column,
             callback_parent="console",
         )
         new_path = splitext(path)[0] + "_molmap.hdf5"
@@ -3094,6 +3096,17 @@ def main():  # noqa: C901
         action="store_false",
         help="do not perform fitting asynchronously (multiprocessing)",
     )
+    g5m_parser.add_argument(
+        "--group-column",
+        type=str,
+        choices=["group", "group_input"],
+        default="group",
+        help=(
+            "column used to group localizations into clusters; use "
+            "'group_input' if 'group' was overwritten but the original "
+            "cluster ids are kept in 'group_input'"
+        ),
+    )
 
     # Dark time
     dark_parser = subparsers.add_parser(
@@ -3425,6 +3438,7 @@ def main():  # noqa: C901
                 args.postprocess,
                 args.max_locs,
                 args.asynch,
+                args.group_column,
             )
         elif args.command == "nneighbor":
             _nneighbor(args.files)
