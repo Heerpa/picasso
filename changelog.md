@@ -39,6 +39,7 @@ Last change: 01-JUL-2026 CEST
 - Rotation dialog allows for rotations around the localizations or the world (see [3D documentation](https://picassosr.readthedocs.io/en/latest/render.html#d-rotation-window))
 - Background color for multichannel data can be adjusted
 - "Apply to all sequentially" available in Apply expression to localizations
+- Updated G5M documentation - drift correction importance
 - Fixed removed plugins menu after removing all localizations
 - Fixed pick similar numba error [#684](https://github.com/jungmannlab/picasso/issues/684)
 - Fixed "Combine all channels" when saving localizations only saving the first channel when channels had differing columns
