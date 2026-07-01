@@ -38,6 +38,7 @@ Last change: 01-JUL-2026 CEST
 - SMAP i/o, see "Other improvements" below
 - Rotation dialog allows for rotations around the localizations or the world (see [3D documentation](https://picassosr.readthedocs.io/en/latest/render.html#d-rotation-window))
 - Background color for multichannel data can be adjusted
+- "Apply to all sequentially" available for drift correction algorithms
 - "Apply to all sequentially" available in Apply expression to localizations
 - G5M accepts `group_input` as the cluster id columns (useful if `group` is overwritten after clustering)
 - Re-grouping localizations (picking, DBSCAN/HDBSCAN/SMLM clustering) now preserves the previous grouping in the `group_input` column instead of discarding it, so the original cluster ids remain available (e.g. for G5M)

@@ -11161,165 +11161,180 @@ class View(QtWidgets.QLabel):
         """Undrift with Adaptive Intersection Maximization (AIM).
 
         See Ma H., et al. Science Advances. 2024."""
-        channel = self.get_channel("Undrift by AIM")
-        if channel is not None:
-            locs = self.locs[channel]
-            info = self.infos[channel]
-            pixelsize = self.pixelsize
+        channel = self.get_channel_all_seq("Undrift by AIM")
+        if channel is None:
+            return
 
-            # get parameters for AIM
-            params, ok = AIMDialog.getParams(self.window)
-            params["intersect_d"] = params["intersect_d"] / pixelsize
-            params["roi_r"] = params["roi_r"] / pixelsize
-            if ok:
-                n_frames = lib.get_from_metadata(
-                    info, "Frames", raise_error=True
-                )
-                n_segments = int(np.ceil(n_frames / params["segmentation"]))
-                progress = lib.ProgressDialog(
-                    "Undrifting by AIM (1/2)", 0, n_segments, self.window
-                )
-                locs, new_info, drift = aim.aim(
-                    locs, info, **params, progress=progress
-                )
-                # sanity check and assign attributes
-                locs = lib.ensure_sanity(locs, info)
-                self.locs[channel] = locs
-                self.infos[channel] = new_info
-                self.index_blocks[channel] = None
-                self.render_index[channel] = None
-                self.add_drift(channel, drift)
-                self.update_scene(resample_locs=True)
-                self.show_drift()
+        # get parameters for AIM
+        params, ok = AIMDialog.getParams(self.window)
+        if not ok:
+            return
+        params["intersect_d"] = params["intersect_d"] / self.pixelsize
+        params["roi_r"] = params["roi_r"] / self.pixelsize
+
+        if channel == len(self.locs_paths):  # apply to all channels
+            for channel in range(len(self.locs_paths)):
+                self._undrift_aim(channel, params)
+        else:
+            self._undrift_aim(channel, params)
+            self.show_drift()
+
+    def _undrift_aim(self, channel: int, params: dict) -> None:
+        """Undrift a given channel by AIM with pre-computed parameters."""
+        locs = self.locs[channel]
+        info = self.infos[channel]
+        n_frames = lib.get_from_metadata(info, "Frames", raise_error=True)
+        n_segments = int(np.ceil(n_frames / params["segmentation"]))
+        progress = lib.ProgressDialog(
+            "Undrifting by AIM (1/2)", 0, n_segments, self.window
+        )
+        locs, new_info, drift = aim.aim(
+            locs, info, **params, progress=progress
+        )
+        # sanity check and assign attributes
+        locs = lib.ensure_sanity(locs, info)
+        self.locs[channel] = locs
+        self.infos[channel] = new_info
+        self.index_blocks[channel] = None
+        self.render_index[channel] = None
+        self.add_drift(channel, drift)
+        self.update_scene(resample_locs=True)
 
     def undrift_rcc(self) -> None:
         """Undrift with RCC.
 
         See Wang Y., et al. Optics Express. 2014."""
-        channel = self.get_channel("Undrift by RCC")
-        if channel is not None:
-            info = self.infos[channel]
-            n_frames = info[0]["Frames"]
-            # get segmentation (number of frames that are considered
-            # in RCC at once)
-            if n_frames < 1000:
-                default_segmentation = int(n_frames / 4)
-            else:
-                default_segmentation = 1000
-            segmentation, ok = QtWidgets.QInputDialog.getInt(
-                self, "Undrift by RCC", "Segmentation:", default_segmentation
+        channel = self.get_channel_all_seq("Undrift by RCC")
+        if channel is None:
+            return
+
+        # get n_frames to suggest a default segmentation. When applying
+        # to all channels, use the first channel as a reference.
+        ref_channel = 0 if channel == len(self.locs_paths) else channel
+        n_frames = self.infos[ref_channel][0]["Frames"]
+        # get segmentation (number of frames that are considered
+        # in RCC at once)
+        if n_frames < 1000:
+            default_segmentation = int(n_frames / 4)
+        else:
+            default_segmentation = 1000
+        segmentation, ok = QtWidgets.QInputDialog.getInt(
+            self, "Undrift by RCC", "Segmentation:", default_segmentation
+        )
+        if not ok:
+            return
+
+        if channel == len(self.locs_paths):  # apply to all channels
+            for channel in range(len(self.locs_paths)):
+                self._undrift_rcc(channel, segmentation)
+        else:
+            self._undrift_rcc(channel, segmentation)
+            self.show_drift()
+
+    def _undrift_rcc(self, channel: int, segmentation: int) -> None:
+        """Undrift a given channel by RCC with a chosen segmentation."""
+        locs = self.locs[channel]
+        info = self.infos[channel]
+        n_segments = postprocess.n_segments(info, segmentation)
+        seg_progress = lib.ProgressDialog(
+            "Generating segments", 0, n_segments, self
+        )
+        n_pairs = int(n_segments * (n_segments - 1) / 2)
+        rcc_progress = lib.ProgressDialog(
+            "Correlating image pairs", 0, n_pairs, self
+        )
+        try:
+            # find drift and apply it to locs
+            drift, undrifted_locs = postprocess.undrift(
+                locs,
+                info,
+                segmentation,
+                False,
+                seg_progress.set_value,
+                rcc_progress.set_value,
             )
+            # sanity check and assign attributes
+            self.index_blocks[channel] = None
+            self.render_index[channel] = None
+            self.add_drift(channel, drift)
+            # ignore undrift_locs since we use _apply_drift to
+            # assign attributes
+            self._apply_drift(channel, drift)
 
-            if ok:
-                locs = self.locs[channel]
-                info = self.infos[channel]
-                n_segments = postprocess.n_segments(info, segmentation)
-                seg_progress = lib.ProgressDialog(
-                    "Generating segments", 0, n_segments, self
-                )
-                n_pairs = int(n_segments * (n_segments - 1) / 2)
-                rcc_progress = lib.ProgressDialog(
-                    "Correlating image pairs", 0, n_pairs, self
-                )
-                try:
-                    # find drift and apply it to locs
-                    drift, undrifted_locs = postprocess.undrift(
-                        locs,
-                        info,
-                        segmentation,
-                        False,
-                        seg_progress.set_value,
-                        rcc_progress.set_value,
-                    )
-                    # sanity check and assign attributes
-                    self.index_blocks[channel] = None
-                    self.render_index[channel] = None
-                    self.add_drift(channel, drift)
-                    # ignore undrift_locs since we use _apply_drift to
-                    # assign attributes
-                    self._apply_drift(channel, drift)
-                    self.show_drift()
-
-                except Exception as e:
-                    QtWidgets.QMessageBox.information(
-                        self,
-                        "RCC Error",
-                        (
-                            "RCC failed. \nConsider changing segmentation "
-                            "and make sure there are enough locs per frame.\n"
-                            f"The following exception occured:\n\n {e}."
-                        ),
-                    )
-                    rcc_progress.set_value(n_pairs)
-                    self.update_scene()
+        except Exception as e:
+            QtWidgets.QMessageBox.information(
+                self,
+                "RCC Error",
+                (
+                    "RCC failed. \nConsider changing segmentation "
+                    "and make sure there are enough locs per frame.\n"
+                    f"The following exception occured:\n\n {e}."
+                ),
+            )
+            rcc_progress.set_value(n_pairs)
+            self.update_scene()
 
     @check_picks
     def undrift_from_picked(self) -> None:
         """Undrift based on picked localizations in a given channel."""
-        channel = self.get_channel("Undrift from picked")
-        if channel is not None:
-            status = lib.StatusDialog("Calculating drift...", self)
-            pick_size = (
-                self._pick_size / 2
-                if self._pick_shape == "Circle"
-                else self._pick_size
-            )
-            if self._pick_shape == "Circle":
-                index_blocks = self.get_index_blocks(channel)
-            else:
-                index_blocks = None
-            undrifted_locs, new_info, drift = (
-                postprocess.undrift_from_fiducials(
-                    locs=self.locs[channel],
-                    info=self.infos[channel],
-                    picks=self._picks,
-                    pick_size=pick_size,
-                    index_blocks=index_blocks,
-                )
-            )
-            self.locs[channel] = undrifted_locs
-            self.infos[channel] = new_info
-            # Cleanup
-            self.index_blocks[channel] = None
-            self.render_index[channel] = None
-            self.add_drift(channel, drift)
-            status.close()
-            self.update_scene(resample_locs=True)
+        channel = self.get_channel_all_seq("Undrift from picked")
+        if channel is None:
+            return
+        if channel == len(self.locs_paths):  # apply to all channels
+            for channel in range(len(self.locs_paths)):
+                self._undrift_from_picked(channel, undrift_z=True)
+        else:
+            self._undrift_from_picked(channel, undrift_z=True)
 
     @check_picks
     def undrift_from_picked2d(self) -> None:
         """Undrift in x and y based on picked localizations in a given
         channel. Available when 3D data is loaded."""
-        channel = self.get_channel("Undrift from picked")
-        if channel is not None:
-            status = lib.StatusDialog("Calculating drift...", self)
-            pick_size = (
-                self._pick_size / 2
-                if self._pick_shape == "Circle"
-                else self._pick_size
-            )
-            if self._pick_shape == "Circle":
-                index_blocks = self.get_index_blocks(channel)
-            else:
-                index_blocks = None
-            undrifted_locs, new_info, drift = (
-                postprocess.undrift_from_fiducials(
-                    locs=self.locs[channel],
-                    info=self.infos[channel],
-                    picks=self._picks,
-                    pick_size=pick_size,
-                    undrift_z=False,
-                    index_blocks=index_blocks,
-                )
-            )
-            self.locs[channel] = undrifted_locs
-            self.infos[channel] = new_info
-            # Cleanup
-            self.index_blocks[channel] = None
-            self.render_index[channel] = None
-            self.add_drift(channel, drift)
-            status.close()
-            self.update_scene(resample_locs=True)
+        channel = self.get_channel_all_seq("Undrift from picked")
+        if channel is None:
+            return
+        if channel == len(self.locs_paths):  # apply to all channels
+            for channel in range(len(self.locs_paths)):
+                self._undrift_from_picked(channel, undrift_z=False)
+        else:
+            self._undrift_from_picked(channel, undrift_z=False)
+
+    def _undrift_from_picked(self, channel: int, undrift_z: bool) -> None:
+        """Undrift a given channel based on picked localizations.
+
+        Parameters
+        ----------
+        channel : int
+            Index of the channel to undrift.
+        undrift_z : bool
+            Whether to also undrift in z (ignored for 2D data).
+        """
+        status = lib.StatusDialog("Calculating drift...", self)
+        pick_size = (
+            self._pick_size / 2
+            if self._pick_shape == "Circle"
+            else self._pick_size
+        )
+        if self._pick_shape == "Circle":
+            index_blocks = self.get_index_blocks(channel)
+        else:
+            index_blocks = None
+        undrifted_locs, new_info, drift = postprocess.undrift_from_fiducials(
+            locs=self.locs[channel],
+            info=self.infos[channel],
+            picks=self._picks,
+            pick_size=pick_size,
+            undrift_z=undrift_z,
+            index_blocks=index_blocks,
+        )
+        self.locs[channel] = undrifted_locs
+        self.infos[channel] = new_info
+        # Cleanup
+        self.index_blocks[channel] = None
+        self.render_index[channel] = None
+        self.add_drift(channel, drift)
+        status.close()
+        self.update_scene(resample_locs=True)
 
     def undo_drift(self) -> None:
         """Get a channel to undo drift."""
