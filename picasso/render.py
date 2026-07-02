@@ -665,16 +665,25 @@ def _draw_gaussian_rot_loc(
     sx_: float,
     sy_: float,
     sz_: float,
+    angle_: float,
     n_pixel_x: int,
     n_pixel_y: int,
     rot_matrix: lib.Array3x3,
     rot_matrixT: lib.Array3x3,
 ) -> None:
     """Render a single rotated 2D Gaussian (projected from 3D) into
-    ``image``."""
+    ``image``. The in-plane precision ellipse (``sx_``, ``sy_``) is
+    first rotated by ``angle_`` (radians) about the z-axis, then the
+    full 3D covariance is rotated by the global ``rot_matrix``."""
+    c = np.cos(angle_)
+    s = np.sin(angle_)
+    vx = sx_ * sx_
+    vy = sy_ * sy_
     cov = np.zeros((3, 3), dtype=np.float32)
-    cov[0, 0] = sx_ * sx_
-    cov[1, 1] = sy_ * sy_
+    cov[0, 0] = vx * c * c + vy * s * s
+    cov[1, 1] = vx * s * s + vy * c * c
+    cov[0, 1] = (vx - vy) * c * s
+    cov[1, 0] = cov[0, 1]
     cov[2, 2] = sz_ * sz_
     cov_rot = rot_matrix @ cov @ rot_matrixT
     s00 = cov_rot[0, 0]
@@ -719,6 +728,7 @@ def _fill_gaussian_rot(
     sx: lib.FloatArray1D,
     sy: lib.FloatArray1D,
     sz: lib.FloatArray1D,
+    angle: lib.FloatArray1D,
     n_pixel_x: int,
     n_pixel_y: int,
     rot_matrix: lib.Array3x3,
@@ -736,6 +746,9 @@ def _fill_gaussian_rot(
         3D coordinates to be rendered.
     sx, sy, sz : lib.FloatArray1D
         Localization precision in x, y and z for each localization.
+    angle : lib.FloatArray1D
+        In-plane rotation angle (radians) for each localization,
+        applied about the z-axis before the global ``rot_matrix``.
     n_pixel_x, n_pixel_y : int
         Number of pixels in x and y.
     rot_matrix : lib.Array3x3
@@ -754,6 +767,7 @@ def _fill_gaussian_rot(
             sx[i],
             sy[i],
             sz[i],
+            angle[i],
             n_pixel_x,
             n_pixel_y,
             rot_matrix,
@@ -1142,11 +1156,18 @@ def _render_gaussian(
         sx = blur_width[in_view]
         sz = blur_depth[in_view]
 
+        # per-localization in-plane rotation (degrees in the stored
+        # column); composed with the global rotation below
+        if "angle" in locs:
+            angle = np.deg2rad(locs["angle"].to_numpy())[in_view]
+        else:
+            angle = np.zeros(len(sx))
+
         rot_matrix = np.ascontiguousarray(
             to_rotation(ang).as_matrix(), dtype=np.float32
         )
         _fill_gaussian_rot(
-            image, x, y, sx, sy, sz, n_pixel_x, n_pixel_y, rot_matrix
+            image, x, y, sx, sy, sz, angle, n_pixel_x, n_pixel_y, rot_matrix
         )
 
     n = len(x)
@@ -1214,11 +1235,14 @@ def _render_gaussian_iso(
         sx = sy
         sz = blur_depth[in_view]
 
+        # isotropic in-plane blur: rotation about z has no effect
+        angle = np.zeros(len(sx))
+
         rot_matrix = np.ascontiguousarray(
             to_rotation(ang).as_matrix(), dtype=np.float32
         )
         _fill_gaussian_rot(
-            image, x, y, sx, sy, sz, n_pixel_x, n_pixel_y, rot_matrix
+            image, x, y, sx, sy, sz, angle, n_pixel_x, n_pixel_y, rot_matrix
         )
 
     return len(x), image

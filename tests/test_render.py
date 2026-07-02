@@ -325,6 +325,66 @@ class TestRender:
         assert n == 0
         assert (im == 0).all()
 
+    def test_gaussian_rot_angle_changes_image(self):
+        """Per-loc angle must affect the globally-rotated (3D) render."""
+        info = {"Pixelsize": 100.0, "Height": 20, "Width": 20}
+        base = pd.DataFrame(
+            {
+                "x": [10.0],
+                "y": [10.0],
+                "z": [0.0],
+                "lpx": [0.6],
+                "lpy": [0.2],
+                "lpz": [0.4],
+            }
+        )
+        ang = (0.3, 0.2, 0.1)
+        _, im0 = render.render(
+            base.assign(angle=[0.0]),
+            info,
+            disp_px_size=25.0,
+            blur_method="gaussian",
+            ang=ang,
+        )
+        _, im45 = render.render(
+            base.assign(angle=[45.0]),
+            info,
+            disp_px_size=25.0,
+            blur_method="gaussian",
+            ang=ang,
+        )
+        assert not np.allclose(im0, im45)
+        # mass is only approximately conserved under a global tilt because
+        # the 3-sigma bounding box truncates differently per orientation
+        assert np.isclose(im0.sum(), im45.sum(), rtol=1e-2)
+
+    def test_gaussian_rot_angle_matches_2d_under_identity(self):
+        """Under identity global rotation the composed 3D path reduces to
+        the pure 2D rotated render."""
+        info = {"Pixelsize": 100.0, "Height": 20, "Width": 20}
+        base = pd.DataFrame(
+            {
+                "x": [10.0],
+                "y": [10.0],
+                "z": [0.0],
+                "lpx": [0.6],
+                "lpy": [0.2],
+                "lpz": [0.4],
+                "angle": [40.0],
+            }
+        )
+        _, im_2d = render.render(
+            base, info, disp_px_size=25.0, blur_method="gaussian"
+        )
+        _, im_3d = render.render(
+            base,
+            info,
+            disp_px_size=25.0,
+            blur_method="gaussian",
+            ang=(0.0, 0.0, 0.0),
+        )
+        assert np.allclose(im_2d, im_3d, rtol=1e-4, atol=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # render_hist_numba
