@@ -563,6 +563,101 @@ def _fill_gaussian(
 
 
 @numba.njit(cache=True)
+def _draw_gaussian_theta_loc(
+    image: lib.FloatArray2D,
+    x_: float,
+    y_: float,
+    sx_: float,
+    sy_: float,
+    angle_: float,
+    n_pixel_x: int,
+    n_pixel_y: int,
+) -> None:
+    """Render a single in-plane rotated 2D Gaussian into ``image``.
+
+    The elliptical Gaussian with standard deviations (``sx_``, ``sy_``)
+    is rotated in the image plane by ``angle_`` (radians) via its 2x2
+    covariance matrix. Unlike ``_draw_gaussian_loc`` the rotated kernel
+    is not separable (it has a cross term), so pixels are evaluated with
+    the full bivariate quadratic form, as in ``_draw_gaussian_rot_loc``.
+    """
+    c = np.cos(angle_)
+    s = np.sin(angle_)
+    vx = sx_ * sx_
+    vy = sy_ * sy_
+    cxx = vx * c * c + vy * s * s
+    cyy = vx * s * s + vy * c * c
+    cxy = (vx - vy) * s * c
+    det2d = cxx * cyy - cxy * cxy
+    if det2d < 1e-10:
+        return
+    inv_xx = cyy / det2d
+    inv_yy = cxx / det2d
+    inv_xy = -cxy / det2d
+    norm = 1.0 / (2.0 * np.pi * np.sqrt(det2d))
+    max_x_off = _DRAW_MAX_SIGMA * np.sqrt(cxx)
+    max_y_off = _DRAW_MAX_SIGMA * np.sqrt(cyy)
+    j_min = int(x_ - max_x_off)
+    if j_min < 0:
+        j_min = 0
+    j_max = int(x_ + max_x_off + 1)
+    if j_max > n_pixel_x:
+        j_max = n_pixel_x
+    i_min = int(y_ - max_y_off)
+    if i_min < 0:
+        i_min = 0
+    i_max = int(y_ + max_y_off + 1)
+    if i_max > n_pixel_y:
+        i_max = n_pixel_y
+    for i in range(i_min, i_max):
+        b = np.float32(i + 0.5 - y_)
+        for j in range(j_min, j_max):
+            a = np.float32(j + 0.5 - x_)
+            exponent = a * a * inv_xx + 2.0 * a * b * inv_xy + b * b * inv_yy
+            image[i, j] += norm * np.exp(-0.5 * exponent)
+
+
+@numba.njit(cache=True)
+def _fill_gaussian_theta(
+    image: lib.FloatArray2D,
+    x: lib.FloatArray1D,
+    y: lib.FloatArray1D,
+    sx: lib.FloatArray1D,
+    sy: lib.FloatArray1D,
+    angle: lib.FloatArray1D,
+    n_pixel_x: int,
+    n_pixel_y: int,
+) -> None:
+    """Fill image with in-plane rotated gaussian-blurred localizations.
+
+    Each localization is rendered as a 2D Gaussian centered at (x, y)
+    with standard deviations (sx, sy) rotated in the image plane by its
+    own ``angle`` (radians).
+
+    Parameters
+    ----------
+    image : lib.FloatArray2D
+        Empty image array.
+    x, y : lib.FloatArray1D
+        x and y coordinates to be rendered.
+    sx, sy : lib.FloatArray1D
+        Localization precision in x and y for each localization.
+    angle : lib.FloatArray1D
+        In-plane rotation angle (radians) for each localization.
+    n_pixel_x, n_pixel_y : int
+        Number of pixels in x and y.
+    """
+    n_locs = len(x)
+    if n_locs == 0:
+        return
+
+    for i in range(n_locs):
+        _draw_gaussian_theta_loc(
+            image, x[i], y[i], sx[i], sy[i], angle[i], n_pixel_x, n_pixel_y
+        )
+
+
+@numba.njit(cache=True)
 def _draw_gaussian_rot_loc(
     image: lib.FloatArray2D,
     x_: float,
@@ -1010,7 +1105,15 @@ def _render_gaussian(
         sy = blur_height[in_view]
         sx = blur_width[in_view]
 
-        _fill_gaussian(image, x, y, sx, sy, n_pixel_x, n_pixel_y)
+        if "angle" in locs:
+            # per-localization in-plane rotation of the precision ellipse;
+            # the stored column is in degrees, the kernel expects radians
+            angle = np.deg2rad(locs["angle"].to_numpy()[in_view])
+            _fill_gaussian_theta(
+                image, x, y, sx, sy, angle, n_pixel_x, n_pixel_y
+            )
+        else:
+            _fill_gaussian(image, x, y, sx, sy, n_pixel_x, n_pixel_y)
 
     else:  # rotated
         x, y, in_view, z = locs_rotation(

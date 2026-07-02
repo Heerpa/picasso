@@ -66,6 +66,7 @@ LOCALIZATION_COLUMNS = {
         "net_gradient",
     ],
     "3D only": ["z", "d_zcalib", "lpz"],
+    "Rotation only": ["angle"],
     "Picked spots only": ["n_id"],
     "MLE only": ["log_likelihood", "iterations"],
 }

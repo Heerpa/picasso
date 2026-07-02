@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 01-JUL-2026 CEST
+Last change: 02-JUL-2026 CEST
 
 ## 0.11.0
 
@@ -31,6 +31,7 @@ Last change: 01-JUL-2026 CEST
 - GPU-accelerated fitting (GPUfit) now documented for Linux: the `libGpufit.so` is not shipped (only the Windows `Gpufit.dll` is), so Linux users must build it themselves. Added build/install instructions to the [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html#gpu-fitting-on-linux), the readme and a README in `picasso/ext/pygpufit/`.
 
 #### Render
+- Rendering rotated Gaussians
 - Improved measure tool
 - Faster AIM through smarter implementation
 - Faster and more memory efficient (especially for large datasets) SMLM clusterer + progress bar added

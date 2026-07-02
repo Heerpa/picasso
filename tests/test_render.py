@@ -248,6 +248,83 @@ class TestRender:
         )
         assert not np.array_equal(im_no_rot, im_rot)
 
+    def test_gaussian_angle_zero_matches_unrotated(self):
+        """An 'angle' column of 0 reproduces the axis-aligned render."""
+        info = {"Pixelsize": 100.0, "Height": 20, "Width": 20}
+        base = pd.DataFrame(
+            {"x": [10.0], "y": [10.0], "lpx": [0.6], "lpy": [0.2]}
+        )
+        _, im_plain = render.render(
+            base, info, disp_px_size=25.0, blur_method="gaussian"
+        )
+        _, im_rot0 = render.render(
+            base.assign(angle=[0.0]),
+            info,
+            disp_px_size=25.0,
+            blur_method="gaussian",
+        )
+        assert np.allclose(im_rot0, im_plain, rtol=1e-4, atol=1e-6)
+
+    def test_gaussian_angle_ninety_swaps_precision(self):
+        """A 90 degree rotation is equivalent to swapping lpx and lpy."""
+        info = {"Pixelsize": 100.0, "Height": 20, "Width": 20}
+        rotated = pd.DataFrame(
+            {
+                "x": [10.0],
+                "y": [10.0],
+                "lpx": [0.6],
+                "lpy": [0.2],
+                "angle": [90.0],
+            }
+        )
+        swapped = pd.DataFrame(
+            {"x": [10.0], "y": [10.0], "lpx": [0.2], "lpy": [0.6]}
+        )
+        _, im_rot = render.render(
+            rotated, info, disp_px_size=25.0, blur_method="gaussian"
+        )
+        _, im_swap = render.render(
+            swapped, info, disp_px_size=25.0, blur_method="gaussian"
+        )
+        assert np.allclose(im_rot, im_swap, rtol=1e-4, atol=1e-6)
+
+    def test_gaussian_angle_changes_image_and_keeps_mass(self):
+        """A non-zero rotation tilts the ellipse while conserving mass."""
+        info = {"Pixelsize": 100.0, "Height": 20, "Width": 20}
+        base = pd.DataFrame(
+            {"x": [10.0], "y": [10.0], "lpx": [0.6], "lpy": [0.2]}
+        )
+        _, im0 = render.render(
+            base.assign(angle=[0.0]),
+            info,
+            disp_px_size=25.0,
+            blur_method="gaussian",
+        )
+        _, im45 = render.render(
+            base.assign(angle=[45.0]),
+            info,
+            disp_px_size=25.0,
+            blur_method="gaussian",
+        )
+        assert not np.allclose(im0, im45)
+        assert np.isclose(im0.sum(), im45.sum(), rtol=1e-3)
+
+    def test_empty_locs_gaussian_theta(self):
+        """Empty input with an 'angle' column must not crash."""
+        info = {"Pixelsize": 100.0, "Height": 20, "Width": 20}
+        empty = (
+            pd.DataFrame(
+                {"x": [10.0], "y": [10.0], "lpx": [0.6], "lpy": [0.2]}
+            )
+            .assign(angle=[0.0])
+            .iloc[:0]
+        )
+        n, im = render.render(
+            empty, info, disp_px_size=25.0, blur_method="gaussian"
+        )
+        assert n == 0
+        assert (im == 0).all()
+
 
 # ---------------------------------------------------------------------------
 # render_hist_numba
