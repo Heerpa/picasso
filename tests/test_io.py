@@ -873,6 +873,123 @@ class TestTiffLoading:
 
 
 # ---------------------------------------------------------------------------
+# MicroManager "separate image files" acquisitions (one TIFF per frame).
+# ---------------------------------------------------------------------------
+
+
+def _write_single_frame(path, frame):
+    """Write one 2-D frame as a single-page TIFF (mimics one file of a
+    MicroManager separate-files acquisition)."""
+    with tifffile.TiffWriter(str(path), ome=False) as tw:
+        tw.write(frame, photometric="minisblack", contiguous=True)
+
+
+class TestMMSeparateFiles:
+    def _mm2_name(self, t, c=0, p=0, z=0):
+        return (
+            f"img_channel{c:03d}_position{p:03d}" f"_time{t:09d}_z{z:03d}.tif"
+        )
+
+    def _mm14_name(self, frame, channel="Default", z=0):
+        return f"img_{frame:09d}_{channel}_{z:03d}.tif"
+
+    def test_mm2_folder_loads_as_single_movie(self, tmp_path):
+        rng = np.random.default_rng(20)
+        data = rng.integers(0, 60000, size=(6, 16, 20), dtype="<u2")
+        for t, frame in enumerate(data):
+            _write_single_frame(tmp_path / self._mm2_name(t), frame)
+
+        # Opening any single frame assembles the whole sequence.
+        movie, info = io.load_tif(str(tmp_path / self._mm2_name(2)))
+        try:
+            assert isinstance(movie, io.MMSeparateTiffMovie)
+            assert movie.n_frames == 6
+            assert movie.shape == (6, 16, 20)
+            assert info[0]["Frames"] == 6
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+            np.testing.assert_array_equal(movie[4], data[4])
+            np.testing.assert_array_equal(movie[-1], data[-1])
+        finally:
+            movie.close()
+
+    def test_mm14_folder_loads_and_orders_frames(self, tmp_path):
+        rng = np.random.default_rng(21)
+        data = rng.integers(0, 60000, size=(5, 12, 8), dtype="<u2")
+        # Write out of order to prove sorting is by frame index.
+        for t in [3, 0, 4, 1, 2]:
+            _write_single_frame(tmp_path / self._mm14_name(t), data[t])
+
+        movie, info = io.load_movie(str(tmp_path / self._mm14_name(0)))
+        try:
+            assert isinstance(movie, io.MMSeparateTiffMovie)
+            assert movie.n_frames == 5
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+        finally:
+            movie.close()
+
+    def test_other_channels_not_interleaved(self, tmp_path):
+        rng = np.random.default_rng(22)
+        ch0 = rng.integers(0, 60000, size=(4, 10, 10), dtype="<u2")
+        ch1 = rng.integers(0, 60000, size=(4, 10, 10), dtype="<u2")
+        for t in range(4):
+            _write_single_frame(tmp_path / self._mm2_name(t, c=0), ch0[t])
+            _write_single_frame(tmp_path / self._mm2_name(t, c=1), ch1[t])
+
+        # Selecting a channel-0 frame yields only channel-0 frames.
+        movie, _ = io.load_tif(str(tmp_path / self._mm2_name(0, c=0)))
+        try:
+            assert movie.n_frames == 4
+            np.testing.assert_array_equal(np.array(list(movie)), ch0)
+        finally:
+            movie.close()
+
+    def test_lone_file_is_not_treated_as_series(self, tmp_path):
+        rng = np.random.default_rng(23)
+        frame = rng.integers(0, 60000, size=(8, 8), dtype="<u2")
+        path = tmp_path / self._mm2_name(0)
+        _write_single_frame(path, frame)
+
+        # A single matching file must not become a separate-files movie;
+        # it opens as an ordinary one-frame TIFF.
+        assert io._mm_separate_files(str(path)) is None
+        movie, _ = io.load_tif(str(path))
+        try:
+            assert not isinstance(movie, io.MMSeparateTiffMovie)
+            assert movie.n_frames == 1
+        finally:
+            movie.close()
+
+    def test_plain_tiff_name_not_detected(self, tmp_path):
+        rng = np.random.default_rng(24)
+        data = rng.integers(0, 60000, size=(3, 8, 8), dtype="<u2")
+        path = tmp_path / "acquisition.tif"
+        _write_tif_stack(path, data)
+        assert io._mm_separate_files(str(path)) is None
+
+    def test_find_mm_separate_first(self, tmp_path):
+        rng = np.random.default_rng(25)
+        data = rng.integers(0, 60000, size=(3, 8, 8), dtype="<u2")
+        for t in range(3):
+            _write_single_frame(tmp_path / self._mm2_name(t), data[t])
+        # A stray metadata.txt and unrelated file must be ignored.
+        (tmp_path / "metadata.txt").write_text("{}")
+
+        first = io.find_mm_separate_first(str(tmp_path))
+        assert first is not None
+        movie, _ = io.load_tif(first)
+        try:
+            assert movie.n_frames == 3
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+        finally:
+            movie.close()
+
+        # A folder without a sequence returns None.
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        assert io.find_mm_separate_first(str(empty)) is None
+
+
+# ---------------------------------------------------------------------------
 # Manual-metadata fallback for movie files whose metadata cannot be read
 # (load_tif / load_nd2 / load_stk via _movie_info_or_prompt).
 # ---------------------------------------------------------------------------

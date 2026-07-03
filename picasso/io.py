@@ -499,7 +499,15 @@ def load_tif(
     Returns None if the metadata could not be read and the user
     cancelled the manual-metadata fallback dialog.
     """
-    movie = TiffMultiMap(path, memmap_frames=False, progress=progress)
+    # MicroManager can save an acquisition as one single-page TIFF per
+    # frame ("separate image files"). If ``path`` is one such frame,
+    # assemble the whole folder into a single movie instead of opening a
+    # one-frame file.
+    separate_paths = _mm_separate_files(path)
+    if separate_paths is not None:
+        movie = MMSeparateTiffMovie(separate_paths)
+    else:
+        movie = TiffMultiMap(path, memmap_frames=False, progress=progress)
     info = _movie_info_or_prompt(movie, path, prompt_info)
     if info is None:
         return None
@@ -3013,6 +3021,167 @@ class TiffMultiMap(AbstractPicassoMovie):
     def tofile(self, file_handle, byte_order=None):
         for map in self.maps:
             map.tofile(file_handle, byte_order)
+
+
+# MicroManager can save an acquisition as one single-page TIFF per camera
+# frame ("separate image files" / "Image files" mode) inside a folder,
+# next to a ``metadata.txt``. The two naming schemes are:
+#   * MM 2.0: img_channel000_position000_time000000000_z000.tif
+#   * MM 1.4: img_000000000_Default_000.tif  (img_<frame>_<channel>_<z>)
+# The frame axis is the time index (MM 2.0) or the leading index (MM
+# 1.4). Channel, position and z are held fixed (they are part of the
+# prefix/suffix below) so a single 2-D time series is assembled and
+# multi-channel / multi-position sets are never interleaved into one
+# movie.
+_MM_SEPARATE_RES = (
+    re.compile(
+        r"^(?P<prefix>img_channel\d+_position\d+_time)\d+"
+        r"(?P<suffix>_z\d+\.tif)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?P<prefix>img_)\d+(?P<suffix>_.+_\d+\.tif)$",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _mm_separate_files(path: str) -> list[str] | None:
+    """Return the ordered sibling frames of a MicroManager "separate
+    image files" acquisition, or ``None`` if ``path`` is not part of one.
+
+    Given one ``img_*.tif`` file, discover every sibling in the same
+    folder that differs only in its frame (time) index - channel,
+    position and z are held at the selected file's values - and return
+    the paths sorted by that index. Returns ``None`` for a name that does
+    not match the MicroManager separate-file convention, or when only a
+    single matching file is present (a lone TIFF, opened as usual).
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    name = os.path.basename(path)
+    for regex in _MM_SEPARATE_RES:
+        m = regex.match(name)
+        if m is None:
+            continue
+        # Siblings share the fixed prefix + suffix and vary only in the
+        # frame index captured between them.
+        sibling_re = re.compile(
+            re.escape(m.group("prefix"))
+            + r"(\d+)"
+            + re.escape(m.group("suffix")),
+            re.IGNORECASE,
+        )
+        indexed = []
+        for entry in os.scandir(directory):
+            if not entry.is_file():
+                continue
+            sm = sibling_re.fullmatch(entry.name)
+            if sm is not None:
+                indexed.append((int(sm.group(1)), entry.path))
+        if len(indexed) <= 1:
+            # A lone file is not a series; open it as an ordinary TIFF.
+            return None
+        indexed.sort()
+        return [p for _, p in indexed]
+    return None
+
+
+class MMSeparateTiffMovie(TiffMultiMap):
+    """Read a MicroManager acquisition saved as *separate image files*.
+
+    In this mode every camera frame is written to its own single-page
+    TIFF inside one folder (see :func:`_mm_separate_files` for the naming
+    schemes), so a long movie can be tens of thousands of files. Unlike
+    ``TiffMultiMap`` - which opens a ``TiffMap`` per file up front - this
+    class reads geometry, dtype and metadata from the first frame only
+    and takes the frame count from the number of files, so opening the
+    movie stays O(1) instead of O(frames). Every other frame's file is
+    opened lazily when that frame is first read and closed again right
+    away, so the movie holds at most one extra file handle open and never
+    exhausts the OS descriptor limit. Frame reads are independent, so
+    they are safe to run concurrently.
+
+    Each file is assumed to hold one plane of identical shape and dtype
+    (always true for this MicroManager mode); the frame count comes from
+    the file list, not from re-parsing each file. The array-like access,
+    iteration and ``camera_parameters`` are inherited from
+    ``TiffMultiMap``.
+    """
+
+    def __init__(self, paths: list[str], verbose: bool = False):
+        # Deliberately skip TiffMultiMap.__init__ (which would eagerly
+        # open a TiffMap per file); build the composite geometry from the
+        # first frame only.
+        AbstractPicassoMovie.__init__(self)
+        if not paths:
+            raise ValueError("No TIFF files given for a separate-files movie.")
+        self.paths = list(paths)
+        self.path = os.path.abspath(self.paths[0])
+        self.dir = os.path.dirname(self.path)
+        self.n_frames = len(self.paths)
+        # Read geometry, dtype and metadata from the first frame only.
+        self._first = TiffMap(self.path, verbose=verbose)
+        self._dtype = self._first.dtype
+        self.height = self._first.height
+        self.width = self._first.width
+        self.frame_shape = (self.height, self.width)
+        self.shape = (self.n_frames, self.height, self.width)
+
+    # Each read opens its own file handle, so concurrent reads are safe.
+    supports_concurrent_reads = True
+
+    def get_frame(self, index: int) -> lib.IntArray2D:
+        if index < 0:
+            index += self.n_frames
+        if not 0 <= index < self.n_frames:
+            raise IndexError(
+                f"Frame {index} out of range for {self.n_frames} frames."
+            )
+        if index == 0:
+            # Frame 0's file stays open for metadata/geometry; reuse it.
+            return self._first.get_frame(0)
+        # Open every other file lazily and close it right away so the
+        # movie never holds thousands of file handles at once.
+        with TiffMap(self.paths[index]) as tif:
+            return tif.get_frame(0)
+
+    def info(self):
+        info = self._first.info()
+        info["Frames"] = self.n_frames
+        self.meta = info
+        return info
+
+    def close(self):
+        self._first.close()
+
+    def tofile(self, file_handle, byte_order=None):
+        self._first.tofile(file_handle, byte_order)
+        for path in self.paths[1:]:
+            with TiffMap(path) as tif:
+                tif.tofile(file_handle, byte_order)
+
+
+def find_mm_separate_first(directory: str) -> str | None:
+    """Return the first-frame path of a MicroManager "separate image
+    files" acquisition inside ``directory``, or ``None`` if the folder
+    holds no such sequence.
+
+    Passing the returned path to :func:`load_tif` (or :func:`load_movie`)
+    assembles the whole folder into a single movie, because those loaders
+    detect the separate-files layout via :func:`_mm_separate_files`.
+    """
+    try:
+        names = sorted(
+            entry.name for entry in os.scandir(directory) if entry.is_file()
+        )
+    except OSError:
+        return None
+    for name in names:
+        if any(regex.match(name) for regex in _MM_SEPARATE_RES):
+            candidate = os.path.join(directory, name)
+            if _mm_separate_files(candidate) is not None:
+                return candidate
+    return None
 
 
 def to_raw_combined(basename: str, paths: list[str]) -> None:

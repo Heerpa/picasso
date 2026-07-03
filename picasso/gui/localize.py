@@ -2447,6 +2447,11 @@ class Window(QtWidgets.QMainWindow):
             self.open_channels_from_files_dialog
         )
         file_menu.addAction(open_channels_action)
+        open_mm_folder_action = file_menu.addAction(
+            "Open MicroManager image folder"
+        )
+        open_mm_folder_action.triggered.connect(self.open_mm_folder_dialog)
+        file_menu.addAction(open_mm_folder_action)
         save_identifications_action = file_menu.addAction(
             "Save identifications"
         )
@@ -2677,6 +2682,31 @@ class Window(QtWidgets.QMainWindow):
         if path:
             self.pwd = path
             self.open(path)
+
+    def open_mm_folder_dialog(self) -> None:
+        """Open a MicroManager "separate image files" acquisition folder.
+
+        MicroManager can save each frame of a movie as its own TIFF
+        (``img_*.tif``) inside one folder. This picks such a folder and
+        loads the whole sequence as a single movie.
+        """
+        dir = None if self.pwd == [] else self.pwd
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Open MicroManager image folder", directory=dir
+        )
+        if not directory:
+            return
+        path = io.find_mm_separate_first(directory)
+        if path is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No image sequence found",
+                "No MicroManager 'separate image files' sequence "
+                "(img_*.tif) was found in the selected folder.",
+            )
+            return
+        self.pwd = path
+        self.open(path)
 
     def _prompt_for_path(self, path: str):
         """Return the metadata prompt callback appropriate for ``path``."""
