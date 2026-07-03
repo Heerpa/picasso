@@ -680,6 +680,28 @@ def _write_tif_stack(
             )
 
 
+def _write_imagej_contiguous_stack(path, data):
+    """Write ``data`` (frames, H, W) in ImageJ's *contiguous stack*
+    layout: a single IFD whose ``ImageDescription`` declares the full
+    plane count, followed by every other plane's pixel data laid out
+    back-to-back. This mirrors ImageJ's own "Save As > Tiff" for large
+    stacks (as opposed to one-IFD-per-plane), which tifffile reports as
+    a single page plus an N-plane series."""
+    tifffile.imwrite(str(path), data[0], imagej=True)
+    with tifffile.TiffFile(str(path)) as t:
+        tag = t.pages[0].tags.get(270)  # ImageDescription
+        offset, count = tag.valueoffset, tag.count
+    n = len(data)
+    desc = f"ImageJ=1.54f\nimages={n}\nslices={n}\n".encode()
+    assert len(desc) <= count, "test description longer than reserved tag"
+    desc = desc + b" " * (count - len(desc))
+    with open(path, "r+b") as fh:
+        fh.seek(offset)
+        fh.write(desc)
+    with open(path, "ab") as fh:
+        fh.write(np.ascontiguousarray(data[1:]).tobytes())
+
+
 class TestTiffLoading:
     def test_load_tif_basic_shape_dtype_frames(self, tmp_path):
         rng = np.random.default_rng(0)
@@ -785,6 +807,59 @@ class TestTiffLoading:
             np.testing.assert_array_equal(np.array(list(movie)), expected)
             # Frame routing across files
             np.testing.assert_array_equal(movie[7], expected[7])
+        finally:
+            movie.close()
+
+    def test_imagej_contiguous_stack_all_frames_detected(self, tmp_path):
+        # ImageJ stores a large stack as one IFD + contiguous plane data,
+        # recording the count in its metadata. Picasso must read every
+        # plane, not just the single page tifffile reports.
+        rng = np.random.default_rng(30)
+        data = rng.integers(0, 60000, size=(50, 24, 32), dtype="<u2")
+        path = tmp_path / "ij_contiguous.tif"
+        _write_imagej_contiguous_stack(path, data)
+
+        movie, info = io.load_tif(str(path))
+        try:
+            assert movie.n_frames == 50
+            assert movie.shape == (50, 24, 32)
+            assert info[0]["Frames"] == 50
+            # Fast offset path is used (uncompressed contiguous planes).
+            assert movie.maps[0]._imagej_planes == 50
+            assert movie.maps[0]._offsets is not None
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+            np.testing.assert_array_equal(movie[37], data[37])
+            np.testing.assert_array_equal(movie[49], data[49])
+        finally:
+            movie.close()
+
+    def test_imagej_contiguous_big_endian(self, tmp_path):
+        # Real-world ImageJ stacks are often big-endian; values must be
+        # normalized to little-endian like every other TIFF path.
+        rng = np.random.default_rng(31)
+        data = rng.integers(0, 60000, size=(20, 16, 16), dtype="<u2")
+        path = tmp_path / "ij_be.tif"
+        _write_imagej_contiguous_stack(path, data.astype(">u2"))
+
+        movie, _ = io.load_tif(str(path))
+        try:
+            assert movie.n_frames == 20
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+        finally:
+            movie.close()
+
+    def test_imagej_single_plane_not_expanded(self, tmp_path):
+        # A genuine single-plane ImageJ image must stay one frame.
+        rng = np.random.default_rng(32)
+        frame = rng.integers(0, 60000, size=(16, 16), dtype="<u2")
+        path = tmp_path / "ij_single.tif"
+        tifffile.imwrite(str(path), frame, imagej=True)
+
+        movie, _ = io.load_tif(str(path))
+        try:
+            assert movie.n_frames == 1
+            assert movie.maps[0]._imagej_planes is None
+            np.testing.assert_array_equal(movie[0], frame)
         finally:
             movie.close()
 

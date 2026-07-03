@@ -2198,6 +2198,16 @@ class TiffMap:
         # The fast np.fromfile path only applies to uncompressed data.
         self._uncompressed = int(page0.compression) == 1
 
+        # ImageJ writes an uncompressed multi-plane stack as a single IFD
+        # followed by every other plane's pixel data laid out
+        # contiguously, recording the plane count in the ImageJ metadata
+        # rather than as separate pages. tifffile then exposes only one
+        # page, so without this the movie would be counted as a single
+        # frame. When detected, _build_offsets derives every frame's
+        # offset arithmetically from the first plane (see
+        # _imagej_contiguous_count).
+        self._imagej_planes = self._imagej_contiguous_count(page0)
+
         # Precompute every frame's byte offset and the true frame count
         # in a single pass over the IFDs. The offset table keeps
         # `get_frame` a pure seek + np.fromfile (one large sequential
@@ -2256,6 +2266,46 @@ class TiffMap:
                 self._open_handles.append(handle)
         return handle
 
+    def _imagej_contiguous_count(self, page0) -> int | None:
+        """Return the plane count of an ImageJ contiguous stack, else None.
+
+        ImageJ stores an uncompressed multi-plane stack as one IFD whose
+        pixel data is followed by every other plane's data back-to-back
+        in the file, recording the plane count in the ImageJ metadata
+        instead of as separate pages. tifffile then reports a single
+        page, so the frames would otherwise be miscounted as 1. The true
+        plane count comes from ``tif.series[0]`` (parsed from the small
+        ImageJ ``ImageDescription``, not the potentially huge per-frame
+        ``Labels`` block). Every non-YX axis (z / t / channel) is
+        flattened into the frame axis, matching how a page-based reader
+        would see the planes.
+
+        Returns None - leaving the normal per-page logic in charge - for
+        anything that is not an uncompressed, single-strip, single-page
+        ImageJ stack, so genuine single-plane images and per-page stacks
+        are unaffected.
+        """
+        if not getattr(self._tif, "is_imagej", False):
+            return None
+        if len(self._pages) != 1 or not self._uncompressed:
+            return None
+        # Fast contiguous reads need exactly one strip of the expected size.
+        if (
+            len(page0.dataoffsets) != 1
+            or int(page0.databytecounts[0]) != self._frame_nbytes
+        ):
+            return None
+        try:
+            shape = tuple(int(d) for d in self._tif.series[0].shape)
+        except Exception:
+            return None
+        if len(shape) < 3 or shape[-2:] != self._page_shape:
+            return None
+        n = 1
+        for dim in shape[:-2]:
+            n *= dim
+        return n if n > 1 else None
+
     def _build_offsets(self, progress=None) -> tuple[list[int] | None, int]:
         """Return ``(offsets, n_frames)`` for the movie.
 
@@ -2284,6 +2334,26 @@ class TiffMap:
         def report(done: int) -> None:
             if progress is not None and (done % step == 0 or done == n_pages):
                 progress(done, n_pages)
+
+        if self._imagej_planes is not None:
+            # ImageJ contiguous stack: one IFD, then every plane's data
+            # laid out back-to-back from the first plane's offset. Derive
+            # each frame's offset arithmetically instead of from
+            # (non-existent) per-page IFDs. Guard against a truncated file
+            # by keeping only the planes that physically fit.
+            base = int(self._pages[0].dataoffsets[0])
+            n = self._imagej_planes
+            try:
+                file_size = os.path.getsize(self.path)
+                fit = (file_size - base) // self._frame_nbytes
+                if fit < n:
+                    n = max(fit, 0)
+            except OSError:
+                pass
+            offsets = [base + i * self._frame_nbytes for i in range(n)]
+            if progress is not None:
+                progress(n, n)
+            return offsets, n
 
         if not self._uncompressed:
             # Compressed / tiled: no fast offset path. In the lightweight
