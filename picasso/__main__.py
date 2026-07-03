@@ -1147,7 +1147,8 @@ def _localize_process_file(
             calibration=z_calibration,
             fitting_method=method,
             filter=0,
-            multiprocess=True,
+            multiprocess=not args.fit_z_gpu,
+            gpu=args.fit_z_gpu,
             progress_callback="console",
         )
         info[-1]["Z Calibration Path"] = zpath
@@ -1286,6 +1287,18 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     z_params = None
     if "-3d" in args.fit_method:
         z_params = _localize_load_3d_calibration(args)
+        if args.fit_z_gpu:
+            from . import zfit
+
+            if zfit.CUDA_AVAILABLE:
+                print("GPU z fitting enabled (numba.cuda)")
+            else:
+                print(
+                    "Warning: GPU z fitting requested (--fit-z-gpu) but no "
+                    "CUDA-capable GPU is available. Falling back to "
+                    "multiprocessed CPU z fitting."
+                )
+                args.fit_z_gpu = False
 
     for i, path in enumerate(paths):
         _localize_process_file(
@@ -2553,6 +2566,14 @@ def main():  # noqa: C901
         type=str,
         default="",
         help="path to 3D calibration file (3D only)",
+    )
+    localize_parser.add_argument(
+        "-zg",
+        "--fit-z-gpu",
+        action="store_true",
+        help=(
+            "fit z coordinates on a CUDA-capable GPU (numba.cuda);" " 3D only"
+        ),
     )
 
     localize_parser.add_argument(

@@ -1598,6 +1598,7 @@ class ParametersDialog(lib.Dialog):
         z_grid.addWidget(load_z_calib, 0, 1)
         z_grid.addWidget(lib.HelpButton(self.CALIB_URL), 2, 0)
         self.fit_z_checkbox = QtWidgets.QCheckBox("Fit Z")
+        self.fit_z_checkbox.setToolTip("Fit z coordinates?")
         self.fit_z_checkbox.setEnabled(False)
         z_grid.addWidget(self.fit_z_checkbox, 2, 1)
         self.z_calib_label = QtWidgets.QLabel("-- no calibration loaded --")
@@ -1619,19 +1620,14 @@ class ParametersDialog(lib.Dialog):
         self.magnification_factor.setValue(0.79)
         z_grid.addWidget(self.magnification_factor, 1, 1)
 
-        # GPU (numba.cuda) z fitting. Only shown when a CUDA-capable GPU is
-        # available; otherwise the checkbox stays hidden and unchecked so the
-        # CPU (multiprocessing) path is used.
-        self.fit_z_gpu_checkbox = QtWidgets.QCheckBox("Fit Z on GPU")
+        self.fit_z_gpu_checkbox = QtWidgets.QCheckBox("Use GPU")
         self.fit_z_gpu_checkbox.setTristate(False)
-        self.fit_z_gpu_checkbox.setToolTip(
-            "Fit z coordinates on a CUDA-capable GPU (numba.cuda).\n"
-            "Reproduces the CPU result but is much faster for many\n"
-            "localizations."
-        )
+        self.fit_z_gpu_checkbox.setToolTip("Fit z coordinates on a GPU?")
+        self.fit_z_gpu_checkbox.setEnabled(self.fit_z_checkbox.isChecked())
+        self.fit_z_checkbox.toggled.connect(self.fit_z_gpu_checkbox.setEnabled)
         if not zfit.CUDA_AVAILABLE:
             self.fit_z_gpu_checkbox.hide()
-        z_grid.addWidget(self.fit_z_gpu_checkbox, 3, 1)
+        z_grid.addWidget(self.fit_z_gpu_checkbox, 2, 2)
 
         if "Cameras" in CONFIG:
             camera = self.camera.currentText()
