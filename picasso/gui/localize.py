@@ -45,6 +45,31 @@ except Exception:
     GPUFIT_INSTALLED = False
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
+
+# Fitting models offered in the GUI, decoupled from the optimizer. Each
+# model maps its optimizer labels to the internal ``fit2D`` codes;
+# models without an optimizer (e.g. averaging) declare a fixed ``code``
+# and ``optimizers=None``. Add a new fitting algorithm by adding an
+# entry here.
+FIT_MODELS = {
+    "2D elliptical Gaussian": {
+        "optimizers": {"Least squares": "gausslq", "MLE": "gaussmle"},
+    },
+    "Average of ROI": {
+        "optimizers": None,
+        "code": "avg",
+    },
+}
+
+
+def _fit_code(model: str, optimizer: str) -> str:
+    """Resolve a (model, optimizer) selection to an internal ``fit2D`` code."""
+    entry = FIT_MODELS[model]
+    if entry["optimizers"] is None:
+        return entry["code"]
+    return entry["optimizers"][optimizer]
+
+
 # Steps allotted to each file in the load progress dialog, so the bar can
 # advance smoothly within a file from the loader's per-page reports.
 PROGRESS_RESOLUTION = 1000
@@ -1110,8 +1135,12 @@ class ParametersDialog(lib.Dialog):
         MLE fitting.
     emission_combos : EmissionSettingComboBoxDict
         Combo boxes for selecting emission wavelengths.
-    fit_method : QtWidgets.QComboBox
-        Combo box for selecting the fitting method.
+    fit_model : QtWidgets.QComboBox
+        Combo box for selecting the fitting model (e.g. 2D elliptical
+        Gaussian or average of ROI).
+    fit_optimizer : QtWidgets.QComboBox
+        Combo box for selecting the optimizer (Least squares or MLE).
+        Hidden for models that do not use an optimizer.
     fit_z_checkbox : QtWidgets.QCheckBox
         Checkbox for enabling/disabling fitting in the z-dimension using
         astigmatism.
@@ -1482,19 +1511,23 @@ class ParametersDialog(lib.Dialog):
         vbox.addWidget(fit_groupbox)
         fit_grid = QtWidgets.QGridLayout(fit_groupbox)
 
-        method_label = QtWidgets.QLabel("Method:")
-        method_label.setToolTip("Fitting method to use for localization.")
-        fit_grid.addWidget(method_label, 1, 0)
-        self.fit_method = QtWidgets.QComboBox()
-        self.fit_method.addItems(
-            ["LQ, Gaussian", "MLE, integrated Gaussian", "Average of ROI"]
-        )
-        self.fit_method.setCurrentIndex(0)
-        fit_grid.addWidget(self.fit_method, 1, 1)
-        fit_stack = QtWidgets.QStackedWidget()
-        fit_grid.addWidget(fit_stack, 2, 0, 1, 2)
-        self.fit_method.currentIndexChanged.connect(fit_stack.setCurrentIndex)
-        self.fit_method.currentIndexChanged.connect(self.on_fit_method_changed)
+        model_label = QtWidgets.QLabel("Model:")
+        model_label.setToolTip("Model fit to each identified spot.")
+        fit_grid.addWidget(model_label, 1, 0)
+        self.fit_model = QtWidgets.QComboBox()
+        self.fit_model.addItems(list(FIT_MODELS.keys()))
+        self.fit_model.setCurrentIndex(0)
+        fit_grid.addWidget(self.fit_model, 1, 1)
+
+        self.optimizer_label = QtWidgets.QLabel("Optimizer:")
+        self.optimizer_label.setToolTip("Optimizer used to fit the model.")
+        fit_grid.addWidget(self.optimizer_label, 2, 0)
+        self.fit_optimizer = QtWidgets.QComboBox()
+        fit_grid.addWidget(self.fit_optimizer, 2, 1)
+
+        self.fit_stack = QtWidgets.QStackedWidget()
+        fit_grid.addWidget(self.fit_stack, 3, 0, 1, 2)
+        fit_stack = self.fit_stack
 
         # MLE
         mle_widget = QtWidgets.QWidget()
@@ -1532,12 +1565,18 @@ class ParametersDialog(lib.Dialog):
             self.gpufit_checkbox.setDisabled(False)
         lq_grid.addWidget(self.gpufit_checkbox)
 
+        # Stack pages are ordered to match the optimizer combobox indices:
+        # 0 -> "Least squares" (GPU option), 1 -> "MLE" (convergence/max_it).
         fit_stack.addWidget(lq_widget)
         fit_stack.addWidget(mle_widget)
-        # lq_grid = QtWidgets.QGridLayout(lq_widget)
 
-        avg_widget = QtWidgets.QWidget()
-        fit_stack.addWidget(avg_widget)
+        self.fit_model.currentIndexChanged.connect(self.on_fit_model_changed)
+        self.fit_optimizer.currentIndexChanged.connect(
+            self.on_fit_optimizer_changed
+        )
+        # Populate the optimizer combobox and set visibility for the default
+        # model.
+        self.on_fit_model_changed()
 
         # 3D
         z_groupbox = QtWidgets.QGroupBox("3D via Astigmatism")
@@ -1759,11 +1798,35 @@ class ParametersDialog(lib.Dialog):
         self.roi_dialog.raise_()
         self.roi_dialog.activateWindow()
 
-    def on_fit_method_changed(self) -> None:
-        """Enable/disable GPU fitting checkbox based on selected fit
-        method."""
-        if self.fit_method.currentText() == "LQ, Gaussian":
-            self.gpufit_checkbox.setDisabled(False)
+    def on_fit_model_changed(self) -> None:
+        """Repopulate the optimizer combobox for the selected model and
+        show/hide the optimizer controls. Models without an optimizer
+        (e.g. averaging) hide the optimizer row and its parameters."""
+        model = self.fit_model.currentText()
+        optimizers = FIT_MODELS[model]["optimizers"]
+        if optimizers is None:
+            self.optimizer_label.hide()
+            self.fit_optimizer.hide()
+            self.fit_stack.hide()
+        else:
+            self.optimizer_label.show()
+            self.fit_optimizer.show()
+            self.fit_stack.show()
+            self.fit_optimizer.blockSignals(True)
+            self.fit_optimizer.clear()
+            self.fit_optimizer.addItems(list(optimizers.keys()))
+            self.fit_optimizer.setCurrentIndex(0)
+            self.fit_optimizer.blockSignals(False)
+            self.on_fit_optimizer_changed()
+
+    def on_fit_optimizer_changed(self) -> None:
+        """Switch the optimizer parameter page and enable/disable the GPU
+        fitting checkbox based on the selected optimizer."""
+        index = self.fit_optimizer.currentIndex()
+        if index >= 0:
+            self.fit_stack.setCurrentIndex(index)
+        if self.fit_optimizer.currentText() == "Least squares":
+            self.gpufit_checkbox.setDisabled(not GPUFIT_INSTALLED)
         else:
             self.gpufit_checkbox.setChecked(False)
             self.gpufit_checkbox.setDisabled(True)
@@ -2959,7 +3022,8 @@ class Window(QtWidgets.QMainWindow):
             "mng": pd.mng_slider.value(),
             "mng_min": pd.mng_min_spinbox.value(),
             "mng_max": pd.mng_max_spinbox.value(),
-            "fit_method": pd.fit_method.currentIndex(),
+            "fit_model": pd.fit_model.currentIndex(),
+            "fit_optimizer": pd.fit_optimizer.currentIndex(),
             "baseline": pd.baseline.value(),
             "gain": pd.gain.value(),
             "sensitivity": pd.sensitivity.value(),
@@ -2995,7 +3059,10 @@ class Window(QtWidgets.QMainWindow):
         pd.mng_max_spinbox.setValue(params["mng_max"])
         pd.mng_slider.setValue(params["mng"])
         pd.mng_spinbox.setValue(params["mng"])
-        pd.fit_method.setCurrentIndex(params["fit_method"])
+        # Set the model first so its handler repopulates the optimizer list,
+        # then restore the optimizer selection.
+        pd.fit_model.setCurrentIndex(params.get("fit_model", 0))
+        pd.fit_optimizer.setCurrentIndex(params.get("fit_optimizer", 0))
         pd.baseline.setValue(params["baseline"])
         pd.gain.setValue(params["gain"])
         pd.sensitivity.setValue(params["sensitivity"])
@@ -3587,12 +3654,9 @@ class Window(QtWidgets.QMainWindow):
         """
         if self.movie is not None and self.ready_for_fit:
             self.status_bar.showMessage("Preparing fit...")
-            method = self.parameters_dialog.fit_method.currentText()
-            method = {
-                "LQ, Gaussian": "gausslq",
-                "MLE, integrated Gaussian": "gaussmle",
-                "Average of ROI": "avg",
-            }[method]
+            model = self.parameters_dialog.fit_model.currentText()
+            optimizer = self.parameters_dialog.fit_optimizer.currentText()
+            method = _fit_code(model, optimizer)
             eps = self.parameters_dialog.convergence_criterion.value()
             max_it = self.parameters_dialog.max_it.value()
             fit_z = self.parameters_dialog.fit_z_checkbox.isChecked()
@@ -3622,12 +3686,12 @@ class Window(QtWidgets.QMainWindow):
         """Fit z coordinates of the fitted localizations based on the
         calibration data."""
         self.status_bar.showMessage("Fitting z position...")
-        # avgroi won't really work but kept for compatibility
-        fitting_method = {
-            "LQ, Gaussian": "gausslq",
-            "MLE, integrated Gaussian": "gaussmle",
-            "Average of ROI": "gausslq",  # fallback for compatibility
-        }[self.parameters_dialog.fit_method.currentText()]
+        model = self.parameters_dialog.fit_model.currentText()
+        optimizer = self.parameters_dialog.fit_optimizer.currentText()
+        fitting_method = _fit_code(model, optimizer)
+        # avgroi won't really work for z; fall back to gausslq for compatibility
+        if fitting_method == "avg":
+            fitting_method = "gausslq"
         self.fit_z_worker = FitZWorker(
             self.locs,
             self.info + [self.camera_info],  # ensure pixel size in info
@@ -3966,9 +4030,12 @@ class Window(QtWidgets.QMainWindow):
         """Save localizations and their metadata."""
         localize_info = self.last_identification_info.copy()
         localize_info["Generated by"] = f"Picasso v{__version__} Localize"
-        localize_info["Fit method"] = (
-            self.parameters_dialog.fit_method.currentText()
-        )
+        model = self.parameters_dialog.fit_model.currentText()
+        if FIT_MODELS[model]["optimizers"] is None:
+            localize_info["Fit method"] = model
+        else:
+            optimizer = self.parameters_dialog.fit_optimizer.currentText()
+            localize_info["Fit method"] = f"{model}, {optimizer}"
         if self.parameters_dialog.fit_z_checkbox.isChecked():
             localize_info["Z Calibration Path"] = (
                 self.parameters_dialog.z_calibration_path
