@@ -334,7 +334,23 @@ def load_calibration(path: str) -> dict:
         A dictionary containing the 3D astigmatic calibration data.
     """
     with open(path, "r") as calibration_file:
-        calibration = yaml.full_load(calibration_file)
+        try:
+            calibration = yaml.full_load(calibration_file)
+        except yaml.composer.ComposerError:
+            raise ValueError(
+                "Invalid calibration file: expected a single-document YAML "
+                "file. This does not look like a 3D calibration file."
+            )
+
+    if not isinstance(calibration, dict) or (
+        "X Coefficients" not in calibration
+        or not isinstance(calibration["X Coefficients"], dict)
+    ):
+        raise ValueError(
+            "Invalid calibration file: 'X Coefficients' must be present and "
+            "be a dictionary."
+        )
+
     return calibration
 
 

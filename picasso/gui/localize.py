@@ -1915,9 +1915,11 @@ class ParametersDialog(lib.Dialog):
             else:
                 self.update_z_calib(None)
                 self.z_calib_label.setText("-- calibration path not found --")
+                self.z_calib_label.setToolTip("")
                 return
             self.z_calib_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
             self.z_calib_label.setText(os.path.basename(path))
+            self.z_calib_label.setToolTip(path)
             self.fit_z_checkbox.setEnabled(True)
             self.fit_z_checkbox.setChecked(True)
         else:
@@ -2411,6 +2413,9 @@ class Window(QtWidgets.QMainWindow):
             self.parameters_dialog.box_spinbox.setValue(box_size)
         if type(gradient) is int:
             self.parameters_dialog.mng_slider.setValue(gradient)
+        self.parameters_dialog.fit_z_gpu_checkbox.setChecked(
+            bool(settings["Localize"]["fit_z_gpu"])
+        )
 
         self.pwd = pwd
 
@@ -2426,6 +2431,9 @@ class Window(QtWidgets.QMainWindow):
             settings["Localize"][
                 "gradient"
             ] = self.parameters_dialog.mng_slider.value()
+        settings["Localize"][
+            "fit_z_gpu"
+        ] = self.parameters_dialog.fit_z_gpu_checkbox.isChecked()
         settings["Localize"]["Columns to save"] = {
             column: checkbox.isChecked()
             for column, checkbox in (
