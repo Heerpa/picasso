@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 02-JUL-2026 CEST
+Last change: 03-JUL-2026 CEST
 
 ## 0.11.0
 
@@ -24,6 +24,7 @@ Last change: 02-JUL-2026 CEST
 - Cutting spots progress is reported between identification and fitting
 - Faster spot identification on network storage: `.tif`/`.ome.tif` and `.stk` movies are now read through a private file handle per worker thread instead of one shared, lock-serialized handle, so frame reads overlap and per-frame network latency is hidden
 - Faster spot cutting (`get_spots`) on network storage (see above)
+- Single-channel data loading with smooth progress bar
 - Improved zooming in/out via scroll wheel
 - Contrast spin boxes use logarithmic scaling
 - Fixed a gap of roughly one box size in the identified spots along the borders between adjacent (e.g. overlapping) ROIs

@@ -483,9 +483,10 @@ def load_tif(
         Called with the readable movie dimensions if the embedded
         metadata cannot be parsed, so the user can enter it manually.
         Must return ``(info, save)`` or None if cancelled.
-    progress : None, optional
-        A placeholder for progress tracking, not used in this function.
-        Default is None.
+    progress : callable, optional
+        ``callable(done, total)`` invoked as the per-page IFD scan
+        proceeds, so a smooth determinate progress bar can be shown while
+        a large movie is opened. Default is None (no reporting).
 
     Returns
     -------
@@ -498,7 +499,7 @@ def load_tif(
     Returns None if the metadata could not be read and the user
     cancelled the manual-metadata fallback dialog.
     """
-    movie = TiffMultiMap(path, memmap_frames=False)
+    movie = TiffMultiMap(path, memmap_frames=False, progress=progress)
     info = _movie_info_or_prompt(movie, path, prompt_info)
     if info is None:
         return None
@@ -781,8 +782,10 @@ def load_movie(
         Format-specific callback used to obtain missing metadata
         interactively (e.g. to select a channel for multi-channel files
         or to enter movie metadata manually when it cannot be read).
-    progress : None
-        Placeholder for progress tracking, not used in this function.
+    progress : callable, optional
+        ``callable(done, total)`` forwarded to the TIFF loader to report
+        per-page progress while a movie is opened. Other formats ignore
+        it (they open effectively instantly). Default is None.
 
     Returns
     -------
@@ -801,7 +804,7 @@ def load_movie(
     if ext == ".raw":
         return load_raw(path, prompt_info=prompt_info)
     elif ext in TIFF_EXTENSIONS:
-        return load_tif(path, prompt_info=prompt_info)
+        return load_tif(path, prompt_info=prompt_info, progress=progress)
     elif ext == ".ims":
         return load_ims(path, prompt_info=prompt_info)
     elif ext == ".nd2":
@@ -2135,9 +2138,14 @@ class TiffMap:
     (slower to open but reads the file) and drops the stray IFD so
     ``n_frames`` matches the real number of image planes."""
 
-    def __init__(self, path: str, verbose: bool = False):
+    def __init__(self, path: str, verbose: bool = False, progress=None):
         """Open the TIFF file with tifffile and extract the geometry,
-        data type and per-page layout needed for lazy frame access."""
+        data type and per-page layout needed for lazy frame access.
+
+        ``progress`` is an optional ``callable(done, total)`` invoked as
+        the per-page IFD scan in ``_build_offsets`` proceeds, so the GUI
+        can show a smooth determinate bar while a single large movie is
+        opened. It is throttled to at most ~200 calls per file."""
         if verbose:
             print("Reading info from {}".format(path))
         self.path = os.path.abspath(path)
@@ -2200,7 +2208,7 @@ class TiffMap:
         # the file with the right number of frames, as the pre-tifffile
         # reader did.
         try:
-            self._offsets, self.n_frames = self._build_offsets()
+            self._offsets, self.n_frames = self._build_offsets(progress)
         except RuntimeError:
             # Flipping useframes in place is cache-safe (Picasso never
             # enables tifffile's page cache, so no stale TiffFrames are
@@ -2208,7 +2216,7 @@ class TiffMap:
             # LSM branch above uses full TiffPages and never raises here.
             self._tif.pages.useframes = False
             self._pages = self._tif.pages
-            self._offsets, self.n_frames = self._build_offsets()
+            self._offsets, self.n_frames = self._build_offsets(progress)
 
         # Per-thread binary handles for the fast offset-based read path.
         # A single shared handle forces every concurrent reader to
@@ -2240,7 +2248,7 @@ class TiffMap:
                 self._open_handles.append(handle)
         return handle
 
-    def _build_offsets(self) -> tuple[list[int] | None, int]:
+    def _build_offsets(self, progress=None) -> tuple[list[int] | None, int]:
         """Return ``(offsets, n_frames)`` for the movie.
 
         ``n_frames`` is the number of genuine image planes: a stray
@@ -2260,6 +2268,15 @@ class TiffMap:
         and is dropped below."""
         n_pages = len(self._pages)
 
+        # Throttle progress reports to at most ~200 per file so a
+        # multi-thousand-frame movie does not flood the GUI event queue
+        # with one cross-thread signal per page.
+        step = max(1, n_pages // 200)
+
+        def report(done: int) -> None:
+            if progress is not None and (done % step == 0 or done == n_pages):
+                progress(done, n_pages)
+
         if not self._uncompressed:
             # Compressed / tiled: no fast offset path. In the lightweight
             # frame mode every frame reports page 0's shape, so a stray
@@ -2272,12 +2289,14 @@ class TiffMap:
                 if n_pages > 1:
                     _ = self._pages[1].dataoffsets
                     _ = self._pages[n_pages - 1].dataoffsets
+                report(n_pages)
                 return None, n_pages
             n_frames = 0
-            for page in self._pages:
+            for i, page in enumerate(self._pages):
                 if tuple(page.shape) != self._page_shape:
                     break
                 n_frames += 1
+                report(i + 1)
             return None, n_frames
 
         # Uncompressed: one pass collects each frame's byte offset and
@@ -2285,10 +2304,11 @@ class TiffMap:
         offsets = []
         n_frames = 0
         fast = True
-        for page in self._pages:
+        for i, page in enumerate(self._pages):
             if tuple(page.shape) != self._page_shape:
                 break
             n_frames += 1
+            report(i + 1)
             if fast:
                 data_offsets = page.dataoffsets
                 byte_counts = page.databytecounts
@@ -2767,6 +2787,7 @@ class TiffMultiMap(AbstractPicassoMovie):
         path: str,
         memmap_frames: bool = False,
         verbose: bool = False,
+        progress=None,
     ):
         super().__init__()
         self.path = os.path.abspath(path)
@@ -2791,7 +2812,28 @@ class TiffMultiMap(AbstractPicassoMovie):
         self.paths = [self.path] + [
             path for index, path in sorted(paths_indices)
         ]
-        self.maps = [TiffMap(path, verbose=verbose) for path in self.paths]
+        # A multi-file OME movie is opened as several TiffMaps. Give each
+        # an equal slice of the composite progress range (weighting by
+        # frame count is not possible before the maps are built) and
+        # rescale its per-page reports into the overall bar. SCALE keeps
+        # a single-file movie animating smoothly across 0..SCALE.
+        n_maps = len(self.paths)
+        SCALE = 1000
+
+        def map_progress(j):
+            if progress is None:
+                return None
+
+            def cb(done, total):
+                if total > 0:
+                    progress(int((j + done / total) * SCALE), n_maps * SCALE)
+
+            return cb
+
+        self.maps = [
+            TiffMap(path, verbose=verbose, progress=map_progress(j))
+            for j, path in enumerate(self.paths)
+        ]
         self.n_maps = len(self.maps)
         self.n_frames_per_map = [_.n_frames for _ in self.maps]
         self.n_frames = sum(self.n_frames_per_map)

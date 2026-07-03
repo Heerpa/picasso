@@ -45,6 +45,9 @@ except Exception:
     GPUFIT_INSTALLED = False
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
+# Steps allotted to each file in the load progress dialog, so the bar can
+# advance smoothly within a file from the loader's per-page reports.
+PROGRESS_RESOLUTION = 1000
 
 
 @dataclass
@@ -100,6 +103,8 @@ class MovieLoadWorker(QtCore.QObject):
     """
 
     progress = QtCore.pyqtSignal(int, str)  # index, filename
+    # sub-file progress within the current file: (done, total) pages
+    subprogress = QtCore.pyqtSignal(int, int)
     # callback, (args, kwargs), holder dict for the return value
     prompt_requested = QtCore.pyqtSignal(object, object, object)
     finished = QtCore.pyqtSignal(list, list, list)  # movies, infos, paths
@@ -145,8 +150,13 @@ class MovieLoadWorker(QtCore.QObject):
                     break
                 self.progress.emit(i, os.path.basename(path))
                 prompt = self._proxy_prompt(self._prompt_for_path(path))
+                # Emitted (queued to the GUI thread) as io scans the
+                # file's IFDs, so the bar advances smoothly within a file.
+                report = self.subprogress.emit
                 if self.load_all:
-                    result = io.load_movie_all(path, prompt_info=prompt)
+                    result = io.load_movie_all(
+                        path, prompt_info=prompt, progress=report
+                    )
                     if result is None:
                         continue
                     file_movies, file_infos = result
@@ -155,7 +165,9 @@ class MovieLoadWorker(QtCore.QObject):
                         infos.append(info)
                         paths.append(path)
                 else:
-                    result = io.load_movie(path, prompt_info=prompt)
+                    result = io.load_movie(
+                        path, prompt_info=prompt, progress=report
+                    )
                     if result is None:
                         continue
                     movie, info = result
@@ -2678,8 +2690,16 @@ class Window(QtWidgets.QMainWindow):
 
         self._load_t0 = time.time()
         self._load_multi_file = multi_file
+        # Each file spans PROGRESS_RESOLUTION steps so the bar can advance
+        # smoothly *within* a file from the worker's per-page reports,
+        # instead of only ticking once per file.
+        self._load_index = 0
         progress = QtWidgets.QProgressDialog(
-            "Loading movie...", "Cancel", 0, len(paths), self
+            "Loading movie...",
+            "Cancel",
+            0,
+            len(paths) * PROGRESS_RESOLUTION,
+            self,
         )
         progress.setWindowTitle("Opening movie")
         progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
@@ -2695,6 +2715,7 @@ class Window(QtWidgets.QMainWindow):
 
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_load_progress)
+        worker.subprogress.connect(self._on_load_subprogress)
         worker.prompt_requested.connect(self._on_load_prompt_requested)
         worker.finished.connect(self._on_load_finished)
         worker.failed.connect(self._on_load_failed)
@@ -2707,10 +2728,27 @@ class Window(QtWidgets.QMainWindow):
         thread.start()
 
     def _on_load_progress(self, index: int, filename: str) -> None:
-        """Update the progress dialog as each file starts loading."""
+        """Update the progress dialog as each file starts loading.
+
+        The bar cannot move yet: before per-page reporting begins, the
+        loader indexes the whole file (opening it and counting frames),
+        which happens inside a single tifffile call with no sub-steps.
+        Say so, so the user does not think the load has stalled."""
+        self._load_index = index
         if self._load_progress is not None:
-            self._load_progress.setLabelText(f"Loading {filename}...")
-            self._load_progress.setValue(index)
+            self._load_progress.setLabelText(
+                f"Opening {filename}...\n"
+                "Indexing frames — the bar starts once they are counted."
+            )
+            self._load_progress.setValue(index * PROGRESS_RESOLUTION)
+
+    def _on_load_subprogress(self, done: int, total: int) -> None:
+        """Advance the bar within the current file from the worker's
+        per-page reports (see ``MovieLoadWorker.subprogress``)."""
+        if self._load_progress is not None and total > 0:
+            fraction = min(done / total, 1.0)
+            value = int((self._load_index + fraction) * PROGRESS_RESOLUTION)
+            self._load_progress.setValue(value)
 
     def _on_load_prompt_requested(
         self, callback, args_kwargs, holder: dict
