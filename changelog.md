@@ -14,6 +14,7 @@ Last change: 03-JUL-2026 CEST
 - Added support for multichannel data, i.e., several movie files in a single Localize window. These can be analyzed sequentially or be treated as a multichannel data for combined localizations, for example, in biplane 3D imaging.
 - Added support for MicroManager "separate image files" acquisitions (one `img_*.tif` per frame in a folder), see [Localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html#extra-features).
 - Fixed ImageJ "contiguous stack" `.tif`/`.tiff` files (as written by ImageJ's "Save As > Tiff" for large stacks) being read as a single frame; all planes are now detected and read.
+- Z fitting on CUDA GPU
 - Movies now load on a background thread, so the Localize window stays responsive (and other windows are no longer blocked) while files are read. A progress dialog with a `Cancel` button is shown; this applies to opening a single movie, a single multichannel file, and several channels from separate files.
 - Accept multiple frame bounds
 - Accept multiple rectangular ROIs

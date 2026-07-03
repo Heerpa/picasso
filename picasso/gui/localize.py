@@ -1144,6 +1144,9 @@ class ParametersDialog(lib.Dialog):
     fit_z_checkbox : QtWidgets.QCheckBox
         Checkbox for enabling/disabling fitting in the z-dimension using
         astigmatism.
+    fit_z_gpu_checkbox : QtWidgets.QCheckBox
+        Checkbox for fitting z coordinates on a CUDA-capable GPU
+        (numba.cuda). Only shown if a compatible GPU is available.
     gain : QtWidgets.QSpinBox
         Spin box for selecting camera EM gain.
     gpufit_checkbox : QtWidgets.QCheckBox
@@ -1615,6 +1618,20 @@ class ParametersDialog(lib.Dialog):
         self.magnification_factor.setDecimals(4)
         self.magnification_factor.setValue(0.79)
         z_grid.addWidget(self.magnification_factor, 1, 1)
+
+        # GPU (numba.cuda) z fitting. Only shown when a CUDA-capable GPU is
+        # available; otherwise the checkbox stays hidden and unchecked so the
+        # CPU (multiprocessing) path is used.
+        self.fit_z_gpu_checkbox = QtWidgets.QCheckBox("Fit Z on GPU")
+        self.fit_z_gpu_checkbox.setTristate(False)
+        self.fit_z_gpu_checkbox.setToolTip(
+            "Fit z coordinates on a CUDA-capable GPU (numba.cuda).\n"
+            "Reproduces the CPU result but is much faster for many\n"
+            "localizations."
+        )
+        if not zfit.CUDA_AVAILABLE:
+            self.fit_z_gpu_checkbox.hide()
+        z_grid.addWidget(self.fit_z_gpu_checkbox, 3, 1)
 
         if "Cameras" in CONFIG:
             camera = self.camera.currentText()
@@ -3064,6 +3081,7 @@ class Window(QtWidgets.QMainWindow):
             "magnification": pd.magnification_factor.value(),
             "fit_z": pd.fit_z_checkbox.isChecked(),
             "fit_z_enabled": pd.fit_z_checkbox.isEnabled(),
+            "fit_z_gpu": pd.fit_z_gpu_checkbox.isChecked(),
             "z_calibration": pd.z_calibration,
             "z_calibration_path": pd.z_calibration_path,
             "z_calib_label": pd.z_calib_label.text(),
@@ -3106,6 +3124,7 @@ class Window(QtWidgets.QMainWindow):
         pd.z_calib_label.setText(params["z_calib_label"])
         pd.fit_z_checkbox.setEnabled(params["fit_z_enabled"])
         pd.fit_z_checkbox.setChecked(params["fit_z"])
+        pd.fit_z_gpu_checkbox.setChecked(params.get("fit_z_gpu", False))
         pd.gpufit_checkbox.setChecked(params["gpufit"])
         pd.frames_edit.setText(params["frames_edit"])
 
@@ -3729,6 +3748,7 @@ class Window(QtWidgets.QMainWindow):
             self.parameters_dialog.magnification_factor.value(),
             self.parameters_dialog.pixelsize.value(),
             fitting_method,
+            self.parameters_dialog.fit_z_gpu_checkbox.isChecked(),
         )
         self.fit_z_worker.progressMade.connect(self.on_fit_z_progress)
         self.fit_z_worker.finished.connect(self.on_fit_z_finished)
@@ -4323,6 +4343,7 @@ class FitZWorker(QtCore.QThread):
         magnification_factor: float,
         pixelsize: float,
         fitting_method: Literal["gausslq", "gaussmle"],
+        gpu: bool = False,
     ) -> None:
         super().__init__()
         self.locs = locs
@@ -4331,6 +4352,7 @@ class FitZWorker(QtCore.QThread):
         self.magnification_factor = magnification_factor
         self.pixelsize = pixelsize
         self.fitting_method = fitting_method
+        self.gpu = gpu
 
     def on_progress(self, n_done: int) -> None:
         self.progressMade.emit(n_done, len(self.locs))
@@ -4346,7 +4368,8 @@ class FitZWorker(QtCore.QThread):
             magnification_factor=self.magnification_factor,
             pixelsize=self.pixelsize,
             fitting_method=self.fitting_method,
-            multiprocess=True,
+            multiprocess=not self.gpu,
+            gpu=self.gpu,
             progress_callback=self.on_progress,
             abort_callback=self.isInterruptionRequested,
         )
