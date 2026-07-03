@@ -2145,7 +2145,7 @@ class LocColumnSelectionDialog(lib.Dialog):
                 for col in subcols:
                     columns[col] = True
         for column, checkbox in self.column_checkboxes.items():
-            is_checked = columns[column]
+            is_checked = columns.get(column, True)
             checkbox.setChecked(is_checked)
 
 
