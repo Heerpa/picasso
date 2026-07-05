@@ -381,16 +381,21 @@ class TestSigmaUncertainty:
 
 
 # ---------------------------------------------------------------------------
-# Optional GPU backend — skipped if pygpufit is not installed
+# Optional GPU backend — the Gpufit wrapper lives in picasso.localize
+# (tested in tests/test_localize.py); gausslq keeps backward-compatible
+# functions for the non-rotated least-squares fit, tested here.
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not gausslq.GPUFIT_INSTALLED, reason="GPUfit/CUDA not available"
+)
 class TestGpufit:
-    """Tests for the optional GPU codepath. Skipped if pygpufit isn't
-    installed (which is true for the typical test environment)."""
+    """Tests for the backward-compatible GPU codepath. Skipped when the
+    Gpufit library or a CUDA-capable GPU is not available (which is true
+    for the typical test environment)."""
 
     def test_fit_spots_gpufit(self, synthetic_spots):
-        pytest.importorskip("pygpufit")
         spots, gt = synthetic_spots
         theta = gausslq.fit_spots_gpufit(spots)
         assert theta.shape == (len(spots), 6)

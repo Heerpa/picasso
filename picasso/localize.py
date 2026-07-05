@@ -44,6 +44,13 @@ from . import (
     __version__,
 )
 
+try:
+    from .ext.pygpufit import gpufit as gf
+
+    GPUFIT_INSTALLED = bool(gf.cuda_available())
+except Exception:
+    GPUFIT_INSTALLED = False
+
 plt.style.use("ggplot")
 
 
@@ -1439,7 +1446,13 @@ def fit2D(
     identifications: pd.DataFrame,
     box: int,
     fitting_method: Literal[
-        "gausslq", "gausslq-gpu", "gaussmle", "avg"
+        "gausslq",
+        "gausslq-gpu",
+        "gausslq-rotated-gpu",
+        "gaussmle",
+        "gaussmle-gpu",
+        "gaussmle-rotated-gpu",
+        "avg",
     ] = "gausslq",
     eps: float = 0.001,
     max_it: int = 100,
@@ -1469,21 +1482,30 @@ def fit2D(
     box : int
         Size of the box to cut out around each spot. Should be an odd
         integer.
-    fitting_method : {"gausslq", "gausslq-gpu", "gaussmle" or "avg"}, \
-            optional
+    fitting_method : {"gausslq", "gausslq-gpu", "gausslq-rotated-gpu", \
+            "gaussmle", "gaussmle-gpu", "gaussmle-rotated-gpu" or \
+            "avg"}, optional
         Which 2D fitting algorithm to use. "gausslq" for least-squares
         fitting of a 2D Gaussian. "gausslq-gpu" for its GPU
         implemntation (if available). "gaussmle" for MLE 2D Gaussian
-        fitting. "avg" for taking the average of each spot.
+        fitting (CPU). "gaussmle-gpu" for MLE fitting of a 2D Gaussian
+        on the GPU (Gpufit's maximum likelihood estimator).
+        "gausslq-rotated-gpu" and "gaussmle-rotated-gpu" for GPU
+        least-squares and MLE fitting, respectively, of a rotated
+        elliptical Gaussian, whose fitted rotation angle (in degrees)
+        is saved in the column "angle". "avg" for taking the average of
+        each spot.
     eps : float, optional
-        The convergence criterion for MLE fitting. Ignored for other
-        methods. Default is 0.001.
+        The convergence criterion for CPU MLE fitting. Ignored for
+        other methods (GPU fitting uses Gpufit's own convergence
+        settings). Default is 0.001.
     max_it : int, optional
-        The maximum number of iterations for MLE fitting. Ignored for
-        other methods. Default is 100.
+        The maximum number of iterations for CPU MLE fitting. Ignored
+        for other methods (GPU fitting uses Gpufit's own convergence
+        settings). Default is 100.
     mle_method : Literal["sigma", "sigmaxy"], optional
-        The method used for MLE fitting (impose same sigma in x and y or
-        not, respectively). Default is "sigmaxy".
+        The method used for CPU MLE fitting (impose same sigma in x and
+        y or not, respectively). Default is "sigmaxy".
     multiprocess: bool, optional
         Whether or not to use multiprocessing. Ignored for GPU fitting.
         Default is True.
@@ -1525,9 +1547,18 @@ def fit2D(
         identifications, pd.DataFrame
     ), "identifications must be a DataFrame"
     assert isinstance(box, int) and box > 0, "box must be a positive integer"
-    assert fitting_method in ["gausslq", "gausslq-gpu", "gaussmle", "avg"], (
+    assert fitting_method in [
+        "gausslq",
+        "gausslq-gpu",
+        "gausslq-rotated-gpu",
+        "gaussmle",
+        "gaussmle-gpu",
+        "gaussmle-rotated-gpu",
+        "avg",
+    ], (
         "fitting_method must be one of 'gausslq', 'gausslq-gpu',"
-        " 'gaussmle', or 'avg'"
+        " 'gausslq-rotated-gpu', 'gaussmle', 'gaussmle-gpu',"
+        " 'gaussmle-rotated-gpu', or 'avg'"
     )
     assert (
         isinstance(eps, (int, float)) and eps > 0
@@ -1566,14 +1597,21 @@ def fit2D(
             progress_callback=progress_callback,
             abort_callback=abort_callback,
         )
-    elif fitting_method == "gausslq-gpu":
+    elif fitting_method in (
+        "gausslq-gpu",
+        "gausslq-rotated-gpu",
+        "gaussmle-gpu",
+        "gaussmle-rotated-gpu",
+    ):
         if callable(progress_callback):
             progress_callback(1)
-        locs = _fit2d_gausslq_gpu(
+        locs = _fit2d_gauss_gpu(
             spots=spots,
             identifications=identifications,
             box=box,
             em=em,
+            rotated="-rotated-" in fitting_method,
+            mle=fitting_method.startswith("gaussmle"),
         )
     elif fitting_method == "gaussmle":
         locs = _fit2d_gaussmle(
@@ -1641,16 +1679,196 @@ def _fit2d_gausslq(
     return locs
 
 
-def _fit2d_gausslq_gpu(
+def _initial_parameters_gpufit(
+    spots: lib.FloatArray3D, size: int, rotated: bool = False
+) -> lib.FloatArray2D:
+    """Initialize the parameters for the GPU fit - photons, x, y, sx,
+    sy, bg (plus the rotation angle if ``rotated``)."""
+    center = (size / 2.0) - 0.5
+    initial_width = np.amax([size / 5.0, 1.0])
+
+    spot_max = np.amax(spots, axis=(1, 2))
+    spot_min = np.amin(spots, axis=(1, 2))
+
+    n_parameters = 7 if rotated else 6
+    initial_parameters = np.empty((len(spots), n_parameters), dtype=np.float32)
+
+    initial_parameters[:, 0] = spot_max - spot_min
+    initial_parameters[:, 1] = center
+    initial_parameters[:, 2] = center
+    initial_parameters[:, 3] = initial_width
+    initial_parameters[:, 4] = initial_width
+    initial_parameters[:, 5] = spot_min
+    if rotated:
+        initial_parameters[:, 6] = 0.0
+
+    return initial_parameters
+
+
+def fit_spots_gpufit(
+    spots: lib.FloatArray3D, rotated: bool = False, mle: bool = False
+) -> lib.FloatArray2D:
+    """Fit multiple spots using GPU-based Gaussian fitting. Each spot is
+    a 2D array representing the pixel values of the spot image. The
+    function returns a 2D array with the optimized parameters for each
+    spot, where each row corresponds to a spot and the columns are the
+    parameters in the following order: [photons, x, y, sx, sy, bg] or,
+    for the rotated elliptical Gaussian, [photons, x, y, sx, sy, bg,
+    angle], where angle is the rotation angle in radians.
+
+    Picasso vendors pyGPUfit under picasso/ext/pygpufit where the
+    License can be found too.
+
+    Only Windows with a CUDA-capable GPU is supported. Linux users
+    need to build the code first, see Localize documentation.
+
+    Cite: Przybylski, et al. Scientific Reports, 2017.
+    DOI: 10.1038/s41598-017-15313-9
+
+    Parameters
+    ----------
+    spots : lib.FloatArray3D
+        A 3D array of shape (n_spots, size, size), where n_spots is the
+        number of spots and size is the length of one side of the square
+        spot image. Each slice along the first axis represents a single
+        spot image.
+    rotated : bool, optional
+        If True, fit a rotated elliptical Gaussian (Gpufit's
+        GAUSS_2D_ROTATED model) whose seventh parameter is the rotation
+        angle. Default is False.
+    mle : bool, optional
+        If True, use Gpufit's maximum likelihood estimator (Poisson
+        noise model) instead of least squares. Default is False.
+
+    Returns
+    -------
+    parameters : lib.FloatArray2D
+        A 2D array with the optimized parameters for each spot. The
+        columns correspond to [photons, x, y, sx, sy, bg] or
+        [photons, x, y, sx, sy, bg, angle] if ``rotated``.
+    """
+    if not GPUFIT_INSTALLED:
+        raise ImportError(
+            "GPUfit could not be found, CUDA-capable GPU is required."
+        )
+    if mle:
+        # Gpufit's MLE estimator assumes Poisson-distributed data;
+        # negative pixel values (possible after camera baseline
+        # subtraction) yield NaNs in the likelihood, so clip them.
+        spots = np.maximum(spots, 0)
+    size = spots.shape[1]
+    initial_parameters = _initial_parameters_gpufit(
+        spots, size, rotated=rotated
+    )
+    model_id = (
+        gf.ModelID.GAUSS_2D_ROTATED
+        if rotated
+        else gf.ModelID.GAUSS_2D_ELLIPTIC
+    )
+    estimator_id = gf.EstimatorID.MLE if mle else gf.EstimatorID.LSE
+
+    parameters, states, chi_squares, number_iterations, exec_time = gf.fit(
+        spots.reshape((len(spots), (size * size))),
+        None,
+        model_id,
+        initial_parameters,
+        tolerance=1e-2,
+        max_number_iterations=20,
+        estimator_id=estimator_id,
+    )
+
+    parameters[:, 0] *= 2.0 * np.pi * parameters[:, 3] * parameters[:, 4]
+
+    return parameters
+
+
+def locs_from_fits_gpufit(
+    identifications: pd.DataFrame,
+    theta: lib.FloatArray2D,
+    box: int,
+    em: bool,
+) -> pd.DataFrame:
+    """Convert the fit results from GPU-based fitting into a data frame
+    array of localizations.
+
+    Parameters
+    ----------
+    identifications : pd.DataFrame
+        Data frame containing the identifications of the spots,
+        including frame numbers, x and y coordinates, and net gradient.
+    theta : lib.FloatArray2D
+        A 2D array with the optimized parameters for each spot, where
+        each row corresponds to a spot and the columns are the
+        parameters in the following order: [photons, x, y, sx, sy, bg]
+        or, for the rotated elliptical Gaussian,
+        [photons, x, y, sx, sy, bg, angle (radians)]. In the latter
+        case, the resulting data frame contains the column ``angle``
+        (in degrees).
+    box : int
+        The size of the box used for localization, which is used to
+        calculate the offsets for the x and y coordinates.
+    em : bool
+        Whether EMCCD was used for the localization.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        Data frame containing the localized spots.
+    """
+    box_offset = int(box / 2)
+    x = theta[:, 1] + identifications["x"] - box_offset
+    y = theta[:, 2] + identifications["y"] - box_offset
+    lpx = gausslq.localization_precision(
+        theta[:, 0], theta[:, 3], theta[:, 4], theta[:, 5], em=em
+    )
+    lpy = gausslq.localization_precision(
+        theta[:, 0], theta[:, 4], theta[:, 3], theta[:, 5], em=em
+    )
+    a = np.maximum(theta[:, 3], theta[:, 4])
+    b = np.minimum(theta[:, 3], theta[:, 4])
+    ellipticity = (a - b) / a
+    columns = {
+        "frame": identifications["frame"].astype(np.uint32),
+        "x": x.astype(np.float32),
+        "y": y.astype(np.float32),
+        "photons": theta[:, 0].astype(np.float32),
+        "sx": theta[:, 3].astype(np.float32),
+        "sy": theta[:, 4].astype(np.float32),
+        "bg": theta[:, 5].astype(np.float32),
+        "lpx": lpx.astype(np.float32),
+        "lpy": lpy.astype(np.float32),
+        "ellipticity": ellipticity.astype(np.float32),
+        "net_gradient": identifications["net_gradient"].astype(np.float32),
+    }
+    if theta.shape[1] == 7:  # rotated elliptical Gaussian
+        # Gpufit rotates the coordinate grid by the fitted angle, which
+        # rotates the ellipse by the negative angle. Picasso's "angle"
+        # column (see picasso.render) rotates the ellipse itself and is
+        # stored in degrees, hence the sign flip and conversion.
+        # Normalize to [-90, 90) as the ellipse repeats every half turn.
+        angle = -np.rad2deg(theta[:, 6])
+        angle = np.mod(angle + 90.0, 180.0) - 90.0
+        columns["angle"] = angle.astype(np.float32)
+    locs = pd.DataFrame(columns)
+    locs.sort_values(by="frame", kind="quicksort", inplace=True)
+    return locs
+
+
+def _fit2d_gauss_gpu(
     spots: lib.FloatArray3D,
     identifications: pd.DataFrame,
     box: int,
     em: bool,
+    rotated: bool = False,
+    mle: bool = False,
 ) -> pd.DataFrame:
-    """Fit 2D Gaussians using least-squares fitting and GPU. See
+    """Fit 2D Gaussians on the GPU using least squares or, if ``mle``,
+    maximum likelihood estimation. If ``rotated``, a rotated elliptical
+    Gaussian is fitted and the resulting localizations contain the
+    fitted rotation angle (in degrees) in the column ``angle``. See
     ``fit_2D`` for more details."""
-    theta = gausslq.fit_spots_gpufit(spots)
-    locs = gausslq.locs_from_fits_gpufit(identifications, theta, box, em)
+    theta = fit_spots_gpufit(spots, rotated=rotated, mle=mle)
+    locs = locs_from_fits_gpufit(identifications, theta, box, em)
     return locs
 
 
@@ -1791,7 +2009,13 @@ def localize(
     frame_bounds: tuple[int, int] | None = None,
     movie_info: list[dict] | None = None,
     fitting_method: Literal[
-        "gausslq", "gausslq-gpu", "gaussmle", "avg"
+        "gausslq",
+        "gausslq-gpu",
+        "gausslq-rotated-gpu",
+        "gaussmle",
+        "gaussmle-gpu",
+        "gaussmle-rotated-gpu",
+        "avg",
     ] = "gausslq",
     eps: float = 0.001,
     max_it: int = 100,
@@ -1836,9 +2060,11 @@ def localize(
     frame_bounds : tuple, optional
         Minimum and maximum frame numbers to consider for the
         identification. If None, all frames are used. Default is None.
-    fitting_method : {"gausslq", "gausslq-gpu", "gaussmle" or "avg"}, \
-            optional
-        Which 2D fitting algorithm to use. Default is "gausslq".
+    fitting_method : {"gausslq", "gausslq-gpu", "gausslq-rotated-gpu", \
+            "gaussmle", "gaussmle-gpu", "gaussmle-rotated-gpu" or \
+            "avg"}, optional
+        Which 2D fitting algorithm to use, see ``fit2D``. Default is
+        "gausslq".
     eps : float, optional
         The convergence criterion for MLE fitting. Default is 0.001.
     max_it : int, optional
@@ -1924,7 +2150,10 @@ def localize_3D(
     fitting_method: Literal[
         "gausslq",
         "gausslq-gpu",
+        "gausslq-rotated-gpu",
         "gaussmle",
+        "gaussmle-gpu",
+        "gaussmle-rotated-gpu",
     ] = "gausslq",
     eps: float = 0.001,
     max_it: int = 100,
@@ -1984,21 +2213,25 @@ def localize_3D(
         is to be specified, the other is to be set to None, for example,
         ``(5, None)`` sets minimum frame to 5 without maximum frame.
         Default is None.
-    fitting_method : {"gausslq", "gausslq-gpu", "gaussmle" or "avg"}, \
+    fitting_method : {"gausslq", "gausslq-gpu", "gausslq-rotated-gpu", \
+            "gaussmle", "gaussmle-gpu" or "gaussmle-rotated-gpu"}, \
             optional
-        Which 2D fitting algorithm to use. "gausslq" for least-squares
-        fitting of a 2D Gaussian. "gausslq-gpu" for its GPU
-        implemntation (if available). "gaussmle" for MLE 2D Gaussian
-        fitting. "avg" for taking the average of each spot.
+        Which 2D fitting algorithm to use, see ``fit2D``. "avg" is not
+        supported since z fitting requires the fitted Gaussian sigmas.
+        Note that the rotated elliptical Gaussian methods report sx and
+        sy along the rotated principal axes, whereas the astigmatism
+        calibration assumes the camera axes, so use them for z fitting
+        with care. Default is "gausslq".
     eps : float, optional
-        The convergence criterion for MLE fitting. Ignored for other
-        methods. Default is 0.001.
+        The convergence criterion for CPU MLE fitting. Ignored for
+        other methods (GPU fitting uses Gpufit's own convergence
+        settings). Default is 0.001.
     max_it : int, optional
-        The maximum number of iterations for MLE fitting. Ignored for
-        other methods. Default is 100.
+        The maximum number of iterations for CPU MLE fitting. Ignored
+        for other methods. Default is 100.
     mle_method : Literal["sigma", "sigmaxy"], optional
-        The method used for MLE fitting (impose same sigma in x and y or
-        not, respectively). Default is "sigmaxy".
+        The method used for CPU MLE fitting (impose same sigma in x and
+        y or not, respectively). Default is "sigmaxy".
     multiprocess: bool, optional
         Whether or not to use multiprocessing. Ignored for GPU fitting.
         Default is True.
@@ -2031,8 +2264,15 @@ def localize_3D(
     assert fitting_method in [
         "gausslq",
         "gausslq-gpu",
+        "gausslq-rotated-gpu",
         "gaussmle",
-    ], "fitting_method must be one of 'gausslq', 'gausslq-gpu', or 'gaussmle'"
+        "gaussmle-gpu",
+        "gaussmle-rotated-gpu",
+    ], (
+        "fitting_method must be one of 'gausslq', 'gausslq-gpu',"
+        " 'gausslq-rotated-gpu', 'gaussmle', 'gaussmle-gpu', or"
+        " 'gaussmle-rotated-gpu'"
+    )
     assert (
         isinstance(eps, (int, float)) and eps > 0
     ), "eps must be a positive number"
@@ -2077,7 +2317,10 @@ def _localize_3D(
     fitting_method: Literal[
         "gausslq",
         "gausslq-gpu",
+        "gausslq-rotated-gpu",
         "gaussmle",
+        "gaussmle-gpu",
+        "gaussmle-rotated-gpu",
     ] = "gausslq",
     eps: float = 0.001,
     max_it: int = 100,
@@ -2113,10 +2356,10 @@ def _localize_3D(
         fit_progress_callback=fit_progress_callback,
         return_info=True,  # TODO: remove in v0.12.0
     )
+    # zfit only knows gausslq/gaussmle; map the GPU/rotated codes to the
+    # corresponding CPU noise model
     fitting_method_3d = (
-        "gausslq"
-        if fitting_method in ["gausslq", "gausslq-gpu"]
-        else "gaussmle"
+        "gaussmle" if fitting_method.startswith("gaussmle") else "gausslq"
     )
     locs, info = zfit.zfit(
         locs=locs,
