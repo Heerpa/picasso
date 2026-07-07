@@ -489,6 +489,11 @@ def _draw_gaussian_loc(
     n_pixel_y: int,
 ) -> None:
     """Render a single separable 2D Gaussian into ``image``."""
+    if not (sx_ > 0.0 and sy_ > 0.0):
+        # Degenerate localization (e.g. lpx/lpy of exactly 0 from a
+        # singular CRLB fit); also catches NaN. Skip instead of
+        # dividing by zero.
+        return
     max_y_off = _DRAW_MAX_SIGMA * sy_
     i_min = np.int32(y_ - max_y_off)
     if i_min < 0:

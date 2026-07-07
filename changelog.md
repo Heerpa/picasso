@@ -54,6 +54,7 @@ Last change: 07-JUL-2026 CEST
 - Fixed pick similar numba error [#684](https://github.com/jungmannlab/picasso/issues/684)
 - Fixed "Combine all channels" when saving localizations only saving the first channel when channels had differing columns
 - Fixed combined saving of multiple channels with different columns
+- Fixed ind. loc. precision rendering of `lpx = 0` [#685](https://github.com/jungmannlab/picasso/issues/685)
 
 #### SPINNA
 - Adjustable font sizes and names for the NND plot's title, labels and ticks
