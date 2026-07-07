@@ -31,6 +31,7 @@ from .. import (
     localize,
     lib,
     postprocess,
+    spline,
     __version__,
     zfit,
 )
@@ -38,6 +39,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from playsound3 import playsound
 
 GPUFIT_INSTALLED = localize.GPUFIT_INSTALLED
+GPUSPLINE_INSTALLED = localize.GPUSPLINE_INSTALLED
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
 
@@ -985,6 +987,98 @@ class Calibrate3DDialog(lib.Dialog):
         frame_order = dialog.frame_order.currentData()
         accepted = result == QtWidgets.QDialog.DialogCode.Accepted
         return step, frames_per_step, frame_order, accepted
+
+
+class CalibrateSplineDialog(lib.Dialog):
+    """Dialog for entering the parameters of a cubic-spline PSF calibration
+    built from a bead z-stack: the z step size, the number of frames acquired
+    per z (stage) position, the acquisition order of those frames, and whether
+    to build a 3D (z-recovering) or 2D (single-plane) spline PSF. The box size
+    and minimum net gradient are taken from the main parameters."""
+
+    def __init__(self, window: QtWidgets.QWidget) -> None:
+        super().__init__(window)
+        self.window = window
+        self.setWindowTitle("Spline PSF Calibration")
+        vbox = QtWidgets.QVBoxLayout(self)
+        grid = QtWidgets.QGridLayout()
+        vbox.addLayout(grid)
+
+        # Step size
+        grid.addWidget(QtWidgets.QLabel("Calibration step size (nm):"), 0, 0)
+        self.step = QtWidgets.QDoubleSpinBox()
+        self.step.setRange(0.01, 1e6)
+        self.step.setDecimals(2)
+        self.step.setValue(20)
+        grid.addWidget(self.step, 0, 1)
+
+        # Number of frames per z (stage) position
+        frames_label = QtWidgets.QLabel("Number of frames per step size:")
+        frames_label.setToolTip(
+            "Number of frames acquired at each z (stage) position.\n"
+            "Acquiring several frames per position (e.g., different fields\n"
+            "of view) increases the number of beads averaged into the PSF."
+        )
+        grid.addWidget(frames_label, 1, 0)
+        self.frames_per_step = QtWidgets.QSpinBox()
+        self.frames_per_step.setRange(1, 100)
+        self.frames_per_step.setValue(1)
+        grid.addWidget(self.frames_per_step, 1, 1)
+
+        # Frame order (only relevant when frames_per_step > 1)
+        self.order_label = QtWidgets.QLabel("Frame order:")
+        grid.addWidget(self.order_label, 2, 0)
+        self.frame_order = QtWidgets.QComboBox()
+        self.frame_order.addItem("Different FOVs first", userData="fov")
+        self.frame_order.addItem("Different z positions first", userData="z")
+        self.frame_order.setToolTip(
+            "Order in which the frames were acquired when more than one\n"
+            "frame per step size is used (see the 3D astigmatism dialog)."
+        )
+        grid.addWidget(self.frame_order, 2, 1)
+
+        # Spline PSF dimensionality
+        grid.addWidget(QtWidgets.QLabel("Spline PSF model:"), 3, 0)
+        self.model = QtWidgets.QComboBox()
+        self.model.addItem("3D (recovers z)", userData="spline-3d")
+        self.model.addItem("2D (single plane)", userData="spline-2d")
+        grid.addWidget(self.model, 3, 1)
+
+        self.frames_per_step.valueChanged.connect(self._update_order_enabled)
+        self._update_order_enabled(self.frames_per_step.value())
+
+        # OK and Cancel buttons
+        self.buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            QtCore.Qt.Orientation.Horizontal,
+            self,
+        )
+        vbox.addWidget(self.buttons)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+    def _update_order_enabled(self, n_frames: int) -> None:
+        """Enable the frame order choice only if more than one frame is
+        acquired per z position."""
+        enabled = n_frames > 1
+        self.order_label.setEnabled(enabled)
+        self.frame_order.setEnabled(enabled)
+
+    @staticmethod
+    def getCalibrationSpecs(
+        parent: QtWidgets.QWidget | None = None,
+    ) -> tuple[float, int, str, str, bool]:
+        """Show the dialog and return the chosen step size, number of frames
+        per step, frame order, spline model and whether it was accepted."""
+        dialog = CalibrateSplineDialog(parent)
+        result = dialog.exec()
+        step = dialog.step.value()
+        frames_per_step = dialog.frames_per_step.value()
+        frame_order = dialog.frame_order.currentData()
+        model = dialog.model.currentData()
+        accepted = result == QtWidgets.QDialog.DialogCode.Accepted
+        return step, frames_per_step, frame_order, model, accepted
 
 
 class ROIDialog(lib.Dialog):
@@ -2692,6 +2786,9 @@ class Window(QtWidgets.QMainWindow):
         calibrate_z_action = threed_menu.addAction("Calibrate 3D")
         calibrate_z_action.triggered.connect(self.calibrate_z)
 
+        calibrate_spline_action = threed_menu.addAction("Calibrate spline PSF")
+        calibrate_spline_action.triggered.connect(self.calibrate_spline)
+
         self.plugin_menu = menu_bar.addMenu("Plugins")  # do not delete
 
     @property
@@ -2709,6 +2806,77 @@ class Window(QtWidgets.QMainWindow):
         """Use the loaded movie to obtain z-calibration data for 3D
         fitting using astigmatism."""
         self.localize(calibrate_z=True)
+
+    def calibrate_spline(self) -> None:
+        """Build a cubic-spline PSF calibration from the loaded bead z-stack
+        movie (Gpuspline). Detects beads, averages them into a PSF volume and
+        computes the spline coefficients, saved as an HDF5 calibration."""
+        if self.movie is None:
+            QtWidgets.QMessageBox.information(
+                self, "Spline PSF Calibration", "No file loaded."
+            )
+            return
+        if not GPUSPLINE_INSTALLED:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Spline PSF Calibration",
+                "Gpuspline could not be loaded. See "
+                "picasso/ext/pygpuspline/README.txt for how to add the "
+                "compiled library.",
+            )
+            return
+
+        specs = CalibrateSplineDialog.getCalibrationSpecs(self)
+        step, frames_per_step, frame_order, model, accepted = specs
+        if not accepted:
+            return
+
+        base = os.path.splitext(self.movie_path)[0] if self.movie_path else ""
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save spline PSF calibration",
+            base + "_spline_calib.hdf5",
+            filter="*.hdf5",
+        )
+        if not path:
+            return
+
+        parameters = self.parameters
+        self.spline_calibration_worker = SplineCalibrationWorker(
+            movie=self.movie,
+            info=self.info,
+            camera_info=self.camera_info,
+            box=parameters["Box Size"],
+            minimum_ng=parameters["Min. Net Gradient"],
+            step=step,
+            frames_per_step=frames_per_step,
+            frame_order=frame_order,
+            model=model,
+            path=path,
+        )
+        self.spline_calibration_worker.finished.connect(
+            self.on_spline_calibration_finished
+        )
+        self.spline_calibration_worker.failed.connect(
+            self.on_spline_calibration_failed
+        )
+        self.status_bar.showMessage("Building spline PSF calibration ..")
+        self.spline_calibration_worker.start()
+
+    def on_spline_calibration_finished(self, path: str, n_beads: int) -> None:
+        """Report a successful spline PSF calibration."""
+        self.status_bar.showMessage("")
+        QtWidgets.QMessageBox.information(
+            self,
+            "Spline PSF Calibration",
+            f"Spline PSF calibration built from {n_beads} beads and saved to:"
+            f"\n{path}",
+        )
+
+    def on_spline_calibration_failed(self, message: str) -> None:
+        """Report a failed spline PSF calibration."""
+        self.status_bar.showMessage("")
+        QtWidgets.QMessageBox.critical(self, "Spline PSF Calibration", message)
 
     def show_metadata(self) -> None:
         """Open the metadata dialog."""
@@ -4470,6 +4638,59 @@ class FitZWorker(QtCore.QThread):
         )
         dt = time.time() - t0
         self.finished.emit(locs, dt)
+
+
+class SplineCalibrationWorker(QtCore.QThread):
+    """Build a cubic-spline PSF calibration from a bead z-stack movie in a
+    background thread (bead detection + averaging on the CPU, coefficients via
+    Gpuspline)."""
+
+    finished = QtCore.pyqtSignal(str, int)  # (path, n_beads)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        movie,
+        info: list[dict],
+        camera_info: dict,
+        box: int,
+        minimum_ng: float,
+        step: float,
+        frames_per_step: int,
+        frame_order: str,
+        model: str,
+        path: str,
+    ) -> None:
+        super().__init__()
+        self.movie = movie
+        self.info = info
+        self.camera_info = camera_info
+        self.box = box
+        self.minimum_ng = minimum_ng
+        self.step = step
+        self.frames_per_step = frames_per_step
+        self.frame_order = frame_order
+        self.model = model
+        self.path = path
+
+    def run(self) -> None:
+        try:
+            calibration = spline.calibrate_spline(
+                self.movie,
+                info=self.info,
+                camera_info=self.camera_info,
+                box=self.box,
+                minimum_ng=self.minimum_ng,
+                d=self.step,
+                frames_per_step=self.frames_per_step,
+                frame_order=self.frame_order,
+                model=self.model,
+                path=self.path,
+            )
+        except Exception as e:  # surface any failure to the GUI
+            self.failed.emit(str(e))
+            return
+        self.finished.emit(self.path, int(calibration.get("n_beads", 0)))
 
 
 class QualityWorker(QtCore.QThread):
