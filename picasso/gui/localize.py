@@ -117,6 +117,11 @@ def _sanitize_filename(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "channel"
 
 
+class _LoadCancelledError(Exception):
+    """Raised inside the loader's progress callback to abort a cancelled
+    load mid-file (the io calls are otherwise uninterruptible)."""
+
+
 class MovieLoadWorker(QtCore.QObject):
     """Load several movie files off the GUI thread, one file per channel.
 
@@ -180,9 +185,17 @@ class MovieLoadWorker(QtCore.QObject):
                     break
                 self.progress.emit(i, os.path.basename(path))
                 prompt = self._proxy_prompt(self._prompt_for_path(path))
-                # Emitted (queued to the GUI thread) as io scans the
-                # file's IFDs, so the bar advances smoothly within a file.
-                report = self.subprogress.emit
+
+                # Called (queued to the GUI thread) as io scans the
+                # file's IFDs, so the bar advances smoothly within a
+                # file. It is also the only code of ours that runs
+                # *during* the otherwise-blocking io call, so it doubles
+                # as the mid-file cancellation point.
+                def report(done: int, total: int) -> None:
+                    if self._cancelled:
+                        raise _LoadCancelledError
+                    self.subprogress.emit(done, total)
+
                 if self.load_all:
                     result = io.load_movie_all(
                         path, prompt_info=prompt, progress=report
@@ -205,8 +218,15 @@ class MovieLoadWorker(QtCore.QObject):
                     infos.append(info)
                     paths.append(path)
         except Exception as e:  # noqa: BLE001 - reported to the GUI
-            self.failed.emit(str(e))
-            return
+            if not self._cancelled:
+                self.failed.emit(str(e))
+                return
+            movies, infos, paths = [], [], []
+        if self._cancelled:
+            # The file being read when the user cancelled has still been
+            # loaded to completion (the blocking io call cannot be
+            # interrupted); discard it instead of delivering it.
+            movies, infos, paths = [], [], []
         self.finished.emit(movies, infos, paths)
 
 
@@ -2408,6 +2428,9 @@ class Window(QtWidgets.QMainWindow):
         self._load_thread = None
         self._load_worker = None
         self._load_progress = None
+        # Load request made while a cancelled load is still winding down;
+        # started as soon as the old worker thread is torn down.
+        self._pending_load = None
         self._load_t0 = 0.0
         self._load_multi_file = False
         # Make sure a running loader thread is stopped before the
@@ -2825,7 +2848,22 @@ class Window(QtWidgets.QMainWindow):
         controls channel naming when several separate files are loaded.
         """
         if self._load_thread is not None:
-            # A load is already in progress; ignore re-entrant requests.
+            if self._load_worker is not None and self._load_worker._cancelled:
+                # The previous load was cancelled but its worker is still
+                # finishing the blocking io call. Remember this request
+                # and start it as soon as the old thread is torn down.
+                self._pending_load = (
+                    paths,
+                    prompt_for_path,
+                    load_all,
+                    multi_file,
+                )
+                self.status_bar.showMessage(
+                    "Finishing cancelled load, the new file will open "
+                    "right after..."
+                )
+            # Otherwise a load is already in progress; ignore re-entrant
+            # requests.
             return
 
         self._load_t0 = time.time()
@@ -2865,6 +2903,7 @@ class Window(QtWidgets.QMainWindow):
         progress.canceled.connect(
             worker.cancel, QtCore.Qt.ConnectionType.DirectConnection
         )
+        progress.canceled.connect(self._on_load_canceled)
         thread.start()
 
     def _on_load_progress(self, index: int, filename: str) -> None:
@@ -2901,6 +2940,16 @@ class Window(QtWidgets.QMainWindow):
         finally:
             self._load_worker._prompt_event.set()
 
+    def _on_load_canceled(self) -> None:
+        """Discard the progress dialog as soon as the user cancels. The
+        worker keeps emitting progress while it finishes the current
+        (uninterruptible) io call, and ``setValue()`` on a cancelled
+        ``QProgressDialog`` re-shows it."""
+        if self._load_progress is not None:
+            self._load_progress.close()
+            self._load_progress = None
+        self.status_bar.showMessage("Cancelling load...")
+
     def _stop_movie_load(self) -> None:
         """Cancel any in-progress load and block until the worker thread
         has stopped. Called before the window/app is destroyed, because
@@ -2924,6 +2973,11 @@ class Window(QtWidgets.QMainWindow):
         if self._load_worker is not None:
             self._load_worker.deleteLater()
             self._load_worker = None
+        if self._pending_load is not None:
+            # A load requested while the cancelled one was winding down;
+            # start it now that the old thread is gone.
+            pending, self._pending_load = self._pending_load, None
+            self._start_movie_load(*pending)
 
     def _on_load_finished(
         self, movies: list, infos: list, paths: list
