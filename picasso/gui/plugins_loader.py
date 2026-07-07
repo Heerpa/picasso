@@ -152,7 +152,7 @@ _reload = reload_plugins
 
 # --- Registry location -------------------------------------------------------
 
-REPO = "rafalkowalewski1/picasso_plugins"
+REPO = "jungmannlab/picasso_plugins"
 BRANCH = "master"
 RAW_BASE = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}"
 MANIFEST_URL = f"{RAW_BASE}/index.json"
