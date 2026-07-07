@@ -1713,8 +1713,14 @@ def _initial_parameters_gpufit(
 
 
 def fit_spots_gpufit(
-    spots: lib.FloatArray3D, rotated: bool = False, mle: bool = False
-) -> lib.FloatArray2D:
+    spots: lib.FloatArray3D,
+    rotated: bool = False,
+    mle: bool = False,
+    return_stats: bool = False,
+) -> (
+    lib.FloatArray2D
+    | tuple[lib.FloatArray2D, lib.FloatArray1D | None, lib.FloatArray1D]
+):
     """Fit multiple spots using GPU-based Gaussian fitting. Each spot is
     a 2D array representing the pixel values of the spot image. The
     function returns a 2D array with the optimized parameters for each
@@ -1746,6 +1752,10 @@ def fit_spots_gpufit(
     mle : bool, optional
         If True, use Gpufit's maximum likelihood estimator (Poisson
         noise model) instead of least squares. Default is False.
+    return_stats : bool, optional
+        If True, additionally return the per-spot fit diagnostics
+        (log-likelihood and iteration counts) reported by Gpufit.
+        Default is False.
 
     Returns
     -------
@@ -1753,6 +1763,15 @@ def fit_spots_gpufit(
         A 2D array with the optimized parameters for each spot. The
         columns correspond to [photons, x, y, sx, sy, bg] or
         [photons, x, y, sx, sy, bg, angle] if ``rotated``.
+    log_likelihood : lib.FloatArray1D or None
+        Only returned if ``return_stats``. The per-spot Poisson
+        log-likelihood when ``mle`` (derived from Gpufit's chi-square,
+        whose MLE value equals twice the negative log-likelihood), or
+        None for least squares, where Gpufit reports a residual sum of
+        squares rather than a likelihood.
+    number_iterations : lib.FloatArray1D
+        Only returned if ``return_stats``. The number of iterations
+        taken to converge for each spot.
     """
     if not GPUFIT_INSTALLED:
         raise ImportError(
@@ -1783,6 +1802,14 @@ def fit_spots_gpufit(
 
     parameters[:, 0] *= 2.0 * np.pi * parameters[:, 3] * parameters[:, 4]
 
+    if return_stats:
+        # Gpufit's MLE chi-square equals twice the negative Poisson
+        # log-likelihood, so -0.5 * chi_square reproduces the CPU MLE
+        # fit's log_likelihood (both Stirling-approximated). For least
+        # squares the chi-square is a residual sum of squares, not a
+        # likelihood, so there is nothing meaningful to return.
+        log_likelihood = -0.5 * chi_squares if mle else None
+        return parameters, log_likelihood, number_iterations
     return parameters
 
 
@@ -1791,6 +1818,8 @@ def locs_from_fits_gpufit(
     theta: lib.FloatArray2D,
     box: int,
     em: bool,
+    log_likelihood: lib.FloatArray1D | None = None,
+    iterations: lib.FloatArray1D | None = None,
 ) -> pd.DataFrame:
     """Convert the fit results from GPU-based fitting into a data frame
     array of localizations.
@@ -1813,6 +1842,14 @@ def locs_from_fits_gpufit(
         calculate the offsets for the x and y coordinates.
     em : bool
         Whether EMCCD was used for the localization.
+    log_likelihood : lib.FloatArray1D, optional
+        The per-spot Poisson log-likelihood (from an MLE fit). If
+        provided together with ``iterations``, the ``log_likelihood``
+        and ``iterations`` columns are added, matching the CPU MLE fit
+        output. Default is None.
+    iterations : lib.FloatArray1D, optional
+        The number of iterations taken to converge for each spot.
+        Default is None.
 
     Returns
     -------
@@ -1853,6 +1890,10 @@ def locs_from_fits_gpufit(
         angle = -np.rad2deg(theta[:, 6])
         angle = np.mod(angle + 90.0, 180.0) - 90.0
         columns["angle"] = angle.astype(np.float32)
+    if log_likelihood is not None:
+        columns["log_likelihood"] = log_likelihood.astype(np.float32)
+    if iterations is not None:
+        columns["iterations"] = iterations.astype(np.int32)
     locs = pd.DataFrame(columns)
     locs.sort_values(by="frame", kind="quicksort", inplace=True)
     return locs
@@ -1871,8 +1912,17 @@ def _fit2d_gauss_gpu(
     Gaussian is fitted and the resulting localizations contain the
     fitted rotation angle (in degrees) in the column ``angle``. See
     ``fit_2D`` for more details."""
-    theta = fit_spots_gpufit(spots, rotated=rotated, mle=mle)
-    locs = locs_from_fits_gpufit(identifications, theta, box, em)
+    theta, log_likelihood, iterations = fit_spots_gpufit(
+        spots, rotated=rotated, mle=mle, return_stats=True
+    )
+    locs = locs_from_fits_gpufit(
+        identifications,
+        theta,
+        box,
+        em,
+        log_likelihood=log_likelihood,
+        iterations=iterations,
+    )
     return locs
 
 
