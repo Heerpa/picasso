@@ -1700,6 +1700,13 @@ def _initial_parameters_gpufit(
     initial_parameters[:, 4] = initial_width
     initial_parameters[:, 5] = spot_min
     if rotated:
+        # With sx == sy, the rotated Gaussian is independent of the
+        # angle, so its derivative is exactly zero and the first LM
+        # Hessian is singular - Gpufit then aborts, returning the
+        # initial parameters. Break the symmetry of the widths to keep
+        # the angle parameter well-defined.
+        initial_parameters[:, 3] *= 1.1
+        initial_parameters[:, 4] *= 0.9
         initial_parameters[:, 6] = 0.0
 
     return initial_parameters
@@ -1752,9 +1759,6 @@ def fit_spots_gpufit(
             "GPUfit could not be found, CUDA-capable GPU is required."
         )
     if mle:
-        # Gpufit's MLE estimator assumes Poisson-distributed data;
-        # negative pixel values (possible after camera baseline
-        # subtraction) yield NaNs in the likelihood, so clip them.
         spots = np.maximum(spots, 0)
     size = spots.shape[1]
     initial_parameters = _initial_parameters_gpufit(
