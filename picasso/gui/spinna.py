@@ -28,6 +28,7 @@ import yaml
 import numpy as np
 import pandas as pd
 import matplotlib
+import matplotlib.font_manager
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvas
 from scipy.spatial.transform import Rotation
@@ -66,6 +67,44 @@ MASK_LEGEND_FIGSIZE = (
     70 / MASK_LEGEND_DPI,
 )  # width, height in inches
 FIT_RESULT_LIM = 100
+
+# The font matplotlib actually resolves for its default family
+# (e.g. "DejaVu Sans"), used as the default in the NND plot font
+# selectors so the plots match matplotlib's out-of-the-box appearance.
+DEFAULT_PLOT_FONT = matplotlib.font_manager.FontProperties().get_name()
+
+
+# Font families matplotlib can actually render with the Latin
+# characters used in plot labels. The NND plot font selectors are
+# restricted to these (rather than all OS fonts) so a chosen font
+# never triggers a "findfont: Font family '...' not found" warning nor a
+# "Glyph ... missing from font" warning (the latter happens for fonts
+# without Latin coverage, e.g. Arabic/CJK-only fonts like "Al Nile").
+def _latin_capable_fonts() -> list[str]:
+    from matplotlib.ft2font import FT2Font
+
+    # basic Latin letters and a digit must be present; the right-arrow
+    # in the default title ("t1 -> t2") is not required (few fonts carry
+    # it and matplotlib falls back per-glyph without warning noise here).
+    required = [ord(c) for c in "AaZz0"]
+    names = set()
+    for font in matplotlib.font_manager.fontManager.ttflist:
+        if font.name.startswith(".") or font.name in names:
+            continue  # hidden OS fonts / already accepted
+        try:
+            cmap = FT2Font(font.fname).get_charmap()
+        except Exception:
+            continue
+        if all(c in cmap for c in required):
+            names.add(font.name)
+    return sorted(names)
+
+
+MATPLOTLIB_FONTS = _latin_capable_fonts()
+
+# Default font sizes for the NND plot elements (tuned to the small
+# embedded canvas). Also used as fallbacks when loading user settings.
+DEFAULT_NND_FONTSIZES = {"title": 8, "labels": 8, "ticks": 6}
 
 
 def ignore_escape_key(event: QtCore.QEvent) -> None:
@@ -2466,6 +2505,15 @@ class NNDPlotSettingsDialog(lib.Dialog):
         Bin size for plotting the simulated data.
     colors : list of QtWidgets.QLineEdit
         Colors for the histograms.
+    font_title, font_labels, font_ticks : QtWidgets.QComboBox
+        Font family selectors for the title, axis labels and tick
+        labels, respectively. Populated only with fonts matplotlib can
+        render, so a selection never triggers a findfont fallback.
+    fontsize_title, fontsize_labels, fontsize_ticks : QtWidgets.QSpinBox
+        Font size selectors for the title, axis labels and tick labels,
+        respectively. The font family/size selections are persisted to
+        and restored from the user settings file (see
+        ``save_font_settings`` / ``load_font_settings``).
     min_dist : QtWidgets.QSpinBox
         Minimum distance to plot.
     max_dist : QtWidgets.QSpinBox
@@ -2593,6 +2641,76 @@ class NNDPlotSettingsDialog(lib.Dialog):
         ylabel_label = QtWidgets.QLabel("Y-axis label:")
         ylabel_label.setToolTip("Label for the Y-axis.")
         const_layout.addRow(ylabel_label, self.ylabel)
+
+        # fonts (family + size) for title, axis labels and ticks. Each
+        # element is placed on one row: [family selector | size]. The
+        # size spin box is given a fixed width and the family selector is
+        # allowed to shrink so the row fits within the form column. The
+        # defaults follow matplotlib's own resolved font so the plots
+        # look unchanged out of the box; persisted values (if any) are
+        # applied below in load_font_settings().
+        def _make_font_row(label_text, tooltip, default_size):
+            combo = QtWidgets.QComboBox()
+            combo.addItems(MATPLOTLIB_FONTS)
+            # preview each entry in its own font, like QFontComboBox does
+            for i, family in enumerate(MATPLOTLIB_FONTS):
+                combo.setItemData(
+                    i,
+                    QtGui.QFont(family),
+                    QtCore.Qt.ItemDataRole.FontRole,
+                )
+            combo.setCurrentText(DEFAULT_PLOT_FONT)
+            combo.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
+            combo.setMinimumWidth(80)
+            size = QtWidgets.QSpinBox()
+            size.setRange(1, 100)
+            size.setValue(default_size)
+            size.setFixedWidth(50)
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(combo)
+            row.addWidget(size)
+            label = QtWidgets.QLabel(label_text)
+            label.setToolTip(tooltip)
+            const_layout.addRow(label, row)
+            return combo, size
+
+        self.font_title, self.fontsize_title = _make_font_row(
+            "Title font/size:",
+            "Font family and size of the title.",
+            DEFAULT_NND_FONTSIZES["title"],
+        )
+        self.font_labels, self.fontsize_labels = _make_font_row(
+            "Axis label font/size:",
+            "Font family and size of the x- and y-axis labels.",
+            DEFAULT_NND_FONTSIZES["labels"],
+        )
+        self.font_ticks, self.fontsize_ticks = _make_font_row(
+            "Tick/legend font/size:",
+            "Font family and size of the tick labels and legend.",
+            DEFAULT_NND_FONTSIZES["ticks"],
+        )
+
+        # apply persisted font settings (if any) before wiring signals so
+        # loading does not trigger a redraw/save on every widget.
+        self.load_font_settings()
+
+        # redraw and persist when any font setting changes
+        for widget in (self.font_title, self.font_labels, self.font_ticks):
+            widget.currentTextChanged.connect(
+                self.sim_tab.display_current_nnd_plot
+            )
+            widget.currentTextChanged.connect(self.save_font_settings)
+        for widget in (
+            self.fontsize_title,
+            self.fontsize_labels,
+            self.fontsize_ticks,
+        ):
+            widget.valueChanged.connect(self.sim_tab.display_current_nnd_plot)
+            widget.valueChanged.connect(self.save_font_settings)
 
         # alpha (for histograms only)
         self.alpha = QtWidgets.QDoubleSpinBox()
@@ -2756,8 +2874,57 @@ class NNDPlotSettingsDialog(lib.Dialog):
             "alpha": self.alpha.value(),
             "colors": colors,
             "nn_counts": self.nn_counts,
+            "fontsize_title": self.fontsize_title.value(),
+            "fontsize_labels": self.fontsize_labels.value(),
+            "fontsize_ticks": self.fontsize_ticks.value(),
+            "fontname_title": self.font_title.currentText(),
+            "fontname_labels": self.font_labels.currentText(),
+            "fontname_ticks": self.font_ticks.currentText(),
         }
         return params
+
+    def load_font_settings(self) -> None:
+        """Restore the NND plot font family/size selectors from the user
+        settings file. Missing entries keep the widget defaults (the
+        matplotlib default font and the sizes tuned for the embedded
+        canvas)."""
+        fonts = io.load_user_settings()["SPINNA"].get("NND fonts")
+        if not fonts:  # missing on first run
+            return
+        combos = {
+            "title": self.font_title,
+            "labels": self.font_labels,
+            "ticks": self.font_ticks,
+        }
+        sizes = {
+            "title": self.fontsize_title,
+            "labels": self.fontsize_labels,
+            "ticks": self.fontsize_ticks,
+        }
+        for key, combo in combos.items():
+            family = fonts.get(f"{key} family")
+            # only restore fonts matplotlib can still render (the saved
+            # font may be gone if settings moved to another machine).
+            if family and combo.findText(family) >= 0:
+                combo.setCurrentText(family)
+        for key, spin in sizes.items():
+            size = fonts.get(f"{key} size")
+            if size:
+                spin.setValue(int(size))
+
+    def save_font_settings(self) -> None:
+        """Persist the NND plot font family/size selectors to the user
+        settings file."""
+        settings = io.load_user_settings()
+        settings["SPINNA"]["NND fonts"] = {
+            "title family": self.font_title.currentText(),
+            "labels family": self.font_labels.currentText(),
+            "ticks family": self.font_ticks.currentText(),
+            "title size": self.fontsize_title.value(),
+            "labels size": self.fontsize_labels.value(),
+            "ticks size": self.fontsize_ticks.value(),
+        }
+        io.save_user_settings(settings)
 
     def tick_rehist_exp(self) -> None:
         """Tick that experimental data needs to be rehistogrammed."""
@@ -4804,9 +4971,12 @@ class SimulationsTab(lib.Dialog):
                 ax=self.nnd_ax,
                 xlim=(plot_params["min_dist"], plot_params["max_dist"]),
                 ylim=plot_params["ylim"],
-                fontsize_labels=8,
-                fontsize_ticks=6,
-                fontsize_title=8,
+                fontsize_labels=plot_params["fontsize_labels"],
+                fontsize_ticks=plot_params["fontsize_ticks"],
+                fontsize_title=plot_params["fontsize_title"],
+                fontname_labels=plot_params["fontname_labels"],
+                fontname_ticks=plot_params["fontname_ticks"],
+                fontname_title=plot_params["fontname_title"],
                 title=title,
                 xlabel=plot_params["xlabel"],
                 ylabel=plot_params["ylabel"],
@@ -4823,9 +4993,12 @@ class SimulationsTab(lib.Dialog):
                 ax=self.nnd_ax,
                 xlim=(plot_params["min_dist"], plot_params["max_dist"]),
                 ylim=plot_params["ylim"],
-                fontsize_labels=8,
-                fontsize_ticks=6,
-                fontsize_title=8,
+                fontsize_labels=plot_params["fontsize_labels"],
+                fontsize_ticks=plot_params["fontsize_ticks"],
+                fontsize_title=plot_params["fontsize_title"],
+                fontname_labels=plot_params["fontname_labels"],
+                fontname_ticks=plot_params["fontname_ticks"],
+                fontname_title=plot_params["fontname_title"],
                 alpha=1.0,
                 title=title,
                 xlabel=plot_params["xlabel"],
@@ -4899,9 +5072,12 @@ class SimulationsTab(lib.Dialog):
                     ax=ax,
                     xlim=(plot_params["min_dist"], plot_params["max_dist"]),
                     ylim=plot_params["ylim"],
-                    fontsize_labels=8,
-                    fontsize_ticks=6,
-                    fontsize_title=8,
+                    fontsize_labels=plot_params["fontsize_labels"],
+                    fontsize_ticks=plot_params["fontsize_ticks"],
+                    fontsize_title=plot_params["fontsize_title"],
+                    fontname_labels=plot_params["fontname_labels"],
+                    fontname_ticks=plot_params["fontname_ticks"],
+                    fontname_title=plot_params["fontname_title"],
                     title=title,
                     xlabel=plot_params["xlabel"],
                     ylabel=plot_params["ylabel"],
@@ -4917,9 +5093,12 @@ class SimulationsTab(lib.Dialog):
                     ax=ax,
                     xlim=(plot_params["min_dist"], plot_params["max_dist"]),
                     ylim=plot_params["ylim"],
-                    fontsize_labels=8,
-                    fontsize_ticks=6,
-                    fontsize_title=8,
+                    fontsize_labels=plot_params["fontsize_labels"],
+                    fontsize_ticks=plot_params["fontsize_ticks"],
+                    fontsize_title=plot_params["fontsize_title"],
+                    fontname_labels=plot_params["fontname_labels"],
+                    fontname_ticks=plot_params["fontname_ticks"],
+                    fontname_title=plot_params["fontname_title"],
                     alpha=1.0,
                     title=title,
                     xlabel=plot_params["xlabel"],

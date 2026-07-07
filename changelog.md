@@ -55,6 +55,7 @@ Last change: 07-JUL-2026 CEST
 - Fixed combined saving of multiple channels with different columns
 
 #### SPINNA
+- Adjustable font sizes and names for the NND plot's title, labels and ticks
 - Fixed incorrect density of plotted molecules when using LE fitting
 - Fixed verbose for batch analysis
 - Batch analysis allows for specifying fitting mode (brute force/coarse to fine/bayesian)
