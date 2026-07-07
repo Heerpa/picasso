@@ -842,7 +842,7 @@ def get_sound_notification_path() -> str | None:
 
 def get_available_sound_notifications() -> list[str | None]:
     """Get a list of file names of the available sound notifications in
-    the folder ``gui/notification_sounds``.
+    the folder ``~/.picasso/notification_sounds``.
 
     Returns
     -------
@@ -879,11 +879,16 @@ def set_sound_notification(action: QtGui.QAction) -> None:
 
 
 def _sound_notification_dir() -> str:
-    """Return the path to the sound notification folder."""
-    return os.path.join(
-        os.path.dirname(os.path.realpath(__file__)),
-        "gui",
-        "notification_sounds",
+    """Return the path to the user sound notification folder
+    (``~/.picasso/notification_sounds``)."""
+    return io.notification_sounds_directory()
+
+
+def open_sound_notifications_folder() -> None:
+    """Open the user sound notification folder
+    (``~/.picasso/notification_sounds``) in the system file browser."""
+    QtGui.QDesktopServices.openUrl(
+        QtCore.QUrl.fromLocalFile(_sound_notification_dir())
     )
 
 
@@ -1776,6 +1781,38 @@ def _merge_locs(
         locs_list[i] = locs
     locs = pd.concat(locs_list, ignore_index=True)
     locs.sort_values(by="frame", inplace=True)
+    return locs
+
+
+def append_group(
+    locs: pd.DataFrame,
+    group: int | SeriesOrIntArray1D,
+) -> pd.DataFrame:
+    """Assign the ``group`` column of ``locs``, preserving any existing
+    grouping. If ``group`` already exists, its contents are moved to
+    ``group_input`` to preserve information.
+
+    The DataFrame is modified in place and returned for convenience.
+
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations to assign the group column to.
+    group : int or array-like of int
+        New group id(s). A scalar is broadcast to all localizations; an
+        array-like must have the same length as ``locs`` and is assigned
+        positionally.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        Localizations with the ``group`` column set. If a ``group``
+        column was already present, its previous values are stored in
+        the ``"group_input"`` column.
+    """
+    if "group" in locs.columns:
+        locs["group_input"] = locs["group"].to_numpy()
+    locs["group"] = group if np.isscalar(group) else np.asarray(group)
     return locs
 
 

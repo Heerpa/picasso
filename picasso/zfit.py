@@ -11,6 +11,7 @@ Fitting z coordinates using astigmatism.
 from __future__ import annotations
 
 import os
+import math
 import multiprocessing
 import time
 from concurrent import futures
@@ -18,6 +19,7 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import Callable, Literal
 
 import numba
+from numba import cuda
 import yaml
 import numpy as np
 import pandas as pd
@@ -29,6 +31,14 @@ from . import lib, gausslq, gaussmle, __version__
 
 
 plt.style.use("ggplot")
+
+
+try:
+    # Probing the CUDA driver can fail on machines without a runtime; treat
+    # any error as "no GPU available" so the CPU path stays the default.
+    CUDA_AVAILABLE = bool(cuda.is_available())
+except Exception:
+    CUDA_AVAILABLE = False
 
 
 def _nan_index(y: lib.FloatArray1D) -> tuple[lib.BoolArray1D, Callable]:
@@ -444,6 +454,242 @@ def _fit_z_parallel(
     return locs_from_futures(fs, filter=filter)
 
 
+@cuda.jit(device=True, inline=True)
+def _poly6_device(c: lib.FloatArray1D, z: float) -> float:
+    """Evaluate the degree-6 z calibration polynomial (highest power
+    first, as returned by ``np.polyfit``) via Horner's scheme."""
+    return (
+        (((((c[0] * z + c[1]) * z + c[2]) * z + c[3]) * z + c[4]) * z + c[5])
+    ) * z + c[6]
+
+
+@cuda.jit(device=True, inline=True)
+def _fit_z_target_device(
+    z: float,
+    sx: float,
+    sy: float,
+    cx: lib.FloatArray1D,
+    cy: lib.FloatArray1D,
+) -> float:
+    """Device version of ``_fit_z_target`` (the objective minimized when
+    fitting a single z coordinate). See ``_fit_z_target`` for details."""
+    wx = _poly6_device(cx, z)
+    wy = _poly6_device(cy, z)
+    return (math.sqrt(sx) - math.sqrt(wx)) ** 2 + (
+        math.sqrt(sy) - math.sqrt(wy)
+    ) ** 2
+
+
+@cuda.jit(device=True)
+def _minimize_z_device(
+    sx: float,
+    sy: float,
+    cx: lib.FloatArray1D,
+    cy: lib.FloatArray1D,
+    x1: float,
+    x2: float,
+) -> tuple[float, float]:
+    """Bounded scalar minimization of ``_fit_z_target_device`` over
+    ``[x1, x2]`` for a single localization.
+
+    This is a faithful port of SciPy's ``_minimize_scalar_bounded``
+    (Brent's method with golden-section fallback, the algorithm used by
+    ``scipy.optimize.minimize_scalar`` when ``bounds`` are given), so the
+    GPU fit reproduces the CPU (``_fit_z``) result. Returns the minimizer
+    ``xf`` and the objective value ``fx`` at that point."""
+    xatol = 1e-5
+    maxfun = 500
+    sqrt_eps = 1.4901161193847656e-08  # sqrt(2.2e-16)
+    golden_mean = 0.3819660112501051  # 0.5 * (3 - sqrt(5))
+
+    a = x1
+    b = x2
+    fulc = a + golden_mean * (b - a)
+    nfc = fulc
+    xf = fulc
+    rat = 0.0
+    e = 0.0
+    x = xf
+    fx = _fit_z_target_device(x, sx, sy, cx, cy)
+    num = 1
+    ffulc = fx
+    fnfc = fx
+    xm = 0.5 * (a + b)
+    tol1 = sqrt_eps * abs(xf) + xatol / 3.0
+    tol2 = 2.0 * tol1
+
+    while abs(xf - xm) > (tol2 - 0.5 * (b - a)):
+        golden = True
+        # Try a parabolic (Brent) step
+        if abs(e) > tol1:
+            golden = False
+            r = (xf - nfc) * (fx - ffulc)
+            q = (xf - fulc) * (fx - fnfc)
+            p = (xf - fulc) * q - (xf - nfc) * r
+            q = 2.0 * (q - r)
+            if q > 0.0:
+                p = -p
+            q = abs(q)
+            r = e
+            e = rat
+            # Is the parabola acceptable?
+            if (
+                (abs(p) < abs(0.5 * q * r))
+                and (p > q * (a - xf))
+                and (p < q * (b - xf))
+            ):
+                rat = p / q
+                x = xf + rat
+                if ((x - a) < tol2) or ((b - x) < tol2):
+                    si = 1.0 if (xm - xf) >= 0 else -1.0
+                    rat = tol1 * si
+            else:  # fall back to golden section
+                golden = True
+
+        if golden:  # golden-section step
+            if xf >= xm:
+                e = a - xf
+            else:
+                e = b - xf
+            rat = golden_mean * e
+
+        si = 1.0 if rat >= 0 else -1.0
+        x = xf + si * max(abs(rat), tol1)
+        fu = _fit_z_target_device(x, sx, sy, cx, cy)
+        num += 1
+
+        if fu <= fx:
+            if x >= xf:
+                a = xf
+            else:
+                b = xf
+            fulc = nfc
+            ffulc = fnfc
+            nfc = xf
+            fnfc = fx
+            xf = x
+            fx = fu
+        else:
+            if x < xf:
+                a = x
+            else:
+                b = x
+            if (fu <= fnfc) or (nfc == xf):
+                fulc = nfc
+                ffulc = fnfc
+                nfc = x
+                fnfc = fu
+            elif (fu <= ffulc) or (fulc == xf) or (fulc == nfc):
+                fulc = x
+                ffulc = fu
+
+        xm = 0.5 * (a + b)
+        tol1 = sqrt_eps * abs(xf) + xatol / 3.0
+        tol2 = 2.0 * tol1
+
+        if num >= maxfun:
+            break
+
+    return xf, fx
+
+
+@cuda.jit
+def _fit_z_kernel(
+    sx: lib.FloatArray1D,
+    sy: lib.FloatArray1D,
+    cx: lib.FloatArray1D,
+    cy: lib.FloatArray1D,
+    z_out: lib.FloatArray1D,
+    fun_out: lib.FloatArray1D,
+) -> None:
+    """One thread per localization: fit its z coordinate and store the
+    minimizer and objective value (residual^2) in the output arrays."""
+    i = cuda.grid(1)
+    if i < sx.shape[0]:
+        # Bounds match the CPU path (``_fit_z``); they avoid potential
+        # gaps in the calibration curve.
+        xf, fx = _minimize_z_device(sx[i], sy[i], cx, cy, -1000.0, 1000.0)
+        z_out[i] = xf
+        fun_out[i] = fx
+
+
+def _fit_z_gpu(
+    locs: pd.DataFrame,
+    info: list[dict],
+    calibration: dict,
+    magnification_factor: float,
+    pixelsize: float,
+    fitting_method: Literal["gausslq", "gaussmle"] = "gausslq",
+    filter: int = 2,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> pd.DataFrame:
+    """GPU (numba.cuda) equivalent of ``_fit_z``. Fits the z coordinate
+    of every localization in parallel on the GPU, reproducing the CPU
+    result. See ``_fit_z`` for details."""
+    if not CUDA_AVAILABLE:
+        raise RuntimeError(
+            "GPU z fitting requested but no CUDA-capable GPU is available."
+        )
+    locs = locs.copy()
+    cx = np.ascontiguousarray(calibration["X Coefficients"], dtype=np.float64)
+    cy = np.ascontiguousarray(calibration["Y Coefficients"], dtype=np.float64)
+    # float64 throughout: the 1e-5 convergence tolerance is unreachable in
+    # float32 for |z| up to 1000, and it keeps the fit faithful to the CPU.
+    sx = np.ascontiguousarray(locs["sx"].to_numpy(), dtype=np.float64)
+    sy = np.ascontiguousarray(locs["sy"].to_numpy(), dtype=np.float64)
+    N = sx.shape[0]
+    z = np.zeros(N, dtype=np.float64)
+    square_d_zcalib = np.zeros(N, dtype=np.float64)
+
+    if N:
+        d_cx = cuda.to_device(cx)
+        d_cy = cuda.to_device(cy)
+        threads_per_block = 128
+        # Process in chunks to bound device memory and report progress.
+        chunk = 1_000_000
+        use_tqdm = progress_callback == "console"
+        pbar = (
+            tqdm(total=N, desc="Fitting z...", unit="locs")
+            if use_tqdm
+            else None
+        )
+        for start in range(0, N, chunk):
+            end = min(start + chunk, N)
+            n = end - start
+            d_sx = cuda.to_device(sx[start:end])
+            d_sy = cuda.to_device(sy[start:end])
+            d_z = cuda.device_array(n, dtype=np.float64)
+            d_fun = cuda.device_array(n, dtype=np.float64)
+            blocks = (n + threads_per_block - 1) // threads_per_block
+            _fit_z_kernel[blocks, threads_per_block](
+                d_sx, d_sy, d_cx, d_cy, d_z, d_fun
+            )
+            z[start:end] = d_z.copy_to_host()
+            square_d_zcalib[start:end] = d_fun.copy_to_host()
+            if use_tqdm:
+                pbar.update(n)
+            elif callable(progress_callback):
+                progress_callback(end)
+        if use_tqdm:
+            pbar.close()
+
+    locs["z"] = (z * magnification_factor).astype(np.float32)
+    locs["d_zcalib"] = np.sqrt(square_d_zcalib).astype(np.float32)
+    lpz = _axial_localization_precision_astig(
+        locs,
+        cx,
+        cy,
+        magnification_factor,
+        pixelsize,
+        fitting_method,
+    )
+    locs["lpz"] = lpz
+    locs = lib.ensure_sanity(locs, info)
+    return filter_z_fits(locs, filter)
+
+
 def zfit(
     locs: pd.DataFrame,
     info: list[dict],
@@ -454,6 +700,7 @@ def zfit(
     fitting_method: Literal["gausslq", "gaussmle"] = "gausslq",
     filter: int = 2,
     multiprocess: bool = False,
+    gpu: bool = False,
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
@@ -504,7 +751,12 @@ def zfit(
         square deviation (RMSD) of the z calibration. Default is 2.
     multiprocess : bool, optional
         Whether to use multiprocessing for fitting the z coordinates.
-        Default is False.
+        Ignored when ``gpu`` is True. Default is False.
+    gpu : bool, optional
+        Whether to fit the z coordinates on a CUDA-capable GPU
+        (numba.cuda). Reproduces the CPU result. Requires
+        ``zfit.CUDA_AVAILABLE`` to be True. Takes precedence over
+        ``multiprocess``. Default is False.
     progress_callback : callable, "console", or None, optional
         If a callable is provided, it will be called with the current
         progress (number of localizations processed) as an argument. If
@@ -526,6 +778,10 @@ def zfit(
     """
     assert fitting_method in ["gausslq", "gaussmle"], "Invalid fitting method."
     assert filter >= 0, "Filter must be non-negative."
+    if gpu and not CUDA_AVAILABLE:
+        raise RuntimeError(
+            "GPU z fitting requested but no CUDA-capable GPU is available."
+        )
     assert isinstance(
         calibration,
         dict,
@@ -558,6 +814,7 @@ def zfit(
         fitting_method,
         filter,
         multiprocess,
+        gpu,
         progress_callback,
         abort_callback,
     )
@@ -570,6 +827,7 @@ def _zfit(
     fitting_method: Literal["gausslq", "gaussmle"],
     filter: int,
     multiprocess: bool,
+    gpu: bool,
     progress_callback: Callable[[int], None] | Literal["console"] | None,
     abort_callback: Callable[[], bool] | None,
 ) -> tuple[pd.DataFrame, list[dict]] | tuple[None, None]:
@@ -577,7 +835,18 @@ def _zfit(
     See `zfit` for details."""
     pixelsize = lib.get_from_metadata(info, "Pixelsize", raise_error=True)
     N = len(locs)
-    if multiprocess:
+    if gpu:
+        locs = _fit_z_gpu(
+            locs=locs,
+            info=info,
+            calibration=calibration,
+            magnification_factor=calibration["Magnification factor"],
+            pixelsize=pixelsize,
+            fitting_method=fitting_method,
+            filter=filter,
+            progress_callback=progress_callback,
+        )
+    elif multiprocess:
         use_tqdm = progress_callback == "console"
         if use_tqdm:
             iter_range = tqdm(range(N), desc="Fitting z...", unit="locs")

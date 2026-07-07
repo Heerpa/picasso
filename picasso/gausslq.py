@@ -23,9 +23,9 @@ from tqdm import tqdm
 from picasso import lib
 
 try:
-    from picasso.ext.pygpufit import gpufit as gf
+    from picasso.ext.pygpufit import gpufit as _gpufit
 
-    GPUFIT_INSTALLED = bool(gf.cuda_available())
+    GPUFIT_INSTALLED = bool(_gpufit.cuda_available())
 except Exception:
     GPUFIT_INSTALLED = False
 
@@ -110,29 +110,6 @@ def _initial_parameters(
     )
     theta[0:2] -= size_half
     return theta
-
-
-def _initial_parameters_gpufit(
-    spots: lib.FloatArray3D, size: int
-) -> lib.FloatArray2D:
-    """Initialize the parameters for the GPU fit - photons, x, y, sx,
-    sy, bg."""
-    center = (size / 2.0) - 0.5
-    initial_width = np.amax([size / 5.0, 1.0])
-
-    spot_max = np.amax(spots, axis=(1, 2))
-    spot_min = np.amin(spots, axis=(1, 2))
-
-    initial_parameters = np.empty((len(spots), 6), dtype=np.float32)
-
-    initial_parameters[:, 0] = spot_max - spot_min
-    initial_parameters[:, 1] = center
-    initial_parameters[:, 2] = center
-    initial_parameters[:, 3] = initial_width
-    initial_parameters[:, 4] = initial_width
-    initial_parameters[:, 5] = spot_min
-
-    return initial_parameters
 
 
 @numba.jit(nopython=True, nogil=True)
@@ -331,19 +308,12 @@ def fit_spots_parallel(
 
 
 def fit_spots_gpufit(spots: lib.FloatArray3D) -> lib.FloatArray2D:
-    """Fit multiple spots using GPU-based Gaussian fitting. Each spot is
-    a 2D array representing the pixel values of the spot image. The
-    function returns a 2D array with the optimized parameters for each
-    spot, where each row corresponds to a spot and the columns are the
-    parameters in the following order: [photons, x, y, sx, sy, bg].
+    """Fit multiple spots with a (non-rotated) elliptical 2D Gaussian
+    using least-squares fitting on the GPU.
 
-    Picasso vendors pyGPUfit under picasso/ext/pygpufit where the
-    License can be found too.
-
-    Only Windows with a CUDA-capable GPU is supported.
-
-    Cite: Przybylski, et al. Scientific Reports, 2017.
-    DOI: 10.1038/s41598-017-15313-9
+    Kept for backward compatibility - the GPU fitting now lives in
+    ``picasso.localize.fit_spots_gpufit``, which additionally supports
+    the rotated elliptical Gaussian model and the MLE estimator.
 
     Parameters
     ----------
@@ -359,27 +329,9 @@ def fit_spots_gpufit(spots: lib.FloatArray3D) -> lib.FloatArray2D:
         A 2D array with the optimized parameters for each spot. The
         columns correspond to [photons, x, y, sx, sy, bg].
     """
-    if not GPUFIT_INSTALLED:
-        raise ImportError(
-            "GPUfit could not be found, Windows with CUDA-capable GPU is"
-            " required."
-        )
-    size = spots.shape[1]
-    initial_parameters = _initial_parameters_gpufit(spots, size)
-    model_id = gf.ModelID.GAUSS_2D_ELLIPTIC
+    from picasso import localize
 
-    parameters, states, chi_squares, number_iterations, exec_time = gf.fit(
-        spots.reshape((len(spots), (size * size))),
-        None,
-        model_id,
-        initial_parameters,
-        tolerance=1e-2,
-        max_number_iterations=20,
-    )
-
-    parameters[:, 0] *= 2.0 * np.pi * parameters[:, 3] * parameters[:, 4]
-
-    return parameters
+    return localize.fit_spots_gpufit(spots)
 
 
 def fits_from_futures(futures: list[futures.Future]) -> lib.FloatArray2D:
@@ -478,7 +430,11 @@ def locs_from_fits_gpufit(
     em: bool,
 ) -> pd.DataFrame:
     """Convert the fit results from GPU-based fitting into a data frame
-    array of localizations.
+    of localizations.
+
+    Kept for backward compatibility - the GPU fitting now lives in
+    ``picasso.localize``, see
+    ``picasso.localize.locs_from_fits_gpufit``.
 
     Parameters
     ----------
@@ -500,35 +456,9 @@ def locs_from_fits_gpufit(
     locs : pd.DataFrame
         Data frame containing the localized spots.
     """
-    box_offset = int(box / 2)
-    x = theta[:, 1] + identifications["x"] - box_offset
-    y = theta[:, 2] + identifications["y"] - box_offset
-    lpx = localization_precision(
-        theta[:, 0], theta[:, 3], theta[:, 4], theta[:, 5], em=em
-    )
-    lpy = localization_precision(
-        theta[:, 0], theta[:, 4], theta[:, 3], theta[:, 5], em=em
-    )
-    a = np.maximum(theta[:, 3], theta[:, 4])
-    b = np.minimum(theta[:, 3], theta[:, 4])
-    ellipticity = (a - b) / a
-    locs = pd.DataFrame(
-        {
-            "frame": identifications["frame"].astype(np.uint32),
-            "x": x.astype(np.float32),
-            "y": y.astype(np.float32),
-            "photons": theta[:, 0].astype(np.float32),
-            "sx": theta[:, 3].astype(np.float32),
-            "sy": theta[:, 4].astype(np.float32),
-            "bg": theta[:, 5].astype(np.float32),
-            "lpx": lpx.astype(np.float32),
-            "lpy": lpy.astype(np.float32),
-            "ellipticity": ellipticity.astype(np.float32),
-            "net_gradient": identifications["net_gradient"].astype(np.float32),
-        }
-    )
-    locs.sort_values(by="frame", kind="quicksort", inplace=True)
-    return locs
+    from picasso import localize
+
+    return localize.locs_from_fits_gpufit(identifications, theta, box, em)
 
 
 def localization_precision(

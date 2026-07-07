@@ -190,6 +190,54 @@ def _hdf2visp(path: str) -> None:
     print("Complete.")
 
 
+def _smap2hdf(path: str, pixelsize: float) -> None:
+    """Convert SMAP _sml.mat localization files to HDF5 format.
+
+    Parameters
+    ----------
+    path : str
+        Path (unix style pattern) to the SMAP _sml.mat files.
+    pixelsize : float
+        Camera pixel size in nanometers.
+    """
+    from glob import glob
+    from tqdm import tqdm as _tqdm
+
+    paths = glob(path)
+    if paths:
+        import os.path
+        from .io import import_smap, save_locs
+
+        for path in _tqdm(paths, desc="Converting from SMAP"):
+            locs, info = import_smap(path, pixelsize)
+            base, ext = os.path.splitext(path)
+            save_locs(base + "_locs.hdf5", locs, info)
+    print("Complete.")
+
+
+def _hdf2smap(path: str) -> None:
+    """Convert HDF5 localization files to SMAP _sml.mat format."""
+    from glob import glob
+    from os.path import isdir
+
+    if isdir(path):
+        paths = glob(path + "/*.hdf5")
+    else:
+        paths = glob(path)
+    if paths:
+        import os.path
+        from .io import load_locs, export_smap
+
+        for path in paths:
+            base, ext = os.path.splitext(path)
+            if ext == ".hdf5":
+                print(f"Converting {path}")
+                out_path = base + "_sml.mat"
+                locs, info = load_locs(path)
+                export_smap(out_path, locs, info)
+    print("Complete.")
+
+
 def _link(files: str, d_max: float, tolerance: float) -> None:
     """Link localizations in HDF5 files, see ``postprocess.link`` for
     details."""
@@ -1099,7 +1147,8 @@ def _localize_process_file(
             calibration=z_calibration,
             fitting_method=method,
             filter=0,
-            multiprocess=True,
+            multiprocess=not args.fit_z_gpu,
+            gpu=args.fit_z_gpu,
             progress_callback="console",
         )
         info[-1]["Z Calibration Path"] = zpath
@@ -1174,7 +1223,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     qe : float
         Not used in the calculations.
     """
-    from . import gausslq
+    from . import localize
     from .io import save_info
 
     picasso_logo()
@@ -1182,7 +1231,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     print("{:<8} {:<15} {:<10}".format("No", "Label", "Value"))
 
     if args.fit_method == "lq-gpu":
-        if gausslq.gpufit_installed:
+        if localize.GPUFIT_INSTALLED:
             print("GPUfit installed")
         else:
             raise Exception("GPUfit not installed. Aborting.")
@@ -1238,6 +1287,18 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     z_params = None
     if "-3d" in args.fit_method:
         z_params = _localize_load_3d_calibration(args)
+        if args.fit_z_gpu:
+            from . import zfit
+
+            if zfit.CUDA_AVAILABLE:
+                print("GPU z fitting enabled (numba.cuda)")
+            else:
+                print(
+                    "Warning: GPU z fitting requested (--fit-z-gpu) but no "
+                    "CUDA-capable GPU is available. Falling back to "
+                    "multiprocessed CPU z fitting."
+                )
+                args.fit_z_gpu = False
 
     for i, path in enumerate(paths):
         _localize_process_file(
@@ -2364,6 +2425,7 @@ def _g5m(
     postprocess: bool = True,
     max_locs: int = 100000,
     asynch: bool = True,
+    group_column: Literal["group", "group_input"] = "group",
 ) -> None:
     """G5M analysis of clustered localizations. See ``picasso.g5m.g5m``
     for details on the parameters."""
@@ -2403,6 +2465,7 @@ def _g5m(
             postprocess=postprocess,
             max_locs_per_cluster=max_locs,
             asynch=asynch,
+            group_column=group_column,
             callback_parent="console",
         )
         new_path = splitext(path)[0] + "_molmap.hdf5"
@@ -2503,6 +2566,14 @@ def main():  # noqa: C901
         type=str,
         default="",
         help="path to 3D calibration file (3D only)",
+    )
+    localize_parser.add_argument(
+        "-zg",
+        "--fit-z-gpu",
+        action="store_true",
+        help=(
+            "fit z coordinates on a CUDA-capable GPU (numba.cuda);" " 3D only"
+        ),
     )
 
     localize_parser.add_argument(
@@ -3046,6 +3117,17 @@ def main():  # noqa: C901
         action="store_false",
         help="do not perform fitting asynchronously (multiprocessing)",
     )
+    g5m_parser.add_argument(
+        "--group-column",
+        type=str,
+        choices=["group", "group_input"],
+        default="group",
+        help=(
+            "column used to group localizations into clusters; use "
+            "'group_input' if 'group' was overwritten but the original "
+            "cluster ids are kept in 'group_input'"
+        ),
+    )
 
     # Dark time
     dark_parser = subparsers.add_parser(
@@ -3175,6 +3257,25 @@ def main():  # noqa: C901
         "hdf2visp", help="convert hdf5 to visp format"
     )
     hdf2visp_parser.add_argument("files", help="one or multiple hdf5 files")
+
+    smap2hdf_parser = subparsers.add_parser(
+        "smap2hdf", help="convert SMAP _sml.mat to hdf5 format"
+    )
+    smap2hdf_parser.add_argument(
+        "files", help="one or multiple _sml.mat files"
+    )
+    smap2hdf_parser.add_argument(
+        "-p",
+        "--pixelsize",
+        help="camera pixel size in nm",
+        type=float,
+        required=True,
+    )
+
+    hdf2smap_parser = subparsers.add_parser(
+        "hdf2smap", help="convert hdf5 to SMAP _sml.mat format"
+    )
+    hdf2smap_parser.add_argument("files", help="one or multiple hdf5 files")
 
     cluster_combine_parser = subparsers.add_parser(
         "cluster_combine",
@@ -3358,6 +3459,7 @@ def main():  # noqa: C901
                 args.postprocess,
                 args.max_locs,
                 args.asynch,
+                args.group_column,
             )
         elif args.command == "nneighbor":
             _nneighbor(args.files)
@@ -3385,6 +3487,10 @@ def main():  # noqa: C901
             _hdf2chimera(args.files)
         elif args.command == "hdf2visp":
             _hdf2visp(args.files)
+        elif args.command == "smap2hdf":
+            _smap2hdf(args.files, args.pixelsize)
+        elif args.command == "hdf2smap":
+            _hdf2smap(args.files)
         elif args.command == "cluster_combine":
             _cluster_combine(args.files)
         elif args.command == "cluster_combine_dist":

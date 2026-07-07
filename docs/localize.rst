@@ -8,12 +8,16 @@ localize
 Localize allows performing super-resolution reconstruction of image stacks. For spot detection, a gradient-based approach is used. For Fitting, the following algorithms are implemented:
 
 - MLE, integrated Gaussian (based on `Smith et al., 2010 <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2862147/>`_.)
-- LQ, Gaussian (least squares). On Windows with a CUDA-capable GPU, an accelerated variant is available via `Gpufit <https://github.com/gpufit/Gpufit>`_, which is vendored into Picasso (``picasso/ext/pygpufit/``) and works automatically — no extra install step.
+- LQ, Gaussian (least squares).
+- Rotated elliptical Gaussian, least squares or MLE (GPU only, see `GPU fitting`_ below). The fitted in-plane rotation angle is saved in the ``angle`` column, in degrees.
 - Average of ROI (finds summed intensity of spots)
+
+Picasso uses `Gpufit <https://github.com/gpufit/Gpufit>`_ for fitting on CUDA-capable GPUs (see `GPU fitting`_ below). On Windows the pre-compiled library (``Gpufit.dll``) is vendored into Picasso (``picasso/ext/pygpufit/``) and works automatically — no extra install step. On Linux there is no pre-compiled binary; you have to build ``libGpufit.so`` yourself and drop it next to the Windows DLL (see `GPU fitting on Linux`_ below). When no GPU library is available, the GPU fitting option simply does not appear and Picasso uses the accessible CPU algorithms.
 
 **Please note:** Picasso Localize supports file formats:
 
 - ``.ome.tif`` and plain ``.tif`` / ``.tiff`` image stacks,
+- MicroManager "separate image files" acquisitions, saved as one ``img_*.tif`` per frame in a folder (see ``File`` > ``Open MicroManager image folder`` below),
 - ``NDTiffStack`` with extension ``.tif``,
 - BigTIFF, with extensions ``.tif``, ``.btf``, ``.tf8`` or ``.tf2``,
 - Zeiss ``.lsm``,
@@ -24,9 +28,60 @@ Localize allows performing super-resolution reconstruction of image stacks. For 
 - ``.nd2``,
 - ``.stk``.
 
-TIFF-family files (``.tif``, ``.tiff``, ``.ome.tif``, ``.btf``, ``.tf8``, ``.tf2``, ``.lsm``) are read via the `tifffile <https://github.com/cgohlke/tifffile>`_ library. **Picasso expects grayscale image stacks with one frame per TIFF page; multi-channel, RGB or tiled whole-slide TIFF variants are not supported.**
+TIFF-family files (``.tif``, ``.tiff``, ``.ome.tif``, ``.btf``, ``.tf8``, ``.tf2``, ``.lsm``) are read via the `tifffile <https://github.com/cgohlke/tifffile>`_ library. **Picasso expects grayscale image stacks with one frame per TIFF page; multi-channel, RGB or tiled whole-slide TIFF variants are not supported.** ImageJ "contiguous stack" files — where ImageJ stores the whole stack as a single TIFF page followed by all planes' pixel data (as its "Save As > Tiff" does for large stacks, e.g. when re-saving a folder of separate images as one ``.tiff``) — are also read correctly, with every plane detected as a frame.
 
 Zeiss ``.czi`` and Leica ``.lif`` movies are read via the optional `czifile <https://github.com/cgohlke/czifile>`_ and `liffile <https://github.com/cgohlke/liffile>`_ libraries, installed with the ``czi`` / ``lif`` extras (e.g. ``pip install picassosr[czi,lif]``; both require Python ≥ 3.12). These files are reduced to a single-channel ``(frames, height, width)`` movie: when a file contains more than one channel a dialog asks which channel to load (a ``.lif`` file may also contain several acquisitions, in which case the one with the most frames is used). We are open to feature requests regarding support for other file formats, please visit our `GitHub page <https://github.com/jungmannlab/picasso>`_.
+
+GPU fitting
+-----------
+
+Picasso can run several of its fitting algorithms on a CUDA-capable NVIDIA GPU via `Gpufit <https://github.com/gpufit/Gpufit>`_, a CUDA Levenberg-Marquardt library that serves as Picasso's GPU fitting backend. Picasso loads it through a small Python binding in ``picasso/ext/pygpufit/``, which expects a compiled Gpufit library next to it:
+
+- ``Gpufit.dll`` on Windows — **shipped with Picasso**, so GPU fitting works out of the box.
+- ``libGpufit.so`` on Linux — **not shipped**, because the binary depends on your CUDA toolkit and GPU. You have to compile it yourself (see `GPU fitting on Linux`_), and copy it into ``picasso/ext/pygpufit/``.
+
+When the library is present and a CUDA GPU is detected, the GPU fitting option becomes available in the ``Parameters`` dialog (Picasso checks ``gpufit.cuda_available()`` at startup) for both optimizers, since Gpufit implements a least-squares and a maximum likelihood estimator. Otherwise the option stays hidden and Picasso uses the CPU implementations. For least squares the CPU and GPU implementations are equivalent, so results are the same — only slower; for MLE the CPU implementation fits an integrated Gaussian (Smith et al., 2010) whereas Gpufit fits a sampled Gaussian with its own convergence settings, so results can differ slightly. Using the GPU is entirely optional and only available if you have an NVIDIA (CUDA-capable) GPU.
+
+GPU fitting on Linux
+~~~~~~~~~~~~~~~~~~~~~
+
+The remainder of this section explains how to build ``libGpufit.so`` so that GPU fitting becomes available on Linux. (On Windows nothing needs to be done.)
+
+Prerequisites
+^^^^^^^^^^^^^
+
+- An NVIDIA GPU with the matching `CUDA toolkit <https://developer.nvidia.com/cuda-downloads>`_ installed.
+- ``CMake`` 3.11 or later.
+- A C/C++ compiler (GCC). CUDA only supports GCC up to a certain version; if ``make`` later complains *"unsupported GNU version! gcc versions later than X are not supported"*, install an older GCC and point CMake at it (see below).
+- ``git``.
+
+Building ``libGpufit.so``
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+From a terminal::
+
+   git clone https://github.com/gpufit/Gpufit.git Gpufit
+   mkdir Gpufit-build
+   cd Gpufit-build
+   cmake -DCMAKE_BUILD_TYPE=RELEASE ../Gpufit
+   make
+
+If ``make`` aborts with an *"unsupported GNU version"* error, your CUDA toolkit needs an older GCC. Install one (e.g. ``gcc-5``) and pass it to CMake::
+
+   cmake -DCMAKE_BUILD_TYPE=RELEASE -DCMAKE_C_COMPILER=gcc-5 ../Gpufit
+
+After a successful build, ``libGpufit.so`` is created inside the build directory (under ``Gpufit-build/Gpufit/``).
+
+Installing the library into Picasso
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Copy the freshly built ``libGpufit.so`` into Picasso's ``picasso/ext/pygpufit/`` folder (the same folder that already contains ``Gpufit.dll`` and ``gpufit.py``)::
+
+   cp Gpufit-build/Gpufit/libGpufit.so /path/to/picasso/picasso/ext/pygpufit/
+
+To locate that folder for a ``pip``-installed Picasso, run ``pip show picassosr`` and look at the ``Location:`` line; the target is ``<Location>/picasso/ext/pygpufit/``. For a cloned repository it is simply ``picasso/ext/pygpufit/`` inside your Picasso folder.
+
+Restart Picasso: Localize. If the library loaded and CUDA is available, the GPU fitting option appears in the ``Parameters`` dialog next to the supported fit methods, as described in `GPU fitting`_ above.
 
 Identification and fitting of single-molecule spots
 ---------------------------------------------------
@@ -59,11 +114,18 @@ To go back to analyzing the whole frame, simply remove all ROIs (double-click th
 Extra features
 --------------
 
+- ``File`` > ``Open one multichannel movie``: Opens a single multichannel file (``.ims``, ``.czi``, ``.lif`` or ``.nd2``) and loads **every** channel at once, one per channel, rather than prompting for a single channel to load.
+- ``File`` > ``Open channels from several movies``: Opens several separate movie files and loads each as one channel. The channel name is taken from the file's metadata where available, otherwise from the file name.
+- ``File`` > ``Open MicroManager image folder``: Opens a MicroManager acquisition that was saved as **separate image files** (one single-page ``img_*.tif`` per frame in a folder, e.g. ``img_channel000_position000_time000000000_z000.tif`` in MicroManager 2.0 or ``img_000000000_Default_000.tif`` in MicroManager 1.4), rather than as a single multi-page stack. Select the acquisition folder and Picasso assembles the whole sequence into one movie, ordered by frame index. Channel, position and z are held fixed at the first frame's values, so a multi-channel or multi-position acquisition is **not** interleaved into a single movie. Only the first frame is read when the movie is opened (the rest are read on demand during localization), so even acquisitions of tens of thousands of files open quickly. You can also reach the same result through ``File`` > ``Open movie`` by selecting any one ``img_*.tif`` file in the folder — Picasso detects the remaining frames automatically, exactly as it does for split μManager stacks.
 - ``File`` > ``Save identifications``: Saves the current set of identifications (frame, x, y, net gradient and identification id, where applicable) to an HDF5 file with a companion YAML metadata file. By default the suggested filename is ``<movie_base>_identifications.hdf5``. The accompanying YAML stores the original movie metadata together with the ``Box Size`` and ``Min. Net Gradient`` used at the time of saving, so the parameters can be restored when the identifications are loaded again.
 - ``File`` > ``Load identifications``: Loads identifications previously saved with ``Save identifications``. The identifications are clipped to the current movie's bounds (using the current ``Box Size``) and the identification parameters stored in the YAML sidecar (``Box Size``, ``Min. Net Gradient``) are restored. *As with the other identification loading actions, changing any identification parameter (box size, min. net gradient, etc.) will reset the loaded identifications, and ``Analyze`` > ``Fit`` should be used (rather than ``Localize (Identify & Fit)``) to fit them without resetting.*
 - ``File`` > ``Load picks as identifications``: Allows the user to load circular picks (from Picasso Render) as identifications. Additionally, the drift correction file (.txt) can be loaded to adjust the positions of the identifications throughout acquisition. The current box size will be used to make the identification, however, min. net gradient will **not** be applied to the identifications. *Note that changing any of the identification parameters (box size, min. net gradient, etc) will reset the loaded identifications. Furthermore, use ``Analyze`` > ``Fit``, rather than ``Analyze`` > ``Localize (Identify & Fit)``, to fit the loaded identifications without reseting them.*
 - ``File`` > ``Load locs as identifications``: Similar to loading picks as identifications (see above) but uses localizations as input. The user is asked to provide the number of frames around localizations to be used for the identifications, i.e., how many frames before and after the frame of the localization should be included in the identifications. For each localization, 2 * n_frames + 1 identifications will be assigned, thus if localizations are close together the identifications may overlap. *Note that changing any of the identification parameters (box size, min. net gradient, etc) will reset the loaded identifications. Furthermore, use ``Analyze`` > ``Fit``, rather than ``Analyze`` > ``Localize (Identify & Fit)``, to fit the loaded identifications without reseting them.*
 - ``File`` > ``Save spots``: Cuts out and saves the identified spots (NxBxB array, with N spots and B being the box side length). The spots can be saved as a .npy file or as a .tif file.
+
+When more than one channel is loaded (by either of the two actions above), a channel selector appears below the image so you can switch between channels; identification, fitting and saving then operate on the currently active channel.
+
+Loading runs in the background, so the window stays responsive while the files are read, and a progress dialog with a ``Cancel`` button is shown. Cancelling stops before the next file begins (a file already being read is finished first). This also applies to opening a single movie. Because the load no longer blocks the interface, large or multi-file datasets can be opened without freezing Picasso.
 
 Camera Config
 -------------

@@ -12,9 +12,12 @@ Graphical user interface for localizing single molecules.
 from __future__ import annotations
 
 import os.path
+import re
 import sys
+import threading
 import time
 from collections import UserDict
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -34,14 +37,197 @@ from .. import (
 from PyQt6 import QtCore, QtGui, QtWidgets
 from playsound3 import playsound
 
-try:
-    from picasso.ext.pygpufit import gpufit
-
-    GPUFIT_INSTALLED = bool(gpufit.cuda_available())
-except Exception:
-    GPUFIT_INSTALLED = False
+GPUFIT_INSTALLED = localize.GPUFIT_INSTALLED
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
+
+# Fitting models offered in the GUI, decoupled from the optimizer. Each
+# model maps its optimizer labels to the internal ``fit2D`` codes;
+# models without an optimizer (e.g. averaging) declare a fixed ``code``
+# and ``optimizers=None``. Add a new fitting algorithm by adding an
+# entry here.
+FIT_MODELS = {
+    "2D elliptical Gaussian": {
+        "optimizers": {"Least squares": "gausslq", "MLE": "gaussmle"},
+    },
+    "2D rotated elliptical Gaussian": {
+        "optimizers": {
+            "Least squares": "gausslq-rotated-gpu",
+            "MLE": "gaussmle-rotated-gpu",
+        },
+    },
+    "Average of ROI": {
+        "optimizers": None,
+        "code": "avg",
+    },
+}
+# The rotated elliptical Gaussian is only implemented in GPUfit (codes
+# ending in "-gpu"), so offer it only when a CUDA-capable GPU is found.
+if not GPUFIT_INSTALLED:
+    del FIT_MODELS["2D rotated elliptical Gaussian"]
+
+
+def _fit_code(model: str, optimizer: str) -> str:
+    """Resolve a (model, optimizer) selection to an internal ``fit2D`` code."""
+    entry = FIT_MODELS[model]
+    if entry["optimizers"] is None:
+        return entry["code"]
+    return entry["optimizers"][optimizer]
+
+
+# Steps allotted to each file in the load progress dialog, so the bar can
+# advance smoothly within a file from the loader's per-page reports.
+PROGRESS_RESOLUTION = 1000
+
+
+@dataclass
+class Channel:
+    """Per-channel state for multichannel localization.
+
+    Localize keeps all loaded channels in ``Window.channels`` and mirrors
+    the *active* channel into the flat ``Window`` attributes (``movie``,
+    ``info``, ``identifications`` ...) so the existing single-movie
+    identify/fit/save/draw code keeps operating on the active channel
+    unchanged. Switching channels snapshots the flat state (plus the
+    Parameters/Contrast dialog values) into the old ``Channel`` and
+    restores the new one.
+
+    All channels' ``movie`` objects stay live simultaneously, so a future
+    across-channel fitting algorithm can read every channel at once.
+    """
+
+    movie: object = None
+    info: list = field(default_factory=list)
+    path: str = ""
+    name: str = "Channel 0"
+    identifications: object = None
+    locs: object = None
+    locs_display: object = None
+    ready_for_fit: bool = False
+    last_identification_info: dict | None = None
+    extra_info: list = field(default_factory=list)
+    frame_range: object = None
+    curr_frame_number: int = 0
+    params: dict = field(default_factory=dict)
+    contrast: dict | None = None
+
+
+def _sanitize_filename(name: str) -> str:
+    """Turn a channel name into a filename-safe suffix."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "channel"
+
+
+class _LoadCancelledError(Exception):
+    """Raised inside the loader's progress callback to abort a cancelled
+    load mid-file (the io calls are otherwise uninterruptible)."""
+
+
+class MovieLoadWorker(QtCore.QObject):
+    """Load several movie files off the GUI thread, one file per channel.
+
+    Loading large movies on the main thread blocks Qt's event loop, so the
+    window stops repainting and responding while several files are read.
+    This worker runs ``io.load_movie`` for each path on a background
+    thread instead.
+
+    The ``prompt_info`` callbacks show modal dialogs and therefore *must*
+    run on the GUI thread. When a loader needs one, the worker emits
+    ``prompt_requested`` (delivered to the main thread via a queued
+    connection) and blocks on a ``threading.Event`` until the main thread
+    has filled the answer into the shared ``holder`` dict and released it.
+    """
+
+    progress = QtCore.pyqtSignal(int, str)  # index, filename
+    # sub-file progress within the current file: (done, total) pages
+    subprogress = QtCore.pyqtSignal(int, int)
+    # callback, (args, kwargs), holder dict for the return value
+    prompt_requested = QtCore.pyqtSignal(object, object, object)
+    finished = QtCore.pyqtSignal(list, list, list)  # movies, infos, paths
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self, paths: list[str], prompt_for_path, load_all: bool = False
+    ) -> None:
+        super().__init__()
+        self.paths = paths
+        self._prompt_for_path = prompt_for_path
+        # When True, each path is read with ``io.load_movie_all`` (every
+        # channel of one multichannel file); otherwise ``io.load_movie``
+        # loads one channel per file.
+        self.load_all = load_all
+        self._prompt_event = threading.Event()
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Request cancellation; takes effect before the next file."""
+        self._cancelled = True
+        # Release the worker if it is currently blocked on a prompt.
+        self._prompt_event.set()
+
+    def _proxy_prompt(self, callback):
+        """Wrap a GUI prompt callback so the dialog runs on the main
+        thread while the worker thread blocks for the result."""
+
+        def wrapper(*args, **kwargs):
+            holder = {}
+            self._prompt_event.clear()
+            self.prompt_requested.emit(callback, (args, kwargs), holder)
+            self._prompt_event.wait()
+            return holder.get("result")
+
+        return wrapper
+
+    def run(self) -> None:
+        movies, infos, paths = [], [], []
+        try:
+            for i, path in enumerate(self.paths):
+                if self._cancelled:
+                    break
+                self.progress.emit(i, os.path.basename(path))
+                prompt = self._proxy_prompt(self._prompt_for_path(path))
+
+                # Called (queued to the GUI thread) as io scans the
+                # file's IFDs, so the bar advances smoothly within a
+                # file. It is also the only code of ours that runs
+                # *during* the otherwise-blocking io call, so it doubles
+                # as the mid-file cancellation point.
+                def report(done: int, total: int) -> None:
+                    if self._cancelled:
+                        raise _LoadCancelledError
+                    self.subprogress.emit(done, total)
+
+                if self.load_all:
+                    result = io.load_movie_all(
+                        path, prompt_info=prompt, progress=report
+                    )
+                    if result is None:
+                        continue
+                    file_movies, file_infos = result
+                    for movie, info in zip(file_movies, file_infos):
+                        movies.append(movie)
+                        infos.append(info)
+                        paths.append(path)
+                else:
+                    result = io.load_movie(
+                        path, prompt_info=prompt, progress=report
+                    )
+                    if result is None:
+                        continue
+                    movie, info = result
+                    movies.append(movie)
+                    infos.append(info)
+                    paths.append(path)
+        except Exception as e:  # noqa: BLE001 - reported to the GUI
+            if not self._cancelled:
+                self.failed.emit(str(e))
+                return
+            movies, infos, paths = [], [], []
+        if self._cancelled:
+            # The file being read when the user cancelled has still been
+            # loaded to completion (the blocking io call cannot be
+            # interrupted); discard it instead of delivering it.
+            movies, infos, paths = [], [], []
+        self.finished.emit(movies, infos, paths)
 
 
 class RubberBand(QtWidgets.QRubberBand):
@@ -199,9 +385,9 @@ class View(QtWidgets.QGraphicsView):
         event.accept()
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
-        """Zoom in/out with the mouse wheel."""
+        """Zoom in/out with the mouse wheel, centered on the cursor."""
         scale = 1.008 ** (-event.angleDelta().y())
-        self.window.zoom(scale)
+        self.window.zoom(scale, anchor=event.position().toPoint())
 
     def on_scroll(self) -> None:
         """Redraw the frame if scale bar is shown."""
@@ -974,11 +1160,18 @@ class ParametersDialog(lib.Dialog):
         MLE fitting.
     emission_combos : EmissionSettingComboBoxDict
         Combo boxes for selecting emission wavelengths.
-    fit_method : QtWidgets.QComboBox
-        Combo box for selecting the fitting method.
+    fit_model : QtWidgets.QComboBox
+        Combo box for selecting the fitting model (e.g. 2D elliptical
+        Gaussian or average of ROI).
+    fit_optimizer : QtWidgets.QComboBox
+        Combo box for selecting the optimizer (Least squares or MLE).
+        Hidden for models that do not use an optimizer.
     fit_z_checkbox : QtWidgets.QCheckBox
         Checkbox for enabling/disabling fitting in the z-dimension using
         astigmatism.
+    fit_z_gpu_checkbox : QtWidgets.QCheckBox
+        Checkbox for fitting z coordinates on a CUDA-capable GPU
+        (numba.cuda). Only shown if a compatible GPU is available.
     gain : QtWidgets.QSpinBox
         Spin box for selecting camera EM gain.
     gpufit_checkbox : QtWidgets.QCheckBox
@@ -1346,19 +1539,23 @@ class ParametersDialog(lib.Dialog):
         vbox.addWidget(fit_groupbox)
         fit_grid = QtWidgets.QGridLayout(fit_groupbox)
 
-        method_label = QtWidgets.QLabel("Method:")
-        method_label.setToolTip("Fitting method to use for localization.")
-        fit_grid.addWidget(method_label, 1, 0)
-        self.fit_method = QtWidgets.QComboBox()
-        self.fit_method.addItems(
-            ["LQ, Gaussian", "MLE, integrated Gaussian", "Average of ROI"]
-        )
-        self.fit_method.setCurrentIndex(0)
-        fit_grid.addWidget(self.fit_method, 1, 1)
-        fit_stack = QtWidgets.QStackedWidget()
-        fit_grid.addWidget(fit_stack, 2, 0, 1, 2)
-        self.fit_method.currentIndexChanged.connect(fit_stack.setCurrentIndex)
-        self.fit_method.currentIndexChanged.connect(self.on_fit_method_changed)
+        model_label = QtWidgets.QLabel("Model:")
+        model_label.setToolTip("Model fit to each identified spot.")
+        fit_grid.addWidget(model_label, 1, 0)
+        self.fit_model = QtWidgets.QComboBox()
+        self.fit_model.addItems(list(FIT_MODELS.keys()))
+        self.fit_model.setCurrentIndex(0)
+        fit_grid.addWidget(self.fit_model, 1, 1)
+
+        self.optimizer_label = QtWidgets.QLabel("Optimizer:")
+        self.optimizer_label.setToolTip("Optimizer used to fit the model.")
+        fit_grid.addWidget(self.optimizer_label, 2, 0)
+        self.fit_optimizer = QtWidgets.QComboBox()
+        fit_grid.addWidget(self.fit_optimizer, 2, 1)
+
+        self.fit_stack = QtWidgets.QStackedWidget()
+        fit_grid.addWidget(self.fit_stack, 3, 0, 1, 2)
+        fit_stack = self.fit_stack
 
         # MLE
         mle_widget = QtWidgets.QWidget()
@@ -1381,10 +1578,18 @@ class ParametersDialog(lib.Dialog):
         self.max_it.setValue(100)
         mle_grid.addWidget(self.max_it, 1, 1)
 
-        # LQ
+        # LQ has no optimizer-specific parameters; an empty page keeps
+        # the stack indices matching the optimizer combobox indices.
         lq_widget = QtWidgets.QWidget()
-        lq_grid = QtWidgets.QGridLayout(lq_widget)
 
+        # Stack pages are ordered to match the optimizer combobox indices:
+        # 0 -> "Least squares" (empty), 1 -> "MLE" (convergence/max_it).
+        fit_stack.addWidget(lq_widget)
+        fit_stack.addWidget(mle_widget)
+
+        # Gpufit implements both least-squares and MLE estimators, so
+        # the checkbox applies to both optimizers and sits below the
+        # optimizer parameter stack.
         self.gpufit_checkbox = QtWidgets.QCheckBox("Use GPUfit")
         self.gpufit_checkbox.setTristate(False)
         self.gpufit_checkbox.setDisabled(True)
@@ -1394,14 +1599,15 @@ class ParametersDialog(lib.Dialog):
             self.gpufit_checkbox.hide()
         else:
             self.gpufit_checkbox.setDisabled(False)
-        lq_grid.addWidget(self.gpufit_checkbox)
+        fit_grid.addWidget(self.gpufit_checkbox, 4, 0, 1, 2)
 
-        fit_stack.addWidget(lq_widget)
-        fit_stack.addWidget(mle_widget)
-        # lq_grid = QtWidgets.QGridLayout(lq_widget)
-
-        avg_widget = QtWidgets.QWidget()
-        fit_stack.addWidget(avg_widget)
+        self.fit_model.currentIndexChanged.connect(self.on_fit_model_changed)
+        self.fit_optimizer.currentIndexChanged.connect(
+            self.on_fit_optimizer_changed
+        )
+        # Populate the optimizer combobox and set visibility for the default
+        # model.
+        self.on_fit_model_changed()
 
         # 3D
         z_groupbox = QtWidgets.QGroupBox("3D via Astigmatism")
@@ -1418,10 +1624,9 @@ class ParametersDialog(lib.Dialog):
         load_z_calib.setAutoDefault(False)
         load_z_calib.clicked.connect(self.load_z_calib)
         z_grid.addWidget(load_z_calib, 0, 1)
-        z_grid.addWidget(lib.HelpButton(self.CALIB_URL), 2, 0)
         self.fit_z_checkbox = QtWidgets.QCheckBox("Fit Z")
+        self.fit_z_checkbox.setToolTip("Fit z coordinates?")
         self.fit_z_checkbox.setEnabled(False)
-        z_grid.addWidget(self.fit_z_checkbox, 2, 1)
         self.z_calib_label = QtWidgets.QLabel("-- no calibration loaded --")
         self.z_calib_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.z_calib_label.setSizePolicy(
@@ -1440,6 +1645,19 @@ class ParametersDialog(lib.Dialog):
         self.magnification_factor.setDecimals(4)
         self.magnification_factor.setValue(0.79)
         z_grid.addWidget(self.magnification_factor, 1, 1)
+
+        self.fit_z_gpu_checkbox = QtWidgets.QCheckBox("Use GPU")
+        self.fit_z_gpu_checkbox.setTristate(False)
+        self.fit_z_gpu_checkbox.setToolTip("Fit z coordinates on a GPU?")
+        self.fit_z_gpu_checkbox.setEnabled(self.fit_z_checkbox.isChecked())
+        self.fit_z_checkbox.toggled.connect(self.fit_z_gpu_checkbox.setEnabled)
+        if not zfit.CUDA_AVAILABLE:
+            self.fit_z_gpu_checkbox.hide()
+        fit_z_row = QtWidgets.QHBoxLayout()
+        fit_z_row.addWidget(lib.HelpButton(self.CALIB_URL))
+        fit_z_row.addWidget(self.fit_z_checkbox)
+        fit_z_row.addWidget(self.fit_z_gpu_checkbox)
+        z_grid.addLayout(fit_z_row, 2, 0, 1, 2)
 
         if "Cameras" in CONFIG:
             camera = self.camera.currentText()
@@ -1623,14 +1841,47 @@ class ParametersDialog(lib.Dialog):
         self.roi_dialog.raise_()
         self.roi_dialog.activateWindow()
 
-    def on_fit_method_changed(self) -> None:
-        """Enable/disable GPU fitting checkbox based on selected fit
-        method."""
-        if self.fit_method.currentText() == "LQ, Gaussian":
-            self.gpufit_checkbox.setDisabled(False)
+    def on_fit_model_changed(self) -> None:
+        """Repopulate the optimizer combobox for the selected model and
+        show/hide the optimizer controls. Models without an optimizer
+        (e.g. averaging) hide the optimizer row and its parameters."""
+        model = self.fit_model.currentText()
+        optimizers = FIT_MODELS[model]["optimizers"]
+        if optimizers is None:
+            self.optimizer_label.hide()
+            self.fit_optimizer.hide()
+            self.fit_stack.hide()
+        else:
+            self.optimizer_label.show()
+            self.fit_optimizer.show()
+            self.fit_stack.show()
+            self.fit_optimizer.blockSignals(True)
+            self.fit_optimizer.clear()
+            self.fit_optimizer.addItems(list(optimizers.keys()))
+            self.fit_optimizer.setCurrentIndex(0)
+            self.fit_optimizer.blockSignals(False)
+            self.on_fit_optimizer_changed()
+
+    def on_fit_optimizer_changed(self) -> None:
+        """Switch the optimizer parameter page and enable/disable the GPU
+        fitting checkbox based on the selected model and optimizer."""
+        index = self.fit_optimizer.currentIndex()
+        if index >= 0:
+            self.fit_stack.setCurrentIndex(index)
+        model = self.fit_model.currentText()
+        optimizer = self.fit_optimizer.currentText()
+        if optimizer and _fit_code(model, optimizer).endswith("-gpu"):
+            # GPU-only method (e.g. the rotated elliptical Gaussian):
+            # fitting always runs on the GPU, so pin the checkbox.
+            self.gpufit_checkbox.setChecked(True)
+            self.gpufit_checkbox.setDisabled(True)
+        elif optimizer in ("Least squares", "MLE"):
+            # Gpufit implements both estimators
+            self.gpufit_checkbox.setDisabled(not GPUFIT_INSTALLED)
         else:
             self.gpufit_checkbox.setChecked(False)
             self.gpufit_checkbox.setDisabled(True)
+        self.on_gpufit_changed()
 
     def on_frames_edit_changed(self) -> None:
         """Handle changes when text is deleted."""
@@ -1703,9 +1954,11 @@ class ParametersDialog(lib.Dialog):
             else:
                 self.update_z_calib(None)
                 self.z_calib_label.setText("-- calibration path not found --")
+                self.z_calib_label.setToolTip("")
                 return
             self.z_calib_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
             self.z_calib_label.setText(os.path.basename(path))
+            self.z_calib_label.setToolTip(path)
             self.fit_z_checkbox.setEnabled(True)
             self.fit_z_checkbox.setChecked(True)
         else:
@@ -1822,8 +2075,15 @@ class ParametersDialog(lib.Dialog):
         self.window.draw_frame()
 
     def on_gpufit_changed(self) -> None:
-        """Handle changes to the GPU fitting option."""
-        self.window.draw_frame()
+        """Handle changes to the GPU fitting option. Gpufit uses its own
+        convergence settings, so the CPU MLE controls are greyed out
+        while GPU fitting is selected."""
+        use_gpufit = self.gpufit_checkbox.isChecked()
+        self.convergence_criterion.setEnabled(not use_gpufit)
+        self.max_it.setEnabled(not use_gpufit)
+        # this dialog is created before the window's movie attribute
+        if getattr(self.window, "movie", None) is not None:
+            self.window.draw_frame()
 
     def get_camera(self, info: dict) -> tuple[str, list[str]]:
         """Get the camera name from the provided camera info."""
@@ -1932,7 +2192,8 @@ class ContrastDialog(lib.Dialog):
         black_label = QtWidgets.QLabel("Black:")
         black_label.setToolTip("Min. intensity rendered")
         grid.addWidget(black_label, 0, 0)
-        self.black_spinbox = QtWidgets.QSpinBox()
+        self.black_spinbox = lib.LogDoubleSpinBox()
+        self.black_spinbox.setDecimals(0)
         self.black_spinbox.setKeyboardTracking(False)
         self.black_spinbox.setRange(1, 999999)
         self.black_spinbox.valueChanged.connect(self.on_contrast_changed)
@@ -1940,7 +2201,8 @@ class ContrastDialog(lib.Dialog):
         white_label = QtWidgets.QLabel("White:")
         white_label.setToolTip("Max. intensity rendered")
         grid.addWidget(white_label, 1, 0)
-        self.white_spinbox = QtWidgets.QSpinBox()
+        self.white_spinbox = lib.LogDoubleSpinBox()
+        self.white_spinbox.setDecimals(0)
         self.white_spinbox.setKeyboardTracking(False)
         self.white_spinbox.setRange(1, 999999)
         self.white_spinbox.valueChanged.connect(self.on_contrast_changed)
@@ -2019,7 +2281,7 @@ class LocColumnSelectionDialog(lib.Dialog):
                 for col in subcols:
                     columns[col] = True
         for column, checkbox in self.column_checkboxes.items():
-            is_checked = columns[column]
+            is_checked = columns.get(column, True)
             checkbox.setChecked(is_checked)
 
 
@@ -2034,6 +2296,13 @@ class Window(QtWidgets.QMainWindow):
         Camera information, such as gain, sensitivity, etc.
     contrast_dialog : ContrastDialog
         The dialog for adjusting display contrast.
+    channels : list of Channel
+        Per-channel state for multichannel data. The active channel
+        (``current_channel``) is mirrored into the flat attributes
+        (``movie``, ``info``, ``movie_path`` ...). A single movie is held
+        as a one-element list.
+    current_channel : int
+        Index of the active channel within ``channels``.
     extra_info : list of dict
         Movie metadata in a format of a dictionary, with Localize info.
     identifications : pd.DataFrame
@@ -2047,9 +2316,10 @@ class Window(QtWidgets.QMainWindow):
         Movie metadata in a format of a dictionary, without Localize
         info, see self.extra_info.
     movie : np.memmap or None
-        Loaded movie (frame, y, x).
-    movie_path : list[str]
-        List of paths to the movie files.
+        Loaded movie (frame, y, x) of the active channel.
+    movie_path : str or list
+        Path to the active channel's movie file (empty list when nothing
+        is loaded).
     parameters_dialog : ParametersDialog
         The dialog for adjusting parameters.
     ready_for_fit : bool
@@ -2106,10 +2376,17 @@ class Window(QtWidgets.QMainWindow):
             """
         )
         self.frame_slider.valueChanged.connect(self.on_frame_slider_changed)
+        # Channel selector (hidden unless several channels are loaded).
+        self.channel_combo = QtWidgets.QComboBox()
+        self.channel_combo.setVisible(False)
+        self.channel_combo.currentIndexChanged.connect(
+            self.on_channel_combo_changed
+        )
         central_widget = QtWidgets.QWidget()
         central_layout = QtWidgets.QVBoxLayout(central_widget)
         central_layout.setContentsMargins(0, 0, 0, 0)
         central_layout.setSpacing(0)
+        central_layout.addWidget(self.channel_combo)
         central_layout.addWidget(self.view)
         central_layout.addWidget(self.frame_slider)
         self.setCentralWidget(central_widget)
@@ -2137,6 +2414,32 @@ class Window(QtWidgets.QMainWindow):
         self.info = []
         self.extra_info = []
         self._active_worker = None
+        # Multichannel state. ``self.channels[self.current_channel]`` is
+        # the active channel, mirrored into the flat attributes above.
+        # Single movies are stored as a one-element list.
+        self.channels = []
+        self.current_channel = 0
+        # Guards the parameter/contrast handlers while restoring a
+        # channel's dialog values, so they don't wipe the channel's
+        # locs/markers.
+        self._switching_channel = False
+
+        # Background movie-loading worker state (see open_channels_from_files).
+        self._load_thread = None
+        self._load_worker = None
+        self._load_progress = None
+        # Load request made while a cancelled load is still winding down;
+        # started as soon as the old worker thread is torn down.
+        self._pending_load = None
+        self._load_t0 = 0.0
+        self._load_multi_file = False
+        # Make sure a running loader thread is stopped before the
+        # QApplication is destroyed; destroying a live QThread aborts the
+        # process. ``aboutToQuit`` fires on every quit path (including
+        # sys.exit through the event loop), unlike ``closeEvent``.
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._stop_movie_load)
 
         self.load_user_settings()
 
@@ -2159,11 +2462,15 @@ class Window(QtWidgets.QMainWindow):
             self.parameters_dialog.box_spinbox.setValue(box_size)
         if type(gradient) is int:
             self.parameters_dialog.mng_slider.setValue(gradient)
+        self.parameters_dialog.fit_z_gpu_checkbox.setChecked(
+            bool(settings["Localize"].get("fit_z_gpu", False))
+        )
 
         self.pwd = pwd
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         """Close the application, save user settings."""
+        self._stop_movie_load()
         settings = io.load_user_settings()
         if self.movie_path != []:
             settings["Localize"]["PWD"] = os.path.dirname(self.movie_path)
@@ -2173,6 +2480,9 @@ class Window(QtWidgets.QMainWindow):
             settings["Localize"][
                 "gradient"
             ] = self.parameters_dialog.mng_slider.value()
+        settings["Localize"][
+            "fit_z_gpu"
+        ] = self.parameters_dialog.fit_z_gpu_checkbox.isChecked()
         settings["Localize"]["Columns to save"] = {
             column: checkbox.isChecked()
             for column, checkbox in (
@@ -2192,6 +2502,26 @@ class Window(QtWidgets.QMainWindow):
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self.open_file_dialog)
         file_menu.addAction(open_action)
+        open_multichannel_action = file_menu.addAction(
+            "Open one multichannel movie"
+        )
+        open_multichannel_action.setShortcut("Ctrl+Shift+O")
+        open_multichannel_action.triggered.connect(
+            self.open_multichannel_file_dialog
+        )
+        file_menu.addAction(open_multichannel_action)
+        open_channels_action = file_menu.addAction(
+            "Open channels from several movies"
+        )
+        open_channels_action.triggered.connect(
+            self.open_channels_from_files_dialog
+        )
+        file_menu.addAction(open_channels_action)
+        open_mm_folder_action = file_menu.addAction(
+            "Open MicroManager image folder"
+        )
+        open_mm_folder_action.triggered.connect(self.open_mm_folder_dialog)
+        file_menu.addAction(open_mm_folder_action)
         save_identifications_action = file_menu.addAction(
             "Save identifications"
         )
@@ -2245,6 +2575,13 @@ class Window(QtWidgets.QMainWindow):
                 action.setChecked(True)
             sounds_menu.addAction(action)
         sounds_actiongroup.triggered.connect(lib.set_sound_notification)
+        sounds_menu.addSeparator()
+        open_sounds_action = sounds_menu.addAction(
+            "Open notification sounds folder..."
+        )
+        open_sounds_action.triggered.connect(
+            lib.open_sound_notifications_folder
+        )
         picasso_settings_action = file_menu.addAction("Picasso settings")
         picasso_settings_action.triggered.connect(
             self.user_settings_dialog.show
@@ -2381,9 +2718,7 @@ class Window(QtWidgets.QMainWindow):
             )
             return
         infos = self.extra_info if self.extra_info else self.info
-        label = (
-            os.path.basename(self.movie_path[0]) if self.movie_path else None
-        )
+        label = os.path.basename(self.movie_path) if self.movie_path else None
         self.metadata_dialog.set_infos(infos, labels=label)
         self.metadata_dialog.show()
         self.metadata_dialog.raise_()
@@ -2418,48 +2753,499 @@ class Window(QtWidgets.QMainWindow):
             self.pwd = path
             self.open(path)
 
-    def open(self, path: str) -> None:
-        """Open a movie file."""
-        t0 = time.time()
+    def open_mm_folder_dialog(self) -> None:
+        """Open a MicroManager "separate image files" acquisition folder.
 
+        MicroManager can save each frame of a movie as its own TIFF
+        (``img_*.tif``) inside one folder. This picks such a folder and
+        loads the whole sequence as a single movie.
+        """
+        dir = None if self.pwd == [] else self.pwd
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Open MicroManager image folder", directory=dir
+        )
+        if not directory:
+            return
+        path = io.find_mm_separate_first(directory)
+        if path is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No image sequence found",
+                "No MicroManager 'separate image files' sequence "
+                "(img_*.tif) was found in the selected folder.",
+            )
+            return
+        self.pwd = path
+        self.open(path)
+
+    def _prompt_for_path(self, path: str):
+        """Return the metadata prompt callback appropriate for ``path``."""
         if path.lower().endswith((".ims", ".czi", ".lif")):
             # Multi-channel .ims/.czi/.lif files prompt for a channel.
-            prompt_info = self.prompt_channel
+            return self.prompt_channel
         elif path.lower().endswith(io.TIFF_EXTENSIONS + (".stk", ".nd2")):
             # For these formats the metadata may fail to parse; prompt the
             # user to enter it manually as a fallback.
-            prompt_info = self.prompt_movie_info
-        else:
-            prompt_info = self.prompt_info
+            return self.prompt_movie_info
+        return self.prompt_info
 
-        result = io.load_movie(path, prompt_info=prompt_info)
+    def open(self, path: str) -> None:
+        """Open a single movie file as one channel."""
+        self._start_movie_load([path], self._prompt_for_path)
 
-        if result is not None:
-            self.movie, self.info = result
-            dt = time.time() - t0
-            self.movie_path = path
-            self.identifications = None
-            self.locs = None
-            self.locs_display = None
-            self.ready_for_fit = False
-            self.frame_slider.setEnabled(True)
-            self.frame_slider.setMaximum(
-                lib.get_from_metadata(self.info, "Frames") - 1
-            )
-            self.set_frame(0)
-            self.fit_in_view()
-            self.parameters_dialog.set_camera_parameters(self.info[0])
-            self.status_bar.showMessage(f"Opened movie in {dt:.2f} seconds.")
-
-            if "Pixelsize" in self.info[0]:
-                self.parameters_dialog.pixelsize.setValue(
-                    int(self.info[0]["Pixelsize"])
-                )
-
-        self.setWindowTitle(
-            f"Picasso v{__version__}: Localize. File: {os.path.basename(path)}"
+    def open_multichannel_file_dialog(self) -> None:
+        """Open a single file and load *all* of its channels."""
+        dir = None if self.pwd == [] else self.pwd
+        path, exe = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open multichannel file",
+            directory=dir,
+            filter="Multichannel files (*.ims *.czi *.lif *.nd2)",
         )
+        if path:
+            self.pwd = path
+            self.open_multichannel_file(path)
+
+    def open_multichannel_file(self, path: str) -> None:
+        """Load every channel of a single multichannel file."""
+        self._start_movie_load(
+            [path], lambda _p: self.prompt_movie_info, load_all=True
+        )
+
+    def open_channels_from_files_dialog(self) -> None:
+        """Open several movie files, each loaded as one channel."""
+        dir = None if self.pwd == [] else self.pwd
+        paths, exe = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Open channels from files",
+            directory=dir,
+            filter=(
+                "All supported formats ("
+                + " ".join("*" + e for e in io.MOVIE_EXTENSIONS)
+                + ")"
+            ),
+        )
+        if paths:
+            self.pwd = paths[0]
+            self.open_channels_from_files(paths)
+
+    def open_channels_from_files(self, paths: list[str]) -> None:
+        """Load several movie files as channels (one file per channel)."""
+        self._start_movie_load(paths, self._prompt_for_path, multi_file=True)
+
+    def _start_movie_load(
+        self,
+        paths: list[str],
+        prompt_for_path,
+        load_all: bool = False,
+        multi_file: bool = False,
+    ) -> None:
+        """Load movies on a background thread (see ``MovieLoadWorker``) so
+        the GUI keeps repainting and responding while files are read.
+
+        ``load_all`` reads every channel of each file (single multichannel
+        file); otherwise one channel is loaded per file. ``multi_file``
+        controls channel naming when several separate files are loaded.
+        """
+        if self._load_thread is not None:
+            if self._load_worker is not None and self._load_worker._cancelled:
+                # The previous load was cancelled but its worker is still
+                # finishing the blocking io call. Remember this request
+                # and start it as soon as the old thread is torn down.
+                self._pending_load = (
+                    paths,
+                    prompt_for_path,
+                    load_all,
+                    multi_file,
+                )
+                self.status_bar.showMessage(
+                    "Finishing cancelled load, the new file will open "
+                    "right after..."
+                )
+            # Otherwise a load is already in progress; ignore re-entrant
+            # requests.
+            return
+
+        self._load_t0 = time.time()
+        self._load_multi_file = multi_file
+        # Each file spans PROGRESS_RESOLUTION steps so the bar can advance
+        # smoothly *within* a file from the worker's per-page reports,
+        # instead of only ticking once per file.
+        self._load_index = 0
+        progress = QtWidgets.QProgressDialog(
+            "Loading movie...",
+            "Cancel",
+            0,
+            len(paths) * PROGRESS_RESOLUTION,
+            self,
+        )
+        progress.setWindowTitle("Opening movie")
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        self._load_progress = progress
+
+        thread = QtCore.QThread(self)
+        worker = MovieLoadWorker(paths, prompt_for_path, load_all=load_all)
+        worker.moveToThread(thread)
+        self._load_thread = thread
+        self._load_worker = worker
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_load_progress)
+        worker.subprogress.connect(self._on_load_subprogress)
+        worker.prompt_requested.connect(self._on_load_prompt_requested)
+        worker.finished.connect(self._on_load_finished)
+        worker.failed.connect(self._on_load_failed)
+        # Direct connection so the flag is set from the GUI thread
+        # immediately; the worker thread is busy in run() and would not
+        # service a queued slot until the current file finished.
+        progress.canceled.connect(
+            worker.cancel, QtCore.Qt.ConnectionType.DirectConnection
+        )
+        progress.canceled.connect(self._on_load_canceled)
+        thread.start()
+
+    def _on_load_progress(self, index: int, filename: str) -> None:
+        """Update the progress dialog as each file starts loading.
+
+        The bar cannot move yet: before per-page reporting begins, the
+        loader indexes the whole file (opening it and counting frames),
+        which happens inside a single tifffile call with no sub-steps.
+        Say so, so the user does not think the load has stalled."""
+        self._load_index = index
+        if self._load_progress is not None:
+            self._load_progress.setLabelText(
+                f"Opening {filename}...\n"
+                "Indexing frames — the bar starts once they are counted."
+            )
+            self._load_progress.setValue(index * PROGRESS_RESOLUTION)
+
+    def _on_load_subprogress(self, done: int, total: int) -> None:
+        """Advance the bar within the current file from the worker's
+        per-page reports (see ``MovieLoadWorker.subprogress``)."""
+        if self._load_progress is not None and total > 0:
+            fraction = min(done / total, 1.0)
+            value = int((self._load_index + fraction) * PROGRESS_RESOLUTION)
+            self._load_progress.setValue(value)
+
+    def _on_load_prompt_requested(
+        self, callback, args_kwargs, holder: dict
+    ) -> None:
+        """Run a worker-requested metadata prompt on the GUI thread and
+        hand the result back, then unblock the worker."""
+        args, kwargs = args_kwargs
+        try:
+            holder["result"] = callback(*args, **kwargs)
+        finally:
+            self._load_worker._prompt_event.set()
+
+    def _on_load_canceled(self) -> None:
+        """Discard the progress dialog as soon as the user cancels. The
+        worker keeps emitting progress while it finishes the current
+        (uninterruptible) io call, and ``setValue()`` on a cancelled
+        ``QProgressDialog`` re-shows it."""
+        if self._load_progress is not None:
+            self._load_progress.close()
+            self._load_progress = None
+        self.status_bar.showMessage("Cancelling load...")
+
+    def _stop_movie_load(self) -> None:
+        """Cancel any in-progress load and block until the worker thread
+        has stopped. Called before the window/app is destroyed, because
+        destroying a still-running QThread aborts the process."""
+        if self._load_worker is not None:
+            self._load_worker.cancel()
+        if self._load_thread is not None:
+            self._load_thread.quit()
+            self._load_thread.wait()
+
+    def _finish_load(self) -> None:
+        """Tear down the worker thread and progress dialog."""
+        if self._load_progress is not None:
+            self._load_progress.close()
+            self._load_progress = None
+        if self._load_thread is not None:
+            self._load_thread.quit()
+            self._load_thread.wait()
+            self._load_thread.deleteLater()
+            self._load_thread = None
+        if self._load_worker is not None:
+            self._load_worker.deleteLater()
+            self._load_worker = None
+        if self._pending_load is not None:
+            # A load requested while the cancelled one was winding down;
+            # start it now that the old thread is gone.
+            pending, self._pending_load = self._pending_load, None
+            self._start_movie_load(*pending)
+
+    def _on_load_finished(
+        self, movies: list, infos: list, paths: list
+    ) -> None:
+        """Activate the loaded channels once the worker is done."""
+        self._finish_load()
+        if not movies:
+            return
+        names = [
+            self._channel_name(
+                infos[i], paths[i], i, multi_file=self._load_multi_file
+            )
+            for i in range(len(movies))
+        ]
+        self._set_channels(movies, infos, paths, names)
+        dt = time.time() - self._load_t0
+        if len(movies) == 1:
+            self.status_bar.showMessage(f"Opened movie in {dt:.2f} seconds.")
+        else:
+            self.status_bar.showMessage(
+                f"Opened {len(movies)} channel(s) in {dt:.2f} seconds."
+            )
+
+    def _on_load_failed(self, message: str) -> None:
+        """Report a load error and tear down the worker."""
+        self._finish_load()
+        QtWidgets.QMessageBox.warning(self, "Could not load file", message)
+
+    def _channel_name(
+        self,
+        info: list,
+        path: str,
+        idx: int,
+        multi_file: bool = False,
+    ) -> str:
+        """Pick a display name for a channel: the metadata ``"Channel"``
+        key if present, else the filename stem (separate files), else
+        ``"Channel N"``."""
+        try:
+            channel = info[0].get("Channel")
+        except (AttributeError, IndexError, TypeError):
+            channel = None
+        if channel:
+            return str(channel)
+        if multi_file:
+            return os.path.splitext(os.path.basename(path))[0]
+        return f"Channel {idx}"
+
+    def _set_channels(
+        self,
+        movies: list,
+        infos: list,
+        paths: list,
+        names: list,
+    ) -> None:
+        """Build the channel list from loaded movies and activate the
+        first one. The single funnel used by every load path."""
+        if not movies:
+            return
+        # Build channels and seed each channel's parameter/contrast
+        # snapshot from the current dialog state, applying any camera /
+        # pixel-size hints from that channel's metadata. Guarded so the
+        # value changes don't wipe localizations.
+        self._switching_channel = True
+        try:
+            self.channels = []
+            for movie, info, path, name in zip(movies, infos, paths, names):
+                channel = Channel(movie=movie, info=info, path=path, name=name)
+                self.parameters_dialog.set_camera_parameters(info[0])
+                if "Pixelsize" in info[0]:
+                    self.parameters_dialog.pixelsize.setValue(
+                        int(info[0]["Pixelsize"])
+                    )
+                channel.params = self._capture_params()
+                channel.contrast = self._capture_contrast()
+                self.channels.append(channel)
+            self.current_channel = 0
+        finally:
+            self._switching_channel = False
+        self._populate_channel_combo()
+        self.frame_slider.setEnabled(True)
+        self._restore_current_channel()
         self.parameters_dialog.reset_quality_check()
+
+    def _populate_channel_combo(self) -> None:
+        """Refresh the channel selector; hidden unless several channels."""
+        self.channel_combo.blockSignals(True)
+        self.channel_combo.clear()
+        self.channel_combo.addItems([c.name for c in self.channels])
+        self.channel_combo.setCurrentIndex(self.current_channel)
+        self.channel_combo.blockSignals(False)
+        self.channel_combo.setVisible(len(self.channels) > 1)
+
+    def on_channel_combo_changed(self, index: int) -> None:
+        """Switch the active channel from the selector."""
+        self.set_current_channel(index)
+
+    def set_current_channel(self, index: int) -> None:
+        """Make channel ``index`` the active one, swapping the flat state
+        and the Parameters/Contrast dialog values."""
+        if (
+            index == self.current_channel
+            or index < 0
+            or index >= len(self.channels)
+        ):
+            return
+        self._snapshot_current_channel()
+        self.current_channel = index
+        self._restore_current_channel()
+        self.parameters_dialog.reset_quality_check()
+
+    def _snapshot_current_channel(self) -> None:
+        """Store the active flat state + dialog values into its Channel."""
+        if not self.channels:
+            return
+        channel = self.channels[self.current_channel]
+        channel.movie = self.movie
+        channel.info = self.info
+        channel.path = self.movie_path
+        channel.identifications = self.identifications
+        channel.locs = self.locs
+        channel.locs_display = self.locs_display
+        channel.ready_for_fit = self.ready_for_fit
+        channel.last_identification_info = self.last_identification_info
+        channel.extra_info = self.extra_info
+        channel.frame_range = self.frame_range
+        channel.curr_frame_number = getattr(self, "curr_frame_number", 0)
+        channel.params = self._capture_params()
+        channel.contrast = self._capture_contrast()
+
+    def _restore_current_channel(self) -> None:
+        """Load the active Channel's state into the flat attrs + dialogs."""
+        channel = self.channels[self.current_channel]
+        self._switching_channel = True
+        try:
+            self.movie = channel.movie
+            self.info = channel.info
+            self.movie_path = channel.path
+            self.identifications = channel.identifications
+            self.locs = channel.locs
+            self.locs_display = channel.locs_display
+            self.ready_for_fit = channel.ready_for_fit
+            self.last_identification_info = channel.last_identification_info
+            self.extra_info = channel.extra_info
+            self.frame_range = channel.frame_range
+            self._apply_params(channel.params)
+            self._apply_contrast(channel.contrast)
+        finally:
+            self._switching_channel = False
+        self._apply_channel_to_ui(channel.curr_frame_number)
+
+    def _apply_channel_to_ui(self, frame_number: int = 0) -> None:
+        """Sync the frame slider, displayed frame, zoom and title to the
+        active channel."""
+        last_frame = lib.get_from_metadata(self.info, "Frames") - 1
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setMaximum(max(0, last_frame))
+        self.frame_slider.blockSignals(False)
+        frame_number = min(max(0, frame_number), max(0, last_frame))
+        self.set_frame(frame_number)
+        self.fit_in_view()
+        base = os.path.basename(self.movie_path) if self.movie_path else ""
+        title = f"Picasso v{__version__}: Localize. File: {base}"
+        if len(self.channels) > 1:
+            title += f" [{self.channels[self.current_channel].name}]"
+        self.setWindowTitle(title)
+
+    def _capture_params(self) -> dict:
+        """Snapshot the analysis-relevant Parameters dialog values."""
+        pd = self.parameters_dialog
+        params = {
+            "box": pd.box_spinbox.value(),
+            "mng": pd.mng_slider.value(),
+            "mng_min": pd.mng_min_spinbox.value(),
+            "mng_max": pd.mng_max_spinbox.value(),
+            "fit_model": pd.fit_model.currentIndex(),
+            "fit_optimizer": pd.fit_optimizer.currentIndex(),
+            "baseline": pd.baseline.value(),
+            "gain": pd.gain.value(),
+            "sensitivity": pd.sensitivity.value(),
+            "qe": pd.qe.value(),
+            "pixelsize": pd.pixelsize.value(),
+            "convergence": pd.convergence_criterion.value(),
+            "max_it": pd.max_it.value(),
+            "magnification": pd.magnification_factor.value(),
+            "fit_z": pd.fit_z_checkbox.isChecked(),
+            "fit_z_enabled": pd.fit_z_checkbox.isEnabled(),
+            "fit_z_gpu": pd.fit_z_gpu_checkbox.isChecked(),
+            "z_calibration": pd.z_calibration,
+            "z_calibration_path": pd.z_calibration_path,
+            "z_calib_label": pd.z_calib_label.text(),
+            "gpufit": pd.gpufit_checkbox.isChecked(),
+            "frames_edit": pd.frames_edit.text(),
+        }
+        if hasattr(pd, "camera"):
+            params["camera"] = pd.camera.currentIndex()
+        return params
+
+    def _apply_params(self, params: dict) -> None:
+        """Restore a channel's analysis parameters into the dialog. Caller
+        sets ``self._switching_channel`` to suppress side effects."""
+        if not params:
+            return
+        pd = self.parameters_dialog
+        # Camera selection first: its cascade fills baseline/gain/pixelsize
+        # from the config, which we then override with the channel's values.
+        if hasattr(pd, "camera") and "camera" in params:
+            pd.camera.setCurrentIndex(params["camera"])
+        pd.box_spinbox.setValue(params["box"])
+        pd.mng_min_spinbox.setValue(params["mng_min"])
+        pd.mng_max_spinbox.setValue(params["mng_max"])
+        pd.mng_slider.setValue(params["mng"])
+        pd.mng_spinbox.setValue(params["mng"])
+        # Set the model first so its handler repopulates the optimizer list,
+        # then restore the optimizer selection.
+        pd.fit_model.setCurrentIndex(params.get("fit_model", 0))
+        pd.fit_optimizer.setCurrentIndex(params.get("fit_optimizer", 0))
+        pd.baseline.setValue(params["baseline"])
+        pd.gain.setValue(params["gain"])
+        pd.sensitivity.setValue(params["sensitivity"])
+        pd.qe.setValue(params["qe"])
+        pd.pixelsize.setValue(params["pixelsize"])
+        pd.convergence_criterion.setValue(params["convergence"])
+        pd.max_it.setValue(params["max_it"])
+        pd.magnification_factor.setValue(params["magnification"])
+        pd.z_calibration = params["z_calibration"]
+        pd.z_calibration_path = params["z_calibration_path"]
+        pd.z_calib_label.setText(params["z_calib_label"])
+        pd.fit_z_checkbox.setEnabled(params["fit_z_enabled"])
+        pd.fit_z_checkbox.setChecked(params["fit_z"])
+        pd.fit_z_gpu_checkbox.setChecked(params.get("fit_z_gpu", False))
+        pd.gpufit_checkbox.setChecked(params["gpufit"])
+        pd.frames_edit.setText(params["frames_edit"])
+
+    def _capture_contrast(self) -> dict:
+        """Snapshot the contrast dialog state."""
+        cd = self.contrast_dialog
+        return {
+            "black": cd.black_spinbox.value(),
+            "white": cd.white_spinbox.value(),
+            "auto": cd.auto_checkbox.isChecked(),
+        }
+
+    def _apply_contrast(self, contrast: dict | None) -> None:
+        """Restore a channel's contrast settings into the dialog."""
+        if not contrast:
+            return
+        cd = self.contrast_dialog
+        cd.auto_checkbox.blockSignals(True)
+        cd.auto_checkbox.setChecked(contrast["auto"])
+        cd.auto_checkbox.blockSignals(False)
+        cd.change_contrast_silently(contrast["black"], contrast["white"])
+
+    def _channels_share_file(self) -> bool:
+        """True when several channels were loaded from one file (so their
+        output names need a channel suffix to avoid overwriting)."""
+        return len(self.channels) > 1 and all(
+            c.path == self.channels[0].path for c in self.channels
+        )
+
+    def channel_output_base(self) -> str:
+        """Base path (no extension) for the active channel's output files,
+        suffixed with the channel name when channels share one file."""
+        base, _ = os.path.splitext(self.movie_path)
+        if self._channels_share_file():
+            name = self.channels[self.current_channel].name
+            base = base + "_" + _sanitize_filename(name)
+        return base
 
     def open_picks(self) -> None:
         """Open a file dialog to select a picks (from Picasso: Render)
@@ -2881,6 +3667,11 @@ class Window(QtWidgets.QMainWindow):
 
     def on_parameters_changed(self) -> None:
         """Reset ``self.locs`` and draw frame."""
+        # Ignore the value changes emitted while restoring a channel's
+        # stored parameters - otherwise switching channels would wipe the
+        # channel's localizations and fit markers.
+        if self._switching_channel:
+            return
         self.locs = None
         self.locs_display = None
         self.ready_for_fit = False
@@ -2895,7 +3686,8 @@ class Window(QtWidgets.QMainWindow):
         """Handle the abortion of any worker thread."""
         self._active_worker = None
         self.abort_action.setEnabled(False)
-        self.parameters_dialog.gpufit_checkbox.setDisabled(False)
+        # restore the GPUfit checkbox state for the selected model
+        self.parameters_dialog.on_fit_optimizer_changed()
         self.status_bar.showMessage("Aborted.")
 
     def identify(
@@ -2996,12 +3788,9 @@ class Window(QtWidgets.QMainWindow):
         """
         if self.movie is not None and self.ready_for_fit:
             self.status_bar.showMessage("Preparing fit...")
-            method = self.parameters_dialog.fit_method.currentText()
-            method = {
-                "LQ, Gaussian": "gausslq",
-                "MLE, integrated Gaussian": "gaussmle",
-                "Average of ROI": "avg",
-            }[method]
+            model = self.parameters_dialog.fit_model.currentText()
+            optimizer = self.parameters_dialog.fit_optimizer.currentText()
+            method = _fit_code(model, optimizer)
             eps = self.parameters_dialog.convergence_criterion.value()
             max_it = self.parameters_dialog.max_it.value()
             fit_z = self.parameters_dialog.fit_z_checkbox.isChecked()
@@ -3031,12 +3820,14 @@ class Window(QtWidgets.QMainWindow):
         """Fit z coordinates of the fitted localizations based on the
         calibration data."""
         self.status_bar.showMessage("Fitting z position...")
-        # avgroi won't really work but kept for compatibility
-        fitting_method = {
-            "LQ, Gaussian": "gausslq",
-            "MLE, integrated Gaussian": "gaussmle",
-            "Average of ROI": "gausslq",  # fallback for compatibility
-        }[self.parameters_dialog.fit_method.currentText()]
+        model = self.parameters_dialog.fit_model.currentText()
+        optimizer = self.parameters_dialog.fit_optimizer.currentText()
+        fitting_method = _fit_code(model, optimizer)
+        # zfit only knows gausslq/gaussmle; map the GPU/rotated/avg
+        # codes to the corresponding CPU noise model
+        fitting_method = (
+            "gaussmle" if fitting_method.startswith("gaussmle") else "gausslq"
+        )
         self.fit_z_worker = FitZWorker(
             self.locs,
             self.info + [self.camera_info],  # ensure pixel size in info
@@ -3044,6 +3835,7 @@ class Window(QtWidgets.QMainWindow):
             self.parameters_dialog.magnification_factor.value(),
             self.parameters_dialog.pixelsize.value(),
             fitting_method,
+            self.parameters_dialog.fit_z_gpu_checkbox.isChecked(),
         )
         self.fit_z_worker.progressMade.connect(self.on_fit_z_progress)
         self.fit_z_worker.finished.connect(self.on_fit_z_finished)
@@ -3088,14 +3880,15 @@ class Window(QtWidgets.QMainWindow):
             sound_path = lib.get_sound_notification_path()
             if sound_path is not None:
                 playsound(sound_path, block=False)
-        base, ext = os.path.splitext(self.movie_path)
+        base = self.channel_output_base()
         if calibrate_z:
-            self.parameters_dialog.gpufit_checkbox.setDisabled(False)
+            # restore the GPUfit checkbox state for the selected model
+            self.parameters_dialog.on_fit_optimizer_changed()
             step, frames_per_step, frame_order, ok = (
                 Calibrate3DDialog.getCalibrationSpecs(self)
             )
             if ok:
-                base, ext = os.path.splitext(self.movie_path)
+                base = self.channel_output_base()
                 out_path = base + "_3d_calib.yaml"
                 path, exe = lib.get_save_filename_ext_dialog(
                     self, "Save 3D calibration", out_path, filter="*.yaml"
@@ -3154,13 +3947,14 @@ class Window(QtWidgets.QMainWindow):
 
     def save_locs_after_fit(self) -> None:
         """Save localizations after fitting to an .hdf5 file."""
-        base, ext = os.path.splitext(self.movie_path)
+        base = self.channel_output_base()
         self.save_locs(base + "_locs.hdf5")
 
         if not self.parameters_dialog.quality_check.isEnabled():
             self.parameters_dialog.quality_check.setEnabled(True)
 
-        self.parameters_dialog.gpufit_checkbox.setDisabled(False)
+        # restore the GPUfit checkbox state for the selected model
+        self.parameters_dialog.on_fit_optimizer_changed()
         self.status_bar.showMessage(f"Saved {len(self.locs):,} localizations.")
 
         # apply drift if requested
@@ -3202,7 +3996,7 @@ class Window(QtWidgets.QMainWindow):
             if len(fiducial_picks) == 0:
                 if drift is not None:
                     # save the AIM drift-corrected localizations
-                    base, ext = os.path.splitext(self.movie_path)
+                    base = self.channel_output_base()
                     self.save_locs(base + "_locs_undrifted.hdf5")
                     # save txt drift file
                     np.savetxt(base + "_locs_drift.txt", drift, newline="\r\n")
@@ -3240,7 +4034,7 @@ class Window(QtWidgets.QMainWindow):
                 "Fiducial-based drift correction finished."
             )
         # save the drift-corrected localizations
-        base, ext = os.path.splitext(self.movie_path)
+        base = self.channel_output_base()
         self.save_locs(base + "_locs_undrifted.hdf5")
         # save txt drift file
         np.savetxt(base + "_locs_drift.txt", drift, newline="\r\n")
@@ -3269,8 +4063,10 @@ class Window(QtWidgets.QMainWindow):
         """Zoom out the view."""
         self.zoom(7 / 10)
 
-    def zoom(self, factor: float) -> None:
-        """Zoom in or out the view by a specific factor."""
+    def zoom(self, factor: float, anchor: QtCore.QPoint | None = None) -> None:
+        """Zoom in or out the view by a specific factor. Anchor can
+        specify the cursor position, otherwise zooms to/from the
+        viewport's center."""
         if not hasattr(self, "movie") or self.movie is None:
             return
         # do not allow zooming out too much
@@ -3280,17 +4076,20 @@ class Window(QtWidgets.QMainWindow):
             if visible_scene_rect.width() / factor > self.movie.shape[2]:
                 self.fit_in_view()
                 return
-        # get the center of the current visible viewport in scene coordinates
-        viewport_rect = self.view.viewport().rect()
-        viewport_center = QtCore.QPointF(
-            viewport_rect.x() + viewport_rect.width() / 2.0,
-            viewport_rect.y() + viewport_rect.height() / 2.0,
+        # fall back to the viewport center if no anchor is given
+        # (e.g. zoom in/out from the menu or keyboard shortcuts)
+        if anchor is None:
+            anchor = self.view.viewport().rect().center()
+        # adjust the transform directly so the scene point under the
+        # anchor stays fixed (NoAnchor avoids scrollbar rounding drift)
+        self.view.setTransformationAnchor(
+            QtWidgets.QGraphicsView.ViewportAnchor.NoAnchor
         )
-        scene_center = self.view.mapToScene(viewport_center.toPoint())
-        # apply the zoom
+        old_scene_pos = self.view.mapToScene(anchor)
         self.view.scale(factor, factor)
-        # re-center the view on the same scene point
-        self.view.centerOn(scene_center)
+        new_scene_pos = self.view.mapToScene(anchor)
+        delta = new_scene_pos - old_scene_pos
+        self.view.translate(delta.x(), delta.y())
 
         self.draw_frame()
 
@@ -3318,7 +4117,7 @@ class Window(QtWidgets.QMainWindow):
     def save_spots_dialog(self) -> None:
         """Get the path for saving identified spots."""
         if self.movie_path != []:
-            base, ext = os.path.splitext(self.movie_path)
+            base = self.channel_output_base()
             path = base + "_spots.tif"
             path, exe = lib.get_save_filename_ext_dialog(
                 self,
@@ -3333,7 +4132,7 @@ class Window(QtWidgets.QMainWindow):
     def export_current(self) -> None:
         """Export current view as .png or .tif."""
         try:
-            base, ext = os.path.splitext(self.movie_path)
+            base = self.channel_output_base()
         except AttributeError:
             return
         out_path = base + "_view.png"
@@ -3370,9 +4169,12 @@ class Window(QtWidgets.QMainWindow):
         """Save localizations and their metadata."""
         localize_info = self.last_identification_info.copy()
         localize_info["Generated by"] = f"Picasso v{__version__} Localize"
-        localize_info["Fit method"] = (
-            self.parameters_dialog.fit_method.currentText()
-        )
+        model = self.parameters_dialog.fit_model.currentText()
+        if FIT_MODELS[model]["optimizers"] is None:
+            localize_info["Fit method"] = model
+        else:
+            optimizer = self.parameters_dialog.fit_optimizer.currentText()
+            localize_info["Fit method"] = f"{model}, {optimizer}"
         if self.parameters_dialog.fit_z_checkbox.isChecked():
             localize_info["Z Calibration Path"] = (
                 self.parameters_dialog.z_calibration_path
@@ -3387,7 +4189,7 @@ class Window(QtWidgets.QMainWindow):
     def save_locs_dialog(self) -> None:
         """Get the path to save localizations."""
         if self.movie_path != []:
-            base, ext = os.path.splitext(self.movie_path)
+            base = self.channel_output_base()
             locs_path = base + "_locs.hdf5"
             path, exe = lib.get_save_filename_ext_dialog(
                 self,
@@ -3419,7 +4221,7 @@ class Window(QtWidgets.QMainWindow):
             )
             return
         if self.movie_path != []:
-            base, ext = os.path.splitext(self.movie_path)
+            base = self.channel_output_base()
             ids_path = base + "_identifications.hdf5"
             path, exe = lib.get_save_filename_ext_dialog(
                 self,
@@ -3552,7 +4354,13 @@ class FitWorker(QtCore.QThread):
         camera_info: dict,
         identifications: pd.DataFrame,
         box: int,
-        method: Literal["gausslq", "gaussmle", "avg"],
+        method: Literal[
+            "gausslq",
+            "gausslq-rotated-gpu",
+            "gaussmle",
+            "gaussmle-rotated-gpu",
+            "avg",
+        ],
         eps: float,
         max_it: int,
         fit_z: bool,
@@ -3571,8 +4379,8 @@ class FitWorker(QtCore.QThread):
         self.calibrate_z = calibrate_z
         self.N = len(identifications)
         self._last_cut_emit = 0
-        if use_gpufit and method == "gausslq":
-            method = "gausslq-gpu"
+        if use_gpufit and method in ("gausslq", "gaussmle"):
+            method += "-gpu"
         self.method = method
 
     def on_progress(self, n_done: int) -> None:
@@ -3630,6 +4438,7 @@ class FitZWorker(QtCore.QThread):
         magnification_factor: float,
         pixelsize: float,
         fitting_method: Literal["gausslq", "gaussmle"],
+        gpu: bool = False,
     ) -> None:
         super().__init__()
         self.locs = locs
@@ -3638,6 +4447,7 @@ class FitZWorker(QtCore.QThread):
         self.magnification_factor = magnification_factor
         self.pixelsize = pixelsize
         self.fitting_method = fitting_method
+        self.gpu = gpu
 
     def on_progress(self, n_done: int) -> None:
         self.progressMade.emit(n_done, len(self.locs))
@@ -3653,7 +4463,8 @@ class FitZWorker(QtCore.QThread):
             magnification_factor=self.magnification_factor,
             pixelsize=self.pixelsize,
             fitting_method=self.fitting_method,
-            multiprocess=True,
+            multiprocess=not self.gpu,
+            gpu=self.gpu,
             progress_callback=self.on_progress,
             abort_callback=self.isInterruptionRequested,
         )

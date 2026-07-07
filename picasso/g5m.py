@@ -2386,6 +2386,7 @@ def g5m(
     postprocess: bool = True,
     max_locs_per_cluster: int = np.inf,
     asynch: bool = True,
+    group_column: Literal["group", "group_input"] = "group",
     callback_parent: (
         QtWidgets.QMainWindow | Literal["console"] | None
     ) = "console",
@@ -2438,6 +2439,11 @@ def g5m(
     asynch : bool, optional
         If True, G5M is run in parallel using multiprocessing. Default
         is True.
+    group_column : {"group", "group_input"}, optional
+        Name of the column used to group localizations into clusters
+        prior to G5M. Use "group_input" when the "group" column has been
+        overwritten but the original cluster ids are preserved in
+        "group_input". Default is "group".
     callback_parent : {QtWidgets.QMainWindow, "console", None}, optional
         Callback function's parent object for displaying progress bar.
         If "console" tqdm is used to display the progress bar in the
@@ -2464,9 +2470,19 @@ def g5m(
     assert (
         sigma_bounds[0] <= sigma_bounds[1]
     ), "sigma_bounds[0] must not be larger than sigma_bounds[1]."
-    assert (
-        "group" in locs.columns
-    ), "Localizations must be grouped. Use DBSCAN or similar."
+    assert group_column in [
+        "group",
+        "group_input",
+    ], "group_column must be 'group' or 'group_input'."
+    assert group_column in locs.columns, (
+        f"Localizations must be grouped. Column '{group_column}' not "
+        "found. Use DBSCAN or similar."
+    )
+    # G5M works on the "group" column internally; if a different column
+    # is requested (e.g. because "group" was overwritten), copy it over.
+    if group_column != "group":
+        locs = locs.copy()
+        locs["group"] = locs[group_column].to_numpy()
 
     pixelsize = lib.get_from_metadata(info, "Pixelsize")
     if pixelsize is None:

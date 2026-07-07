@@ -823,10 +823,11 @@ def extract_valid_labels(
     -------
     locs : pd.DataFrame
         Localization list with "group" column appended, providing
-        cluster label.
+        cluster label. If ``locs`` was already grouped, the previous
+        grouping is preserved in the ``group_input`` column.
     """
     # add cluster id to locs, as "group"
-    locs["group"] = labels
+    locs = lib.append_group(locs, labels)
 
     # -1 means no cluster assigned to a loc
     locs = locs[locs["group"] != -1]

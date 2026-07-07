@@ -291,6 +291,90 @@ class TestZfit:
 
 
 # ---------------------------------------------------------------------------
+# GPU (numba.cuda) z fitting
+# ---------------------------------------------------------------------------
+
+
+class TestZfitGPU:
+    """Tests for the numba.cuda GPU z-fitting path."""
+
+    def test_gpu_requested_without_cuda_raises(self, locs, info, monkeypatch):
+        """Requesting the GPU path when no CUDA device is available must
+        raise a clear error rather than silently falling back."""
+        monkeypatch.setattr(zfit, "CUDA_AVAILABLE", False)
+        with pytest.raises(RuntimeError, match="CUDA"):
+            zfit.zfit(locs, info, calibration=dict(CALIB_3D), gpu=True)
+
+    @pytest.mark.skipif(
+        not zfit.CUDA_AVAILABLE, reason="requires a CUDA-capable GPU"
+    )
+    def test_gpu_matches_serial(self, locs, info):
+        """On real GPU hardware, the GPU path reproduces the serial CPU
+        path for z and lpz."""
+        out_serial, _ = zfit.zfit(
+            locs,
+            info,
+            calibration=dict(CALIB_3D),
+            multiprocess=False,
+            filter=0,
+        )
+        out_gpu, _ = zfit.zfit(
+            locs, info, calibration=dict(CALIB_3D), gpu=True, filter=0
+        )
+        assert len(out_serial) == len(out_gpu)
+        keys = ["frame", "x", "y"]
+        s = out_serial.sort_values(keys).reset_index(drop=True)
+        g = out_gpu.sort_values(keys).reset_index(drop=True)
+        np.testing.assert_allclose(
+            s["z"].to_numpy(), g["z"].to_numpy(), atol=1e-3
+        )
+        np.testing.assert_allclose(
+            s["lpz"].to_numpy(), g["lpz"].to_numpy(), atol=1e-3
+        )
+
+    @pytest.mark.slow
+    def test_gpu_simulator_matches_serial(self):
+        """Under Numba's CUDA simulator (no physical GPU needed) the GPU
+        kernel + device functions reproduce the serial CPU path. Runs in a
+        subprocess because the simulator must be enabled before numba is
+        imported (the parent process already imported it)."""
+        import subprocess
+        import sys
+
+        script = (
+            "import os\n"
+            "os.environ['NUMBA_ENABLE_CUDASIM'] = '1'\n"
+            "import numpy as np\n"
+            "import matplotlib\n"
+            "matplotlib.use('Agg')\n"
+            "from picasso import zfit, io\n"
+            "assert zfit.CUDA_AVAILABLE, 'simulator should report available'\n"
+            f"calib = {dict(CALIB_3D)!r}\n"
+            "locs, info = io.load_locs('./tests/data/testdata_locs.hdf5')\n"
+            "locs = locs.head(25).reset_index(drop=True)\n"
+            "s, _ = zfit.zfit(locs, info, calibration=dict(calib), "
+            "filter=0, multiprocess=False)\n"
+            "g, _ = zfit.zfit(locs, info, calibration=dict(calib), "
+            "filter=0, gpu=True)\n"
+            "keys = ['frame', 'x', 'y']\n"
+            "s = s.sort_values(keys).reset_index(drop=True)\n"
+            "g = g.sort_values(keys).reset_index(drop=True)\n"
+            "assert len(s) == len(g)\n"
+            "np.testing.assert_allclose("
+            "s['z'].to_numpy(), g['z'].to_numpy(), atol=1e-3)\n"
+            "np.testing.assert_allclose("
+            "s['lpz'].to_numpy(), g['lpz'].to_numpy(), atol=1e-3)\n"
+            "print('SIMOK')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+        )
+        assert "SIMOK" in result.stdout, result.stdout + result.stderr
+
+
+# ---------------------------------------------------------------------------
 # axial_localization_precision and ..._astig
 # ---------------------------------------------------------------------------
 

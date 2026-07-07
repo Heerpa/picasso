@@ -91,6 +91,8 @@ In Picasso 0.9.5, a new algorithm for molecular mapping (i.e., finding the posit
 
 G5M requires some preprocessing of localizations to filter out the badly fitted ones, especially the ones arising from crosstalk (overlapping blinking). These can be excluded from 2D data where the ellipticity and size of the image of an emitter in x and y can be filtered (in Picasso these are found under names “ellipticity”, “sx” and “sy”, respectively). Moreover, the photon count can be cut-off as crosstalk is likely to result in a higher-intensity signal. In 3D data these filters are less reliable due to astigmatism, however, “d_zcalib” could be used. We strongly encourage avoiding dense blinking, where emission signals from neighboring molecules overlap, especially during 3D image acquisition.
 
+Note that G5M assumes that the localization precision values (``lpx``, ``lpy`` and ``lpz`` columns) correspond to the real spread of the localization clouds. For example, drift correction needs to done precisely. In astigmatic imaging, great care needs to be taken if fiducials are used for drift correction, especially if they lie at a different plane from the target localizations. In fact, we recommend using the new fiducial-free algorithms such as `COMET <https://www.biorxiv.org/content/10.64898/2026.03.27.714864v1>`_ and `AIM <https://www.science.org/doi/10.1126/sciadv.adm7765>`_. This prevenents overfitting of too many molecules.
+
 Prior to molecular mapping, clustering of localizations is required to split the data into smaller chunks. For many datasets, DBSCAN works well. While in some cases some adjustments may be needed, we recommend the following DBSCAN parameters: In 2D, DBSCAN radius (epsilon) of 2*LP, in 3D - 3*LP (LP - average localization precision of the dataset, for example, NeNA or median localization precision). Default min. samples is set to 4. Clustering in Picasso adds the ``group`` column to the localization file, which is required for G5M. **Note: G5M relies on the information in the ``group`` column, therefore, if it is overwritten (for example, by picking localizations after DBSCAN clustering), G5M will not work.**
 
 To account for fluorophore non-specific sticking, frame analysis is normally recommended (especially the filtering of st. dev. of frame per molecule). However, if localizations from neighboring localization clouds overlap, this is not sufficient due to ambigous assignment of localizations to molecules. Therefore, we recommend filtering of molecules that express too few binding events (saved in the column ``n_events``). In the publication, we recommend a threshold of at least 3 binding events per molecule.
@@ -190,7 +192,7 @@ File
 
 Open [Ctrl+O]
 ^^^^^^^^^^^^^
-Open an .hdf5 file to open in render.
+Open a localization file in render. Picasso ``.hdf5`` files are loaded directly; ThunderSTORM ``.csv`` and SMAP ``_sml.mat`` files are imported (you will be asked for the camera pixel size in nm). Localization files can also be imported by dragging and dropping them onto the render window.
 
 Open rotated localizations [Ctrl+Shift+O]
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -258,6 +260,12 @@ Export as .txt file to be used for Chimera import.
 Export as .3d for ViSP
 ++++++++++++++++++++++
 Export as .3d file to be used ViSP.
+
+Export as .mat for SMAP
++++++++++++++++++++++++
+Export the dataset as a SMAP (`https://github.com/jries/SMAP <https://github.com/jries/SMAP>`_) ``_sml.mat`` file that can be loaded in SMAP via File > Load. The output is named ``<file>_sml.mat`` (the ``_sml`` suffix is required for SMAP to recognize the file).
+
+Coordinates and localization precision are converted from camera pixels to nm using the pixel size set in Display Settings; z and its precision (``lpz``) are written in nm; frames are made 1-based (SMAP convention). ``lpx`` and ``lpy`` are combined into SMAP's single ``locprecnm`` field as their mean.
 
 Remove all localizations
 ^^^^^^^^^^^^^^^^^^^^^^^^

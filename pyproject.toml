@@ -50,7 +50,7 @@ dependencies = [
     "imageio-ffmpeg>=0.6.0,<1",
     "tifffile>=2024.7.24,<2027",
     "PyImarisWriter==0.7.0; sys_platform=='win32'",
-    "hdf5plugin; sys.platform=='win32'"
+    "hdf5plugin; sys_platform=='win32'"
 ]
 
 [project.optional-dependencies]
@@ -62,6 +62,11 @@ cuda12 = [
 ]
 cuda13 = [
     "numba-cuda[cu13]"
+]
+# Convenience alias for the most common CUDA toolkit (12.x). For other
+# toolkits install picassosr[cuda11] or picassosr[cuda13] instead.
+gpu = [
+    "picassosr[cuda12]"
 ]
 dev = [
     "build",
@@ -112,34 +117,10 @@ installer = [
     "PyImarisWriter==0.7.0; sys_platform=='win32'",
     "hdf5plugin==6.0.0; sys_platform=='win32'"
 ]
+# GPU build: identical to the CPU installer plus the CUDA runtime.
+# Reuse picassosr[installer] so the pinned versions never drift apart.
 installer_gpu = [
-    "PyQt6==6.11.0",
-    "numpy==2.4.4",
-    "matplotlib==3.10.8",
-    "h5py==3.16.0",
-    "numba==0.65.0",
-    "scipy==1.17.1",
-    "pandas==2.3.3",
-    "tables==3.11.1",
-    "pyyaml==6.0.3",
-    "scikit-learn==1.7.2",
-    "tqdm==4.67.3",
-    "streamlit==1.56.0",
-    "nd2==0.11.3",
-    "sqlalchemy==2.0.49",
-    "plotly-express==0.4.1",
-    "watchdog==6.0.0",
-    "psutil==7.2.2",
-    "playsound3==3.3.1",
-    "imageio==2.37.3",
-    "imageio-ffmpeg==0.6.0",
-    "tifffile==2026.4.11",
-    "czifile==2026.6.12",
-    "liffile==2026.4.11",
-    "imagecodecs==2026.6.6",
-    "pyinstaller==6.19.0",
-    "PyImarisWriter==0.7.0; sys_platform=='win32'",
-    "hdf5plugin==6.0.0; sys_platform=='win32'",
+    "picassosr[installer]",
     "numba-cuda[cu12]==0.30.2"
 ]
 
@@ -162,8 +143,6 @@ include = ["picasso*"]
 picasso = [
     "gui/icons/*.ico",
     "gui/icons/*.png",
-    "gui/notification_sounds/*.mp3",
-    "gui/notification_sounds/*.wav",
     "config_template.yaml",
     "ext/pygpufit/Gpufit.dll",
     "ext/pygpufit/LICENSE.txt",

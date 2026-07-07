@@ -190,7 +190,7 @@ def _picked_circular_locs(
         group_locs = block_locs.iloc[group_locs_idx].copy()
 
         if add_group:
-            group_locs["group"] = i
+            group_locs = lib.append_group(group_locs, i)
         group_locs.sort_values(
             by="frame",
             kind="quicksort",
@@ -239,7 +239,7 @@ def _picked_rectangular_locs(
         group_locs["x_pick_rot"] = x_pick_rot
         group_locs["y_pick_rot"] = y_pick_rot
         if add_group:
-            group_locs["group"] = i
+            group_locs = lib.append_group(group_locs, i)
         group_locs.sort_values(by="frame", kind="quicksort", inplace=True)
         picked_locs.append(group_locs)
 
@@ -276,7 +276,7 @@ def _picked_polygonal_locs(
         )
         group_locs = lib.locs_in_polygon(locs[mask], X, Y).copy()
         if add_group:
-            group_locs["group"] = i
+            group_locs = lib.append_group(group_locs, i)
         group_locs.sort_values(by="frame", kind="quicksort", inplace=True)
         picked_locs.append(group_locs)
 
@@ -313,7 +313,7 @@ def _picked_square_locs(
         )
         group_locs = locs[mask].copy()
         if add_group:
-            group_locs["group"] = i
+            group_locs = lib.append_group(group_locs, i)
         group_locs.sort_values(by="frame", kind="quicksort", inplace=True)
         picked_locs.append(group_locs)
 
@@ -508,8 +508,8 @@ def pick_similar(
     max_rmsd = mean_rmsd + std_range * std_rmsd
 
     # x, y coordinates of found regions:
-    x_similar = np.array([_[0] for _ in picks])
-    y_similar = np.array([_[1] for _ in picks])
+    x_similar = np.array([_[0] for _ in picks], dtype=np.float64)
+    y_similar = np.array([_[1] for _ in picks], dtype=np.float64)
 
     # preparations for grid search
     x_range = np.arange(d / 2, info[0]["Width"], np.sqrt(3) * d / 2)
