@@ -37,12 +37,7 @@ from .. import (
 from PyQt6 import QtCore, QtGui, QtWidgets
 from playsound3 import playsound
 
-try:
-    from picasso.ext.pygpufit import gpufit
-
-    GPUFIT_INSTALLED = bool(gpufit.cuda_available())
-except Exception:
-    GPUFIT_INSTALLED = False
+GPUFIT_INSTALLED = localize.GPUFIT_INSTALLED
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
 
@@ -55,11 +50,21 @@ FIT_MODELS = {
     "2D elliptical Gaussian": {
         "optimizers": {"Least squares": "gausslq", "MLE": "gaussmle"},
     },
+    "2D rotated elliptical Gaussian": {
+        "optimizers": {
+            "Least squares": "gausslq-rotated-gpu",
+            "MLE": "gaussmle-rotated-gpu",
+        },
+    },
     "Average of ROI": {
         "optimizers": None,
         "code": "avg",
     },
 }
+# The rotated elliptical Gaussian is only implemented in GPUfit (codes
+# ending in "-gpu"), so offer it only when a CUDA-capable GPU is found.
+if not GPUFIT_INSTALLED:
+    del FIT_MODELS["2D rotated elliptical Gaussian"]
 
 
 def _fit_code(model: str, optimizer: str) -> str:
@@ -1553,10 +1558,18 @@ class ParametersDialog(lib.Dialog):
         self.max_it.setValue(100)
         mle_grid.addWidget(self.max_it, 1, 1)
 
-        # LQ
+        # LQ has no optimizer-specific parameters; an empty page keeps
+        # the stack indices matching the optimizer combobox indices.
         lq_widget = QtWidgets.QWidget()
-        lq_grid = QtWidgets.QGridLayout(lq_widget)
 
+        # Stack pages are ordered to match the optimizer combobox indices:
+        # 0 -> "Least squares" (empty), 1 -> "MLE" (convergence/max_it).
+        fit_stack.addWidget(lq_widget)
+        fit_stack.addWidget(mle_widget)
+
+        # Gpufit implements both least-squares and MLE estimators, so
+        # the checkbox applies to both optimizers and sits below the
+        # optimizer parameter stack.
         self.gpufit_checkbox = QtWidgets.QCheckBox("Use GPUfit")
         self.gpufit_checkbox.setTristate(False)
         self.gpufit_checkbox.setDisabled(True)
@@ -1566,12 +1579,7 @@ class ParametersDialog(lib.Dialog):
             self.gpufit_checkbox.hide()
         else:
             self.gpufit_checkbox.setDisabled(False)
-        lq_grid.addWidget(self.gpufit_checkbox)
-
-        # Stack pages are ordered to match the optimizer combobox indices:
-        # 0 -> "Least squares" (GPU option), 1 -> "MLE" (convergence/max_it).
-        fit_stack.addWidget(lq_widget)
-        fit_stack.addWidget(mle_widget)
+        fit_grid.addWidget(self.gpufit_checkbox, 4, 0, 1, 2)
 
         self.fit_model.currentIndexChanged.connect(self.on_fit_model_changed)
         self.fit_optimizer.currentIndexChanged.connect(
@@ -1834,15 +1842,24 @@ class ParametersDialog(lib.Dialog):
 
     def on_fit_optimizer_changed(self) -> None:
         """Switch the optimizer parameter page and enable/disable the GPU
-        fitting checkbox based on the selected optimizer."""
+        fitting checkbox based on the selected model and optimizer."""
         index = self.fit_optimizer.currentIndex()
         if index >= 0:
             self.fit_stack.setCurrentIndex(index)
-        if self.fit_optimizer.currentText() == "Least squares":
+        model = self.fit_model.currentText()
+        optimizer = self.fit_optimizer.currentText()
+        if optimizer and _fit_code(model, optimizer).endswith("-gpu"):
+            # GPU-only method (e.g. the rotated elliptical Gaussian):
+            # fitting always runs on the GPU, so pin the checkbox.
+            self.gpufit_checkbox.setChecked(True)
+            self.gpufit_checkbox.setDisabled(True)
+        elif optimizer in ("Least squares", "MLE"):
+            # Gpufit implements both estimators
             self.gpufit_checkbox.setDisabled(not GPUFIT_INSTALLED)
         else:
             self.gpufit_checkbox.setChecked(False)
             self.gpufit_checkbox.setDisabled(True)
+        self.on_gpufit_changed()
 
     def on_frames_edit_changed(self) -> None:
         """Handle changes when text is deleted."""
@@ -2036,8 +2053,15 @@ class ParametersDialog(lib.Dialog):
         self.window.draw_frame()
 
     def on_gpufit_changed(self) -> None:
-        """Handle changes to the GPU fitting option."""
-        self.window.draw_frame()
+        """Handle changes to the GPU fitting option. Gpufit uses its own
+        convergence settings, so the CPU MLE controls are greyed out
+        while GPU fitting is selected."""
+        use_gpufit = self.gpufit_checkbox.isChecked()
+        self.convergence_criterion.setEnabled(not use_gpufit)
+        self.max_it.setEnabled(not use_gpufit)
+        # this dialog is created before the window's movie attribute
+        if getattr(self.window, "movie", None) is not None:
+            self.window.draw_frame()
 
     def get_camera(self, info: dict) -> tuple[str, list[str]]:
         """Get the camera name from the provided camera info."""
@@ -3606,7 +3630,8 @@ class Window(QtWidgets.QMainWindow):
         """Handle the abortion of any worker thread."""
         self._active_worker = None
         self.abort_action.setEnabled(False)
-        self.parameters_dialog.gpufit_checkbox.setDisabled(False)
+        # restore the GPUfit checkbox state for the selected model
+        self.parameters_dialog.on_fit_optimizer_changed()
         self.status_bar.showMessage("Aborted.")
 
     def identify(
@@ -3742,9 +3767,11 @@ class Window(QtWidgets.QMainWindow):
         model = self.parameters_dialog.fit_model.currentText()
         optimizer = self.parameters_dialog.fit_optimizer.currentText()
         fitting_method = _fit_code(model, optimizer)
-        # avgroi won't really work for z; fall back to gausslq for compatibility
-        if fitting_method == "avg":
-            fitting_method = "gausslq"
+        # zfit only knows gausslq/gaussmle; map the GPU/rotated/avg
+        # codes to the corresponding CPU noise model
+        fitting_method = (
+            "gaussmle" if fitting_method.startswith("gaussmle") else "gausslq"
+        )
         self.fit_z_worker = FitZWorker(
             self.locs,
             self.info + [self.camera_info],  # ensure pixel size in info
@@ -3799,7 +3826,8 @@ class Window(QtWidgets.QMainWindow):
                 playsound(sound_path, block=False)
         base = self.channel_output_base()
         if calibrate_z:
-            self.parameters_dialog.gpufit_checkbox.setDisabled(False)
+            # restore the GPUfit checkbox state for the selected model
+            self.parameters_dialog.on_fit_optimizer_changed()
             step, frames_per_step, frame_order, ok = (
                 Calibrate3DDialog.getCalibrationSpecs(self)
             )
@@ -3869,7 +3897,8 @@ class Window(QtWidgets.QMainWindow):
         if not self.parameters_dialog.quality_check.isEnabled():
             self.parameters_dialog.quality_check.setEnabled(True)
 
-        self.parameters_dialog.gpufit_checkbox.setDisabled(False)
+        # restore the GPUfit checkbox state for the selected model
+        self.parameters_dialog.on_fit_optimizer_changed()
         self.status_bar.showMessage(f"Saved {len(self.locs):,} localizations.")
 
         # apply drift if requested
@@ -4269,7 +4298,13 @@ class FitWorker(QtCore.QThread):
         camera_info: dict,
         identifications: pd.DataFrame,
         box: int,
-        method: Literal["gausslq", "gaussmle", "avg"],
+        method: Literal[
+            "gausslq",
+            "gausslq-rotated-gpu",
+            "gaussmle",
+            "gaussmle-rotated-gpu",
+            "avg",
+        ],
         eps: float,
         max_it: int,
         fit_z: bool,
@@ -4288,8 +4323,8 @@ class FitWorker(QtCore.QThread):
         self.calibrate_z = calibrate_z
         self.N = len(identifications)
         self._last_cut_emit = 0
-        if use_gpufit and method == "gausslq":
-            method = "gausslq-gpu"
+        if use_gpufit and method in ("gausslq", "gaussmle"):
+            method += "-gpu"
         self.method = method
 
     def on_progress(self, n_done: int) -> None:

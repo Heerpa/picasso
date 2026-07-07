@@ -1388,3 +1388,36 @@ class TestMovieLoadWorker:
         # Only the first file was loaded; the second was never attempted.
         assert seen == ["first.tif"]
         assert out.finished[2] == ["first.tif"]
+
+
+# ---------------------------------------------------------------------------
+# Optional GPU backend (Gpufit) — skipped when no CUDA GPU is available
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not localize.GPUFIT_INSTALLED, reason="GPUfit/CUDA not available"
+)
+class TestGpufit:
+    """Tests for the optional GPU codepath. Skipped when the Gpufit
+    library or a CUDA-capable GPU is not available (which is true for
+    the typical test environment)."""
+
+    def test_fit_spots_gpufit(self, synthetic_spots):
+        spots, gt = synthetic_spots
+        theta = localize.fit_spots_gpufit(spots)
+        assert theta.shape == (len(spots), 6)
+        # GPU returns parameters as [photons, x, y, sx, sy, bg]
+        np.testing.assert_allclose(theta[:, 0], gt.photons.values, rtol=0.05)
+
+    def test_fit_spots_gpufit_mle(self, synthetic_spots):
+        spots, gt = synthetic_spots
+        theta = localize.fit_spots_gpufit(spots, mle=True)
+        assert theta.shape == (len(spots), 6)
+        np.testing.assert_allclose(theta[:, 0], gt.photons.values, rtol=0.05)
+
+    def test_fit_spots_gpufit_rotated(self, synthetic_spots):
+        spots, gt = synthetic_spots
+        theta = localize.fit_spots_gpufit(spots, rotated=True)
+        assert theta.shape == (len(spots), 7)
+        np.testing.assert_allclose(theta[:, 0], gt.photons.values, rtol=0.05)

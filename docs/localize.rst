@@ -9,6 +9,7 @@ Localize allows performing super-resolution reconstruction of image stacks. For 
 
 - MLE, integrated Gaussian (based on `Smith et al., 2010 <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2862147/>`_.)
 - LQ, Gaussian (least squares).
+- Rotated elliptical Gaussian, least squares or MLE (GPU only, see `GPU fitting`_ below). The fitted in-plane rotation angle is saved in the ``angle`` column, in degrees.
 - Average of ROI (finds summed intensity of spots)
 
 Picasso uses `Gpufit <https://github.com/gpufit/Gpufit>`_ for fitting on CUDA-capable GPUs (see `GPU fitting`_ below). On Windows the pre-compiled library (``Gpufit.dll``) is vendored into Picasso (``picasso/ext/pygpufit/``) and works automatically — no extra install step. On Linux there is no pre-compiled binary; you have to build ``libGpufit.so`` yourself and drop it next to the Windows DLL (see `GPU fitting on Linux`_ below). When no GPU library is available, the GPU fitting option simply does not appear and Picasso uses the accessible CPU algorithms.
@@ -39,7 +40,7 @@ Picasso can run several of its fitting algorithms on a CUDA-capable NVIDIA GPU v
 - ``Gpufit.dll`` on Windows — **shipped with Picasso**, so GPU fitting works out of the box.
 - ``libGpufit.so`` on Linux — **not shipped**, because the binary depends on your CUDA toolkit and GPU. You have to compile it yourself (see `GPU fitting on Linux`_), and copy it into ``picasso/ext/pygpufit/``.
 
-When the library is present and a CUDA GPU is detected, the GPU fitting option becomes available in the ``Parameters`` dialog (Picasso checks ``gpufit.cuda_available()`` at startup). Otherwise the option stays hidden and Picasso uses the equivalent CPU implementation, so results are the same — only slower. Using the GPU is entirely optional and only worthwhile if you have an NVIDIA (CUDA-capable) GPU.
+When the library is present and a CUDA GPU is detected, the GPU fitting option becomes available in the ``Parameters`` dialog (Picasso checks ``gpufit.cuda_available()`` at startup) for both optimizers, since Gpufit implements a least-squares and a maximum likelihood estimator. Otherwise the option stays hidden and Picasso uses the CPU implementations. For least squares the CPU and GPU implementations are equivalent, so results are the same — only slower; for MLE the CPU implementation fits an integrated Gaussian (Smith et al., 2010) whereas Gpufit fits a sampled Gaussian with its own convergence settings, so results can differ slightly. Using the GPU is entirely optional and only available if you have an NVIDIA (CUDA-capable) GPU.
 
 GPU fitting on Linux
 ~~~~~~~~~~~~~~~~~~~~~

@@ -1223,7 +1223,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     qe : float
         Not used in the calculations.
     """
-    from . import gausslq
+    from . import localize
     from .io import save_info
 
     picasso_logo()
@@ -1231,7 +1231,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     print("{:<8} {:<15} {:<10}".format("No", "Label", "Value"))
 
     if args.fit_method == "lq-gpu":
-        if gausslq.gpufit_installed:
+        if localize.GPUFIT_INSTALLED:
             print("GPUfit installed")
         else:
             raise Exception("GPUfit not installed. Aborting.")
