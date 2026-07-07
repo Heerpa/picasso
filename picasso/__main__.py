@@ -1357,32 +1357,54 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
             "could not be loaded. See picasso/ext/pygpuspline/README.txt."
         )
 
-    movie, info = load_movie(args.files)
     camera_info = {
         "Baseline": args.baseline,
         "Sensitivity": args.sensitivity,
         "Gain": args.gain,
         "Pixelsize": args.pixelsize,
     }
+    files = args.files
     if args.output:
         out_path = args.output
     else:
-        base, _ = splitext(args.files)
+        base, _ = splitext(files[0])
         out_path = base + "_spline_calib.hdf5"
 
-    calibration = spline.calibrate_spline(
-        movie,
-        info=info,
-        camera_info=camera_info,
-        box=args.box_side_length,
-        minimum_ng=args.gradient,
-        d=args.step,
-        frames_per_step=args.frames_per_step,
-        frame_order=args.frame_order,
-        model=args.model,
-        path=out_path,
-        progress_callback=lambda i: print(f"  step {i}/3"),
-    )
+    if len(files) == 1:
+        movie, info = load_movie(files[0])
+        calibration = spline.calibrate_spline(
+            movie,
+            info=info,
+            camera_info=camera_info,
+            box=args.box_side_length,
+            minimum_ng=args.gradient,
+            d=args.step,
+            frames_per_step=args.frames_per_step,
+            frame_order=args.frame_order,
+            model=args.model,
+            path=out_path,
+            progress_callback=lambda i: print(f"  step {i}/3"),
+        )
+    else:
+        print(f"Multichannel calibration from {len(files)} channels")
+        movies, infos, camera_infos = [], [], []
+        for f in files:
+            movie, info = load_movie(f)
+            movies.append(movie)
+            infos.append(info)
+            camera_infos.append(dict(camera_info))
+        calibration = spline.calibrate_spline_multichannel(
+            movies,
+            infos=infos,
+            camera_infos=camera_infos,
+            box=args.box_side_length,
+            minimum_ng=args.gradient,
+            d=args.step,
+            frames_per_step=args.frames_per_step,
+            frame_order=args.frame_order,
+            path=out_path,
+            progress_callback=lambda i: print(f"  step {i}/3"),
+        )
     print("------------------------------------------")
     print(
         f"Spline PSF calibration built from {calibration['n_beads']} beads "
@@ -2694,7 +2716,14 @@ def main():  # noqa: C901
         "spline-calibrate",
         help="build a cubic-spline PSF calibration from a bead z-stack",
     )
-    spline_calib_parser.add_argument("files", help="bead z-stack movie file")
+    spline_calib_parser.add_argument(
+        "files",
+        nargs="+",
+        help=(
+            "bead z-stack movie file(s); pass several (one per channel) to "
+            "build a multichannel calibration"
+        ),
+    )
     spline_calib_parser.add_argument(
         "-o",
         "--output",

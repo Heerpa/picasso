@@ -4067,6 +4067,11 @@ class Window(QtWidgets.QMainWindow):
                 # A 3D spline fit recovers z directly, so the separate
                 # astigmatism z-fitting step must not run.
                 fit_z = False
+                if spline_calibration.get("model") == "spline-3d-multichannel":
+                    self._start_multichannel_spline_fit(
+                        spline_calibration, method
+                    )
+                    return
             self.fit_worker = FitWorker(
                 self.movie,
                 self.info,
@@ -4088,6 +4093,52 @@ class Window(QtWidgets.QMainWindow):
             self._active_worker = self.fit_worker
             self.abort_action.setEnabled(True)
             self.fit_worker.start()
+
+    def _start_multichannel_spline_fit(
+        self, calibration: dict, method: str
+    ) -> None:
+        """Fit a multichannel spline PSF across all loaded channels
+        simultaneously. The first loaded channel is the reference; its
+        identifications are mapped into every channel via the calibration's
+        stored transforms."""
+        n_channels = int(calibration.get("n_channels", 0))
+        if len(self.channels) < n_channels:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Multichannel spline fit",
+                f"This calibration expects {n_channels} channels, but "
+                f"{len(self.channels)} are loaded. Load them with "
+                "'File > Open channels from several movies' in the same "
+                "order as the calibration.",
+            )
+            self.status_bar.showMessage("")
+            return
+        reference = self.channels[0]
+        if reference.identifications is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Multichannel spline fit",
+                "Identify spots in the reference channel (the first loaded "
+                "channel) before running a multichannel spline fit.",
+            )
+            self.status_bar.showMessage("")
+            return
+        movies = [self.channels[c].movie for c in range(n_channels)]
+        camera_infos = [self.camera_info for _ in range(n_channels)]
+        self.fit_worker = MultichannelSplineFitWorker(
+            movies,
+            camera_infos,
+            reference.identifications,
+            self.parameters["Box Size"],
+            calibration,
+            mle=method == "spline-mle-gpu",
+        )
+        self.fit_worker.progressMade.connect(self.on_fit_progress)
+        self.fit_worker.finished.connect(self.on_fit_finished)
+        self.fit_worker.aborted.connect(self.on_worker_aborted)
+        self._active_worker = self.fit_worker
+        self.abort_action.setEnabled(True)
+        self.fit_worker.start()
 
     def fit_z(self) -> None:
         """Fit z coordinates of the fitted localizations based on the
@@ -4707,6 +4758,59 @@ class FitWorker(QtCore.QThread):
         self.progressMade.emit(self.N + 1, self.N)
         dt = time.time() - t0
         self.finished.emit(locs, dt, self.fit_z, self.calibrate_z)
+
+
+class MultichannelSplineFitWorker(QtCore.QThread):
+    """Fit a multichannel cubic-spline PSF across several registered channels
+    simultaneously. The reference channel's identifications are mapped into
+    every channel via the calibration's stored affine transforms."""
+
+    progressMade = QtCore.pyqtSignal(int, int)
+    finished = QtCore.pyqtSignal(pd.DataFrame, float, bool, bool)
+    aborted = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        movies: list,
+        camera_infos: list,
+        identifications: pd.DataFrame,
+        box: int,
+        calibration: dict,
+        mle: bool = False,
+    ) -> None:
+        super().__init__()
+        self.movies = movies
+        self.camera_infos = camera_infos
+        self.identifications = identifications
+        self.box = box
+        self.calibration = calibration
+        self.mle = mle
+        self.N = len(identifications)
+
+    def on_progress(self, n_done: int) -> None:
+        self.progressMade.emit(n_done, self.N)
+
+    def run(self) -> None:
+        t0 = time.time()
+        try:
+            locs = localize.fit_spline_multichannel(
+                self.movies,
+                self.camera_infos,
+                self.identifications,
+                self.box,
+                self.calibration,
+                mle=self.mle,
+                progress_callback=self.on_progress,
+            )
+        except Exception as e:
+            print(f"Multichannel spline fit failed: {e}")
+            self.aborted.emit()
+            return
+        self.progressMade.emit(self.N + 1, self.N)
+        dt = time.time() - t0
+        # fit_z / calibrate_z are always False for the multichannel spline
+        # path (z comes from the fit; there is no astigmatism step)
+        self.finished.emit(locs, dt, False, False)
 
 
 class FitZWorker(QtCore.QThread):

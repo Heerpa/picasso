@@ -212,6 +212,94 @@ def test_calibrate_spline_requires_gpuspline():
 
 
 # ---------------------------------------------------------------------------
+# Multichannel calibration (Session D) - registration/matching without a GPU
+# ---------------------------------------------------------------------------
+
+
+class TestMultichannelCalibration:
+    def test_match_beads(self):
+        ref = np.array([[0, 0], [10, 10], [20, 20]], dtype=float)
+        other = np.array([[20.3, 20.1], [0.2, -0.1], [100, 100]], dtype=float)
+        ref_idx, other_idx = spline._match_beads(ref, other, 1.0)
+        # ref[0]->other[1], ref[2]->other[0]; ref[1] has no match within 1 px
+        assert ref_idx.tolist() == [0, 2]
+        assert other_idx.tolist() == [1, 0]
+
+    def test_match_beads_unique_targets(self):
+        ref = np.array([[0, 0], [0.5, 0]], dtype=float)
+        other = np.array([[0.1, 0.0]], dtype=float)
+        ref_idx, other_idx = spline._match_beads(ref, other, 5.0)
+        # both refs are near the single target; it must be used only once
+        assert len(other_idx) == 1
+        assert ref_idx.tolist() == [0]  # closest reference wins
+
+    def test_estimate_channel_transform_recovers_shift(self):
+        movie_ref, _, _ = _synthetic_bead_movie()
+        dx, dy = 3, -2  # channel is the reference shifted by (dx, dy)
+        movie_c = np.roll(movie_ref, shift=(dy, dx), axis=(1, 2))
+
+        step_of_frame, _, step_range = spline._step_of_frame(
+            movie_ref.shape[0], 20.0, 1, "fov", None
+        )
+        ref_bounds = spline._reference_frame_bounds(step_of_frame, step_range)
+        mid = (ref_bounds[0] + ref_bounds[1]) // 2
+        beads_ref = spline._detect_bead_positions(
+            movie_ref, 2000.0, BOX, ref_bounds
+        )
+        transform, n_matches = spline._estimate_channel_transform(
+            movie_ref,
+            movie_c,
+            beads_ref,
+            2000.0,
+            BOX,
+            ref_bounds,
+            mid,
+            max_distance=float(BOX),
+        )
+        assert n_matches >= 3
+        # transform maps reference (x, y) -> channel (x + dx, y + dy)
+        np.testing.assert_allclose(
+            transform,
+            np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]]),
+            atol=0.6,
+        )
+
+
+@pytest.mark.skipif(
+    not localize.GPUSPLINE_INSTALLED, reason="Gpuspline not available"
+)
+class TestCalibrateSplineMultichannel:
+    """Full multichannel calibration including the Gpuspline coefficient
+    step (CPU). Skipped unless Gpuspline is installed."""
+
+    def test_calibrate_multichannel(self, tmp_path):
+        from picasso import io
+
+        movie_ref, _, _ = _synthetic_bead_movie()
+        movie_c = np.roll(movie_ref, shift=(2, -1), axis=(1, 2))
+        info = [{"Frames": int(movie_ref.shape[0])}]
+        path = str(tmp_path / "mc_spline_calib.hdf5")
+        calib = spline.calibrate_spline_multichannel(
+            [movie_ref, movie_c],
+            infos=[info, info],
+            camera_infos=[CAMERA_INFO, CAMERA_INFO],
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            path=path,
+        )
+        assert calib["model"] == "spline-3d-multichannel"
+        assert calib["n_channels"] == 2
+        assert calib["coefficients"].shape[0] == 64
+        assert calib["coefficients"].shape[-1] == 2
+        assert len(calib["channel_transforms"]) == 2
+        # round-trips and drives the multichannel user_info packer
+        loaded = io.load_spline_calibration(path)
+        user_info = localize._pack_spline_user_info(loaded)
+        assert user_info.dtype == np.float32
+
+
+# ---------------------------------------------------------------------------
 # Session C: GUI + CLI wiring (no GPU required)
 # ---------------------------------------------------------------------------
 

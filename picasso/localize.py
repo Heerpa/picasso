@@ -2009,14 +2009,18 @@ def _spline_model_id(model: str) -> int:
 def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
     """Pack a spline calibration into Gpufit's ``user_info`` blob, matching
     the layout of the official pyGpufit spline examples
-    (``splinefit_2d.py`` / ``splinefit_3d.py``):
+    (``splinefit_2d.py`` / ``splinefit_3d.py`` /
+    ``splinefit_3d_multi_channel.py``):
 
     - 2D: ``[n_data_x, n_data_y, n_int_x, n_int_y, coefficients...]``
     - 3D: ``[n_data_x, n_data_y, n_data_z(=1), n_int_x, n_int_y, n_int_z,
       coefficients...]``
+    - 3D multichannel: ``[n_channels, n_data_x, n_data_y, n_data_z(=1),
+      n_int_x, n_int_y, n_int_z, coefficients...]``
 
     The coefficient block is the calibration's ``coefficients`` array
-    (shape ``(4**d, *n_intervals)``) flattened in C order, exactly as the
+    (shape ``(4**d, *n_intervals)``, or ``(64, *n_intervals, n_channels)``
+    for the multichannel model) flattened in C order, exactly as the
     reference examples do.
 
     IMPORTANT: the whole blob is cast to ``float32`` to match the
@@ -2035,6 +2039,19 @@ def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
     n_intervals = list(calibration["n_intervals"])
     if model == "spline-2d":
         header = [n_data[0], n_data[1], n_intervals[0], n_intervals[1]]
+    elif model == "spline-3d-multichannel":
+        # The multichannel model prepends the number of channels; the
+        # coefficient table is (64, n_int_x, n_int_y, n_int_z, n_channels).
+        n_channels = int(calibration.get("n_channels", coefficients.shape[-1]))
+        header = [
+            n_channels,
+            n_data[0],
+            n_data[1],
+            1,
+            n_intervals[0],
+            n_intervals[1],
+            n_intervals[2],
+        ]
     else:  # 3D
         # A single camera frame is fitted, so the number of data points in z
         # is 1; the spline recovers the continuous z position.
@@ -2062,13 +2079,18 @@ def _initial_parameters_spline(
 
     Parameter order matches the Gpufit spline models:
     ``[amplitude, x_shift, y_shift, offset]`` (2D) or
-    ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D). Following the
-    reference examples, a spot centered in its ROI has zero lateral shift; the
-    initial z guess is the calibration's in-focus slice (``z_center``)."""
+    ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D and 3D
+    multichannel). Following the reference examples, a spot centered in its
+    ROI has zero lateral shift; the initial z guess is the calibration's
+    in-focus slice (``z_center``). For the multichannel model ``spots`` is
+    channel-stacked ``(n, box, box, n_channels)``; amplitude/offset are then
+    estimated across all channels."""
     model = calibration["model"]
     n_parameters = 4 if model == "spline-2d" else 5
-    spot_max = np.amax(spots, axis=(1, 2))
-    spot_min = np.amin(spots, axis=(1, 2))
+    # spots is (n, box, box) or, for multichannel, (n, box, box, n_channels)
+    reduce_axes = tuple(range(1, spots.ndim))
+    spot_max = np.amax(spots, axis=reduce_axes)
+    spot_min = np.amin(spots, axis=reduce_axes)
     initial = np.zeros((len(spots), n_parameters), dtype=np.float32)
     initial[:, 0] = spot_max - spot_min  # amplitude
     # x_shift (col 1) and y_shift (col 2) start at 0 (spline centered on ROI).
@@ -2097,7 +2119,9 @@ def fit_spots_gpufit_spline(
     Parameters
     ----------
     spots : lib.FloatArray3D
-        Spot stack of shape ``(n_spots, box, box)``.
+        Spot stack of shape ``(n_spots, box, box)``, or, for the multichannel
+        model, channel-stacked ``(n_spots, box, box, n_channels)`` (see
+        ``get_spots_multichannel``).
     calibration : dict
         Spline PSF calibration (see ``io.load_spline_calibration``). Must
         contain ``model``, ``coefficients``, ``n_data`` and ``n_intervals``.
@@ -2119,11 +2143,7 @@ def fit_spots_gpufit_spline(
             "GPUfit could not be found, CUDA-capable GPU is required."
         )
     model = calibration["model"]
-    if model == "spline-3d-multichannel":
-        raise NotImplementedError(
-            "Multichannel spline fitting requires the multi-movie spot "
-            "extraction path, which is not yet implemented."
-        )
+    is_multichannel = model == "spline-3d-multichannel"
     box = spots.shape[1]
     n_data = list(calibration["n_data"])
     if box != n_data[0] or box != n_data[1]:
@@ -2132,6 +2152,29 @@ def fit_spots_gpufit_spline(
             f"lateral data size ({n_data[0]}x{n_data[1]}). Re-run with a box "
             "size equal to the calibration's, or rebuild the calibration."
         )
+    if is_multichannel:
+        # Multichannel spots are channel-stacked (n, box, box, n_channels);
+        # the per-fit data is the channels concatenated pixel-major, exactly
+        # as in the reference splinefit_3d_multi_channel example.
+        if spots.ndim != 4:
+            raise ValueError(
+                "Multichannel spline fitting expects spots of shape "
+                "(n_spots, box, box, n_channels)."
+            )
+        n_channels = int(
+            calibration.get(
+                "n_channels",
+                np.asarray(calibration["coefficients"]).shape[-1],
+            )
+        )
+        if spots.shape[3] != n_channels:
+            raise ValueError(
+                f"Spots have {spots.shape[3]} channels but the calibration "
+                f"has {n_channels}."
+            )
+        n_points = box * box * n_channels
+    else:
+        n_points = box * box
     if mle:
         spots = np.maximum(spots, 0)
     initial_parameters = _initial_parameters_spline(spots, calibration)
@@ -2140,7 +2183,7 @@ def fit_spots_gpufit_spline(
     estimator_id = gf.EstimatorID.MLE if mle else gf.EstimatorID.LSE
 
     parameters, states, chi_squares, number_iterations, exec_time = gf.fit(
-        spots.reshape((len(spots), box * box)),
+        spots.reshape((len(spots), n_points)),
         None,
         model_id,
         initial_parameters,
@@ -2258,6 +2301,189 @@ def _fit2d_spline_gpu(
         iterations=iterations,
     )
     return locs
+
+
+# ----------------------------------------------------------------------
+# Multichannel cubic-spline PSF fitting (Gpufit SPLINE_3D_MULTICHANNEL)
+#
+# Several spatially-registered channels (separate movies, e.g. biplane /
+# 4Pi microscopy) are fit simultaneously with shared x, y, z. A detection in
+# the reference channel is mapped into every channel via a per-channel affine
+# transform (stored in the calibration), the box ROIs are cut from each
+# channel and stacked, and the stack is fitted against the per-channel spline
+# coefficients. There is no affine-transform machinery elsewhere in Picasso,
+# so the small least-squares helpers below are self-contained.
+# ----------------------------------------------------------------------
+
+
+def estimate_affine_transform(
+    src_xy: lib.FloatArray2D, dst_xy: lib.FloatArray2D
+) -> lib.FloatArray2D:
+    """Least-squares 2D affine transform mapping ``src_xy`` to ``dst_xy``.
+
+    Both inputs are ``(n, 2)`` arrays of matching point correspondences (e.g.
+    the same beads seen in two channels). Returns a ``(2, 3)`` matrix ``M``
+    such that ``dst ≈ src @ M[:, :2].T + M[:, 2]`` (see
+    ``apply_affine_transform``). At least 3 non-collinear correspondences are
+    required."""
+    src = np.asarray(src_xy, dtype=np.float64)
+    dst = np.asarray(dst_xy, dtype=np.float64)
+    if src.shape[0] < 3:
+        raise ValueError(
+            "At least 3 point correspondences are required to estimate an "
+            "affine transform."
+        )
+    a = np.hstack([src, np.ones((len(src), 1))])  # (n, 3): [x, y, 1]
+    solution, *_ = np.linalg.lstsq(a, dst, rcond=None)  # (3, 2)
+    return solution.T.astype(np.float64)  # (2, 3)
+
+
+def apply_affine_transform(
+    xy: lib.FloatArray2D, transform: lib.FloatArray2D
+) -> lib.FloatArray2D:
+    """Apply a ``(2, 3)`` affine ``transform`` to ``(n, 2)`` points."""
+    xy = np.asarray(xy, dtype=np.float64)
+    transform = np.asarray(transform, dtype=np.float64)
+    return xy @ transform[:, :2].T + transform[:, 2]
+
+
+def get_spots_multichannel(
+    movies: list,
+    identifications: pd.DataFrame,
+    box: int,
+    camera_infos: list[dict],
+    transforms: list,
+    progress_callback: Callable[[int], None] | None = None,
+) -> np.ndarray:
+    """Extract channel-stacked spots for multichannel spline fitting.
+
+    For each identification (given in the reference channel's coordinates),
+    the position is mapped into every channel via its affine ``transform`` and
+    the box ROI is cut from that channel's movie. The per-channel ROIs are
+    stacked along a new trailing axis.
+
+    Parameters
+    ----------
+    movies : list
+        One movie per channel (as loaded by ``io.load_movie``). ``movies[0]``
+        is the reference channel.
+    identifications : pd.DataFrame
+        Detections in the reference channel (``frame``, ``x``, ``y``,
+        ``net_gradient``).
+    box : int
+        Box side length (camera pixels).
+    camera_infos : list of dict
+        One camera-info dict per channel (for the photon conversion).
+    transforms : list
+        One ``(2, 3)`` affine transform per channel mapping reference-channel
+        coordinates to that channel; ``transforms[0]`` is the identity.
+    progress_callback : callable, optional
+        Forwarded to ``get_spots`` for the reference channel.
+
+    Returns
+    -------
+    spots : np.ndarray
+        Array of shape ``(n_spots, box, box, n_channels)`` in photon units.
+    """
+    n_channels = len(movies)
+    if not (len(camera_infos) == len(transforms) == n_channels):
+        raise ValueError(
+            "movies, camera_infos and transforms must have the same length "
+            "(one per channel)."
+        )
+    ref_xy = np.column_stack(
+        [
+            np.asarray(identifications["x"], dtype=np.float64),
+            np.asarray(identifications["y"], dtype=np.float64),
+        ]
+    )
+    channel_spots = []
+    for c in range(n_channels):
+        if c == 0:
+            ids_c = identifications
+        else:
+            mapped = apply_affine_transform(ref_xy, transforms[c])
+            ids_c = identifications.copy()
+            # get_spots/_cut_spots cut an integer-pixel box; the fixed
+            # fractional per-channel offset is absorbed consistently because
+            # the calibration is built with the same extractor.
+            ids_c["x"] = np.rint(mapped[:, 0]).astype(np.int64)
+            ids_c["y"] = np.rint(mapped[:, 1]).astype(np.int64)
+        spots_c = get_spots(
+            movies[c],
+            ids_c,
+            box,
+            camera_infos[c],
+            progress_callback=progress_callback if c == 0 else None,
+        )
+        channel_spots.append(spots_c)
+    return np.stack(channel_spots, axis=-1)
+
+
+def fit_spline_multichannel(
+    movies: list,
+    camera_infos: list[dict],
+    identifications: pd.DataFrame,
+    box: int,
+    calibration: dict,
+    mle: bool = False,
+    progress_callback: Callable[[int], None] | None = None,
+) -> pd.DataFrame:
+    """Fit a multichannel cubic-spline PSF across several registered channels.
+
+    Ties ``get_spots_multichannel`` (extraction via the calibration's stored
+    ``channel_transforms``) to ``fit_spots_gpufit_spline`` and
+    ``locs_from_fits_spline``. The resulting localizations are in the
+    reference channel's coordinates and contain the fitted ``z`` directly.
+
+    Parameters
+    ----------
+    movies : list
+        One movie per channel; ``movies[0]`` is the reference channel and its
+        order must match the calibration's channels.
+    camera_infos : list of dict
+        One camera-info dict per channel.
+    identifications : pd.DataFrame
+        Detections in the reference channel.
+    box : int
+        Box side length (camera pixels), must match the calibration.
+    calibration : dict
+        A ``"spline-3d-multichannel"`` calibration (see ``picasso.spline``).
+    mle : bool, optional
+        Use Gpufit's maximum-likelihood estimator. Default False.
+    """
+    if calibration.get("model") != "spline-3d-multichannel":
+        raise ValueError(
+            "fit_spline_multichannel requires a 'spline-3d-multichannel' "
+            "calibration."
+        )
+    transforms = calibration["channel_transforms"]
+    if len(movies) != len(transforms):
+        raise ValueError(
+            f"Got {len(movies)} channels but the calibration has "
+            f"{len(transforms)} channel transforms."
+        )
+    spots = get_spots_multichannel(
+        movies,
+        identifications,
+        box,
+        camera_infos,
+        transforms,
+        progress_callback=progress_callback,
+    )
+    theta, log_likelihood, iterations = fit_spots_gpufit_spline(
+        spots, calibration, mle=mle, return_stats=True
+    )
+    em = camera_infos[0].get("Gain", 1) > 1
+    return locs_from_fits_spline(
+        identifications,
+        theta,
+        box,
+        em,
+        calibration,
+        log_likelihood=log_likelihood,
+        iterations=iterations,
+    )
 
 
 def _fit2d_gaussmle(

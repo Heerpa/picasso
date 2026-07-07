@@ -259,6 +259,18 @@ def _normalize_template(
     return template, background, amplitude, photon_scale
 
 
+def _reference_frame_bounds(
+    step_of_frame: np.ndarray, step_range: np.ndarray
+) -> tuple[int, int]:
+    """Frame bounds of the middle third of the scan (near focus, brightest),
+    used for bead detection."""
+    n_steps = len(step_range)
+    lo = step_range[n_steps // 3]
+    hi = step_range[min(n_steps - 1, 2 * n_steps // 3)]
+    ref_frames = np.where((step_of_frame >= lo) & (step_of_frame <= hi))[0]
+    return int(ref_frames.min()), int(ref_frames.max())
+
+
 def build_psf_template(
     movie: lib.IntArray3D,
     camera_info: dict,
@@ -269,6 +281,7 @@ def build_psf_template(
     frame_bounds: tuple[int, int] | list | None = None,
     frame_order: Literal["fov", "z"] = "fov",
     threaded: bool = True,
+    beads: pd.DataFrame | None = None,
 ) -> dict:
     """Build a normalized PSF template volume from a bead z-stack.
 
@@ -277,23 +290,22 @@ def build_psf_template(
     ``template`` (box, box, n_steps), ``z_center``, ``effective_sigma``,
     ``background``, ``amplitude``, ``photon_scale``, ``n_beads`` and
     ``z_of_step``.
+
+    If ``beads`` (a data frame with integer ``x``/``y`` columns) is given, it
+    is used instead of detecting beads on this movie - this lets the
+    multichannel calibration reuse the same physical beads, mapped into each
+    channel, across all channels.
     """
     n_frames = int(movie.shape[0])
     step_of_frame, z_of_step, step_range = _step_of_frame(
         n_frames, d, frames_per_step, frame_order, frame_bounds
     )
 
-    # reference frames for bead detection: the middle third of the scan, where
-    # beads are near focus and brightest
-    n_steps = len(step_range)
-    lo = step_range[n_steps // 3]
-    hi = step_range[min(n_steps - 1, 2 * n_steps // 3)]
-    ref_frames = np.where((step_of_frame >= lo) & (step_of_frame <= hi))[0]
-    ref_bounds = (int(ref_frames.min()), int(ref_frames.max()))
-
-    beads = _detect_bead_positions(
-        movie, minimum_ng, box, ref_bounds, threaded=threaded
-    )
+    if beads is None:
+        ref_bounds = _reference_frame_bounds(step_of_frame, step_range)
+        beads = _detect_bead_positions(
+            movie, minimum_ng, box, ref_bounds, threaded=threaded
+        )
     volumes = _bead_volumes(
         movie, camera_info, beads, box, step_of_frame, step_range
     )
@@ -444,6 +456,247 @@ def calibrate_spline(
     if path is not None:
         io.save_spline_calibration(path, calibration)
         _save_diagnostic_plot(built, calibration, path)
+
+    if callable(progress_callback):
+        progress_callback(3)
+    return calibration
+
+
+# ----------------------------------------------------------------------
+# Multichannel calibration (SPLINE_3D_MULTICHANNEL)
+# ----------------------------------------------------------------------
+
+
+def _match_beads(
+    ref_xy: np.ndarray, other_xy: np.ndarray, max_distance: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Nearest-neighbor match beads between two channels.
+
+    Returns ``(ref_idx, other_idx)`` index arrays of matched pairs within
+    ``max_distance``; each ``other`` bead is used at most once (closest match
+    wins)."""
+    from scipy.spatial import cKDTree
+
+    ref_xy = np.asarray(ref_xy, dtype=np.float64)
+    other_xy = np.asarray(other_xy, dtype=np.float64)
+    if len(ref_xy) == 0 or len(other_xy) == 0:
+        empty = np.array([], dtype=int)
+        return empty, empty
+    tree = cKDTree(other_xy)
+    dist, idx = tree.query(ref_xy, k=1)
+    keep = np.where(dist <= max_distance)[0]
+    # resolve duplicate targets: assign each target to its closest reference
+    order = keep[np.argsort(dist[keep])]
+    seen: set[int] = set()
+    ref_idx, other_idx = [], []
+    for r in order:
+        o = int(idx[r])
+        if o in seen:
+            continue
+        seen.add(o)
+        ref_idx.append(int(r))
+        other_idx.append(o)
+    return np.array(ref_idx, dtype=int), np.array(other_idx, dtype=int)
+
+
+def _estimate_channel_transform(
+    movie_ref,
+    movie_c,
+    beads_ref: pd.DataFrame,
+    minimum_ng: float,
+    box: int,
+    ref_bounds: tuple[int, int],
+    mid_frame: int,
+    max_distance: float,
+) -> tuple[np.ndarray, int]:
+    """Estimate the affine transform mapping reference-channel coordinates to
+    channel ``c``.
+
+    Beads are detected in channel ``c``, coarsely aligned to the reference via
+    image cross-correlation, matched to the reference beads and an affine
+    transform is fitted to the correspondences. Returns
+    ``(transform (2, 3), n_matches)``."""
+    from . import imageprocess
+
+    beads_c = _detect_bead_positions(movie_c, minimum_ng, box, ref_bounds)
+    ref_xy = beads_ref[["x", "y"]].to_numpy(dtype=np.float64)
+    c_xy = beads_c[["x", "y"]].to_numpy(dtype=np.float64)
+
+    # coarse translational pre-alignment from a mid (in-focus) frame
+    try:
+        img_ref = np.asarray(movie_ref[mid_frame], dtype=np.float32)
+        img_c = np.asarray(movie_c[mid_frame], dtype=np.float32)
+        dy, dx = imageprocess.get_image_shift(img_ref, img_c, 5)
+    except Exception:
+        dx, dy = 0.0, 0.0
+
+    # try both shift signs and keep whichever yields more correspondences
+    best_ref_idx, best_c_idx = np.array([], int), np.array([], int)
+    for sign in (1.0, -1.0):
+        shifted = c_xy + sign * np.array([dx, dy])
+        ri, ci = _match_beads(ref_xy, shifted, max_distance)
+        if len(ri) > len(best_ref_idx):
+            best_ref_idx, best_c_idx = ri, ci
+
+    if len(best_ref_idx) < 3:
+        raise ValueError(
+            f"Only {len(best_ref_idx)} bead correspondences found between the "
+            "reference channel and another channel; cannot estimate an affine "
+            "transform. Increase the bead count or the match distance."
+        )
+    transform = localize.estimate_affine_transform(
+        ref_xy[best_ref_idx], c_xy[best_c_idx]
+    )
+    return transform, int(len(best_ref_idx))
+
+
+def calibrate_spline_multichannel(
+    movies: list,
+    infos: list,
+    camera_infos: list[dict],
+    box: int,
+    minimum_ng: float,
+    d: float,
+    frames_per_step: int = 1,
+    frame_bounds: tuple[int, int] | list | None = None,
+    frame_order: Literal["fov", "z"] = "fov",
+    max_match_distance: float | None = None,
+    path: str | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+) -> dict:
+    """Generate a multichannel cubic-spline PSF calibration from registered
+    bead z-stacks (one movie per channel).
+
+    Detects beads in the reference channel (``movies[0]``), estimates an affine
+    transform from the reference channel to each other channel from bead
+    correspondences, builds a per-channel PSF template using the same physical
+    beads (mapped into each channel), and assembles the per-channel spline
+    coefficients into a ``(64, n_int_x, n_int_y, n_int_z, n_channels)`` table.
+    The transforms are stored in the calibration and reused at fit time by
+    ``localize.fit_spline_multichannel`` / ``get_spots_multichannel``.
+
+    Parameters are as in ``calibrate_spline`` but per-channel lists; all movies
+    must share the same frame layout (z scan). Returns a
+    ``"spline-3d-multichannel"`` calibration dict.
+    """
+    if not localize.GPUSPLINE_INSTALLED:
+        raise ImportError(
+            "Gpuspline is required to build a spline PSF calibration but "
+            "could not be loaded. See picasso/ext/pygpuspline/README.txt."
+        )
+    n_channels = len(movies)
+    if n_channels < 2:
+        raise ValueError(
+            "Multichannel calibration needs at least 2 channels; use "
+            "calibrate_spline for a single channel."
+        )
+    if not (len(camera_infos) == len(infos) == n_channels):
+        raise ValueError(
+            "movies, infos and camera_infos must have the same length."
+        )
+    if max_match_distance is None:
+        max_match_distance = float(box)
+
+    if callable(progress_callback):
+        progress_callback(0)
+
+    n_frames = int(movies[0].shape[0])
+    step_of_frame, _, step_range = _step_of_frame(
+        n_frames, d, frames_per_step, frame_order, frame_bounds
+    )
+    ref_bounds = _reference_frame_bounds(step_of_frame, step_range)
+    mid_frame = (ref_bounds[0] + ref_bounds[1]) // 2
+
+    beads_ref = _detect_bead_positions(movies[0], minimum_ng, box, ref_bounds)
+
+    # channel transforms (channel 0 is the identity reference)
+    identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    transforms = [identity]
+    for c in range(1, n_channels):
+        transform, _ = _estimate_channel_transform(
+            movies[0],
+            movies[c],
+            beads_ref,
+            minimum_ng,
+            box,
+            ref_bounds,
+            mid_frame,
+            max_match_distance,
+        )
+        transforms.append(transform)
+
+    if callable(progress_callback):
+        progress_callback(1)
+
+    # per-channel PSF templates from the same physical beads
+    ref_xy = beads_ref[["x", "y"]].to_numpy(dtype=np.float64)
+    gs = localize.gs
+    per_channel = []
+    for c in range(n_channels):
+        if c == 0:
+            beads_c = beads_ref
+        else:
+            mapped = localize.apply_affine_transform(ref_xy, transforms[c])
+            beads_c = pd.DataFrame(
+                {
+                    "x": np.rint(mapped[:, 0]).astype(int),
+                    "y": np.rint(mapped[:, 1]).astype(int),
+                }
+            )
+        built = build_psf_template(
+            movies[c],
+            camera_infos[c],
+            box,
+            minimum_ng,
+            d,
+            frames_per_step=frames_per_step,
+            frame_bounds=frame_bounds,
+            frame_order=frame_order,
+            beads=beads_c,
+        )
+        per_channel.append(built)
+
+    if callable(progress_callback):
+        progress_callback(2)
+
+    # assemble coefficients (64, n_int_x, n_int_y, n_int_z, n_channels)
+    templates = [p["template"] for p in per_channel]
+    n_intervals = [int(i) for i in (np.array(templates[0].shape) - 1)]
+    coefficients = np.zeros(
+        [64] + n_intervals + [n_channels], dtype=np.float32
+    )
+    for c, template in enumerate(templates):
+        coeff_c = gs.spline_coefficients(template)
+        coefficients[..., c] = np.reshape(coeff_c, [64] + n_intervals)
+
+    ref = per_channel[0]
+    pixelsize = camera_infos[0].get("Pixelsize", 130)
+    calibration = {
+        "model": "spline-3d-multichannel",
+        "coefficients": coefficients,
+        "n_data": [int(s) for s in templates[0].shape],
+        "n_intervals": n_intervals,
+        "n_channels": n_channels,
+        "channel_transforms": [t.tolist() for t in transforms],
+        "oversampling": 1.0,
+        "z_center": float(ref["z_center"]),
+        "z_step_nm": float(d),
+        "effective_sigma": float(ref["effective_sigma"]),
+        "photon_scale": float(ref["photon_scale"]),
+        "box": int(box),
+        "pixelsize": float(pixelsize),
+        "n_beads": int(ref["n_beads"]),
+        "Frames per step": int(frames_per_step),
+        "Frame order": frame_order,
+        "Frame bounds": frame_bounds,
+        "Generated by": (
+            f"Picasso: v{__version__} Spline PSF calibration (multichannel)"
+        ),
+        "Path": path if path is not None else "N/A",
+    }
+
+    if path is not None:
+        io.save_spline_calibration(path, calibration)
 
     if callable(progress_callback):
         progress_callback(3)

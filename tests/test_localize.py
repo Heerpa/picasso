@@ -25,7 +25,6 @@ from picasso.gui import localize as localize_gui
 
 from tests.conftest import BOX, CALIB_3D, CAMERA_INFO, MIN_NG, PIXELSIZE
 
-
 CAMERA_INFO_WITH_PIXELSIZE = {**CAMERA_INFO, "Pixelsize": PIXELSIZE}
 
 
@@ -1428,7 +1427,7 @@ class TestGpufit:
 # ---------------------------------------------------------------------------
 
 
-def _fake_spline_calibration(model="spline-3d", box=BOX):
+def _fake_spline_calibration(model="spline-3d", box=BOX, n_channels=2):
     """Build a small, structurally valid spline calibration dict. The
     coefficient values are arbitrary - these tests exercise the packing,
     parameter mapping and I/O, not a real fit."""
@@ -1439,6 +1438,13 @@ def _fake_spline_calibration(model="spline-3d", box=BOX):
         coefficients = np.arange(
             n_coef * np.prod(n_intervals), dtype=np.float32
         ).reshape([n_coef] + n_intervals)
+    elif model == "spline-3d-multichannel":
+        nz = 21
+        n_intervals = [box - 1, box - 1, nz - 1]
+        n_data = [box, box, nz]
+        coefficients = np.arange(
+            64 * np.prod(n_intervals) * n_channels, dtype=np.float32
+        ).reshape([64] + n_intervals + [n_channels])
     else:
         nz = 21
         n_intervals = [box - 1, box - 1, nz - 1]
@@ -1447,7 +1453,7 @@ def _fake_spline_calibration(model="spline-3d", box=BOX):
         coefficients = np.arange(
             n_coef * np.prod(n_intervals), dtype=np.float32
         ).reshape([n_coef] + n_intervals)
-    return {
+    calib = {
         "model": model,
         "coefficients": coefficients,
         "n_data": n_data,
@@ -1461,6 +1467,11 @@ def _fake_spline_calibration(model="spline-3d", box=BOX):
         "pixelsize": PIXELSIZE,
         "Path": "test_calibration",
     }
+    if model == "spline-3d-multichannel":
+        calib["n_channels"] = n_channels
+        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        calib["channel_transforms"] = [identity for _ in range(n_channels)]
+    return calib
 
 
 class TestSplineCalibrationIO:
@@ -1611,6 +1622,68 @@ class TestSplineHelpers:
         calib = _fake_spline_calibration(model="spline-3d")
         with pytest.raises(ImportError):
             localize.fit_spots_gpufit_spline(spots, calib)
+
+    def test_affine_transform_roundtrip(self):
+        src = np.array([[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [5.0, 7.0]])
+        m_true = np.array([[1.02, -0.03, 3.0], [0.01, 0.98, -2.0]])
+        dst = localize.apply_affine_transform(src, m_true)
+        m_est = localize.estimate_affine_transform(src, dst)
+        np.testing.assert_allclose(m_est, m_true, atol=1e-9)
+
+    def test_estimate_affine_needs_three_points(self):
+        with pytest.raises(ValueError):
+            localize.estimate_affine_transform(
+                np.zeros((2, 2)), np.zeros((2, 2))
+            )
+
+    def test_pack_user_info_multichannel_layout(self):
+        n_channels = 3
+        calib = _fake_spline_calibration(
+            model="spline-3d-multichannel", n_channels=n_channels
+        )
+        user_info = localize._pack_spline_user_info(calib)
+        assert user_info.dtype == np.float32
+        nx, ny, _ = calib["n_data"]
+        ix, iy, iz = calib["n_intervals"]
+        # header: [n_channels, nx, ny, nz=1, ix, iy, iz]
+        np.testing.assert_array_equal(
+            user_info[:7],
+            np.array([n_channels, nx, ny, 1, ix, iy, iz], np.float32),
+        )
+        assert user_info.size == 7 + calib["coefficients"].size
+
+    def test_initial_parameters_multichannel_stacked(self):
+        calib = _fake_spline_calibration(
+            model="spline-3d-multichannel", n_channels=2
+        )
+        # channel-stacked spots (n, box, box, n_channels)
+        spots = (
+            np.random.default_rng(0)
+            .random((4, BOX, BOX, 2), dtype=np.float64)
+            .astype(np.float32)
+        )
+        init = localize._initial_parameters_spline(spots, calib)
+        assert init.shape == (4, 5)
+        np.testing.assert_allclose(init[:, 3], calib["z_center"])
+
+    def test_get_spots_multichannel_identity(
+        self, movie, real_identifications
+    ):
+        single = localize.get_spots(
+            movie, real_identifications, BOX, CAMERA_INFO
+        )
+        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        stacked = localize.get_spots_multichannel(
+            [movie, movie],
+            real_identifications,
+            BOX,
+            [CAMERA_INFO, CAMERA_INFO],
+            [identity, identity],
+        )
+        assert stacked.shape == (len(real_identifications), BOX, BOX, 2)
+        # identity transform => each channel equals the single-movie extraction
+        np.testing.assert_array_equal(stacked[..., 0], single)
+        np.testing.assert_array_equal(stacked[..., 1], single)
 
 
 def _synthetic_spline_3d_calibration(box=BOX, nz=41):
