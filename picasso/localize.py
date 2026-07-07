@@ -1466,6 +1466,7 @@ def fit2D(
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
         "spline-gpu",
+        "spline-mle-gpu",
         "avg",
     ] = "gausslq",
     eps: float = 0.001,
@@ -1499,7 +1500,7 @@ def fit2D(
         integer.
     fitting_method : {"gausslq", "gausslq-gpu", "gausslq-rotated-gpu", \
             "gaussmle", "gaussmle-gpu", "gaussmle-rotated-gpu", \
-            "spline-gpu" or "avg"}, optional
+            "spline-gpu", "spline-mle-gpu" or "avg"}, optional
         Which 2D fitting algorithm to use. "gausslq" for least-squares
         fitting of a 2D Gaussian. "gausslq-gpu" for its GPU
         implemntation (if available). "gaussmle" for MLE 2D Gaussian
@@ -1508,9 +1509,10 @@ def fit2D(
         "gausslq-rotated-gpu" and "gaussmle-rotated-gpu" for GPU
         least-squares and MLE fitting, respectively, of a rotated
         elliptical Gaussian, whose fitted rotation angle (in degrees)
-        is saved in the column "angle". "spline-gpu" for GPU fitting of
-        an experimentally measured cubic-spline PSF (Gpufit's SPLINE_2D
-        / SPLINE_3D models); requires ``spline_calibration``, and a 3D
+        is saved in the column "angle". "spline-gpu" and "spline-mle-gpu"
+        for GPU least-squares / maximum-likelihood fitting of an
+        experimentally measured cubic-spline PSF (Gpufit's SPLINE_2D /
+        SPLINE_3D models); both require ``spline_calibration``, and a 3D
         spline calibration yields the fitted ``z`` directly. "avg" for
         taking the average of each spot.
     eps : float, optional
@@ -1579,16 +1581,17 @@ def fit2D(
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
         "spline-gpu",
+        "spline-mle-gpu",
         "avg",
     ], (
         "fitting_method must be one of 'gausslq', 'gausslq-gpu',"
         " 'gausslq-rotated-gpu', 'gaussmle', 'gaussmle-gpu',"
-        " 'gaussmle-rotated-gpu', 'spline-gpu', or 'avg'"
+        " 'gaussmle-rotated-gpu', 'spline-gpu', 'spline-mle-gpu', or 'avg'"
     )
-    if fitting_method == "spline-gpu":
+    if fitting_method.startswith("spline"):
         assert isinstance(spline_calibration, dict), (
             "spline_calibration (a spline PSF calibration dict, see "
-            "io.load_spline_calibration) is required for 'spline-gpu' fitting"
+            "io.load_spline_calibration) is required for spline fitting"
         )
     assert (
         isinstance(eps, (int, float)) and eps > 0
@@ -1643,19 +1646,18 @@ def fit2D(
             rotated="-rotated-" in fitting_method,
             mle=fitting_method.startswith("gaussmle"),
         )
-    elif fitting_method == "spline-gpu":
+    elif fitting_method in ("spline-gpu", "spline-mle-gpu"):
         if callable(progress_callback):
             progress_callback(1)
-        # Default to least-squares, as in the reference pyGpufit spline
-        # examples. Exposing the LSE/MLE choice through the GUI/CLI is wired
-        # up in a later session.
+        # "spline-mle-gpu" uses Gpufit's Poisson maximum-likelihood estimator,
+        # "spline-gpu" least squares (as in the reference pyGpufit examples).
         locs = _fit2d_spline_gpu(
             spots=spots,
             identifications=identifications,
             box=box,
             em=em,
             calibration=spline_calibration,
-            mle=False,
+            mle=fitting_method == "spline-mle-gpu",
         )
     elif fitting_method == "gaussmle":
         locs = _fit2d_gaussmle(
@@ -1687,7 +1689,7 @@ def fit2D(
     if fitting_method == "gaussmle":
         localize_info["Convergence criterion"] = eps
         localize_info["Max iterations"] = max_it
-    if fitting_method == "spline-gpu":
+    if fitting_method.startswith("spline"):
         localize_info["Spline calibration model"] = spline_calibration.get(
             "model"
         )
@@ -2402,6 +2404,7 @@ def localize(
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
         "spline-gpu",
+        "spline-mle-gpu",
         "avg",
     ] = "gausslq",
     eps: float = 0.001,
@@ -2544,6 +2547,7 @@ def localize_3D(
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
         "spline-gpu",
+        "spline-mle-gpu",
     ] = "gausslq",
     eps: float = 0.001,
     max_it: int = 100,
@@ -2662,17 +2666,18 @@ def localize_3D(
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
         "spline-gpu",
+        "spline-mle-gpu",
     ], (
         "fitting_method must be one of 'gausslq', 'gausslq-gpu',"
         " 'gausslq-rotated-gpu', 'gaussmle', 'gaussmle-gpu',"
-        " 'gaussmle-rotated-gpu', or 'spline-gpu'"
+        " 'gaussmle-rotated-gpu', 'spline-gpu', or 'spline-mle-gpu'"
     )
-    if fitting_method == "spline-gpu":
+    if fitting_method.startswith("spline"):
         # The spline PSF fit recovers z itself; it uses a spline calibration
         # instead of the astigmatism polynomials in calibration_3d.
         assert isinstance(spline_calibration, dict), (
             "spline_calibration (a spline PSF calibration dict, see "
-            "io.load_spline_calibration) is required for 'spline-gpu' 3D "
+            "io.load_spline_calibration) is required for spline 3D "
             "localization"
         )
     else:
@@ -2729,6 +2734,7 @@ def _localize_3D(
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
         "spline-gpu",
+        "spline-mle-gpu",
     ] = "gausslq",
     eps: float = 0.001,
     max_it: int = 100,
@@ -2766,7 +2772,7 @@ def _localize_3D(
         fit_progress_callback=fit_progress_callback,
         return_info=True,  # TODO: remove in v0.12.0
     )
-    if fitting_method == "spline-gpu":
+    if fitting_method.startswith("spline"):
         # The 3D cubic-spline fit already produced the z column directly, so
         # there is no separate astigmatism z-fitting step to run.
         return locs, info

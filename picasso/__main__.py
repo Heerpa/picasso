@@ -1073,6 +1073,8 @@ _FIT_METHOD_MAP = {
     "lq-gpu-3d": "gausslq-gpu",
     "mle": "gaussmle",
     "mle-3d": "gaussmle",
+    "spline": "spline-gpu",
+    "spline-mle": "spline-mle-gpu",
     "avg": "avg",
 }
 
@@ -1090,14 +1092,18 @@ def _localize_process_file(
     convergence: float,
     max_iterations: int,
     z_params,
+    spline_calibration: dict | None = None,
 ) -> None:
     """Identify, fit, save and optionally undrift one movie file.
 
     Parameters
     ----------
     z_params : tuple or None
-        If 3D fitting is active, a tuple
+        If 3D astigmatism fitting is active, a tuple
         ``(zpath, magnification_factor, z_calibration)``; else ``None``.
+    spline_calibration : dict or None
+        Cubic-spline PSF calibration when the fit method is a spline method;
+        else ``None``. A 3D spline fit recovers z directly (no ``zfit``).
     """
     from os.path import splitext
     from .io import load_movie, save_locs
@@ -1127,6 +1133,7 @@ def _localize_process_file(
         fitting_method=fitting_method,
         eps=convergence if convergence > 0 else 0.001,
         max_it=max_iterations if max_iterations > 0 else 100,
+        spline_calibration=spline_calibration,
         threaded=True,
         identification_progress_callback="console",
         fit_progress_callback="console",
@@ -1230,7 +1237,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     print("Localize - Parameters:")
     print("{:<8} {:<15} {:<10}".format("No", "Label", "Value"))
 
-    if args.fit_method == "lq-gpu":
+    if args.fit_method in ("lq-gpu", "spline", "spline-mle"):
         if localize.GPUFIT_INSTALLED:
             print("GPUfit installed")
         else:
@@ -1300,6 +1307,22 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
                 )
                 args.fit_z_gpu = False
 
+    spline_calibration = None
+    if args.fit_method in ("spline", "spline-mle"):
+        from .io import load_spline_calibration
+
+        if not args.spline_calibration:
+            raise Exception(
+                "Spline fitting requires --spline-calibration <file.hdf5>. "
+                "Build one with 'picasso spline-calibrate'."
+            )
+        spline_calibration = load_spline_calibration(args.spline_calibration)
+        print(
+            "Loaded spline PSF calibration "
+            f"({spline_calibration.get('model')}) from "
+            f"{args.spline_calibration}"
+        )
+
     for i, path in enumerate(paths):
         _localize_process_file(
             path,
@@ -1314,7 +1337,57 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             convergence,
             max_iterations,
             z_params,
+            spline_calibration=spline_calibration,
         )
+
+
+def _spline_calibrate(args: argparse.Namespace) -> None:
+    """Build a cubic-spline PSF calibration from a bead z-stack movie."""
+    from os.path import splitext
+    from . import localize, spline
+    from .io import load_movie
+
+    picasso_logo()
+    print("Spline PSF calibration")
+    print("------------------------------------------")
+
+    if not localize.GPUSPLINE_INSTALLED:
+        raise Exception(
+            "Gpuspline is required to build a spline PSF calibration but "
+            "could not be loaded. See picasso/ext/pygpuspline/README.txt."
+        )
+
+    movie, info = load_movie(args.files)
+    camera_info = {
+        "Baseline": args.baseline,
+        "Sensitivity": args.sensitivity,
+        "Gain": args.gain,
+        "Pixelsize": args.pixelsize,
+    }
+    if args.output:
+        out_path = args.output
+    else:
+        base, _ = splitext(args.files)
+        out_path = base + "_spline_calib.hdf5"
+
+    calibration = spline.calibrate_spline(
+        movie,
+        info=info,
+        camera_info=camera_info,
+        box=args.box_side_length,
+        minimum_ng=args.gradient,
+        d=args.step,
+        frames_per_step=args.frames_per_step,
+        frame_order=args.frame_order,
+        model=args.model,
+        path=out_path,
+        progress_callback=lambda i: print(f"  step {i}/3"),
+    )
+    print("------------------------------------------")
+    print(
+        f"Spline PSF calibration built from {calibration['n_beads']} beads "
+        f"and saved to {out_path}"
+    )
 
 
 def _render_many(
@@ -2495,9 +2568,32 @@ def main():  # noqa: C901
     localize_parser.add_argument(
         "-a",
         "--fit-method",
-        choices=["mle", "lq", "lq-gpu", "lq-3d", "lq-gpu-3d", "mle-3d", "avg"],
+        choices=[
+            "mle",
+            "lq",
+            "lq-gpu",
+            "lq-3d",
+            "lq-gpu-3d",
+            "mle-3d",
+            "spline",
+            "spline-mle",
+            "avg",
+        ],
         default="mle",
-        help="fitting method",
+        help=(
+            "fitting method ('spline'/'spline-mle' fit an experimental "
+            "cubic-spline PSF on the GPU and need --spline-calibration)"
+        ),
+    )
+    localize_parser.add_argument(
+        "-sc",
+        "--spline-calibration",
+        type=str,
+        default="",
+        help=(
+            "path to a cubic-spline PSF calibration (.hdf5) for the "
+            "'spline'/'spline-mle' fit methods"
+        ),
     )
     localize_parser.add_argument(
         "-g", "--gradient", type=int, default=5000, help="minimum net gradient"
@@ -2589,6 +2685,76 @@ def main():  # noqa: C901
         "--database",
         action="store_true",
         help="add the run to the local database",
+    )
+
+    # spline-calibrate: build a cubic-spline PSF calibration from a bead
+    # z-stack movie (Gpuspline; CPU) for later use with the 'spline' fit
+    # methods.
+    spline_calib_parser = subparsers.add_parser(
+        "spline-calibrate",
+        help="build a cubic-spline PSF calibration from a bead z-stack",
+    )
+    spline_calib_parser.add_argument("files", help="bead z-stack movie file")
+    spline_calib_parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default="",
+        help="output calibration path (.hdf5); default alongside the movie",
+    )
+    spline_calib_parser.add_argument(
+        "-b", "--box-side-length", type=int, default=13, help="box side length"
+    )
+    spline_calib_parser.add_argument(
+        "-g",
+        "--gradient",
+        type=int,
+        default=5000,
+        help="minimum net gradient for bead detection",
+    )
+    spline_calib_parser.add_argument(
+        "-s",
+        "--step",
+        type=float,
+        required=True,
+        help="z step size in nm between consecutive stage positions",
+    )
+    spline_calib_parser.add_argument(
+        "-fps",
+        "--frames-per-step",
+        type=int,
+        default=1,
+        help="number of frames acquired per z position (multi-FOV)",
+    )
+    spline_calib_parser.add_argument(
+        "-fo",
+        "--frame-order",
+        choices=["fov", "z"],
+        default="fov",
+        help="acquisition order when frames-per-step > 1",
+    )
+    spline_calib_parser.add_argument(
+        "-m",
+        "--model",
+        choices=["spline-3d", "spline-2d"],
+        default="spline-3d",
+        help="build a 3D (z-recovering) or 2D (single-plane) spline PSF",
+    )
+    spline_calib_parser.add_argument(
+        "-bl", "--baseline", type=float, default=0, help="camera baseline"
+    )
+    spline_calib_parser.add_argument(
+        "-se",
+        "--sensitivity",
+        type=float,
+        default=1,
+        help="camera sensitivity",
+    )
+    spline_calib_parser.add_argument(
+        "-ga", "--gain", type=int, default=1, help="camera gain"
+    )
+    spline_calib_parser.add_argument(
+        "-px", "--pixelsize", type=int, default=130, help="pixelsize in nm"
     )
 
     subparsers.add_parser("filter", help="filter raw files based on SNR (GUI)")
@@ -3345,6 +3511,8 @@ def main():  # noqa: C901
                 from picasso.gui import localize
 
                 localize.main()
+        elif args.command == "spline-calibrate":
+            _spline_calibrate(args)
         elif args.command == "filter":
             from .gui import filter
 

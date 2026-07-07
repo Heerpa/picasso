@@ -14,7 +14,6 @@ from picasso import localize, spline
 
 from tests.conftest import BOX, CAMERA_INFO
 
-
 # ---------------------------------------------------------------------------
 # Synthetic bead z-stack
 # ---------------------------------------------------------------------------
@@ -210,3 +209,83 @@ def test_calibrate_spline_requires_gpuspline():
             minimum_ng=2000.0,
             d=20.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Session C: GUI + CLI wiring (no GPU required)
+# ---------------------------------------------------------------------------
+
+
+class TestCliWiring:
+    def test_fit_method_map(self):
+        from picasso import __main__ as cli
+
+        assert cli._FIT_METHOD_MAP["spline"] == "spline-gpu"
+        assert cli._FIT_METHOD_MAP["spline-mle"] == "spline-mle-gpu"
+
+    def test_spline_calibrate_handler_exists(self):
+        from picasso import __main__ as cli
+
+        assert callable(cli._spline_calibrate)
+
+    def test_backend_accepts_both_spline_codes(self):
+        # both spline codes must be recognised model ids by the backend
+        # (guards the fit2D / localize / localize_3D dispatch strings)
+        import inspect
+
+        src = inspect.getsource(localize.fit2D)
+        assert "spline-gpu" in src and "spline-mle-gpu" in src
+
+
+class TestGuiWiring:
+    def test_fit_code_resolves_spline(self, monkeypatch):
+        from picasso.gui import localize as glocalize
+
+        models = dict(glocalize.FIT_MODELS)
+        models["Experimental PSF (cubic spline)"] = {
+            "optimizers": {
+                "Least squares": "spline-gpu",
+                "MLE": "spline-mle-gpu",
+            },
+            "needs_spline_calibration": True,
+        }
+        monkeypatch.setattr(glocalize, "FIT_MODELS", models)
+        assert (
+            glocalize._fit_code(
+                "Experimental PSF (cubic spline)", "Least squares"
+            )
+            == "spline-gpu"
+        )
+        assert (
+            glocalize._fit_code("Experimental PSF (cubic spline)", "MLE")
+            == "spline-mle-gpu"
+        )
+
+    def test_fit_worker_preserves_spline_method_and_calibration(self):
+        import sys
+        import pandas as pd
+        from PyQt6 import QtWidgets
+        from picasso.gui import localize as glocalize
+
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            app = QtWidgets.QApplication(sys.argv)
+
+        calib = {"model": "spline-3d"}
+        worker = glocalize.FitWorker(
+            None,
+            [],
+            {},
+            pd.DataFrame({"x": [], "y": [], "frame": []}),
+            BOX,
+            "spline-mle-gpu",
+            0.001,
+            100,
+            False,
+            False,
+            True,  # use_gpufit
+            spline_calibration=calib,
+        )
+        # the "-gpu" suffix must not be appended to an already-gpu spline code
+        assert worker.method == "spline-mle-gpu"
+        assert worker.spline_calibration is calib

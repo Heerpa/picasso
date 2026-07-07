@@ -58,15 +58,24 @@ FIT_MODELS = {
             "MLE": "gaussmle-rotated-gpu",
         },
     },
+    "Experimental PSF (cubic spline)": {
+        "optimizers": {
+            "Least squares": "spline-gpu",
+            "MLE": "spline-mle-gpu",
+        },
+        "needs_spline_calibration": True,
+    },
     "Average of ROI": {
         "optimizers": None,
         "code": "avg",
     },
 }
-# The rotated elliptical Gaussian is only implemented in GPUfit (codes
-# ending in "-gpu"), so offer it only when a CUDA-capable GPU is found.
+# The rotated elliptical Gaussian and the cubic-spline PSF are only
+# implemented in GPUfit (codes ending in "-gpu"), so offer them only when a
+# CUDA-capable GPU is found.
 if not GPUFIT_INSTALLED:
     del FIT_MODELS["2D rotated elliptical Gaussian"]
+    del FIT_MODELS["Experimental PSF (cubic spline)"]
 
 
 def _fit_code(model: str, optimizer: str) -> str:
@@ -1326,6 +1335,8 @@ class ParametersDialog(lib.Dialog):
 
         self.z_calibration = {}
         self.z_calibration_path = None
+        self.spline_calibration = {}
+        self.spline_calibration_path = None
 
         self.scroll_area = QtWidgets.QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -1753,6 +1764,34 @@ class ParametersDialog(lib.Dialog):
         fit_z_row.addWidget(self.fit_z_gpu_checkbox)
         z_grid.addLayout(fit_z_row, 2, 0, 1, 2)
 
+        # Experimental PSF (cubic spline). Only meaningful with GPUfit, which
+        # runs the spline fit; the calibration is loaded here and passed to
+        # the fit when the "Experimental PSF (cubic spline)" model is chosen.
+        if GPUFIT_INSTALLED:
+            spline_groupbox = QtWidgets.QGroupBox("Experimental PSF (spline)")
+            vbox.addWidget(spline_groupbox)
+            spline_grid = QtWidgets.QGridLayout(spline_groupbox)
+            load_spline_calib = QtWidgets.QPushButton("Load calibration")
+            load_spline_calib.setToolTip(
+                "Load a cubic-spline PSF calibration (.hdf5), built via\n"
+                "3D > Calibrate spline PSF. Used by the 'Experimental PSF\n"
+                "(cubic spline)' fit model."
+            )
+            load_spline_calib.setAutoDefault(False)
+            load_spline_calib.clicked.connect(self.load_spline_calib)
+            spline_grid.addWidget(load_spline_calib, 0, 1)
+            self.spline_calib_label = QtWidgets.QLabel(
+                "-- no calibration loaded --"
+            )
+            self.spline_calib_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignCenter
+            )
+            self.spline_calib_label.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Ignored,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
+            spline_grid.addWidget(self.spline_calib_label, 0, 0)
+
         if "Cameras" in CONFIG:
             camera = self.camera.currentText()
             if camera in CONFIG["Cameras"]:
@@ -2016,6 +2055,55 @@ class ParametersDialog(lib.Dialog):
         )
         if path:
             self.update_z_calib(path)
+
+    def load_spline_calib(self) -> None:
+        """Load a cubic-spline PSF calibration from a user-selected HDF5."""
+        if self.spline_calibration_path:
+            dialog_directory, _ = os.path.split(self.spline_calibration_path)
+        else:
+            dialog_directory = None
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load spline PSF calibration",
+            directory=dialog_directory,
+            filter="*.hdf5",
+        )
+        if path:
+            self.update_spline_calib(path)
+
+    def update_spline_calib(self, path: str | None) -> None:
+        """Load (or clear) a cubic-spline PSF calibration from an HDF5 file."""
+        if path:
+            if os.path.exists(path):
+                try:
+                    self.spline_calibration = io.load_spline_calibration(path)
+                except Exception as e:
+                    self.update_spline_calib(None)
+                    self.spline_calib_label.setText(
+                        "-- invalid calibration --"
+                    )
+                    self.spline_calib_label.setToolTip(str(e))
+                    return
+                self.spline_calibration_path = path
+            else:
+                self.update_spline_calib(None)
+                self.spline_calib_label.setText(
+                    "-- calibration path not found --"
+                )
+                self.spline_calib_label.setToolTip("")
+                return
+            self.spline_calib_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignRight
+            )
+            self.spline_calib_label.setText(os.path.basename(path))
+            self.spline_calib_label.setToolTip(path)
+        else:
+            self.spline_calibration = {}
+            self.spline_calibration_path = None
+            self.spline_calib_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignCenter
+            )
+            self.spline_calib_label.setText("-- no calibration loaded --")
 
     def update_z_calib_with_config_path(self):
         """Retrieve the z calibration path that corresponds to the
@@ -3963,6 +4051,22 @@ class Window(QtWidgets.QMainWindow):
             max_it = self.parameters_dialog.max_it.value()
             fit_z = self.parameters_dialog.fit_z_checkbox.isChecked()
             use_gpufit = self.parameters_dialog.gpufit_checkbox.isChecked()
+            spline_calibration = None
+            if method.startswith("spline"):
+                spline_calibration = self.parameters_dialog.spline_calibration
+                if not spline_calibration:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Spline PSF fit",
+                        "Load a spline PSF calibration first (Experimental "
+                        "PSF (spline) > Load calibration), or build one via "
+                        "3D > Calibrate spline PSF.",
+                    )
+                    self.status_bar.showMessage("")
+                    return
+                # A 3D spline fit recovers z directly, so the separate
+                # astigmatism z-fitting step must not run.
+                fit_z = False
             self.fit_worker = FitWorker(
                 self.movie,
                 self.info,
@@ -3975,6 +4079,7 @@ class Window(QtWidgets.QMainWindow):
                 fit_z,
                 calibrate_z,
                 use_gpufit,
+                spline_calibration=spline_calibration,
             )
             self.fit_worker.progressMade.connect(self.on_fit_progress)
             self.fit_worker.cutProgressMade.connect(self.on_cut_progress)
@@ -4350,6 +4455,15 @@ class Window(QtWidgets.QMainWindow):
             localize_info["Z Calibration"] = (
                 self.parameters_dialog.z_calibration
             )
+        if FIT_MODELS.get(model, {}).get("needs_spline_calibration"):
+            # Record the path and model only; the coefficient table is far
+            # too large to embed in the metadata.
+            localize_info["Spline Calibration Path"] = (
+                self.parameters_dialog.spline_calibration_path
+            )
+            localize_info["Spline Calibration Model"] = (
+                self.parameters_dialog.spline_calibration.get("model")
+            )
         self.extra_info = self.info + [localize_info | self.camera_info]
         self.select_locs_columns()  # save only selected columns
         io.save_locs(path, self.locs, self.extra_info)
@@ -4527,6 +4641,8 @@ class FitWorker(QtCore.QThread):
             "gausslq-rotated-gpu",
             "gaussmle",
             "gaussmle-rotated-gpu",
+            "spline-gpu",
+            "spline-mle-gpu",
             "avg",
         ],
         eps: float,
@@ -4534,6 +4650,7 @@ class FitWorker(QtCore.QThread):
         fit_z: bool,
         calibrate_z: bool,
         use_gpufit: bool,
+        spline_calibration: dict | None = None,
     ) -> None:
         super().__init__()
         self.movie = movie
@@ -4545,6 +4662,7 @@ class FitWorker(QtCore.QThread):
         self.max_it = max_it
         self.fit_z = fit_z
         self.calibrate_z = calibrate_z
+        self.spline_calibration = spline_calibration
         self.N = len(identifications)
         self._last_cut_emit = 0
         if use_gpufit and method in ("gausslq", "gaussmle"):
@@ -4577,6 +4695,7 @@ class FitWorker(QtCore.QThread):
             eps=self.eps,
             max_it=self.max_it,
             mle_method="sigmaxy",
+            spline_calibration=self.spline_calibration,
             multiprocess=True,
             progress_callback=self.on_progress,
             abort_callback=self.isInterruptionRequested,
