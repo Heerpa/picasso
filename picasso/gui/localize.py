@@ -1604,11 +1604,9 @@ class ParametersDialog(lib.Dialog):
         load_z_calib.setAutoDefault(False)
         load_z_calib.clicked.connect(self.load_z_calib)
         z_grid.addWidget(load_z_calib, 0, 1)
-        z_grid.addWidget(lib.HelpButton(self.CALIB_URL), 2, 0)
         self.fit_z_checkbox = QtWidgets.QCheckBox("Fit Z")
         self.fit_z_checkbox.setToolTip("Fit z coordinates?")
         self.fit_z_checkbox.setEnabled(False)
-        z_grid.addWidget(self.fit_z_checkbox, 2, 1)
         self.z_calib_label = QtWidgets.QLabel("-- no calibration loaded --")
         self.z_calib_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.z_calib_label.setSizePolicy(
@@ -1635,7 +1633,11 @@ class ParametersDialog(lib.Dialog):
         self.fit_z_checkbox.toggled.connect(self.fit_z_gpu_checkbox.setEnabled)
         if not zfit.CUDA_AVAILABLE:
             self.fit_z_gpu_checkbox.hide()
-        z_grid.addWidget(self.fit_z_gpu_checkbox, 2, 2)
+        fit_z_row = QtWidgets.QHBoxLayout()
+        fit_z_row.addWidget(lib.HelpButton(self.CALIB_URL))
+        fit_z_row.addWidget(self.fit_z_checkbox)
+        fit_z_row.addWidget(self.fit_z_gpu_checkbox)
+        z_grid.addLayout(fit_z_row, 2, 0, 1, 2)
 
         if "Cameras" in CONFIG:
             camera = self.camera.currentText()
