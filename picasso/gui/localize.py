@@ -2414,7 +2414,7 @@ class Window(QtWidgets.QMainWindow):
         if type(gradient) is int:
             self.parameters_dialog.mng_slider.setValue(gradient)
         self.parameters_dialog.fit_z_gpu_checkbox.setChecked(
-            bool(settings["Localize"]["fit_z_gpu"])
+            bool(settings["Localize"].get("fit_z_gpu", False))
         )
 
         self.pwd = pwd
