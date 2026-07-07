@@ -1421,3 +1421,286 @@ class TestGpufit:
         theta = localize.fit_spots_gpufit(spots, rotated=True)
         assert theta.shape == (len(spots), 7)
         np.testing.assert_allclose(theta[:, 0], gt.photons.values, rtol=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Cubic-spline PSF fitting (Gpufit SPLINE_2D / SPLINE_3D)
+# ---------------------------------------------------------------------------
+
+
+def _fake_spline_calibration(model="spline-3d", box=BOX):
+    """Build a small, structurally valid spline calibration dict. The
+    coefficient values are arbitrary - these tests exercise the packing,
+    parameter mapping and I/O, not a real fit."""
+    if model == "spline-2d":
+        n_intervals = [box - 1, box - 1]
+        n_data = [box, box]
+        n_coef = 16
+        coefficients = np.arange(
+            n_coef * np.prod(n_intervals), dtype=np.float32
+        ).reshape([n_coef] + n_intervals)
+    else:
+        nz = 21
+        n_intervals = [box - 1, box - 1, nz - 1]
+        n_data = [box, box, nz]
+        n_coef = 64
+        coefficients = np.arange(
+            n_coef * np.prod(n_intervals), dtype=np.float32
+        ).reshape([n_coef] + n_intervals)
+    return {
+        "model": model,
+        "coefficients": coefficients,
+        "n_data": n_data,
+        "n_intervals": n_intervals,
+        "oversampling": 1.0,
+        "z_center": 10.0,
+        "z_step_nm": 20.0,
+        "effective_sigma": 1.2,
+        "photon_scale": 1.0,
+        "box": box,
+        "pixelsize": PIXELSIZE,
+        "Path": "test_calibration",
+    }
+
+
+class TestSplineCalibrationIO:
+    """Round-trip of the spline PSF calibration through HDF5 (no GPU)."""
+
+    @pytest.mark.parametrize("model", ["spline-2d", "spline-3d"])
+    def test_save_load_roundtrip(self, tmp_path, model):
+        calib = _fake_spline_calibration(model=model)
+        path = str(tmp_path / "psf_spline_calib.hdf5")
+        io.save_spline_calibration(path, calib)
+        loaded = io.load_spline_calibration(path)
+
+        assert loaded["model"] == model
+        np.testing.assert_array_equal(
+            loaded["coefficients"], calib["coefficients"]
+        )
+        assert loaded["coefficients"].dtype == np.float32
+        assert list(loaded["n_data"]) == list(calib["n_data"])
+        assert list(loaded["n_intervals"]) == list(calib["n_intervals"])
+        assert loaded["z_step_nm"] == calib["z_step_nm"]
+        assert loaded["Path"] == "test_calibration"
+
+    def test_save_requires_coefficients(self, tmp_path):
+        with pytest.raises(ValueError):
+            io.save_spline_calibration(
+                str(tmp_path / "bad.hdf5"), {"model": "spline-3d"}
+            )
+
+    def test_load_rejects_non_spline_file(self, tmp_path):
+        path = str(tmp_path / "not_a_spline.hdf5")
+        with h5py.File(path, "w") as f:
+            f.create_dataset("locs", data=np.zeros(3))
+        with pytest.raises(ValueError):
+            io.load_spline_calibration(path)
+
+
+class TestSplineHelpers:
+    """Pure-logic tests for the spline backend (run without a GPU)."""
+
+    def test_model_id_mapping(self):
+        if not localize.GPUFIT_INSTALLED:
+            pytest.skip("ModelID enum needs the Gpufit binding")
+        assert localize._spline_model_id("spline-2d") == (
+            localize.gf.ModelID.SPLINE_2D
+        )
+        assert localize._spline_model_id("spline-3d") == (
+            localize.gf.ModelID.SPLINE_3D
+        )
+        with pytest.raises(ValueError):
+            localize._spline_model_id("nonsense")
+
+    def test_pack_user_info_3d_layout(self):
+        calib = _fake_spline_calibration(model="spline-3d")
+        user_info = localize._pack_spline_user_info(calib)
+        # dtype must be float32 (matches single-precision Gpufit build)
+        assert user_info.dtype == np.float32
+        nx, ny, _ = calib["n_data"]
+        ix, iy, iz = calib["n_intervals"]
+        # header: [n_data_x, n_data_y, n_data_z=1, n_int_x, n_int_y, n_int_z]
+        np.testing.assert_array_equal(
+            user_info[:6], np.array([nx, ny, 1, ix, iy, iz], np.float32)
+        )
+        expected_len = 6 + calib["coefficients"].size
+        assert user_info.size == expected_len
+        np.testing.assert_array_equal(
+            user_info[6:], calib["coefficients"].ravel(order="C")
+        )
+
+    def test_pack_user_info_2d_layout(self):
+        calib = _fake_spline_calibration(model="spline-2d")
+        user_info = localize._pack_spline_user_info(calib)
+        nx, ny = calib["n_data"]
+        ix, iy = calib["n_intervals"]
+        np.testing.assert_array_equal(
+            user_info[:4], np.array([nx, ny, ix, iy], np.float32)
+        )
+        assert user_info.size == 4 + calib["coefficients"].size
+
+    def test_initial_parameters_shape(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        calib_3d = _fake_spline_calibration(model="spline-3d")
+        init_3d = localize._initial_parameters_spline(spots, calib_3d)
+        assert init_3d.shape == (len(spots), 5)
+        assert init_3d.dtype == np.float32
+        # z_shift initialised to the calibration's in-focus slice
+        np.testing.assert_allclose(init_3d[:, 3], calib_3d["z_center"])
+
+        calib_2d = _fake_spline_calibration(model="spline-2d")
+        init_2d = localize._initial_parameters_spline(spots, calib_2d)
+        assert init_2d.shape == (len(spots), 4)
+
+    def test_locs_from_fits_spline_3d(self):
+        calib = _fake_spline_calibration(model="spline-3d")
+        n = 5
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(n, dtype=np.uint32),
+                "x": np.full(n, 20.0),
+                "y": np.full(n, 30.0),
+                "net_gradient": np.full(n, 1000.0),
+            }
+        )
+        # theta: [amplitude, x_shift, y_shift, z_shift, offset]
+        theta = np.zeros((n, 5), dtype=np.float32)
+        theta[:, 0] = 5000.0  # amplitude
+        theta[:, 1] = 0.5  # x_shift
+        theta[:, 2] = -0.5  # y_shift
+        theta[:, 3] = calib["z_center"] + 2.0  # z_shift (2 slices past focus)
+        theta[:, 4] = 12.0  # offset (bg)
+
+        locs = localize.locs_from_fits_spline(ids, theta, BOX, False, calib)
+
+        box_offset = int(BOX / 2)
+        np.testing.assert_allclose(locs["x"], 0.5 + 20.0 - box_offset)
+        np.testing.assert_allclose(locs["y"], -0.5 + 30.0 - box_offset)
+        np.testing.assert_allclose(locs["photons"], 5000.0)
+        np.testing.assert_allclose(locs["bg"], 12.0)
+        # z = (z_shift - z_center) * z_step_nm = 2 * 20 = 40 nm
+        np.testing.assert_allclose(locs["z"], 40.0)
+        # d_zcalib / lpz are not available for the spline model
+        assert np.all(np.isnan(locs["d_zcalib"]))
+        assert np.all(np.isnan(locs["lpz"]))
+
+    def test_locs_from_fits_spline_2d_has_no_z(self):
+        calib = _fake_spline_calibration(model="spline-2d")
+        n = 3
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(n, dtype=np.uint32),
+                "x": np.full(n, 10.0),
+                "y": np.full(n, 10.0),
+                "net_gradient": np.full(n, 500.0),
+            }
+        )
+        theta = np.zeros((n, 4), dtype=np.float32)
+        theta[:, 0] = 3000.0
+        theta[:, 3] = 8.0
+        locs = localize.locs_from_fits_spline(ids, theta, BOX, False, calib)
+        assert "z" not in locs.columns
+        np.testing.assert_allclose(locs["photons"], 3000.0)
+
+    @pytest.mark.skipif(
+        localize.GPUFIT_INSTALLED,
+        reason="ImportError only raised when Gpufit is unavailable",
+    )
+    def test_fit_spots_spline_without_gpu_raises(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        calib = _fake_spline_calibration(model="spline-3d")
+        with pytest.raises(ImportError):
+            localize.fit_spots_gpufit_spline(spots, calib)
+
+
+def _synthetic_spline_3d_calibration(box=BOX, nz=41):
+    """Build a 3D spline calibration from a synthetic astigmatic PSF,
+    mirroring the reference pyGpufit splinefit_3d example. Requires Gpuspline
+    (CPU) to compute the coefficients; returns (calibration, template,
+    amplitude, offset)."""
+    gs = localize.gs
+    x = np.arange(box, dtype=np.float32)
+    y = np.arange(box, dtype=np.float32)
+    amplitude, offset = 100.0, 10.0
+    s0 = box / 6.0
+    template = np.zeros((box, box, nz), dtype=np.float32)
+    for k in range(nz):
+        sx = s0 * (1.0 + 0.4 * (k - nz / 2) / nz)
+        sy = s0 * (1.0 - 0.4 * (k - nz / 2) / nz)
+        gx = np.exp(-0.5 * ((x - (box - 1) / 2) / sx) ** 2)
+        gy = np.exp(-0.5 * ((y - (box - 1) / 2) / sy) ** 2)
+        template[:, :, k] = np.outer(gx, gy)
+    coefficients = gs.spline_coefficients(template)
+    n_intervals = np.array(template.shape) - 1
+    coefficients = np.reshape(
+        coefficients,
+        (64, n_intervals[0], n_intervals[1], n_intervals[2]),
+    )
+    calib = {
+        "model": "spline-3d",
+        "coefficients": coefficients.astype(np.float32),
+        "n_data": [box, box, nz],
+        "n_intervals": [int(i) for i in n_intervals],
+        "oversampling": 1.0,
+        "z_center": (nz - 1) / 2,
+        "z_step_nm": 20.0,
+        "effective_sigma": s0,
+        "photon_scale": 1.0,
+        "box": box,
+        "pixelsize": PIXELSIZE,
+        "Path": "synthetic",
+    }
+    return calib, template, amplitude, offset
+
+
+@pytest.mark.skipif(
+    not localize.GPUSPLINE_INSTALLED,
+    reason="Gpuspline not available",
+)
+class TestSplineCoefficients:
+    """Coefficient computation/evaluation with Gpuspline. This is a plain CPU
+    library (no GPU/CUDA), so these run wherever the compiled splines library
+    is present - independently of Gpufit."""
+
+    def test_spline_coefficients_roundtrip(self):
+        """spline_values on the computed coefficients must reproduce the
+        source template (validates coefficient layout / flatten order)."""
+        gs = localize.gs
+        calib, template, _, _ = _synthetic_spline_3d_calibration()
+        box, _, nz = calib["n_data"]
+        x = np.arange(box, dtype=np.float32)
+        y = np.arange(box, dtype=np.float32)
+        z = np.arange(nz, dtype=np.float32)
+        # spline_values wants the flat (per-interval) coefficient array
+        coeffs_flat = calib["coefficients"].reshape(64, -1)
+        values = gs.spline_values(coeffs_flat, x, y, z)
+        np.testing.assert_allclose(values, template, atol=1e-3)
+
+
+@pytest.mark.skipif(
+    not (localize.GPUFIT_INSTALLED and localize.GPUSPLINE_INSTALLED),
+    reason="Gpufit (CUDA GPU) + Gpuspline not available",
+)
+class TestSplineGpufit:
+    """End-to-end spline fitting. The fit itself runs on Gpufit (CUDA GPU);
+    the calibration is built with Gpuspline (CPU). Skipped in the typical
+    (GPU-less) test environment."""
+
+    def test_fit_spots_spline_3d(self):
+        calib, template, amplitude, offset = _synthetic_spline_3d_calibration()
+        z_slice = int(calib["z_center"])
+        spot = (amplitude * template[:, :, z_slice] + offset).astype(
+            np.float32
+        )
+        spots = np.stack([spot] * 4)
+        theta = localize.fit_spots_gpufit_spline(spots, calib)
+        assert theta.shape == (len(spots), 5)
+        # recovered z shift should sit near the taken slice
+        np.testing.assert_allclose(theta[:, 3], z_slice, atol=2.0)
+
+    def test_fit_spots_spline_box_mismatch(self):
+        calib, _, _, _ = _synthetic_spline_3d_calibration(box=BOX)
+        wrong_box = BOX + 2
+        spots = np.zeros((2, wrong_box, wrong_box), dtype=np.float32)
+        with pytest.raises(ValueError):
+            localize.fit_spots_gpufit_spline(spots, calib)

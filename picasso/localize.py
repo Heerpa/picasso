@@ -51,6 +51,19 @@ try:
 except Exception:
     GPUFIT_INSTALLED = False
 
+try:
+    from .ext.pygpuspline import gpuspline as gs  # noqa: F401
+
+    # gpuspline is a plain CPU coefficient library (despite the name, it does
+    # not use CUDA/GPU); the import succeeds only if the compiled splines
+    # library can be loaded. It is required only to *generate* a spline PSF
+    # calibration (spline_coefficients), not to fit an existing one - fitting
+    # needs only Gpufit. Exposed as ``localize.gs`` for the calibration
+    # builder.
+    GPUSPLINE_INSTALLED = True
+except Exception:
+    GPUSPLINE_INSTALLED = False
+
 plt.style.use("ggplot")
 
 
@@ -1452,11 +1465,13 @@ def fit2D(
         "gaussmle",
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
+        "spline-gpu",
         "avg",
     ] = "gausslq",
     eps: float = 0.001,
     max_it: int = 100,
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
+    spline_calibration: dict | None = None,
     multiprocess: bool = True,
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
@@ -1483,8 +1498,8 @@ def fit2D(
         Size of the box to cut out around each spot. Should be an odd
         integer.
     fitting_method : {"gausslq", "gausslq-gpu", "gausslq-rotated-gpu", \
-            "gaussmle", "gaussmle-gpu", "gaussmle-rotated-gpu" or \
-            "avg"}, optional
+            "gaussmle", "gaussmle-gpu", "gaussmle-rotated-gpu", \
+            "spline-gpu" or "avg"}, optional
         Which 2D fitting algorithm to use. "gausslq" for least-squares
         fitting of a 2D Gaussian. "gausslq-gpu" for its GPU
         implemntation (if available). "gaussmle" for MLE 2D Gaussian
@@ -1493,8 +1508,11 @@ def fit2D(
         "gausslq-rotated-gpu" and "gaussmle-rotated-gpu" for GPU
         least-squares and MLE fitting, respectively, of a rotated
         elliptical Gaussian, whose fitted rotation angle (in degrees)
-        is saved in the column "angle". "avg" for taking the average of
-        each spot.
+        is saved in the column "angle". "spline-gpu" for GPU fitting of
+        an experimentally measured cubic-spline PSF (Gpufit's SPLINE_2D
+        / SPLINE_3D models); requires ``spline_calibration``, and a 3D
+        spline calibration yields the fitted ``z`` directly. "avg" for
+        taking the average of each spot.
     eps : float, optional
         The convergence criterion for CPU MLE fitting. Ignored for
         other methods (GPU fitting uses Gpufit's own convergence
@@ -1506,6 +1524,12 @@ def fit2D(
     mle_method : Literal["sigma", "sigmaxy"], optional
         The method used for CPU MLE fitting (impose same sigma in x and
         y or not, respectively). Default is "sigmaxy".
+    spline_calibration : dict or None, optional
+        Cubic-spline PSF calibration (see ``io.load_spline_calibration``),
+        required when ``fitting_method`` is "spline-gpu" and ignored
+        otherwise. For a 3D spline calibration the resulting localizations
+        contain the fitted ``z`` directly (no separate z-fitting step is
+        needed). Default is None.
     multiprocess: bool, optional
         Whether or not to use multiprocessing. Ignored for GPU fitting.
         Default is True.
@@ -1554,12 +1578,18 @@ def fit2D(
         "gaussmle",
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
+        "spline-gpu",
         "avg",
     ], (
         "fitting_method must be one of 'gausslq', 'gausslq-gpu',"
         " 'gausslq-rotated-gpu', 'gaussmle', 'gaussmle-gpu',"
-        " 'gaussmle-rotated-gpu', or 'avg'"
+        " 'gaussmle-rotated-gpu', 'spline-gpu', or 'avg'"
     )
+    if fitting_method == "spline-gpu":
+        assert isinstance(spline_calibration, dict), (
+            "spline_calibration (a spline PSF calibration dict, see "
+            "io.load_spline_calibration) is required for 'spline-gpu' fitting"
+        )
     assert (
         isinstance(eps, (int, float)) and eps > 0
     ), "eps must be a positive number"
@@ -1613,6 +1643,20 @@ def fit2D(
             rotated="-rotated-" in fitting_method,
             mle=fitting_method.startswith("gaussmle"),
         )
+    elif fitting_method == "spline-gpu":
+        if callable(progress_callback):
+            progress_callback(1)
+        # Default to least-squares, as in the reference pyGpufit spline
+        # examples. Exposing the LSE/MLE choice through the GUI/CLI is wired
+        # up in a later session.
+        locs = _fit2d_spline_gpu(
+            spots=spots,
+            identifications=identifications,
+            box=box,
+            em=em,
+            calibration=spline_calibration,
+            mle=False,
+        )
     elif fitting_method == "gaussmle":
         locs = _fit2d_gaussmle(
             spots=spots,
@@ -1643,6 +1687,13 @@ def fit2D(
     if fitting_method == "gaussmle":
         localize_info["Convergence criterion"] = eps
         localize_info["Max iterations"] = max_it
+    if fitting_method == "spline-gpu":
+        localize_info["Spline calibration model"] = spline_calibration.get(
+            "model"
+        )
+        localize_info["Spline calibration path"] = spline_calibration.get(
+            "Path", "N/A"
+        )
     new_info = localize_info | camera_info
     return locs, new_info
 
@@ -1926,6 +1977,287 @@ def _fit2d_gauss_gpu(
     return locs
 
 
+# ----------------------------------------------------------------------
+# Cubic-spline PSF fitting (Gpufit SPLINE_2D / SPLINE_3D models)
+#
+# The spline models fit an experimentally measured PSF (a cubic-spline model
+# built from a bead z-stack with Gpuspline) instead of a Gaussian. Unlike the
+# Gaussian models, they need the spline coefficient table passed through
+# Gpufit's ``user_info`` argument; everything else mirrors ``fit_spots_gpufit``.
+# The 3D model recovers x, y, *z*, photons and background in a single fit, so
+# no separate ``zfit`` step is needed. The coefficients live inside the
+# calibration dict (see ``io.load_spline_calibration``).
+# ----------------------------------------------------------------------
+
+
+def _spline_model_id(model: str) -> int:
+    """Map a spline calibration ``model`` string to a Gpufit ModelID."""
+    if model == "spline-2d":
+        return gf.ModelID.SPLINE_2D
+    if model == "spline-3d":
+        return gf.ModelID.SPLINE_3D
+    if model == "spline-3d-multichannel":
+        return gf.ModelID.SPLINE_3D_MULTICHANNEL
+    raise ValueError(
+        f"Unknown spline calibration model '{model}'. Expected one of "
+        "'spline-2d', 'spline-3d', 'spline-3d-multichannel'."
+    )
+
+
+def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
+    """Pack a spline calibration into Gpufit's ``user_info`` blob, matching
+    the layout of the official pyGpufit spline examples
+    (``splinefit_2d.py`` / ``splinefit_3d.py``):
+
+    - 2D: ``[n_data_x, n_data_y, n_int_x, n_int_y, coefficients...]``
+    - 3D: ``[n_data_x, n_data_y, n_data_z(=1), n_int_x, n_int_y, n_int_z,
+      coefficients...]``
+
+    The coefficient block is the calibration's ``coefficients`` array
+    (shape ``(4**d, *n_intervals)``) flattened in C order, exactly as the
+    reference examples do.
+
+    IMPORTANT: the whole blob is cast to ``float32`` to match the
+    single-precision (``REAL=float``) Gpufit build shipped with Picasso. The
+    reference examples build ``user_info`` with ``np.hstack`` of mixed ints and
+    float32 arrays, which NumPy promotes to float64 - that only works against a
+    double-precision Gpufit build. Passing float64 to a single-precision build
+    makes Gpufit misread the coefficients, so the explicit ``float32`` cast
+    here is deliberate (and the single most likely source of a silent bug).
+    """
+    model = calibration["model"]
+    coefficients = np.ascontiguousarray(
+        calibration["coefficients"], dtype=np.float32
+    )
+    n_data = list(calibration["n_data"])
+    n_intervals = list(calibration["n_intervals"])
+    if model == "spline-2d":
+        header = [n_data[0], n_data[1], n_intervals[0], n_intervals[1]]
+    else:  # 3D
+        # A single camera frame is fitted, so the number of data points in z
+        # is 1; the spline recovers the continuous z position.
+        header = [
+            n_data[0],
+            n_data[1],
+            1,
+            n_intervals[0],
+            n_intervals[1],
+            n_intervals[2],
+        ]
+    user_info = np.hstack(
+        (
+            np.asarray(header, dtype=np.float32),
+            coefficients.ravel(order="C"),
+        )
+    ).astype(np.float32)
+    return user_info
+
+
+def _initial_parameters_spline(
+    spots: lib.FloatArray3D, calibration: dict
+) -> lib.FloatArray2D:
+    """Initialize spline fit parameters per spot.
+
+    Parameter order matches the Gpufit spline models:
+    ``[amplitude, x_shift, y_shift, offset]`` (2D) or
+    ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D). Following the
+    reference examples, a spot centered in its ROI has zero lateral shift; the
+    initial z guess is the calibration's in-focus slice (``z_center``)."""
+    model = calibration["model"]
+    n_parameters = 4 if model == "spline-2d" else 5
+    spot_max = np.amax(spots, axis=(1, 2))
+    spot_min = np.amin(spots, axis=(1, 2))
+    initial = np.zeros((len(spots), n_parameters), dtype=np.float32)
+    initial[:, 0] = spot_max - spot_min  # amplitude
+    # x_shift (col 1) and y_shift (col 2) start at 0 (spline centered on ROI).
+    if model == "spline-2d":
+        initial[:, 3] = spot_min  # offset
+    else:
+        initial[:, 3] = float(calibration.get("z_center", 0.0))  # z_shift
+        initial[:, 4] = spot_min  # offset
+    return initial
+
+
+def fit_spots_gpufit_spline(
+    spots: lib.FloatArray3D,
+    calibration: dict,
+    mle: bool = False,
+    return_stats: bool = False,
+) -> (
+    lib.FloatArray2D
+    | tuple[lib.FloatArray2D, lib.FloatArray1D | None, lib.FloatArray1D]
+):
+    """Fit multiple spots with a cubic-spline PSF model on the GPU.
+
+    Mirrors ``fit_spots_gpufit`` but uses Gpufit's SPLINE_2D / SPLINE_3D model
+    with the coefficient table from ``calibration`` passed via ``user_info``.
+
+    Parameters
+    ----------
+    spots : lib.FloatArray3D
+        Spot stack of shape ``(n_spots, box, box)``.
+    calibration : dict
+        Spline PSF calibration (see ``io.load_spline_calibration``). Must
+        contain ``model``, ``coefficients``, ``n_data`` and ``n_intervals``.
+    mle : bool, optional
+        Use Gpufit's maximum likelihood (Poisson) estimator. Default False.
+    return_stats : bool, optional
+        Also return ``(log_likelihood, number_iterations)``. Default False.
+
+    Returns
+    -------
+    parameters : lib.FloatArray2D
+        Fitted parameters, columns ``[amplitude, x_shift, y_shift, offset]``
+        (2D) or ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D).
+    log_likelihood, number_iterations
+        Only if ``return_stats`` (log_likelihood is None for least squares).
+    """
+    if not GPUFIT_INSTALLED:
+        raise ImportError(
+            "GPUfit could not be found, CUDA-capable GPU is required."
+        )
+    model = calibration["model"]
+    if model == "spline-3d-multichannel":
+        raise NotImplementedError(
+            "Multichannel spline fitting requires the multi-movie spot "
+            "extraction path, which is not yet implemented."
+        )
+    box = spots.shape[1]
+    n_data = list(calibration["n_data"])
+    if box != n_data[0] or box != n_data[1]:
+        raise ValueError(
+            f"Fit box size ({box}) does not match the spline calibration's "
+            f"lateral data size ({n_data[0]}x{n_data[1]}). Re-run with a box "
+            "size equal to the calibration's, or rebuild the calibration."
+        )
+    if mle:
+        spots = np.maximum(spots, 0)
+    initial_parameters = _initial_parameters_spline(spots, calibration)
+    user_info = _pack_spline_user_info(calibration)
+    model_id = _spline_model_id(model)
+    estimator_id = gf.EstimatorID.MLE if mle else gf.EstimatorID.LSE
+
+    parameters, states, chi_squares, number_iterations, exec_time = gf.fit(
+        spots.reshape((len(spots), box * box)),
+        None,
+        model_id,
+        initial_parameters,
+        tolerance=1e-2,
+        max_number_iterations=20,
+        estimator_id=estimator_id,
+        user_info=user_info,
+    )
+
+    if return_stats:
+        # As in fit_spots_gpufit: Gpufit's MLE chi-square is twice the
+        # negative Poisson log-likelihood; for least squares it is a residual
+        # sum of squares, so there is no likelihood to report.
+        log_likelihood = -0.5 * chi_squares if mle else None
+        return parameters, log_likelihood, number_iterations
+    return parameters
+
+
+def locs_from_fits_spline(
+    identifications: pd.DataFrame,
+    theta: lib.FloatArray2D,
+    box: int,
+    em: bool,
+    calibration: dict,
+    log_likelihood: lib.FloatArray1D | None = None,
+    iterations: lib.FloatArray1D | None = None,
+) -> pd.DataFrame:
+    """Convert spline fit results into a localizations data frame.
+
+    ``theta`` columns are ``[amplitude, x_shift, y_shift, offset]`` (2D) or
+    ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D). For the 3D model
+    the ``z``/``d_zcalib``/``lpz`` columns are added.
+
+    Note: Gpufit returns no CRLB for the spline models, so ``lpx``/``lpy`` are
+    approximated from the fitted photon count and the calibration's stored
+    ``effective_sigma`` (Mortensen precision, as for the Gaussian fits), and
+    ``lpz``/``d_zcalib`` are reported as NaN (no axial CRLB is available yet).
+    """
+    model = calibration["model"]
+    is_3d = model != "spline-2d"
+    box_offset = int(box / 2)
+    oversampling = float(calibration.get("oversampling", 1.0))
+
+    amplitude = np.asarray(theta[:, 0])
+    x_shift = np.asarray(theta[:, 1])
+    y_shift = np.asarray(theta[:, 2])
+    offset = np.asarray(theta[:, -1])
+
+    # x_shift/y_shift are in spline data-point units; divide by the lateral
+    # oversampling to convert to camera pixels before applying the box offset.
+    x = x_shift / oversampling + identifications["x"] - box_offset
+    y = y_shift / oversampling + identifications["y"] - box_offset
+
+    photon_scale = float(calibration.get("photon_scale", 1.0))
+    photons = amplitude * photon_scale
+    sigma = float(calibration.get("effective_sigma", np.nan))
+    sigma_arr = np.full(len(theta), sigma, dtype=np.float32)
+    lpx = gausslq.localization_precision(
+        photons, sigma_arr, sigma_arr, offset, em=em
+    )
+
+    columns = {
+        "frame": identifications["frame"].astype(np.uint32),
+        "x": x.astype(np.float32),
+        "y": y.astype(np.float32),
+        "photons": photons.astype(np.float32),
+        "sx": sigma_arr,
+        "sy": sigma_arr,
+        "bg": offset.astype(np.float32),
+        "lpx": lpx.astype(np.float32),
+        "lpy": lpx.astype(np.float32),
+        "ellipticity": np.zeros(len(theta), dtype=np.float32),
+        "net_gradient": identifications["net_gradient"].astype(np.float32),
+    }
+    if is_3d:
+        z_shift = np.asarray(theta[:, 3])
+        z_center = float(calibration.get("z_center", 0.0))
+        z_step_nm = float(calibration.get("z_step_nm", 1.0))
+        z = (z_shift - z_center) * z_step_nm
+        columns["z"] = z.astype(np.float32)
+        # d_zcalib is an astigmatism-specific residual with no spline analogue,
+        # and no axial CRLB is available - report both as NaN.
+        columns["d_zcalib"] = np.full(len(theta), np.nan, dtype=np.float32)
+        columns["lpz"] = np.full(len(theta), np.nan, dtype=np.float32)
+    if log_likelihood is not None:
+        columns["log_likelihood"] = log_likelihood.astype(np.float32)
+    if iterations is not None:
+        columns["iterations"] = iterations.astype(np.int32)
+    locs = pd.DataFrame(columns)
+    locs.sort_values(by="frame", kind="quicksort", inplace=True)
+    return locs
+
+
+def _fit2d_spline_gpu(
+    spots: lib.FloatArray3D,
+    identifications: pd.DataFrame,
+    box: int,
+    em: bool,
+    calibration: dict,
+    mle: bool = False,
+) -> pd.DataFrame:
+    """Fit an experimentally measured cubic-spline PSF on the GPU. For a 3D
+    calibration the localizations contain the fitted ``z`` directly. See
+    ``fit2D`` for more details."""
+    theta, log_likelihood, iterations = fit_spots_gpufit_spline(
+        spots, calibration, mle=mle, return_stats=True
+    )
+    locs = locs_from_fits_spline(
+        identifications,
+        theta,
+        box,
+        em,
+        calibration,
+        log_likelihood=log_likelihood,
+        iterations=iterations,
+    )
+    return locs
+
+
 def _fit2d_gaussmle(
     spots,
     identifications: pd.DataFrame,
@@ -2069,11 +2401,13 @@ def localize(
         "gaussmle",
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
+        "spline-gpu",
         "avg",
     ] = "gausslq",
     eps: float = 0.001,
     max_it: int = 100,
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
+    spline_calibration: dict | None = None,
     threaded: bool = True,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
@@ -2182,6 +2516,7 @@ def localize(
         eps=eps,
         max_it=max_it,
         mle_method=mle_method,
+        spline_calibration=spline_calibration,
         multiprocess=threaded,
         progress_callback=fit_progress_callback,
     )
@@ -2208,10 +2543,12 @@ def localize_3D(
         "gaussmle",
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
+        "spline-gpu",
     ] = "gausslq",
     eps: float = 0.001,
     max_it: int = 100,
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
+    spline_calibration: dict | None = None,
     multiprocess: bool = True,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
@@ -2224,9 +2561,14 @@ def localize_3D(
     ) = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """Localize (i.e., identify and fit) spots in 3D in a movie using
-    the specified parameters. First runs 2D localizations, followed
-    by z position fitting assuming astigmatism, see Huang, et al.
-    Science, 2008.
+    the specified parameters.
+
+    For the Gaussian ``fitting_method`` values this first runs 2D
+    localizations, followed by z position fitting assuming astigmatism, see
+    Huang, et al. Science, 2008 (``calibration_3d`` holds the astigmatism
+    polynomials). For ``"spline-gpu"`` a cubic-spline PSF fit recovers z
+    directly in the 2D fit, so no separate z-fitting step is run and
+    ``spline_calibration`` is used instead of ``calibration_3d``.
 
     Parameters
     ----------
@@ -2312,9 +2654,6 @@ def localize_3D(
         isinstance(box, int) and box > 0 and box % 2 == 1
     ), "box must be a positive odd integer"
     assert isinstance(minimum_ng, (int, float)), "minimum_ng must be a number"
-    assert isinstance(
-        calibration_3d, (dict, str)
-    ), "calibration_3d must be a dict or a path to a YAML file"
     assert fitting_method in [
         "gausslq",
         "gausslq-gpu",
@@ -2322,11 +2661,24 @@ def localize_3D(
         "gaussmle",
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
+        "spline-gpu",
     ], (
         "fitting_method must be one of 'gausslq', 'gausslq-gpu',"
-        " 'gausslq-rotated-gpu', 'gaussmle', 'gaussmle-gpu', or"
-        " 'gaussmle-rotated-gpu'"
+        " 'gausslq-rotated-gpu', 'gaussmle', 'gaussmle-gpu',"
+        " 'gaussmle-rotated-gpu', or 'spline-gpu'"
     )
+    if fitting_method == "spline-gpu":
+        # The spline PSF fit recovers z itself; it uses a spline calibration
+        # instead of the astigmatism polynomials in calibration_3d.
+        assert isinstance(spline_calibration, dict), (
+            "spline_calibration (a spline PSF calibration dict, see "
+            "io.load_spline_calibration) is required for 'spline-gpu' 3D "
+            "localization"
+        )
+    else:
+        assert isinstance(
+            calibration_3d, (dict, str)
+        ), "calibration_3d must be a dict or a path to a YAML file"
     assert (
         isinstance(eps, (int, float)) and eps > 0
     ), "eps must be a positive number"
@@ -2351,6 +2703,7 @@ def localize_3D(
         eps=eps,
         max_it=max_it,
         mle_method=mle_method,
+        spline_calibration=spline_calibration,
         multiprocess=multiprocess,
         identification_progress_callback=identification_progress_callback,
         fit_progress_callback=fit_progress_callback,
@@ -2375,10 +2728,12 @@ def _localize_3D(
         "gaussmle",
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
+        "spline-gpu",
     ] = "gausslq",
     eps: float = 0.001,
     max_it: int = 100,
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
+    spline_calibration: dict | None = None,
     multiprocess: bool = True,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
@@ -2405,11 +2760,16 @@ def _localize_3D(
         eps=eps,
         max_it=max_it,
         mle_method=mle_method,
+        spline_calibration=spline_calibration,
         threaded=multiprocess,
         identification_progress_callback=identification_progress_callback,
         fit_progress_callback=fit_progress_callback,
         return_info=True,  # TODO: remove in v0.12.0
     )
+    if fitting_method == "spline-gpu":
+        # The 3D cubic-spline fit already produced the z column directly, so
+        # there is no separate astigmatism z-fitting step to run.
+        return locs, info
     # zfit only knows gausslq/gaussmle; map the GPU/rotated codes to the
     # corresponding CPU noise model
     fitting_method_3d = (

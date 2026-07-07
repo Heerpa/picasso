@@ -354,6 +354,82 @@ def load_calibration(path: str) -> dict:
     return calibration
 
 
+def _json_default(obj):
+    """Coerce numpy scalars/arrays into JSON-serializable Python objects."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    raise TypeError(
+        f"Object of type {type(obj).__name__} is not JSON serializable"
+    )
+
+
+def save_spline_calibration(path: str, calibration: dict) -> None:
+    """Save a cubic-spline PSF calibration to an HDF5 file.
+
+    Unlike the astigmatism calibration (a handful of polynomial coefficients
+    stored as YAML via ``zfit.calibrate_z``), a spline PSF calibration holds a
+    large coefficient table (64 coefficients per interval for a 3D tricubic
+    spline, times the number of intervals), so it is stored in HDF5. The
+    coefficient array goes into the ``coefficients`` dataset; all remaining
+    (scalar / list) metadata is stored as a JSON string in the file attribute
+    ``metadata``.
+
+    Parameters
+    ----------
+    path : str
+        Destination HDF5 path (conventionally ``*_spline_calib.hdf5``).
+    calibration : dict
+        Calibration dictionary. Must contain a numpy array under the key
+        ``"coefficients"``; every other key must be JSON-serializable (numpy
+        scalars/arrays are coerced automatically).
+    """
+    if "coefficients" not in calibration:
+        raise ValueError(
+            "Invalid spline calibration: missing 'coefficients' array."
+        )
+    coefficients = np.ascontiguousarray(
+        calibration["coefficients"], dtype=np.float32
+    )
+    metadata = {
+        key: value
+        for key, value in calibration.items()
+        if key != "coefficients"
+    }
+    with h5py.File(path, "w") as f:
+        f.create_dataset("coefficients", data=coefficients)
+        f.attrs["metadata"] = json.dumps(metadata, default=_json_default)
+
+
+def load_spline_calibration(path: str) -> dict:
+    """Load a cubic-spline PSF calibration saved by
+    ``save_spline_calibration``.
+
+    Parameters
+    ----------
+    path : str
+        Path to the spline calibration HDF5 file.
+
+    Returns
+    -------
+    calibration : dict
+        The calibration dictionary, with the coefficient table restored under
+        the ``"coefficients"`` key (float32 numpy array) and all metadata
+        keys alongside it.
+    """
+    with h5py.File(path, "r") as f:
+        if "coefficients" not in f or "metadata" not in f.attrs:
+            raise ValueError(
+                "Invalid spline calibration file: expected a 'coefficients' "
+                "dataset and a 'metadata' attribute. This does not look like "
+                "a Picasso spline PSF calibration."
+            )
+        calibration = json.loads(f.attrs["metadata"])
+        calibration["coefficients"] = f["coefficients"][:].astype(np.float32)
+    return calibration
+
+
 def _readable_movie_dims(movie: AbstractPicassoMovie) -> dict:
     """Collect the movie dimensions that can be read straight from the
     file structure (frames, height, width), independent of the embedded
