@@ -344,7 +344,7 @@ def load_calibration(path: str) -> dict:
 
     if not isinstance(calibration, dict) or (
         "X Coefficients" not in calibration
-        or not isinstance(calibration["X Coefficients"], dict)
+        or not isinstance(calibration["X Coefficients"], list)
     ):
         raise ValueError(
             "Invalid calibration file: 'X Coefficients' must be present and "
