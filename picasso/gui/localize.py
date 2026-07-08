@@ -1018,7 +1018,7 @@ class CalibrateSplineDialog(lib.Dialog):
         self.step = QtWidgets.QDoubleSpinBox()
         self.step.setRange(0.01, 1e6)
         self.step.setDecimals(2)
-        self.step.setValue(20)
+        self.step.setValue(5)
         grid.addWidget(self.step, 0, 1)
 
         # Number of frames per z (stage) position
@@ -2948,7 +2948,7 @@ class Window(QtWidgets.QMainWindow):
         self.spline_calibration_worker.failed.connect(
             self.on_spline_calibration_failed
         )
-        self.status_bar.showMessage("Building spline PSF calibration ..")
+        self.status_bar.showMessage("Building spline PSF calibration ...")
         self.spline_calibration_worker.start()
 
     def on_spline_calibration_finished(self, path: str, n_beads: int) -> None:

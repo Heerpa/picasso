@@ -84,23 +84,54 @@ def _step_of_frame(
     return step_of_frame, z_of_step, step_range
 
 
+def _dedupe_beads(
+    x: np.ndarray, y: np.ndarray, min_separation: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Collapse detections that are closer than ``min_separation`` pixels into
+    a single bead.
+
+    The same physical bead is detected on every reference frame and its
+    sub-pixel jitter rounds to slightly different integer positions, so exact
+    de-duplication would count it several times. We greedily keep detections
+    in scan order, dropping any that fall within ``min_separation`` of an
+    already-kept bead.
+    """
+    order = np.lexsort((y, x))
+    keep = np.ones(len(order), dtype=bool)
+    kept_xy: list[tuple[int, int]] = []
+    sq = min_separation * min_separation
+    for pos, i in enumerate(order):
+        xi, yi = x[i], y[i]
+        if any((xi - kx) ** 2 + (yi - ky) ** 2 < sq for kx, ky in kept_xy):
+            keep[pos] = False
+        else:
+            kept_xy.append((xi, yi))
+    kept = order[keep]
+    return x[kept], y[kept]
+
+
 def _detect_bead_positions(
     movie: lib.IntArray3D,
     minimum_ng: float,
     box: int,
     ref_frame_bounds: tuple[int, int],
     threaded: bool = True,
+    min_separation: float | None = None,
 ) -> pd.DataFrame:
     """Detect bead centers (integer pixel positions) from a set of reference
     frames (ideally the in-focus ones, where beads are brightest).
 
     Beads are static in x/y (only the stage moves in z), so we detect them
     once and reuse the positions across all z-steps. Detections are pooled
-    across the reference frames, rounded to the pixel grid and de-duplicated;
-    beads whose box would fall outside the frame are dropped.
+    across the reference frames, rounded to the pixel grid and de-duplicated
+    spatially (detections within ``min_separation`` pixels - defaulting to the
+    box size - are treated as the same bead); beads whose box would fall
+    outside the frame are dropped.
 
     Returns a data frame with integer ``x``/``y`` columns (one row per bead).
     """
+    if min_separation is None:
+        min_separation = box
     ids, _ = localize.identify(
         movie,
         minimum_ng,
@@ -127,7 +158,10 @@ def _detect_bead_positions(
     )
     x, y = x[inside], y[inside]
 
-    beads = pd.DataFrame({"x": x, "y": y}).drop_duplicates()
+    # merge detections of the same physical bead pooled across reference frames
+    x, y = _dedupe_beads(x, y, min_separation)
+
+    beads = pd.DataFrame({"x": x, "y": y})
     beads = beads.reset_index(drop=True)
     if len(beads) == 0:
         raise ValueError(
