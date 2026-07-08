@@ -1337,6 +1337,10 @@ class ParametersDialog(lib.Dialog):
         self.z_calibration_path = None
         self.spline_calibration = {}
         self.spline_calibration_path = None
+        # calibration group boxes, toggled by the selected fit model; set up
+        # further below (spline box only exists when GPUfit is available)
+        self.z_groupbox = None
+        self.spline_groupbox = None
 
         self.scroll_area = QtWidgets.QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -1714,8 +1718,10 @@ class ParametersDialog(lib.Dialog):
         # model.
         self.on_fit_model_changed()
 
-        # 3D
-        z_groupbox = QtWidgets.QGroupBox("3D via Astigmatism")
+        # 3D via astigmatism (Gaussian models); shown for non-spline fits
+        self.z_groupbox = z_groupbox = QtWidgets.QGroupBox(
+            "3D via Astigmatism"
+        )
         vbox.addWidget(z_groupbox)
 
         z_grid = QtWidgets.QGridLayout(z_groupbox)
@@ -1768,7 +1774,9 @@ class ParametersDialog(lib.Dialog):
         # runs the spline fit; the calibration is loaded here and passed to
         # the fit when the "Experimental PSF (cubic spline)" model is chosen.
         if GPUFIT_INSTALLED:
-            spline_groupbox = QtWidgets.QGroupBox("Experimental PSF (spline)")
+            self.spline_groupbox = spline_groupbox = QtWidgets.QGroupBox(
+                "Experimental PSF (spline)"
+            )
             vbox.addWidget(spline_groupbox)
             spline_grid = QtWidgets.QGridLayout(spline_groupbox)
             load_spline_calib = QtWidgets.QPushButton("Load calibration")
@@ -1791,6 +1799,9 @@ class ParametersDialog(lib.Dialog):
                 QtWidgets.QSizePolicy.Policy.Fixed,
             )
             spline_grid.addWidget(self.spline_calib_label, 0, 0)
+
+        # show the calibration box that matches the initial fit model
+        self._update_calib_group_visibility()
 
         if "Cameras" in CONFIG:
             camera = self.camera.currentText()
@@ -1994,6 +2005,21 @@ class ParametersDialog(lib.Dialog):
             self.fit_optimizer.setCurrentIndex(0)
             self.fit_optimizer.blockSignals(False)
             self.on_fit_optimizer_changed()
+        self._update_calib_group_visibility()
+
+    def _update_calib_group_visibility(self) -> None:
+        """Show only the calibration box relevant to the selected fit model:
+        the astigmatism z-calibration for Gaussian models, or the spline PSF
+        calibration for the experimental-PSF (spline) model. Guarded so the
+        initial ``on_fit_model_changed`` call (before the boxes exist) is a
+        no-op."""
+        needs_spline = FIT_MODELS[self.fit_model.currentText()].get(
+            "needs_spline_calibration", False
+        )
+        if self.z_groupbox is not None:
+            self.z_groupbox.setVisible(not needs_spline)
+        if self.spline_groupbox is not None:
+            self.spline_groupbox.setVisible(needs_spline)
 
     def on_fit_optimizer_changed(self) -> None:
         """Switch the optimizer parameter page and enable/disable the GPU
