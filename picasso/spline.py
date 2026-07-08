@@ -737,34 +737,121 @@ def calibrate_spline_multichannel(
     return calibration
 
 
-def _save_diagnostic_plot(built: dict, calibration: dict, path: str) -> None:
-    """Save a PNG summarizing the calibration (PSF slices + focus curve)."""
-    template = built["template"]
-    z_center = built["z_center"]
-    z_of_step = built["z_of_step"]
-    n_steps = template.shape[2]
+def _even_slice_indices(n_total: int, n_want: int, forced: int | None = None):
+    """Pick up to ``n_want`` evenly spaced indices over ``[0, n_total - 1]``.
 
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-    slice_idx = [
-        0,
-        max(0, z_center // 2),
-        z_center,
-        n_steps - 1,
-    ]
-    for ax, k in zip(axes[:3], slice_idx[:3]):
-        ax.imshow(template[:, :, k], cmap="hot")
-        ax.set_title(f"z = {z_of_step[k]:.0f} nm (step {k})")
+    If ``forced`` is given, the nearest picked index is snapped to it so the
+    slice is guaranteed to appear without inflating the count.
+    """
+    idx = np.rint(np.linspace(0, n_total - 1, min(n_want, n_total))).astype(
+        int
+    )
+    if forced is not None and len(idx):
+        idx[np.argmin(np.abs(idx - forced))] = forced
+    return np.unique(idx)
+
+
+def _montage(subfig, panels, title: str, n_cols: int = 5) -> None:
+    """Draw a labeled grid of image panels into a subfigure.
+
+    ``panels`` is a list of ``(image, title, imshow_kwargs, highlight, vline)``
+    tuples: ``highlight`` outlines the panel (in-focus slice), ``vline`` (or
+    ``None``) draws a focal-plane marker in data coordinates. Unused grid cells
+    are hidden.
+    """
+    n_cols = min(n_cols, len(panels))
+    n_rows = int(np.ceil(len(panels) / n_cols))
+    axes = subfig.subplots(n_rows, n_cols, squeeze=False).ravel()
+    for ax, (img, ptitle, kw, highlight, vline) in zip(axes, panels):
+        ax.imshow(img, **kw)
+        ax.set_title(ptitle, fontsize=8)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if vline is not None:
+            ax.axvline(vline, color="cyan", lw=0.8)
+        if highlight:
+            for spine in ax.spines.values():
+                spine.set(color="cyan", linewidth=2.5, visible=True)
+    for ax in axes[len(panels) :]:  # hide empty cells
         ax.axis("off")
+    subfig.suptitle(title, fontsize=11, fontweight="bold")
 
-    # focus curve: peak intensity vs z step
-    peak = template.max(axis=(0, 1))
-    axes[3].plot(z_of_step, peak, ".-")
-    axes[3].axvline(z_of_step[z_center], color="0.3", lw=1.0)
-    axes[3].set_xlabel("Stage position (nm)")
-    axes[3].set_ylabel("Normalized PSF peak")
-    axes[3].set_title(f"{built['n_beads']} beads")
-    plt.tight_layout()
+
+def _save_diagnostic_plot(
+    built: dict, calibration: dict, path: str, n_slices: int = 10
+) -> None:
+    """Save a PNG summarizing the calibration.
+
+    Three montages of ``n_slices`` slices each - xy across z, xz across y, yz
+    across x - plus the axial intensity profile. All image panels share one
+    intensity scale so brightness is comparable across slices.
+    """
+    template = built["template"]
+    z_center = int(built["z_center"])
+    z_of_step = np.asarray(built["z_of_step"])
+    box, _, n_steps = template.shape
+    c = box // 2
+    vmax = float(template.max()) or 1.0
+    img_kw = dict(cmap="hot", vmin=0.0, vmax=vmax)
+    z_lo, z_hi = float(z_of_step[-1]), float(z_of_step[0])  # z decreases
+
+    # slice indices for each projection
+    z_idx = _even_slice_indices(n_steps, n_slices, forced=z_center)
+    y_idx = _even_slice_indices(box, n_slices, forced=c)
+    x_idx = _even_slice_indices(box, n_slices, forced=c)
+
+    # cross-section images share z (nm) on the x-axis, lateral px on the y-axis
+    ext = [z_lo, z_hi, -c, box - c - 1]
+    cs_kw = dict(aspect="auto", extent=ext, **img_kw)
+
+    z_focus = z_of_step[z_center]
+    xy_panels = [
+        (
+            template[:, :, k],
+            f"z = {z_of_step[k]:.0f} nm",
+            img_kw,
+            k == z_center,
+            None,
+        )
+        for k in z_idx
+    ]
+    xz_panels = [
+        (template[y, :, :], f"y = {y - c:+d} px", cs_kw, False, z_focus)
+        for y in y_idx
+    ]
+    yz_panels = [
+        (template[:, x, :], f"x = {x - c:+d} px", cs_kw, False, z_focus)
+        for x in x_idx
+    ]
+
+    def n_rows(n):
+        return int(np.ceil(n / min(5, max(1, n))))
+
+    heights = [n_rows(len(z_idx)), n_rows(len(y_idx)), n_rows(len(x_idx)), 1.2]
+    fig = plt.figure(
+        figsize=(14, 2.6 * sum(heights) + 1.0), constrained_layout=True
+    )
+    sf_xy, sf_xz, sf_yz, sf_prof = fig.subfigures(4, 1, height_ratios=heights)
+
+    _montage(sf_xy, xy_panels, "xy slices (across z, focus outlined)")
+    _montage(sf_xz, xz_panels, "xz cross-sections (across y)")
+    _montage(sf_yz, yz_panels, "yz cross-sections (across x)")
+
+    # axial intensity profile: brightest normalized pixel per slice, ~1 at
+    # focus and decaying as the PSF spreads with defocus (a sharpness check)
+    ax = sf_prof.subplots(1, 1)
+    ax.plot(z_of_step, template.max(axis=(0, 1)), ".-")
+    ax.axvline(z_of_step[z_center], color="0.3", lw=1.0)
+    ax.set_xlabel("Stage position (nm)")
+    ax.set_ylabel("Peak pixel value (norm.)")
+    sf_prof.suptitle("Axial intensity profile", fontsize=11)
+
+    fig.suptitle(
+        f"{built['n_beads']} beads | z range {z_lo:.0f} to {z_hi:.0f} nm | "
+        f"box {box} px",
+        fontsize=12,
+    )
 
     base, _ = os.path.splitext(path)
-    plt.savefig(base + ".png", format="png", dpi=200)
+    fig.savefig(base + ".png", format="png", dpi=200)
     plt.close(fig)
