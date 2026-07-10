@@ -2219,8 +2219,10 @@ def locs_from_fits_spline(
 
     Note: Gpufit returns no CRLB for the spline models, so ``lpx``/``lpy`` are
     approximated from the fitted photon count and the calibration's stored
-    ``effective_sigma`` (Mortensen precision, as for the Gaussian fits), and
-    ``lpz``/``d_zcalib`` are reported as NaN (no axial CRLB is available yet).
+    ``effective_sigma`` (Mortensen precision, as for the Gaussian fits). No
+    axial CRLB is available yet, so ``lpz`` is approximated with the lateral
+    precision and ``d_zcalib`` is reported as 0 (both must stay finite:
+    ``lib.ensure_sanity`` drops any row with a NaN on save).
     """
     model = calibration["model"]
     is_3d = model != "spline-2d"
@@ -2232,10 +2234,14 @@ def locs_from_fits_spline(
     y_shift = np.asarray(theta[:, 2])
     offset = np.asarray(theta[:, -1])
 
-    # x_shift/y_shift are in spline data-point units; divide by the lateral
-    # oversampling to convert to camera pixels before applying the box offset.
-    x = x_shift / oversampling + identifications["x"] - box_offset
-    y = y_shift / oversampling + identifications["y"] - box_offset
+    # x_shift/y_shift are offsets (in spline data-point units) from the spline
+    # template center, which is itself the ROI center. Convert to camera pixels
+    # (divide by the lateral oversampling) and add the ROI-center offset before
+    # mapping the ROI back to the movie frame. Without the center term a
+    # well-centered emitter (x_shift ~ 0) lands at the ROI's top-left corner.
+    center = (box - 1) / 2.0
+    x = x_shift / oversampling + center + identifications["x"] - box_offset
+    y = y_shift / oversampling + center + identifications["y"] - box_offset
 
     photon_scale = float(calibration.get("photon_scale", 1.0))
     photons = amplitude * photon_scale
@@ -2264,10 +2270,14 @@ def locs_from_fits_spline(
         z_step_nm = float(calibration.get("z_step_nm", 1.0))
         z = (z_shift - z_center) * z_step_nm
         columns["z"] = z.astype(np.float32)
-        # d_zcalib is an astigmatism-specific residual with no spline analogue,
-        # and no axial CRLB is available - report both as NaN.
-        columns["d_zcalib"] = np.full(len(theta), np.nan, dtype=np.float32)
-        columns["lpz"] = np.full(len(theta), np.nan, dtype=np.float32)
+        # d_zcalib is an astigmatism-specific calibration residual with no
+        # spline analogue, so report 0. No axial CRLB is available from the
+        # Gpufit spline fit, so approximate lpz with the lateral precision as a
+        # placeholder. Both must stay finite: lib.ensure_sanity (called on save)
+        # runs dropna(how="any"), so a single NaN column would silently discard
+        # every spline localization, saving an empty file.
+        columns["d_zcalib"] = np.zeros(len(theta), dtype=np.float32)
+        columns["lpz"] = lpx.astype(np.float32)
     if log_likelihood is not None:
         columns["log_likelihood"] = log_likelihood.astype(np.float32)
     if iterations is not None:
