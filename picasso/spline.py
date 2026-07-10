@@ -444,8 +444,15 @@ def calibrate_spline(
         progress_callback(1)
 
     gs = localize.gs
+    # The template is (row=y, col=x, z), but at fit time spots are flattened
+    # C-order so the Gpufit spline model's fast pixel index (point_index_x) is
+    # the movie column (x). The spline's first axis must therefore be x, so we
+    # swap the lateral axes before computing coefficients. Skipping this
+    # transposes the PSF laterally, which corrupts an astigmatic PSF's z
+    # encoding (z barely recovers) and mis-fits amplitude/position. It is a
+    # no-op for a laterally symmetric PSF.
     if model == "spline-2d":
-        slab = np.ascontiguousarray(template[:, :, z_center])
+        slab = np.ascontiguousarray(template[:, :, z_center].T)
         coefficients = gs.spline_coefficients(slab)
         n_intervals = [int(i) for i in (np.array(slab.shape) - 1)]
         coefficients = np.reshape(coefficients, [16] + n_intervals).astype(
@@ -453,12 +460,13 @@ def calibrate_spline(
         )
         n_data = [box, box]
     else:
-        coefficients = gs.spline_coefficients(template)
-        n_intervals = [int(i) for i in (np.array(template.shape) - 1)]
+        template_xyz = np.ascontiguousarray(template.transpose(1, 0, 2))
+        coefficients = gs.spline_coefficients(template_xyz)
+        n_intervals = [int(i) for i in (np.array(template_xyz.shape) - 1)]
         coefficients = np.reshape(coefficients, [64] + n_intervals).astype(
             np.float32
         )
-        n_data = [int(s) for s in template.shape]
+        n_data = [int(s) for s in template_xyz.shape]
 
     if callable(progress_callback):
         progress_callback(2)
@@ -693,8 +701,13 @@ def calibrate_spline_multichannel(
     if callable(progress_callback):
         progress_callback(2)
 
-    # assemble coefficients (64, n_int_x, n_int_y, n_int_z, n_channels)
-    templates = [p["template"] for p in per_channel]
+    # assemble coefficients (64, n_int_x, n_int_y, n_int_z, n_channels).
+    # Swap the lateral axes (row=y, col=x) -> (x, y) so the spline's first axis
+    # is x, matching the model's fast pixel index (see calibrate_spline).
+    templates = [
+        np.ascontiguousarray(p["template"].transpose(1, 0, 2))
+        for p in per_channel
+    ]
     n_intervals = [int(i) for i in (np.array(templates[0].shape) - 1)]
     coefficients = np.zeros(
         [64] + n_intervals + [n_channels], dtype=np.float32
