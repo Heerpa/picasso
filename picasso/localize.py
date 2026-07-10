@@ -2080,31 +2080,33 @@ def _initial_parameters_spline(
     Parameter order matches the Gpufit spline models:
     ``[amplitude, x_shift, y_shift, offset]`` (2D) or
     ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D and 3D
-    multichannel). x_shift/y_shift/z_shift are *absolute* emitter positions
-    within the spline grid, so they are initialized at the grid center: the
-    lateral centers ``(n_data - 1) / 2`` and, in z, the calibration's in-focus
-    slice ``z_center``. Initializing the lateral shifts at 0 (the ROI corner)
-    instead starts the fit on the flat tail of the PSF, where the gradient is
-    ~0, so the fit collapses (amplitude -> 0, position and z stuck). For the
-    multichannel model ``spots`` is channel-stacked ``(n, box, box,
-    n_channels)``; amplitude/offset are then estimated across all channels."""
+    multichannel). The Gpufit spline model evaluates the spline at
+    ``position = pixel_index - parameter`` (see ``spline_3d.cuh``), so:
+
+    - x_shift/y_shift are the emitter's lateral offset from the (centered)
+      template, i.e. 0 for a spot centered in its ROI.
+    - z_shift is initialized to ``-z_center``. A single camera plane is fitted,
+      so ``point_index_z == 0`` and the model samples the spline z axis at
+      ``-z_shift``; ``-z_center`` therefore starts the fit at the in-focus
+      slice. A positive ``+z_center`` would sample the spline at a negative
+      (out-of-range) z, collapsing the fit (amplitude -> 0, z pinned).
+
+    For the multichannel model ``spots`` is channel-stacked
+    ``(n, box, box, n_channels)``; amplitude/offset are estimated across all
+    channels."""
     model = calibration["model"]
     n_parameters = 4 if model == "spline-2d" else 5
-    n_data = list(calibration["n_data"])
-    center_x = (n_data[0] - 1) / 2.0
-    center_y = (n_data[1] - 1) / 2.0
     # spots is (n, box, box) or, for multichannel, (n, box, box, n_channels)
     reduce_axes = tuple(range(1, spots.ndim))
     spot_max = np.amax(spots, axis=reduce_axes)
     spot_min = np.amin(spots, axis=reduce_axes)
     initial = np.zeros((len(spots), n_parameters), dtype=np.float32)
     initial[:, 0] = spot_max - spot_min  # amplitude
-    initial[:, 1] = center_x  # x center (absolute spline coordinate)
-    initial[:, 2] = center_y  # y center (absolute spline coordinate)
+    # x_shift (col 1) and y_shift (col 2) start at 0 (spot centered in the ROI).
     if model == "spline-2d":
         initial[:, 3] = spot_min  # offset
     else:
-        initial[:, 3] = float(calibration.get("z_center", 0.0))  # z center
+        initial[:, 3] = -float(calibration.get("z_center", 0.0))  # z_shift
         initial[:, 4] = spot_min  # offset
     return initial
 
@@ -2222,7 +2224,7 @@ def locs_from_fits_spline(
 
     ``theta`` columns are ``[amplitude, x_shift, y_shift, offset]`` (2D) or
     ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D). For the 3D model
-    the ``z``/``d_zcalib``/``lpz`` columns are added.
+    the ``z`` and ``lpz`` columns are added.
 
     Note: Gpufit returns no CRLB for the spline models, so ``lpx``/``lpy`` are
     approximated from the fitted photon count and the calibration's stored
@@ -2241,13 +2243,15 @@ def locs_from_fits_spline(
     y_shift = np.asarray(theta[:, 2])
     offset = np.asarray(theta[:, -1])
 
-    # x_shift/y_shift are absolute emitter positions within the ROI (in spline
-    # data-point units, 0..n_data-1, centered on the ROI); divide by the lateral
-    # oversampling to convert to camera pixels, then map the ROI back into the
-    # movie frame. (They are initialized at the ROI center in
-    # _initial_parameters_spline, mirroring the absolute z_shift handling.)
-    x = x_shift / oversampling + identifications["x"] - box_offset
-    y = y_shift / oversampling + identifications["y"] - box_offset
+    # The Gpufit spline model samples the spline at (pixel_index - parameter)
+    # and the template PSF is centered on node (n_data - 1) / 2, so x_shift /
+    # y_shift are the emitter's offset from the ROI center: the emitter pixel is
+    # (center + shift). Convert the shift to camera pixels (lateral oversampling)
+    # and map the ROI back into the movie frame. Omitting the center term places
+    # every spot at the ROI's top-left corner.
+    center = (box - 1) / 2.0
+    x = x_shift / oversampling + center + identifications["x"] - box_offset
+    y = y_shift / oversampling + center + identifications["y"] - box_offset
 
     photon_scale = float(calibration.get("photon_scale", 1.0))
     photons = amplitude * photon_scale
@@ -2274,7 +2278,12 @@ def locs_from_fits_spline(
         z_shift = np.asarray(theta[:, 3])
         z_center = float(calibration.get("z_center", 0.0))
         z_step_nm = float(calibration.get("z_step_nm", 1.0))
-        z = (z_shift - z_center) * z_step_nm
+        # The model samples the spline z axis at -z_shift (point_index_z == 0),
+        # so the fitted spline z node is -z_shift and the physical z relative to
+        # the in-focus slice is (z_center - node) * step = (z_shift + z_center) *
+        # step, matching the calibration's z_of_step (z decreasing with node).
+        # Negate if the recovered z is inverted for your optical geometry.
+        z = (z_shift + z_center) * z_step_nm
         columns["z"] = z.astype(np.float32)
         columns["lpz"] = lpx.astype(np.float32)
     if log_likelihood is not None:
