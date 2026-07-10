@@ -2080,24 +2080,31 @@ def _initial_parameters_spline(
     Parameter order matches the Gpufit spline models:
     ``[amplitude, x_shift, y_shift, offset]`` (2D) or
     ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D and 3D
-    multichannel). Following the reference examples, a spot centered in its
-    ROI has zero lateral shift; the initial z guess is the calibration's
-    in-focus slice (``z_center``). For the multichannel model ``spots`` is
-    channel-stacked ``(n, box, box, n_channels)``; amplitude/offset are then
-    estimated across all channels."""
+    multichannel). x_shift/y_shift/z_shift are *absolute* emitter positions
+    within the spline grid, so they are initialized at the grid center: the
+    lateral centers ``(n_data - 1) / 2`` and, in z, the calibration's in-focus
+    slice ``z_center``. Initializing the lateral shifts at 0 (the ROI corner)
+    instead starts the fit on the flat tail of the PSF, where the gradient is
+    ~0, so the fit collapses (amplitude -> 0, position and z stuck). For the
+    multichannel model ``spots`` is channel-stacked ``(n, box, box,
+    n_channels)``; amplitude/offset are then estimated across all channels."""
     model = calibration["model"]
     n_parameters = 4 if model == "spline-2d" else 5
+    n_data = list(calibration["n_data"])
+    center_x = (n_data[0] - 1) / 2.0
+    center_y = (n_data[1] - 1) / 2.0
     # spots is (n, box, box) or, for multichannel, (n, box, box, n_channels)
     reduce_axes = tuple(range(1, spots.ndim))
     spot_max = np.amax(spots, axis=reduce_axes)
     spot_min = np.amin(spots, axis=reduce_axes)
     initial = np.zeros((len(spots), n_parameters), dtype=np.float32)
     initial[:, 0] = spot_max - spot_min  # amplitude
-    # x_shift (col 1) and y_shift (col 2) start at 0 (spline centered on ROI).
+    initial[:, 1] = center_x  # x center (absolute spline coordinate)
+    initial[:, 2] = center_y  # y center (absolute spline coordinate)
     if model == "spline-2d":
         initial[:, 3] = spot_min  # offset
     else:
-        initial[:, 3] = float(calibration.get("z_center", 0.0))  # z_shift
+        initial[:, 3] = float(calibration.get("z_center", 0.0))  # z center
         initial[:, 4] = spot_min  # offset
     return initial
 
@@ -2234,14 +2241,13 @@ def locs_from_fits_spline(
     y_shift = np.asarray(theta[:, 2])
     offset = np.asarray(theta[:, -1])
 
-    # x_shift/y_shift are offsets (in spline data-point units) from the spline
-    # template center, which is itself the ROI center. Convert to camera pixels
-    # (divide by the lateral oversampling) and add the ROI-center offset before
-    # mapping the ROI back to the movie frame. Without the center term a
-    # well-centered emitter (x_shift ~ 0) lands at the ROI's top-left corner.
-    center = (box - 1) / 2.0
-    x = x_shift / oversampling + center + identifications["x"] - box_offset
-    y = y_shift / oversampling + center + identifications["y"] - box_offset
+    # x_shift/y_shift are absolute emitter positions within the ROI (in spline
+    # data-point units, 0..n_data-1, centered on the ROI); divide by the lateral
+    # oversampling to convert to camera pixels, then map the ROI back into the
+    # movie frame. (They are initialized at the ROI center in
+    # _initial_parameters_spline, mirroring the absolute z_shift handling.)
+    x = x_shift / oversampling + identifications["x"] - box_offset
+    y = y_shift / oversampling + identifications["y"] - box_offset
 
     photon_scale = float(calibration.get("photon_scale", 1.0))
     photons = amplitude * photon_scale
@@ -2270,13 +2276,6 @@ def locs_from_fits_spline(
         z_step_nm = float(calibration.get("z_step_nm", 1.0))
         z = (z_shift - z_center) * z_step_nm
         columns["z"] = z.astype(np.float32)
-        # d_zcalib is an astigmatism-specific calibration residual with no
-        # spline analogue, so report 0. No axial CRLB is available from the
-        # Gpufit spline fit, so approximate lpz with the lateral precision as a
-        # placeholder. Both must stay finite: lib.ensure_sanity (called on save)
-        # runs dropna(how="any"), so a single NaN column would silently discard
-        # every spline localization, saving an empty file.
-        columns["d_zcalib"] = np.zeros(len(theta), dtype=np.float32)
         columns["lpz"] = lpx.astype(np.float32)
     if log_likelihood is not None:
         columns["log_likelihood"] = log_likelihood.astype(np.float32)
