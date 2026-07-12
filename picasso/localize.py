@@ -2006,11 +2006,71 @@ def _spline_model_id(model: str) -> int:
     )
 
 
+def _reorder_spline_coefficients_for_gpufit(
+    coefficients: np.ndarray, model: str
+) -> np.ndarray:
+    """Reorder a spline coefficient table into the axis order Gpufit indexes.
+
+    Gpuspline's ``spline_coefficients`` Python binding calls the C library with
+    its spatial axes **reversed** (it passes ``data.shape`` as
+    ``(size[-1], ..., size[0])``). The flat coefficient buffer it returns is
+    therefore interval-major but in reversed spatial-axis order, while NumPy
+    merely *labels* the array ``(4**d, *n_intervals)`` - the label does not
+    match the physical memory order. Gpufit's ``spline_2d.cuh`` /
+    ``spline_3d.cuh`` read coefficients in **forward** order
+    (``coeff[(i*niy*niz + j*niz + k)*64 + oi*16+oj*4+ok]``, with ``i`` the fast
+    pixel index = column = x). At the C level Gpuspline's own
+    ``Spline{2,3}D::calculate_value`` uses the identical formula, so the *only*
+    discrepancy is the binding's reversal.
+
+    Passing the buffer through unchanged (as the reference pyGpufit examples
+    and older Picasso did) makes Gpufit read every interval's coefficients from
+    the wrong location: the fit then diverges even when seeded at the true
+    minimum, while a CPU least-squares fit over the *same* coefficients (via
+    ``gpuspline.spline_values``) recovers it. This undoes the reversal by
+    transposing both the interval axes and the per-interval power axes back to
+    forward ``(x, y[, z])`` order. Returns a flat ``float32`` array ready to
+    drop into ``user_info``.
+    """
+    coeff = np.ascontiguousarray(coefficients, dtype=np.float32)
+    if model == "spline-2d":
+        # label (16, nix, niy); the raw buffer reshapes to (niy, nix, 4, 4)
+        # = (y_interval, x_interval, y_power, x_power). Swap to forward (x, y).
+        _, nix, niy = coeff.shape
+        phys = coeff.ravel(order="C").reshape(niy, nix, 4, 4)
+        return np.ascontiguousarray(phys.transpose(1, 0, 3, 2)).ravel(
+            order="C"
+        )
+    if model == "spline-3d":
+        # label (64, nix, niy, niz); the raw buffer reshapes to
+        # (niz, niy, nix, 4, 4, 4) = (z, y, x, z_power, y_power, x_power).
+        # Swap to forward (x, y, z).
+        _, nix, niy, niz = coeff.shape
+        phys = coeff.ravel(order="C").reshape(niz, niy, nix, 4, 4, 4)
+        return np.ascontiguousarray(phys.transpose(2, 1, 0, 5, 4, 3)).ravel(
+            order="C"
+        )
+    if model == "spline-3d-multichannel":
+        # label (64, nix, niy, niz, n_channels); Gpufit expects the channel as
+        # the OUTERMOST axis, each channel a plain forward 3D table. Reorder
+        # each channel's block like the single-channel 3D case, concatenated
+        # channel-major.
+        _, nix, niy, niz, n_channels = coeff.shape
+        blocks = []
+        for c in range(n_channels):
+            sub = np.ascontiguousarray(coeff[..., c])
+            phys = sub.ravel(order="C").reshape(niz, niy, nix, 4, 4, 4)
+            blocks.append(
+                np.ascontiguousarray(phys.transpose(2, 1, 0, 5, 4, 3)).ravel(
+                    order="C"
+                )
+            )
+        return np.concatenate(blocks).astype(np.float32)
+    raise ValueError(f"Unknown spline model '{model}'.")
+
+
 def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
-    """Pack a spline calibration into Gpufit's ``user_info`` blob, matching
-    the layout of the official pyGpufit spline examples
-    (``splinefit_2d.py`` / ``splinefit_3d.py`` /
-    ``splinefit_3d_multi_channel.py``):
+    """Pack a spline calibration into Gpufit's ``user_info`` blob:
 
     - 2D: ``[n_data_x, n_data_y, n_int_x, n_int_y, coefficients...]``
     - 3D: ``[n_data_x, n_data_y, n_data_z(=1), n_int_x, n_int_y, n_int_z,
@@ -2018,10 +2078,12 @@ def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
     - 3D multichannel: ``[n_channels, n_data_x, n_data_y, n_data_z(=1),
       n_int_x, n_int_y, n_int_z, coefficients...]``
 
-    The coefficient block is the calibration's ``coefficients`` array
-    (shape ``(4**d, *n_intervals)``, or ``(64, *n_intervals, n_channels)``
-    for the multichannel model) flattened in C order, exactly as the
-    reference examples do.
+    The coefficient block is the calibration's ``coefficients`` array reordered
+    by :func:`_reorder_spline_coefficients_for_gpufit` from Gpuspline's
+    (binding-reversed) layout into the forward axis order Gpufit's spline
+    models index. This reorder is essential: without it Gpufit reads scrambled
+    coefficients and the fit diverges (see that function's docstring). It is
+    what the reference pyGpufit examples get wrong.
 
     IMPORTANT: the whole blob is cast to ``float32`` to match the
     single-precision (``REAL=float``) Gpufit build shipped with Picasso. The
@@ -2029,7 +2091,7 @@ def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
     float32 arrays, which NumPy promotes to float64 - that only works against a
     double-precision Gpufit build. Passing float64 to a single-precision build
     makes Gpufit misread the coefficients, so the explicit ``float32`` cast
-    here is deliberate (and the single most likely source of a silent bug).
+    here is deliberate.
     """
     model = calibration["model"]
     coefficients = np.ascontiguousarray(
@@ -2063,10 +2125,13 @@ def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
             n_intervals[1],
             n_intervals[2],
         ]
+    coefficient_block = _reorder_spline_coefficients_for_gpufit(
+        coefficients, model
+    )
     user_info = np.hstack(
         (
             np.asarray(header, dtype=np.float32),
-            coefficients.ravel(order="C"),
+            coefficient_block,
         )
     ).astype(np.float32)
     return user_info
@@ -2191,8 +2256,20 @@ def fit_spots_gpufit_spline(
     model_id = _spline_model_id(model)
     estimator_id = gf.EstimatorID.MLE if mle else gf.EstimatorID.LSE
 
+    if is_multichannel:
+        # Gpufit's multichannel model is channel-MAJOR: each channel occupies a
+        # contiguous box*box block (channel_id = point_index // (box*box), see
+        # spline_3d_multichannel.cuh). Picasso's spots are (n, box, box,
+        # n_channels) = channel-minor, so move the channel axis in front of the
+        # pixels before flattening.
+        fit_data = np.ascontiguousarray(spots.transpose(0, 3, 1, 2)).reshape(
+            (len(spots), n_points)
+        )
+    else:
+        fit_data = spots.reshape((len(spots), n_points))
+
     parameters, states, chi_squares, number_iterations, exec_time = gf.fit(
-        spots.reshape((len(spots), n_points)),
+        fit_data,
         None,
         model_id,
         initial_parameters,
