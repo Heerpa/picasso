@@ -1579,21 +1579,27 @@ class TestSplineHelpers:
         theta[:, 0] = 5000.0  # amplitude
         theta[:, 1] = 0.5  # x_shift
         theta[:, 2] = -0.5  # y_shift
-        theta[:, 3] = calib["z_center"] + 2.0  # z_shift (2 slices past focus)
+        # z_shift is initialized to -z_center (focus); 2 slices past focus
+        theta[:, 3] = -calib["z_center"] + 2.0
         theta[:, 4] = 12.0  # offset (bg)
 
         locs = localize.locs_from_fits_spline(ids, theta, BOX, False, calib)
 
         box_offset = int(BOX / 2)
-        np.testing.assert_allclose(locs["x"], 0.5 + 20.0 - box_offset)
-        np.testing.assert_allclose(locs["y"], -0.5 + 30.0 - box_offset)
+        center = (BOX - 1) / 2.0
+        np.testing.assert_allclose(locs["x"], 0.5 + center + 20.0 - box_offset)
+        np.testing.assert_allclose(
+            locs["y"], -0.5 + center + 30.0 - box_offset
+        )
         np.testing.assert_allclose(locs["photons"], 5000.0)
         np.testing.assert_allclose(locs["bg"], 12.0)
-        # z = (z_shift - z_center) * z_step_nm = 2 * 20 = 40 nm
-        np.testing.assert_allclose(locs["z"], 40.0)
-        # d_zcalib / lpz are not available for the spline model
-        assert np.all(np.isnan(locs["d_zcalib"]))
-        assert np.all(np.isnan(locs["lpz"]))
+        # z is inverted (as in the astigmatism fit) and scaled by the
+        # magnification factor (default 1.0 when absent):
+        # z = -(z_shift + z_center) * z_step_nm = -(2) * 20 = -40 nm
+        np.testing.assert_allclose(locs["z"], -40.0)
+        # lpz mirrors the (finite) lateral precision for the spline model
+        np.testing.assert_allclose(locs["lpz"], locs["lpx"])
+        assert np.all(np.isfinite(locs["lpz"]))
 
     def test_locs_from_fits_spline_2d_has_no_z(self):
         calib = _fake_spline_calibration(model="spline-2d")

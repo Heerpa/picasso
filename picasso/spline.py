@@ -293,6 +293,27 @@ def _normalize_template(
     return template, background, amplitude, photon_scale
 
 
+def _axial_intensity_focus(template: np.ndarray) -> float:
+    """Sub-slice z index where the PSF's axial intensity profile peaks.
+
+    The profile is the brightest (normalized) pixel per z-slice - the same
+    curve drawn in the diagnostic plot's "Axial intensity profile" panel. A
+    parabolic interpolation around the discrete maximum gives sub-slice
+    precision. Used (optionally) to define z = 0 at this intensity focus,
+    correcting a potential z bias in the raw stage scan. This only makes sense
+    when the PSF has a single, well-defined axial intensity peak (e.g.
+    astigmatism)."""
+    profile = template.max(axis=(0, 1)).astype(np.float64)
+    k = int(np.argmax(profile))
+    if 0 < k < len(profile) - 1:
+        y0, y1, y2 = profile[k - 1], profile[k], profile[k + 1]
+        denom = y0 - 2.0 * y1 + y2
+        if denom != 0.0:
+            # vertex of the parabola through the three points around the peak
+            return k + 0.5 * (y0 - y2) / denom
+    return float(k)
+
+
 def _reference_frame_bounds(
     step_of_frame: np.ndarray, step_range: np.ndarray
 ) -> tuple[int, int]:
@@ -350,9 +371,14 @@ def build_psf_template(
     template, background, amplitude, photon_scale = _normalize_template(
         mean_volume, z_center
     )
+    # fractional z-slice of the axial intensity peak; used (optionally) to
+    # define z = 0 at the intensity focus (see ``calibrate_spline``'s
+    # ``correct_z_bias``)
+    z_focus = _axial_intensity_focus(template)
     return {
         "template": template,
         "z_center": z_center,
+        "z_focus": z_focus,
         "effective_sigma": effective_sigma,
         "background": background,
         "amplitude": amplitude,
@@ -373,6 +399,8 @@ def calibrate_spline(
     frame_bounds: tuple[int, int] | list | None = None,
     frame_order: Literal["fov", "z"] = "fov",
     model: Literal["spline-2d", "spline-3d"] = "spline-3d",
+    magnification_factor: float = 0.79,
+    correct_z_bias: bool = False,
     path: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
 ) -> dict:
@@ -403,6 +431,19 @@ def calibrate_spline(
     model : {"spline-2d", "spline-3d"}, optional
         Whether to build a 3D spline PSF (recovers z) or a single-plane 2D
         spline PSF (the in-focus slice only). Default "spline-3d".
+    magnification_factor : float, optional
+        Ratio between the actual axial position and the stage travel of the
+        calibration scan (refractive-index mismatch), applied to the fitted
+        z at localization time (as in ``picasso.zfit``). Stored in the
+        calibration. Default 0.79.
+    correct_z_bias : bool, optional
+        If True, define z = 0 at the axial intensity peak of the averaged PSF
+        (the peak of the diagnostic plot's axial intensity profile) instead of
+        the sharpest (smallest-sigma) slice, correcting a potential z bias in
+        the raw stage scan. Analogous to the astigmatism calibration pinning
+        z = 0 to the sx == sy crossing (see ``picasso.zfit.calibrate_z``); only
+        meaningful for a PSF with a single, well-defined intensity focus (e.g.
+        astigmatism). Default False.
     path : str, optional
         Where to save the calibration (HDF5) and a diagnostic PNG. If None,
         nothing is written. Default None.
@@ -439,6 +480,9 @@ def calibrate_spline(
     )
     template = built["template"]  # (box, box, n_steps)
     z_center = built["z_center"]
+    # z origin used at fit time: the sharpest slice by default, or the axial
+    # intensity peak when correcting for a stage-scan z bias (astigmatism)
+    z_origin = built["z_focus"] if correct_z_bias else float(z_center)
 
     if callable(progress_callback):
         progress_callback(1)
@@ -480,8 +524,10 @@ def calibrate_spline(
         # lateral template sampling equals the camera pixel grid, so shifts
         # are already in camera pixels
         "oversampling": 1.0,
-        "z_center": float(z_center),
+        "z_center": float(z_origin),
         "z_step_nm": float(d),
+        "magnification_factor": float(magnification_factor),
+        "correct_z_bias": bool(correct_z_bias),
         "effective_sigma": float(built["effective_sigma"]),
         "photon_scale": float(built["photon_scale"]),
         "box": int(box),
@@ -602,6 +648,8 @@ def calibrate_spline_multichannel(
     frames_per_step: int = 1,
     frame_bounds: tuple[int, int] | list | None = None,
     frame_order: Literal["fov", "z"] = "fov",
+    magnification_factor: float = 0.79,
+    correct_z_bias: bool = False,
     max_match_distance: float | None = None,
     path: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
@@ -717,6 +765,7 @@ def calibrate_spline_multichannel(
         coefficients[..., c] = np.reshape(coeff_c, [64] + n_intervals)
 
     ref = per_channel[0]
+    z_origin = ref["z_focus"] if correct_z_bias else float(ref["z_center"])
     pixelsize = camera_infos[0].get("Pixelsize", 130)
     calibration = {
         "model": "spline-3d-multichannel",
@@ -726,8 +775,10 @@ def calibrate_spline_multichannel(
         "n_channels": n_channels,
         "channel_transforms": [t.tolist() for t in transforms],
         "oversampling": 1.0,
-        "z_center": float(ref["z_center"]),
+        "z_center": float(z_origin),
         "z_step_nm": float(d),
+        "magnification_factor": float(magnification_factor),
+        "correct_z_bias": bool(correct_z_bias),
         "effective_sigma": float(ref["effective_sigma"]),
         "photon_scale": float(ref["photon_scale"]),
         "box": int(box),

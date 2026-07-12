@@ -1382,6 +1382,8 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
             frames_per_step=args.frames_per_step,
             frame_order=args.frame_order,
             model=args.model,
+            magnification_factor=args.magnification_factor,
+            correct_z_bias=args.correct_z_bias,
             path=out_path,
             progress_callback=lambda i: print(f"  step {i}/3"),
         )
@@ -1402,6 +1404,8 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
             d=args.step,
             frames_per_step=args.frames_per_step,
             frame_order=args.frame_order,
+            magnification_factor=args.magnification_factor,
+            correct_z_bias=args.correct_z_bias,
             path=out_path,
             progress_callback=lambda i: print(f"  step {i}/3"),
         )
@@ -2768,6 +2772,25 @@ def main():  # noqa: C901
         choices=["spline-3d", "spline-2d"],
         default="spline-3d",
         help="build a 3D (z-recovering) or 2D (single-plane) spline PSF",
+    )
+    spline_calib_parser.add_argument(
+        "-mf",
+        "--magnification-factor",
+        type=float,
+        default=0.79,
+        help=(
+            "magnification factor applied to the fitted z at localization "
+            "time (refractive-index mismatch), as in the astigmatism fit"
+        ),
+    )
+    spline_calib_parser.add_argument(
+        "-cz",
+        "--correct-z-bias",
+        action="store_true",
+        help=(
+            "define z = 0 at the axial intensity peak of the averaged PSF "
+            "(astigmatism); corrects a potential z bias in the stage scan"
+        ),
     )
     spline_calib_parser.add_argument(
         "-bl", "--baseline", type=float, default=0, help="camera baseline"

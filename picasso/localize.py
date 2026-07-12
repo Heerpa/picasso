@@ -2397,12 +2397,10 @@ def locs_from_fits_spline(
         z_shift = np.asarray(theta[:, 3])
         z_center = float(calibration.get("z_center", 0.0))
         z_step_nm = float(calibration.get("z_step_nm", 1.0))
-        # The model samples the spline z axis at -z_shift (point_index_z == 0),
-        # so the fitted spline z node is -z_shift and the physical z relative to
-        # the in-focus slice is (z_center - node) * step = (z_shift + z_center) *
-        # step, matching the calibration's z_of_step (z decreasing with node).
-        # Negate if the recovered z is inverted for your optical geometry.
-        z = (z_shift + z_center) * z_step_nm
+        magnification_factor = float(
+            calibration.get("magnification_factor", 1.0)
+        )
+        z = -(z_shift + z_center) * z_step_nm * magnification_factor
         columns["z"] = z.astype(np.float32)
         columns["lpz"] = lpx.astype(np.float32)
     if log_likelihood is not None:

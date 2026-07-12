@@ -1053,6 +1053,32 @@ class CalibrateSplineDialog(lib.Dialog):
         self.model.addItem("2D (single plane)", userData="spline-2d")
         grid.addWidget(self.model, 3, 1)
 
+        # Magnification factor (applied to the fitted z, as in astigmatism)
+        magnification_label = QtWidgets.QLabel("Magnification factor:")
+        magnification_label.setToolTip(
+            "Factor used to correct for z-position abberation due to\n"
+            "refractive index mismatch, see Huang B, et al. Science. 2008."
+        )
+        grid.addWidget(magnification_label, 4, 0)
+        self.magnification_factor = QtWidgets.QDoubleSpinBox()
+        self.magnification_factor.setRange(0, 1e6)
+        self.magnification_factor.setDecimals(4)
+        self.magnification_factor.setValue(0.79)
+        grid.addWidget(self.magnification_factor, 4, 1)
+
+        # Optional z-bias correction (astigmatism)
+        self.correct_z_bias = QtWidgets.QCheckBox(
+            "Set z = 0 at max. intensity"
+        )
+        self.correct_z_bias.setToolTip(
+            "Define z = 0 at the axial intensity peak of the averaged PSF,\n"
+            "correcting a potential z bias in the raw stage scan.\n"
+            "Only meaningful for a PSF with a single,\n"
+            "well-defined intensity focus (e.g. astigmatism)."
+        )
+        self.correct_z_bias.setChecked(False)
+        grid.addWidget(self.correct_z_bias, 5, 0, 1, 2)
+
         self.frames_per_step.valueChanged.connect(self._update_order_enabled)
         self._update_order_enabled(self.frames_per_step.value())
 
@@ -1077,17 +1103,28 @@ class CalibrateSplineDialog(lib.Dialog):
     @staticmethod
     def getCalibrationSpecs(
         parent: QtWidgets.QWidget | None = None,
-    ) -> tuple[float, int, str, str, bool]:
+    ) -> tuple[float, int, str, str, float, bool, bool]:
         """Show the dialog and return the chosen step size, number of frames
-        per step, frame order, spline model and whether it was accepted."""
+        per step, frame order, spline model, magnification factor, whether to
+        correct the z bias, and whether it was accepted."""
         dialog = CalibrateSplineDialog(parent)
         result = dialog.exec()
         step = dialog.step.value()
         frames_per_step = dialog.frames_per_step.value()
         frame_order = dialog.frame_order.currentData()
         model = dialog.model.currentData()
+        magnification_factor = dialog.magnification_factor.value()
+        correct_z_bias = dialog.correct_z_bias.isChecked()
         accepted = result == QtWidgets.QDialog.DialogCode.Accepted
-        return step, frames_per_step, frame_order, model, accepted
+        return (
+            step,
+            frames_per_step,
+            frame_order,
+            model,
+            magnification_factor,
+            correct_z_bias,
+            accepted,
+        )
 
 
 class ROIDialog(lib.Dialog):
@@ -2941,7 +2978,15 @@ class Window(QtWidgets.QMainWindow):
             return
 
         specs = CalibrateSplineDialog.getCalibrationSpecs(self)
-        step, frames_per_step, frame_order, model, accepted = specs
+        (
+            step,
+            frames_per_step,
+            frame_order,
+            model,
+            magnification_factor,
+            correct_z_bias,
+            accepted,
+        ) = specs
         if not accepted:
             return
 
@@ -2966,6 +3011,8 @@ class Window(QtWidgets.QMainWindow):
             frames_per_step=frames_per_step,
             frame_order=frame_order,
             model=model,
+            magnification_factor=magnification_factor,
+            correct_z_bias=correct_z_bias,
             path=path,
         )
         self.spline_calibration_worker.finished.connect(
@@ -4909,6 +4956,8 @@ class SplineCalibrationWorker(QtCore.QThread):
         frame_order: str,
         model: str,
         path: str,
+        magnification_factor: float = 0.79,
+        correct_z_bias: bool = False,
     ) -> None:
         super().__init__()
         self.movie = movie
@@ -4920,6 +4969,8 @@ class SplineCalibrationWorker(QtCore.QThread):
         self.frames_per_step = frames_per_step
         self.frame_order = frame_order
         self.model = model
+        self.magnification_factor = magnification_factor
+        self.correct_z_bias = correct_z_bias
         self.path = path
 
     def run(self) -> None:
@@ -4934,6 +4985,8 @@ class SplineCalibrationWorker(QtCore.QThread):
                 frames_per_step=self.frames_per_step,
                 frame_order=self.frame_order,
                 model=self.model,
+                magnification_factor=self.magnification_factor,
+                correct_z_bias=self.correct_z_bias,
                 path=self.path,
             )
         except Exception as e:  # surface any failure to the GUI
