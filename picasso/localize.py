@@ -2361,36 +2361,22 @@ def locs_from_fits_spline(
     x_shift = np.asarray(theta[:, 1])
     y_shift = np.asarray(theta[:, 2])
     offset = np.asarray(theta[:, -1])
-
-    # The Gpufit spline model samples the spline at (pixel_index - parameter)
-    # and the template PSF is centered on node (n_data - 1) / 2, so x_shift /
-    # y_shift are the emitter's offset from the ROI center: the emitter pixel is
-    # (center + shift). Convert the shift to camera pixels (lateral oversampling)
-    # and map the ROI back into the movie frame. Omitting the center term places
-    # every spot at the ROI's top-left corner.
     center = (box - 1) / 2.0
     x = x_shift / oversampling + center + identifications["x"] - box_offset
     y = y_shift / oversampling + center + identifications["y"] - box_offset
 
     photon_scale = float(calibration.get("photon_scale", 1.0))
     photons = amplitude * photon_scale
-    sigma = float(calibration.get("effective_sigma", np.nan))
-    sigma_arr = np.full(len(theta), sigma, dtype=np.float32)
-    lpx = gausslq.localization_precision(
-        photons, sigma_arr, sigma_arr, offset, em=em
-    )
+    lpx = 0.01
 
     columns = {
         "frame": identifications["frame"].astype(np.uint32),
         "x": x.astype(np.float32),
         "y": y.astype(np.float32),
         "photons": photons.astype(np.float32),
-        "sx": sigma_arr,
-        "sy": sigma_arr,
         "bg": offset.astype(np.float32),
-        "lpx": lpx.astype(np.float32),
-        "lpy": lpx.astype(np.float32),
-        "ellipticity": np.zeros(len(theta), dtype=np.float32),
+        "lpx": lpx.astype(np.float32),  # TODO: correct
+        "lpy": lpx.astype(np.float32),  # TODO: correct
         "net_gradient": identifications["net_gradient"].astype(np.float32),
     }
     if is_3d:
@@ -2402,7 +2388,7 @@ def locs_from_fits_spline(
         )
         z = -(z_shift + z_center) * z_step_nm * magnification_factor
         columns["z"] = z.astype(np.float32)
-        columns["lpz"] = lpx.astype(np.float32)
+        columns["lpz"] = lpx.astype(np.float32)  # TODO: correct
     if log_likelihood is not None:
         columns["log_likelihood"] = log_likelihood.astype(np.float32)
     if iterations is not None:

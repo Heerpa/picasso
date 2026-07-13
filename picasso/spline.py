@@ -32,7 +32,8 @@ from typing import Callable, Literal
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from scipy.ndimage import shift as _ndi_shift
 
 from . import io, lib, gausslq, localize, __version__
@@ -178,12 +179,17 @@ def _bead_volumes(
     box: int,
     step_of_frame: np.ndarray,
     step_range: np.ndarray,
-) -> np.ndarray:
+    return_spots: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract and z-step-average a PSF volume for every bead.
 
     Returns an array of shape ``(n_beads, box, box, n_steps)`` in photon units,
     where each z-slice is the mean over all (multi-FOV) frames assigned to that
-    step.
+    step. If ``return_spots`` is True, also returns the individual (un-averaged)
+    per-frame spots ``(n_valid_frames, n_beads, box, box)`` and the z-step of
+    each valid frame ``(n_valid_frames,)``, so the axial precision can be
+    measured by fitting every single-frame spot separately (the realistic,
+    single-frame shot-noise regime) rather than the frame-averaged volumes.
     """
     n_beads = len(beads)
     valid_frames = np.where(step_of_frame >= 0)[0]
@@ -212,6 +218,8 @@ def _bead_volumes(
         mask = steps_of_valid == s
         # mean over the frames belonging to this step -> (n_beads, box, box)
         volumes[:, :, :, i] = spots[mask].mean(axis=0)
+    if return_spots:
+        return volumes, spots, steps_of_valid
     return volumes
 
 
@@ -230,16 +238,22 @@ def _focus_step(volume: np.ndarray) -> tuple[int, float]:
     return z_center, float(sigmas[z_center])
 
 
-def _register_and_average(volumes: np.ndarray, z_center: int) -> np.ndarray:
+def _register_and_average(
+    volumes: np.ndarray, z_center: int, return_registered: bool = False
+):
     """Laterally center every bead volume on its in-focus slice and average.
 
     Each bead's sub-pixel center is measured from its ``z_center`` slice with
     a Gaussian fit (offset from the box center) and the whole bead volume is
     shifted to the center before averaging. Returns the mean PSF volume
-    ``(box, box, n_steps)``.
+    ``(box, box, n_steps)``. If ``return_registered`` is True, also returns the
+    stack of the individual laterally-centered bead volumes (photon units,
+    shape ``(n_used, box, box, n_steps)``) so the averaged model can be
+    compared against the individual beads (goodness of fit).
     """
     n_beads, box, _, n_steps = volumes.shape
     accum = np.zeros((box, box, n_steps), dtype=np.float64)
+    registered: list[np.ndarray] = []
     n_used = 0
     for b in range(n_beads):
         focus_slice = np.ascontiguousarray(volumes[b, :, :, z_center])
@@ -255,11 +269,16 @@ def _register_and_average(volumes: np.ndarray, z_center: int) -> np.ndarray:
         )
         accum += shifted
         n_used += 1
+        if return_registered:
+            registered.append(shifted.astype(np.float32))
     if n_used == 0:
         raise ValueError(
             "No usable beads after centering; the calibration failed."
         )
-    return (accum / n_used).astype(np.float32)
+    mean_volume = (accum / n_used).astype(np.float32)
+    if return_registered:
+        return mean_volume, np.stack(registered)
+    return mean_volume
 
 
 def _normalize_template(
@@ -291,6 +310,71 @@ def _normalize_template(
     template = ((volume - background) / amplitude).astype(np.float32)
     photon_scale = float(np.clip(template[:, :, z_center], 0, None).sum())
     return template, background, amplitude, photon_scale
+
+
+def _goodness_of_fit(registered: np.ndarray, template: np.ndarray) -> dict:
+    """Quantify how well the averaged PSF template reproduces the individual
+    measured beads.
+
+    The spline is an (interpolating) representation of ``template``, so it
+    reproduces the template exactly at its nodes; the only independent "data"
+    to compare against is the individual beads that were averaged into it. For
+    each laterally-centered bead volume a single amplitude ``a`` and background
+    ``o`` are least-squares fitted to the unit-peak ``template`` (i.e.
+    ``bead ~= a * template + o`` over the whole volume) and the residual is
+    measured. Returns ``r2`` (per-bead coefficient of determination),
+    ``r2_median``, ``nrmse_pct`` (residual RMSE as a percentage of the fitted
+    peak amplitude, pooled over all beads) and ``residual_profile_pct`` (the
+    same normalized RMSE resolved per z-slice - where in z the single PSF model
+    describes the beads best/worst).
+    """
+    n_beads = int(registered.shape[0])
+    nz = int(registered.shape[2 + 1])
+    model = template.reshape(-1, nz).astype(np.float64)  # (n_pixels, nz)
+    m_flat = model.ravel()
+    m_mean = m_flat.mean()
+    m_c = m_flat - m_mean
+    denom = float(m_c @ m_c)
+
+    r2: list[float] = []
+    slice_sq = np.zeros(nz, dtype=np.float64)
+    slice_cnt = np.zeros(nz, dtype=np.float64)
+    for b in range(n_beads):
+        bead = registered[b].reshape(-1, nz).astype(np.float64)
+        v_flat = bead.ravel()
+        v_mean = v_flat.mean()
+        if denom <= 0:
+            continue
+        # closed-form linear fit v ~= a * model + o
+        a = float(m_c @ (v_flat - v_mean)) / denom
+        o = v_mean - a * m_mean
+        if not np.isfinite(a) or a <= 0:
+            continue
+        resid = bead - (a * model + o)  # (n_pixels, nz), photon units
+        ss_res = float((resid.ravel() ** 2).sum())
+        ss_tot = float(((v_flat - v_mean) ** 2).sum())
+        if ss_tot > 0:
+            r2.append(1.0 - ss_res / ss_tot)
+        # amplitude-normalized squared residual, accumulated per z-slice
+        norm_sq = (resid / a) ** 2
+        slice_sq += norm_sq.sum(axis=0)
+        slice_cnt += bead.shape[0]
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        profile_pct = 100.0 * np.sqrt(slice_sq / slice_cnt)
+    total_cnt = float(slice_cnt.sum())
+    nrmse_pct = (
+        100.0 * float(np.sqrt(slice_sq.sum() / total_cnt))
+        if total_cnt > 0
+        else float("nan")
+    )
+    return {
+        "r2": np.asarray(r2, dtype=np.float64),
+        "r2_median": float(np.median(r2)) if r2 else float("nan"),
+        "nrmse_pct": nrmse_pct,
+        "residual_profile_pct": profile_pct,
+        "n_used": len(r2),
+    }
 
 
 def _axial_intensity_focus(template: np.ndarray) -> float:
@@ -337,14 +421,23 @@ def build_psf_template(
     frame_order: Literal["fov", "z"] = "fov",
     threaded: bool = True,
     beads: pd.DataFrame | None = None,
+    return_spots: bool = False,
 ) -> dict:
     """Build a normalized PSF template volume from a bead z-stack.
 
     This is the GPU-independent part of the calibration (no Gpuspline needed),
     factored out so it can be unit-tested. Returns a dict with keys
     ``template`` (box, box, n_steps), ``z_center``, ``effective_sigma``,
-    ``background``, ``amplitude``, ``photon_scale``, ``n_beads`` and
-    ``z_of_step``.
+    ``background``, ``amplitude``, ``photon_scale``, ``n_beads``,
+    ``z_of_step``, ``gof`` and ``registered`` (the laterally-centered
+    individual bead volumes, ``(n_used, box, box, n_steps)``, photon units,
+    used for the goodness-of-fit).
+
+    If ``return_spots`` is True, the dict also carries ``spots`` (every
+    individual per-frame bead spot, ``(n_spots, box, box)``, photon units) and
+    ``spot_step_idx`` (the index into the template z-axis of each spot's stage
+    step), which ``_axial_precision`` fits one by one to measure the axial
+    precision in the realistic single-frame regime.
 
     If ``beads`` (a data frame with integer ``x``/``y`` columns) is given, it
     is used instead of detecting beads on this movie - this lets the
@@ -361,21 +454,36 @@ def build_psf_template(
         beads = _detect_bead_positions(
             movie, minimum_ng, box, ref_bounds, threaded=threaded
         )
-    volumes = _bead_volumes(
-        movie, camera_info, beads, box, step_of_frame, step_range
-    )
+    if return_spots:
+        volumes, spots, steps_of_valid = _bead_volumes(
+            movie,
+            camera_info,
+            beads,
+            box,
+            step_of_frame,
+            step_range,
+            return_spots=True,
+        )
+    else:
+        volumes = _bead_volumes(
+            movie, camera_info, beads, box, step_of_frame, step_range
+        )
     # first pass on the raw bead-average to locate focus, then register
     z_center, _ = _focus_step(volumes.mean(axis=0))
-    mean_volume = _register_and_average(volumes, z_center)
+    mean_volume, registered = _register_and_average(
+        volumes, z_center, return_registered=True
+    )
     z_center, effective_sigma = _focus_step(mean_volume)
     template, background, amplitude, photon_scale = _normalize_template(
         mean_volume, z_center
     )
+    # how well the averaged PSF model represents the individual beads
+    gof = _goodness_of_fit(registered, template)
     # fractional z-slice of the axial intensity peak; used (optionally) to
     # define z = 0 at the intensity focus (see ``calibrate_spline``'s
     # ``correct_z_bias``)
     z_focus = _axial_intensity_focus(template)
-    return {
+    result = {
         "template": template,
         "z_center": z_center,
         "z_focus": z_focus,
@@ -385,7 +493,22 @@ def build_psf_template(
         "photon_scale": photon_scale,
         "n_beads": int(len(beads)),
         "z_of_step": z_of_step[step_range],
+        "gof": gof,
+        "registered": registered,
     }
+    if return_spots:
+        # every individual per-frame bead spot flattened to (n_spots, box, box)
+        # (frame-major, bead-minor) with, for each spot, the index into the
+        # template z-axis (0..n_steps-1) of its stage step. z_of_step[step_idx]
+        # is then the spot's known stage position (see _axial_precision).
+        n_valid, n_beads_s = spots.shape[0], spots.shape[1]
+        step_to_pos = {int(s): i for i, s in enumerate(step_range)}
+        pos_of_frame = np.array(
+            [step_to_pos[int(s)] for s in steps_of_valid], dtype=int
+        )
+        result["spots"] = spots.reshape(n_valid * n_beads_s, box, box)
+        result["spot_step_idx"] = np.repeat(pos_of_frame, n_beads_s)
+    return result
 
 
 def calibrate_spline(
@@ -477,6 +600,9 @@ def calibrate_spline(
         frames_per_step=frames_per_step,
         frame_bounds=frame_bounds,
         frame_order=frame_order,
+        # keep the individual per-frame spots so the diagnostic PNG can measure
+        # the axial precision by fitting each spot (only needed when we plot)
+        return_spots=path is not None,
     )
     template = built["template"]  # (box, box, n_steps)
     z_center = built["z_center"]
@@ -543,7 +669,12 @@ def calibrate_spline(
 
     if path is not None:
         io.save_spline_calibration(path, calibration)
-        _save_diagnostic_plot(built, calibration, path)
+        # empirical axial precision (z RMSD to the true stage position vs z)
+        # from fitting every individual per-frame bead spot through the
+        # just-built spline model; None when no GPU fitter is available or for a
+        # 2D calibration (the plot then falls back to the model-vs-data RMSE)
+        precision = _axial_precision(built, calibration)
+        _save_diagnostic_plot(built, calibration, path, precision=precision)
 
     if callable(progress_callback):
         progress_callback(3)
@@ -815,107 +946,420 @@ def _even_slice_indices(n_total: int, n_want: int, forced: int | None = None):
     return np.unique(idx)
 
 
-def _montage(subfig, panels, title: str, n_cols: int = 5) -> None:
-    """Draw a labeled grid of image panels into a subfigure.
+def _place_row(fig, panels, top_in, fig_w_in, fig_h_in, scale, gap_in):
+    """Draw one horizontally-centered row of image panels at a fixed scale.
 
-    ``panels`` is a list of ``(image, title, imshow_kwargs, highlight, vline)``
-    tuples: ``highlight`` outlines the panel (in-focus slice), ``vline`` (or
-    ``None``) draws a focal-plane marker in data coordinates. Unused grid cells
-    are hidden.
+    Each entry of ``panels`` is ``(image, title, imshow_kwargs, w_px, h_px,
+    highlight, hline)``: the axes is sized to ``w_px`` x ``h_px`` *camera
+    pixels* times ``scale`` (inches/pixel), so one camera pixel renders at the
+    same physical size in every panel of the figure regardless of projection.
+    ``highlight`` outlines the panel (in-focus slice); ``hline`` (or ``None``)
+    draws a focal-plane marker in data coordinates. Panels are drawn with
+    ``aspect="auto"`` so the image fills the correctly-proportioned axes.
+    Returns the y (inches from the figure top) just below the row.
     """
-    n_cols = min(n_cols, len(panels))
-    n_rows = int(np.ceil(len(panels) / n_cols))
-    axes = subfig.subplots(n_rows, n_cols, squeeze=False).ravel()
-    for ax, (img, ptitle, kw, highlight, vline) in zip(axes, panels):
-        ax.imshow(img, **kw)
+    row_w_in = sum(p[3] * scale for p in panels) + gap_in * (len(panels) - 1)
+    row_h_in = max(p[4] for p in panels) * scale
+    x_in = (fig_w_in - row_w_in) / 2.0
+    for img, ptitle, kw, w_px, h_px, highlight, hline in panels:
+        w_in, h_in = w_px * scale, h_px * scale
+        ax = fig.add_axes(
+            [
+                x_in / fig_w_in,
+                (fig_h_in - top_in - h_in) / fig_h_in,
+                w_in / fig_w_in,
+                h_in / fig_h_in,
+            ]
+        )
+        ax.imshow(img, aspect="auto", **kw)
         ax.set_title(ptitle, fontsize=8)
         ax.set_xticks([])
         ax.set_yticks([])
-        if vline is not None:
-            ax.axvline(vline, color="cyan", lw=0.8)
+        if hline is not None:
+            ax.axhline(hline, color="cyan", lw=0.8)
         if highlight:
             for spine in ax.spines.values():
                 spine.set(color="cyan", linewidth=2.5, visible=True)
-    for ax in axes[len(panels) :]:  # hide empty cells
-        ax.axis("off")
-    subfig.suptitle(title, fontsize=11, fontweight="bold")
+        x_in += w_in + gap_in
+    return top_in + row_h_in
+
+
+def _robust_rmsd(deviation: np.ndarray) -> float:
+    """RMSD of a 1D deviation-to-truth array, robust to the occasional
+    non-converged fit: deviations farther than 5 (scaled) MADs from the median
+    are dropped before the root mean square is taken (the RMSD itself stays
+    referenced to zero deviation, so a genuine consistent bias is retained).
+    Returns NaN if fewer than two finite values are present."""
+    dev = np.asarray(deviation, dtype=np.float64)
+    dev = dev[np.isfinite(dev)]
+    if dev.size < 2:
+        return float("nan")
+    med = np.median(dev)
+    mad = np.median(np.abs(dev - med))
+    if mad > 0:
+        keep = np.abs(dev - med) <= 5.0 * 1.4826 * mad
+        if keep.sum() >= 2:
+            dev = dev[keep]
+    return float(np.sqrt(np.mean(dev**2)))
+
+
+def _axial_precision(built: dict, calibration: dict) -> dict | None:
+    """Empirical axial precision of the spline PSF model across z.
+
+    Every individual single-frame bead spot (``built["spots"]``) is fitted with
+    the calibration's own spline PSF model (the very GPU fitter used at
+    localization time) and the recovered z is compared against the known stage
+    position of its frame. The per-z-step RMSD of that deviation is the
+    calibration's axial precision at that z - the spline analog of the "mean z
+    precision" curve in ``zfit.calibrate_z``, which likewise fits the
+    calibration data back with its own model, per single-frame localization,
+    and reports the RMSD to the true stage position. Fitting the raw per-frame
+    spots (rather than the frame-averaged bead volumes) keeps the realistic,
+    single-frame shot-noise regime and gives many samples per z-step. Only z
+    has a ground truth (the known stage position), so no lateral precision is
+    reported.
+
+    Parameters
+    ----------
+    built : dict
+        ``build_psf_template`` output built with ``return_spots=True``; uses
+        ``spots`` (``(n_spots, box, box)``, photon units), ``spot_step_idx``
+        (each spot's index into the template z-axis) and ``z_of_step`` (the
+        known stage position, nm, of each z-step).
+    calibration : dict
+        The spline calibration (must already contain the fitted
+        ``coefficients``; see ``calibrate_spline``).
+
+    Returns
+    -------
+    precision : dict or None
+        ``{"rmsd_z", "n_beads", "n_spots"}`` with the per-z-step axial RMSD in
+        nm, aligned to ``z_of_step``. Returns ``None`` for a 2D calibration (no
+        z), when the per-frame spots are absent, or when GPU spline fitting is
+        unavailable or fails, so the caller can fall back to the model-vs-data
+        RMSE panel.
+    """
+    if not localize.GPUFIT_INSTALLED:
+        return None
+    if calibration["model"] == "spline-2d":
+        return None  # no axial coordinate to assess
+    spots = built.get("spots")
+    spot_step_idx = built.get("spot_step_idx")
+    if spots is None or spot_step_idx is None or len(spots) < 2:
+        return None
+    z_of_step = np.asarray(built["z_of_step"], dtype=np.float64)
+    spot_step_idx = np.asarray(spot_step_idx)
+    # pixel layout stays (row=y, col=x), exactly as ``localize.get_spots``
+    # returns - the fitter and the coefficient table already account for the
+    # lateral axis order (see ``calibrate_spline``). This is the same spot
+    # stack the normal fitting path consumes.
+    spots = np.ascontiguousarray(spots)
+    try:
+        theta = localize.fit_spots_gpufit_spline(spots, calibration)
+    except Exception:
+        return None
+    theta = np.asarray(theta)
+
+    # Stage-equivalent fitted z (theta column 3 is z_shift), so the RMSD is in
+    # stage nm and directly comparable to ``z_of_step`` - as in
+    # ``zfit.calibrate_z``, which divides the localization z by the
+    # magnification factor before comparing to the stage positions. Note the
+    # sign: ``locs_from_fits_spline`` reports the *physical* z as
+    # ``-(z_shift + z_center) * z_step_nm * mag`` with the spline's z-axis
+    # deliberately inverted (see the "invert z" handling), so the physical z
+    # runs opposite to stage travel. The stage-equivalent that lines up with
+    # ``z_of_step`` is therefore ``-z_physical / mag = (z_shift + z_center) *
+    # z_step_nm`` - i.e. no leading minus here.
+    z_step_nm = float(calibration.get("z_step_nm", 1.0))
+    z_center = float(calibration.get("z_center", 0.0))
+    z_fit = (theta[:, 3] + z_center) * z_step_nm  # (n_spots,)
+    deviation = z_fit - z_of_step[spot_step_idx]  # (n_spots,)
+
+    n_steps = len(z_of_step)
+    rmsd_z = np.array(
+        [_robust_rmsd(deviation[spot_step_idx == i]) for i in range(n_steps)]
+    )
+    if not np.any(np.isfinite(rmsd_z)):
+        return None
+    return {
+        "rmsd_z": rmsd_z,
+        "n_beads": int(built.get("n_beads", 0)),
+        "n_spots": int(np.isfinite(deviation).sum()),
+    }
 
 
 def _save_diagnostic_plot(
-    built: dict, calibration: dict, path: str, n_slices: int = 10
+    built: dict,
+    calibration: dict,
+    path: str,
+    n_slices: int = 10,
+    precision: dict | None = None,
 ) -> None:
     """Save a PNG summarizing the calibration.
 
     Three montages of ``n_slices`` slices each - xy across z, xz across y, yz
-    across x - plus the axial intensity profile. All image panels share one
-    intensity scale so brightness is comparable across slices.
+    across x - plus, at the bottom, the axial intensity profile and a second
+    panel. When ``precision`` is given (empirical axial precision - z RMSD to
+    the true stage position - from re-fitting the beads, see
+    ``_axial_precision``) that panel shows the axial precision vs z; otherwise
+    it falls back to the model-vs-data agreement (per-z RMSE) curve. The
+    xz/yz cross-sections are oriented with z on the
+    vertical axis (lateral on the horizontal). Every image panel shares one
+    intensity scale, and one camera pixel renders at the same physical size in
+    all panels: the z axis of the cross-sections is converted from nm to camera
+    pixels via the calibration pixel size.
     """
     template = built["template"]
     z_center = int(built["z_center"])
     z_of_step = np.asarray(built["z_of_step"])
+    gof = built.get("gof") or {}
+    have_gof = bool(gof.get("n_used"))
+    have_prec = bool(precision) and np.any(np.isfinite(precision["rmsd_z"]))
+    # the second bottom panel: empirical axial precision if available, else the
+    # model-vs-data RMSE curve
+    have_second = have_prec or have_gof
     box, _, n_steps = template.shape
     c = box // 2
+    ps = float(calibration.get("pixelsize", 130)) or 130.0  # nm / camera px
     vmax = float(template.max()) or 1.0
     img_kw = dict(cmap="hot", vmin=0.0, vmax=vmax)
-    z_lo, z_hi = float(z_of_step[-1]), float(z_of_step[0])  # z decreases
+
+    # z = 0 reference the fitter (localize) uses: the calibration's z origin
+    # (a fractional step index). With ``correct_z_bias`` it is the axial
+    # intensity peak; otherwise the sharpest (in-focus) slice. Shift the
+    # plotted z so this origin lands at z = 0 - matching the z that
+    # ``locs_from_fits_spline`` reports - and mark/label/outline it there.
+    correct_z_bias = bool(calibration.get("correct_z_bias", False))
+    z_origin = float(calibration.get("z_center", z_center))
+    shifted = correct_z_bias and n_steps > 1
+    if shifted:
+        dz_step = (float(z_of_step[-1]) - float(z_of_step[0])) / (n_steps - 1)
+        z_ref_nm = (
+            float(z_of_step[0]) + z_origin * dz_step
+        )  # stage nm at origin
+        origin_idx = int(np.clip(round(z_origin), 0, n_steps - 1))
+        x_label = "z (nm, 0 at intensity focus)"
+    else:
+        z_ref_nm = 0.0
+        origin_idx = z_center
+        x_label = "Stage position (nm)"
+    z_plot = np.asarray(z_of_step, dtype=float) - z_ref_nm
+    # position of the z = 0 marker in the (shifted) plot coordinates: exactly 0
+    # when shifted to the intensity focus, else the sharpest slice's position
+    z_focus_marker = 0.0 if shifted else float(z_plot[origin_idx])
+    z_lo, z_hi = float(z_plot[-1]), float(z_plot[0])  # z decreases
 
     # slice indices for each projection
-    z_idx = _even_slice_indices(n_steps, n_slices, forced=z_center)
+    z_idx = _even_slice_indices(n_steps, n_slices, forced=origin_idx)
     y_idx = _even_slice_indices(box, n_slices, forced=c)
     x_idx = _even_slice_indices(box, n_slices, forced=c)
 
-    # cross-section images share z (nm) on the x-axis, lateral px on the y-axis
-    ext = [z_lo, z_hi, -c, box - c - 1]
-    cs_kw = dict(aspect="auto", extent=ext, **img_kw)
+    # cross-sections: z (converted to camera px) on the vertical axis, lateral
+    # px on the horizontal axis, with z increasing upward. Extents are given at
+    # pixel *edges* (half a pixel/step beyond the first and last sample
+    # centers) so N pixels span exactly N units on every axis - the lateral and
+    # z axes then render one camera pixel at the identical physical size, so xy,
+    # xz and yz share one pixel scale. (Center-based extents would span only
+    # box-1 laterally while the panel is box wide, stretching lateral pixels
+    # ~box/(box-1) relative to z.)
+    dz_px = (abs(z_hi - z_lo) / (n_steps - 1)) / ps if n_steps > 1 else 1.0
+    z_top = z_hi / ps + dz_px / 2.0  # +z edge (top of the panel)
+    z_bot = z_lo / ps - dz_px / 2.0  # -z edge (bottom of the panel)
+    z_span_px = z_top - z_bot
+    lat_lo, lat_hi = -c - 0.5, box - c - 0.5  # spans exactly `box` pixels
+    cs_ext = [lat_lo, lat_hi, z_bot, z_top]
+    cs_kw = dict(extent=cs_ext, origin="upper", **img_kw)
+    xy_ext = [lat_lo, lat_hi, lat_hi, lat_lo]
+    xy_kw = dict(extent=xy_ext, origin="upper", **img_kw)
 
-    z_focus = z_of_step[z_center]
+    z_focus_px = z_focus_marker / ps
+    # (image, title, imshow_kwargs, w_px, h_px, highlight, hline)
     xy_panels = [
         (
             template[:, :, k],
-            f"z = {z_of_step[k]:.0f} nm",
-            img_kw,
-            k == z_center,
+            f"z = {z_plot[k] + 0.0:.0f} nm",
+            xy_kw,
+            box,
+            box,
+            k == origin_idx,
             None,
         )
         for k in z_idx
     ]
+    # rotate 90 deg: transpose so z runs down the rows, lateral across columns
     xz_panels = [
-        (template[y, :, :], f"y = {y - c:+d} px", cs_kw, False, z_focus)
+        (
+            template[y, :, :].T,
+            f"y = {y - c:+d} px",
+            cs_kw,
+            box,
+            z_span_px,
+            False,
+            z_focus_px,
+        )
         for y in y_idx
     ]
     yz_panels = [
-        (template[:, x, :], f"x = {x - c:+d} px", cs_kw, False, z_focus)
+        (
+            template[:, x, :].T,
+            f"x = {x - c:+d} px",
+            cs_kw,
+            box,
+            z_span_px,
+            False,
+            z_focus_px,
+        )
         for x in x_idx
     ]
 
-    def n_rows(n):
-        return int(np.ceil(n / min(5, max(1, n))))
+    # Manual inch-based layout so the pixel scale is identical across rows.
+    scale = 0.09  # inches per camera pixel
+    gap_in = 0.12  # gap between panels within a row
+    margin = 0.5
+    title_h = 0.5  # room for each row's heading + panel titles
+    head_h = 0.16  # heading baseline offset from the top of its band
+    row_gap = 0.35
+    prof_h = 1.4
 
-    heights = [n_rows(len(z_idx)), n_rows(len(y_idx)), n_rows(len(x_idx)), 1.2]
-    fig = plt.figure(
-        figsize=(14, 2.6 * sum(heights) + 1.0), constrained_layout=True
+    def row_w(panels):
+        return sum(p[3] * scale for p in panels) + gap_in * (len(panels) - 1)
+
+    def row_h(panels):
+        return max(p[4] for p in panels) * scale
+
+    rows = [
+        ("xy slices (across z, focus outlined)", xy_panels),
+        ("xz cross-sections (across y)", xz_panels),
+        ("yz cross-sections (across x)", yz_panels),
+    ]
+    fig_w = max(row_w(p) for _, p in rows) + 2 * margin
+    fig_h = (
+        margin  # top margin (also holds the suptitle)
+        + sum(title_h + row_h(p) + row_gap for _, p in rows)
+        + title_h
+        + prof_h
+        + margin
     )
-    sf_xy, sf_xz, sf_yz, sf_prof = fig.subfigures(4, 1, height_ratios=heights)
 
-    _montage(sf_xy, xy_panels, "xy slices (across z, focus outlined)")
-    _montage(sf_xz, xz_panels, "xz cross-sections (across y)")
-    _montage(sf_yz, yz_panels, "yz cross-sections (across x)")
+    gof_txt = ""
+    if have_gof:
+        gof_txt = (
+            f" | model vs data: R² = {gof['r2_median']:.3f}, "
+            f"NRMSE = {gof['nrmse_pct']:.1f}% of peak"
+        )
+
+    # Object-oriented Agg figure (no pyplot): the calibration can run in a
+    # worker thread, where the pyplot GUI backend warns/fails, and the layout
+    # here is fully manual (fig.add_axes), so constrained_layout has nothing to
+    # manage and would warn too.
+    fig = Figure(figsize=(fig_w, fig_h))
+    FigureCanvasAgg(fig)
+    fig.suptitle(
+        f"{built['n_beads']} beads | z range {z_lo:.0f} to {z_hi:.0f} nm | "
+        f"box {box} px | 1 px = 1 camera pixel ({ps:.0f} nm)" + gof_txt,
+        fontsize=12,
+        y=1.0 - 0.15 / fig_h,
+    )
+
+    top = margin
+    for heading, panels in rows:
+        fig.text(
+            margin / fig_w,
+            1.0 - (top + head_h) / fig_h,
+            heading,
+            fontsize=11,
+            fontweight="bold",
+            va="center",
+        )
+        top += title_h
+        top = _place_row(fig, panels, top, fig_w, fig_h, scale, gap_in)
+        top += row_gap
+
+    # bottom row: axial intensity profile and, alongside it, a second panel -
+    # the empirical axial precision (z RMSD vs z) when available, otherwise the
+    # model-vs-data agreement (per-z RMSE) curve.
+    usable_w = fig_w - 2 * margin
+    prof_gap = 0.7
+    panel_w = (usable_w - prof_gap) / 2.0 if have_second else usable_w
+    head_y = 1.0 - (top + title_h * 0.35) / fig_h
 
     # axial intensity profile: brightest normalized pixel per slice, ~1 at
     # focus and decaying as the PSF spreads with defocus (a sharpness check)
-    ax = sf_prof.subplots(1, 1)
-    ax.plot(z_of_step, template.max(axis=(0, 1)), ".-")
-    ax.axvline(z_of_step[z_center], color="0.3", lw=1.0)
-    ax.set_xlabel("Stage position (nm)")
-    ax.set_ylabel("Peak pixel value (norm.)")
-    sf_prof.suptitle("Axial intensity profile", fontsize=11)
-
-    fig.suptitle(
-        f"{built['n_beads']} beads | z range {z_lo:.0f} to {z_hi:.0f} nm | "
-        f"box {box} px",
-        fontsize=12,
+    fig.text(
+        margin / fig_w,
+        head_y,
+        "Axial intensity profile",
+        fontsize=11,
+        fontweight="bold",
+        va="center",
     )
+    if have_second:
+        second_head = (
+            "Axial precision (z RMSD to stage position)"
+            if have_prec
+            else "Model–data agreement (per-z RMSE)"
+        )
+        fig.text(
+            (margin + panel_w + prof_gap) / fig_w,
+            head_y,
+            second_head,
+            fontsize=11,
+            fontweight="bold",
+            va="center",
+        )
+    top += title_h
+    ax = fig.add_axes(
+        [
+            margin / fig_w,
+            (fig_h - top - prof_h) / fig_h,
+            panel_w / fig_w,
+            (prof_h - 0.4) / fig_h,
+        ]
+    )
+    ax.plot(z_plot, template.max(axis=(0, 1)), ".-")
+    ax.axvline(z_focus_marker, color="0.3", lw=1.0)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Peak pixel value (norm.)")
+
+    if have_second:
+        ax2 = fig.add_axes(
+            [
+                (margin + panel_w + prof_gap) / fig_w,
+                (fig_h - top - prof_h) / fig_h,
+                panel_w / fig_w,
+                (prof_h - 0.4) / fig_h,
+            ]
+        )
+        if have_prec:
+            # empirical axial precision: RMSD between the spline-refitted z and
+            # the known stage position at each z-step - what the calibration
+            # delivers vs z (lower is better; rises with defocus). Analogous to
+            # the "mean z precision" panel in ``zfit.calibrate_z``.
+            ax2.plot(z_plot, precision["rmsd_z"], ".-", color="tab:red")
+            ax2.axvline(z_focus_marker, color="0.3", lw=1.0)
+            ax2.set_xlabel(x_label)
+            ax2.set_ylabel("z RMSD (nm)")
+            ax2.set_ylim(bottom=0.0)
+            ax2.set_title(
+                f"{precision['n_beads']} beads",
+                fontsize=9,
+            )
+        else:
+            # amplitude-normalized RMSE between the averaged PSF model and the
+            # individual beads, per z-slice: how faithfully one PSF describes
+            # the measured beads (lower is better; rises where beads disagree)
+            ax2.plot(
+                z_plot, gof["residual_profile_pct"], ".-", color="tab:red"
+            )
+            ax2.axvline(z_focus_marker, color="0.3", lw=1.0)
+            ax2.set_xlabel(x_label)
+            ax2.set_ylabel("RMSE (% of peak)")
+            ax2.set_ylim(bottom=0.0)
+            ax2.set_title(
+                f"median bead R² = {gof['r2_median']:.3f}  "
+                f"(n = {gof['n_used']})",
+                fontsize=9,
+            )
 
     base, _ = os.path.splitext(path)
     fig.savefig(base + ".png", format="png", dpi=200)
-    plt.close(fig)
