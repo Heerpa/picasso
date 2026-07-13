@@ -6,7 +6,7 @@ Generate cubic-spline PSF calibrations from a bead z-stack.
 
 A calibration bead sample (e.g., fluorescent/gold beads) is imaged while the
 stage is scanned through z. This module averages the beads into a clean,
-laterally-centered PSF volume, normalizes it, and computes cubic-spline
+3D-registered PSF volume, normalizes it, and computes cubic-spline
 coefficients with Gpuspline. The resulting calibration (coefficients +
 metadata) is saved via ``picasso.io.save_spline_calibration`` and later fitted
 per spot with Gpufit's SPLINE_2D / SPLINE_3D models (see
@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
-from scipy.ndimage import shift as _ndi_shift
+from scipy.ndimage import shift as _ndi_shift, zoom as _ndi_zoom
 
 from . import io, lib, gausslq, localize, __version__
 
@@ -238,46 +238,199 @@ def _focus_step(volume: np.ndarray) -> tuple[int, float]:
     return z_center, float(sigmas[z_center])
 
 
-def _register_and_average(
-    volumes: np.ndarray, z_center: int, return_registered: bool = False
-):
-    """Laterally center every bead volume on its in-focus slice and average.
+def _fft_cross_correlation(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Zero-mean 3D cross-correlation of two equally shaped volumes.
 
-    Each bead's sub-pixel center is measured from its ``z_center`` slice with
-    a Gaussian fit (offset from the box center) and the whole bead volume is
-    shifted to the center before averaging. Returns the mean PSF volume
-    ``(box, box, n_steps)``. If ``return_registered`` is True, also returns the
-    stack of the individual laterally-centered bead volumes (photon units,
-    shape ``(n_used, box, box, n_steps)``) so the averaged model can be
-    compared against the individual beads (goodness of fit).
+    Returned fft-shifted so a zero relative shift sits at the array center; the
+    offset of the peak from the center is then the shift that aligns ``b`` onto
+    ``a`` (apply it with ``scipy.ndimage.shift(b, shift)``). Both volumes are
+    mean-subtracted first so the correlation is insensitive to a constant
+    background offset.
     """
-    n_beads, box, _, n_steps = volumes.shape
-    accum = np.zeros((box, box, n_steps), dtype=np.float64)
-    registered: list[np.ndarray] = []
-    n_used = 0
-    for b in range(n_beads):
-        focus_slice = np.ascontiguousarray(volumes[b, :, :, z_center])
-        theta = gausslq.fit_spot(focus_slice)
-        dx, dy = theta[0], theta[1]  # offset from box center (col, row)
-        if not (np.isfinite(dx) and np.isfinite(dy)):
+    a = a - a.mean()
+    b = b - b.mean()
+    cc = np.fft.ifftn(np.fft.fftn(a) * np.conj(np.fft.fftn(b))).real
+    return np.fft.fftshift(cc)
+
+
+def _subpixel_shift(
+    cc: np.ndarray,
+    max_shift: np.ndarray,
+    upsample: int = 20,
+    radius: int = 3,
+) -> tuple[np.ndarray, float]:
+    """Locate a cross-correlation peak with sub-voxel precision.
+
+    The integer peak is found first, within ``+/- max_shift`` voxels (per axis)
+    of the array center. A small window (``radius`` voxels) around it is then
+    upsampled ``upsample``-fold by cubic-spline interpolation and the
+    interpolated maximum gives the fractional part - mirroring the reference
+    implementation (Li et al., Nat. Methods 2018), which scales up the central
+    part of the cross-correlation by a factor of 20 by cubic-spline
+    interpolation and reads the x, y, z shift off the position of the maximum.
+    Returns ``(shift, peak_value)`` with ``shift`` the ``(row, col, z)``
+    displacement from the center voxel.
+    """
+    shape = np.array(cc.shape)
+    center = shape // 2
+    max_shift = np.minimum(np.asarray(max_shift, dtype=int), center)
+    lo = center - max_shift
+    hi = center + max_shift + 1
+    region = cc[lo[0] : hi[0], lo[1] : hi[1], lo[2] : hi[2]]
+    ip = np.array(np.unravel_index(int(np.argmax(region)), region.shape)) + lo
+    peak_value = float(cc[ip[0], ip[1], ip[2]])
+
+    # sub-voxel refinement: cubic-spline upsample a small window around the peak
+    wlo = np.maximum(ip - radius, 0)
+    whi = np.minimum(ip + radius + 1, shape)
+    window = cc[wlo[0] : whi[0], wlo[1] : whi[1], wlo[2] : whi[2]]
+    win_center = ip - wlo
+    order = int(min(3, min(window.shape) - 1))
+    if order >= 2:
+        zoomed = _ndi_zoom(window, upsample, order=order, mode="nearest")
+        zshape = zoomed.shape
+        peak = np.unravel_index(int(np.argmax(zoomed)), zshape)
+        # zoom (grid_mode=False) maps corners to corners: the input coordinate
+        # of output index p is p * (L - 1) / (M - 1)
+        frac = np.array(
+            [
+                peak[ax] * (window.shape[ax] - 1) / (zshape[ax] - 1)
+                - win_center[ax]
+                for ax in range(cc.ndim)
+            ]
+        )
+    else:
+        frac = np.zeros(cc.ndim)
+    return (ip - center) + frac, peak_value
+
+
+def _keep_inliers(
+    ncc: np.ndarray, mse: np.ndarray, k: float = 2.5
+) -> np.ndarray:
+    """Boolean mask of beads to keep during iterative averaging.
+
+    A bead is dropped when it is dissimilar from the running average - either
+    its normalized cross-correlation with the average falls far below, or its
+    mean-square error rises far above, the robust spread (median ``+/- k``
+    scaled MADs) of the population. At least half of the beads (and never fewer
+    than three) are always kept, falling back to the lowest-MSE beads if the
+    two criteria together would reject too many.
+    """
+    ncc = np.asarray(ncc, dtype=np.float64)
+    mse = np.asarray(mse, dtype=np.float64)
+    n = len(mse)
+    if n <= 3:
+        return np.ones(n, dtype=bool)
+    keep = np.ones(n, dtype=bool)
+    for values, high_is_bad in ((ncc, False), (mse, True)):
+        med = np.median(values)
+        mad = np.median(np.abs(values - med))
+        if mad <= 0:
             continue
-        if abs(dx) > box / 2 or abs(dy) > box / 2:
-            continue  # nonsense fit, skip this bead
-        # shift so the bead center lands at the box center; axes (row, col, z)
-        shifted = _ndi_shift(
-            volumes[b], shift=(-dy, -dx, 0.0), order=3, mode="nearest"
-        )
-        accum += shifted
-        n_used += 1
-        if return_registered:
-            registered.append(shifted.astype(np.float32))
-    if n_used == 0:
+        t = 1.4826 * k * mad
+        keep &= values <= med + t if high_is_bad else values >= med - t
+    min_keep = max(3, n // 2)
+    if keep.sum() < min_keep:
+        keep = np.zeros(n, dtype=bool)
+        keep[np.argsort(mse)[:min_keep]] = True
+    return keep
+
+
+def _register_and_average(
+    volumes: np.ndarray,
+    z_center: int,
+    return_registered: bool = False,
+    n_iter: int = 3,
+    upsample: int = 20,
+):
+    """Register every bead volume to a common 3D center and average.
+
+    Following Li et al. (Nat. Methods 2018), the beads are aligned to one
+    another in all three dimensions by 3D cross-correlation: each bead's
+    ``(row, col, z)`` sub-voxel shift is read from the cross-correlation
+    peak (upsampled ``upsample``-fold by cubic-spline interpolation,
+    see ``_subpixel_shift``) and the whole volume is shifted there by
+    cubic-spline interpolation. Being model-free, this also centers
+    non-Gaussian PSFs (e.g. double-helix), and the axial alignment
+    should remove the per-bead focus jitter caused by coverslip tilt /
+    bead-height variation.
+
+    The first round aligns all beads to a single (brightest in-focus)
+    bead; each subsequent round realigns the original volumes to the
+    average of the aligned beads and excludes beads that are dissimilar
+    from that average (by cross-correlation peak and mean-square error,
+    see ``_keep_inliers``) before recomputing it. The correlation uses
+    only a central z-band (the sharp, high SNR, in-focus region) so
+    defocus rings cannot create spurious axial matches.
+
+    Returns the mean PSF volume ``(box, box, n_steps)`` (photon units). If
+    ``return_registered`` is True, also returns the stack of the retained
+    individual registered bead volumes (photon units, shape
+    ``(n_used, box, box, n_steps)``) so the averaged model can be compared
+    against the individual beads (goodness of fit)."""
+    n_beads, box, _, n_steps = volumes.shape
+    vols = volumes.astype(np.float64)
+    z_center = int(z_center)
+
+    # per-axis integer search range: small laterally (beads are already
+    # detected on the pixel grid) and wider axially (beads reach focus at
+    # slightly different stage positions)
+    max_shift = np.array(
+        [max(2, box // 4), max(2, box // 4), max(2, n_steps // 4)], dtype=int
+    )
+    # correlate only a central z-band around focus (sharp, high-SNR slices)
+    band = max(3, n_steps // 4)
+    z0 = max(0, z_center - band)
+    z1 = min(n_steps, z_center + band + 1)
+    cmax = max_shift.copy()
+    cmax[2] = min(cmax[2], (z1 - z0) // 2)
+
+    def central(v):
+        return v[:, :, z0:z1]
+
+    # round-0 reference: the single brightest in-focus bead
+    ref = vols[int(np.argmax(vols[:, :, :, z_center].max(axis=(1, 2))))]
+
+    keep = np.ones(n_beads, dtype=bool)
+    aligned = vols
+    for _ in range(n_iter):
+        ref_c = central(ref)
+        ref_z = ref_c - ref_c.mean()
+        ref_energy = float((ref_z * ref_z).sum())
+        aligned = np.empty_like(vols)
+        ncc = np.zeros(n_beads)
+        for b in range(n_beads):
+            vb = central(vols[b])
+            cc = _fft_cross_correlation(ref_c, vb)
+            shift, peak = _subpixel_shift(cc, cmax, upsample=upsample)
+            aligned[b] = _ndi_shift(
+                vols[b], shift=shift, order=3, mode="nearest"
+            )
+            # energy-normalized peak correlation, one dissimilarity measure
+            vb_z = vb - vb.mean()
+            denom = np.sqrt(ref_energy * float((vb_z * vb_z).sum()))
+            ncc[b] = peak / denom if denom > 0 else 0.0
+
+        # mean-square error of each (amplitude-matched) bead vs the running
+        # average, over the central band, as the second dissimilarity measure
+        avg_c = central(aligned[keep].mean(axis=0))
+        avg_energy = float((avg_c * avg_c).sum()) or 1.0
+        mse = np.empty(n_beads)
+        for b in range(n_beads):
+            bead_c = central(aligned[b])
+            scale = float((bead_c * avg_c).sum()) / avg_energy
+            mse[b] = float(((bead_c - scale * avg_c) ** 2).mean())
+
+        keep = _keep_inliers(ncc, mse)
+        ref = aligned[keep].mean(axis=0)
+
+    if not keep.any():
         raise ValueError(
-            "No usable beads after centering; the calibration failed."
+            "No usable beads after registration; the calibration failed."
         )
-    mean_volume = (accum / n_used).astype(np.float32)
+    mean_volume = ref.astype(np.float32)
     if return_registered:
-        return mean_volume, np.stack(registered)
+        return mean_volume, aligned[keep].astype(np.float32)
     return mean_volume
 
 
@@ -319,7 +472,7 @@ def _goodness_of_fit(registered: np.ndarray, template: np.ndarray) -> dict:
     The spline is an (interpolating) representation of ``template``, so it
     reproduces the template exactly at its nodes; the only independent "data"
     to compare against is the individual beads that were averaged into it. For
-    each laterally-centered bead volume a single amplitude ``a`` and background
+    each registered bead volume a single amplitude ``a`` and background
     ``o`` are least-squares fitted to the unit-peak ``template`` (i.e.
     ``bead ~= a * template + o`` over the whole volume) and the residual is
     measured. Returns ``r2`` (per-bead coefficient of determination),
@@ -441,9 +594,9 @@ def build_psf_template(
     factored out so it can be unit-tested. Returns a dict with keys
     ``template`` (box, box, n_steps), ``z_center``, ``effective_sigma``,
     ``background``, ``amplitude``, ``photon_scale``, ``n_beads``,
-    ``z_of_step``, ``gof`` and ``registered`` (the laterally-centered
-    individual bead volumes, ``(n_used, box, box, n_steps)``, photon units,
-    used for the goodness-of-fit).
+    ``z_of_step``, ``gof`` and ``registered`` (the 3D-registered individual
+    bead volumes, ``(n_used, box, box, n_steps)``, photon units, used for the
+    goodness-of-fit).
 
     If ``return_spots`` is True, the dict also carries ``spots`` (every
     individual per-frame bead spot, ``(n_spots, box, box)``, photon units) and
