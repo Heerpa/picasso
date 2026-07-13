@@ -68,14 +68,6 @@ plt.style.use("ggplot")
 
 
 MAX_LOCS = int(1e6)
-
-# Spline CRLB (Cramer-Rao lower bound) computation. The Poisson Fisher
-# information for the cubic-spline PSF model needs the model's spatial
-# derivatives; there is no Python spline-derivative routine, so they are
-# obtained by central differences over ``gpuspline.spline_values`` (the same
-# evaluator used to build the model). See ``_spline_crlb``.
-_SPLINE_CRLB_DXY = 1e-2  # lateral finite-difference step (camera pixels)
-_SPLINE_CRLB_DZ = 1e-2  # axial finite-difference step (spline z-slices)
 _SPLINE_CRLB_MU_FLOOR = 1e-3  # photons; floors 1 / mu in the Fisher weight
 
 # The columns under base are always available and the keys such as "3D
@@ -2341,6 +2333,364 @@ def fit_spots_gpufit_spline(
     return parameters
 
 
+def _spline_model_and_grad(
+    coeff: np.ndarray,
+    box: int,
+    x_shift: np.ndarray,
+    y_shift: np.ndarray,
+    z_eval: np.ndarray | None,
+) -> tuple:
+    """Vectorized cubic-spline model image and its analytic spatial derivatives.
+
+    Reimplements ``gpuspline.spline_values`` in NumPy for a batch of ``M``
+    localizations and, because a tricubic/bicubic is a polynomial in the local
+    fractional coordinate, also returns its exact spatial derivatives by
+    differentiating that polynomial term-by-term (the closed form Gpufit uses on
+    the GPU). This is the readable reference for the tricubic evaluation; the
+    production CRLB uses the equivalent parallel numba kernels
+    (:func:`_spline_fisher_3d` / :func:`_spline_fisher_2d`). It is kept for tests
+    and to validate the coefficient layout against ``gpuspline.spline_values``.
+
+    ``coeff`` is one channel's raw calibration coefficient table, ``(16, nix,
+    niy)`` (2D) or ``(64, nix, niy, niz)`` (3D). Its flat C-order buffer is the
+    Gpuspline-binding layout - it reshapes to ``(niy, nix, yp, xp)`` /
+    ``(niz, niy, nix, zp, yp, xp)`` (see
+    ``_reorder_spline_coefficients_for_gpufit``). The model pixel ``(i, j)``
+    (column ``i`` = x, row ``j`` = y) samples the template at ``x = i -
+    x_shift`` and ``y = j - y_shift`` ("position = pixel - parameter", see
+    ``_initial_parameters_spline``); ``z_eval`` is the native z coordinate.
+
+    Returns ``(phi, dphi_dx, dphi_dy, dphi_dz)``, each ``(M, box, box)`` indexed
+    ``[loc, x-pixel, y-pixel]`` (``dphi_dz`` is None for 2D). Derivatives are
+    w.r.t. the native coordinate; the shift derivative is their negative
+    (irrelevant to the sign-invariant CRLB diagonal).
+    """
+    x_shift = np.asarray(x_shift, dtype=np.float32)
+    y_shift = np.asarray(y_shift, dtype=np.float32)
+    grid = np.arange(box, dtype=np.float32)
+    xc = grid[None, :] - x_shift[:, None]  # (M, box) native x per pixel
+    yc = grid[None, :] - y_shift[:, None]
+
+    def _axis_basis(coords, n_int):
+        # interval index (clamped, so out-of-range extrapolates like Gpuspline)
+        # + value/derivative power bases [1,f,f^2,f^3] / [0,1,2f,3f^2].
+        idx = np.clip(np.floor(coords), 0, n_int - 1).astype(np.intp)
+        f = coords - idx
+        ones, zeros = np.ones_like(f), np.zeros_like(f)
+        p = np.stack([ones, f, f * f, f * f * f], axis=-1)
+        dp = np.stack([zeros, ones, 2.0 * f, 3.0 * f * f], axis=-1)
+        return idx, p, dp
+
+    coeff = np.ascontiguousarray(coeff, dtype=np.float32)
+    if z_eval is None:  # 2D bicubic
+        _, nix, niy = coeff.shape
+        c = coeff.reshape(-1).reshape(niy, nix, 4, 4)  # (yi, xi, yp, xp)
+        xi, px, dpx = _axis_basis(xc, nix)
+        yi, py, dpy = _axis_basis(yc, niy)
+        cg = c[yi[:, None, :], xi[:, :, None]]  # (M, box_x, box_y, yp, xp)
+        phi = np.einsum("mijyx,mjy,mix->mij", cg, py, px)
+        dphi_dx = np.einsum("mijyx,mjy,mix->mij", cg, py, dpx)
+        dphi_dy = np.einsum("mijyx,mjy,mix->mij", cg, dpy, px)
+        return phi, dphi_dx, dphi_dy, None
+
+    # 3D tricubic
+    _, nix, niy, niz = coeff.shape
+    c = coeff.reshape(-1).reshape(
+        niz, niy, nix, 4, 4, 4
+    )  # (zi,yi,xi,zp,yp,xp)
+    xi, px, dpx = _axis_basis(xc, nix)
+    yi, py, dpy = _axis_basis(yc, niy)
+    zc = np.asarray(z_eval, dtype=np.float32)
+    zidx = np.clip(np.floor(zc), 0, niz - 1).astype(np.intp)
+    fz = zc - zidx
+    pz = np.stack([np.ones_like(fz), fz, fz * fz, fz * fz * fz], axis=-1)
+    dpz = np.stack(
+        [np.zeros_like(fz), np.ones_like(fz), 2.0 * fz, 3.0 * fz * fz], axis=-1
+    )
+    # z is one slice per loc: contract the z power first, then gather per pixel.
+    cz = c[zidx]  # (M, niy, nix, 4, 4, 4)
+    c_val = np.einsum("mYXzyx,mz->mYXyx", cz, pz)  # (M, niy, nix, yp, xp)
+    c_dz = np.einsum("mYXzyx,mz->mYXyx", cz, dpz)
+    mm = np.arange(len(x_shift))[:, None, None]
+    cg = c_val[mm, yi[:, None, :], xi[:, :, None]]  # (M, box_x, box_y, yp, xp)
+    cg_dz = c_dz[mm, yi[:, None, :], xi[:, :, None]]
+    phi = np.einsum("mijyx,mjy,mix->mij", cg, py, px)
+    dphi_dx = np.einsum("mijyx,mjy,mix->mij", cg, py, dpx)
+    dphi_dy = np.einsum("mijyx,mjy,mix->mij", cg, dpy, px)
+    dphi_dz = np.einsum("mijyx,mjy,mix->mij", cg_dz, py, px)
+    return phi, dphi_dx, dphi_dy, dphi_dz
+
+
+@numba.njit(parallel=True, cache=True, fastmath=True)
+def _spline_fisher_3d(
+    coeff, box, amp, x_shift, y_shift, z_eval, offset, finite, mu_floor, fisher
+):
+    """Fill ``fisher`` (n, 5, 5) with the per-localization Poisson Fisher matrix
+    of the 3D cubic-spline model. Parallel per-spot numba kernel; the readable
+    reference is :func:`_spline_model_and_grad`. ``coeff`` is
+    ``(n_channels, niz, niy, nix, 4, 4, 4)``. Non-converged rows are skipped
+    (left as preset by the caller). Parameter order [x, y, z, amplitude, offset].
+    """
+    n_channels, niz, niy, nix = (
+        coeff.shape[0],
+        coeff.shape[1],
+        (coeff.shape[2]),
+        coeff.shape[3],
+    )
+    n_locs = amp.shape[0]
+    for m in numba.prange(n_locs):
+        if not finite[m]:
+            continue
+        a = amp[m]
+        o = offset[m]
+        f00 = f01 = f02 = f03 = f04 = 0.0
+        f11 = f12 = f13 = f14 = 0.0
+        f22 = f23 = f24 = 0.0
+        f33 = f34 = 0.0
+        f44 = 0.0
+        # z basis (one slice per localization)
+        zc = z_eval[m]
+        zi = int(np.floor(zc))
+        zi = 0 if zi < 0 else (niz - 1 if zi > niz - 1 else zi)
+        fz = zc - zi
+        pz0, pz1, pz2, pz3 = 1.0, fz, fz * fz, fz * fz * fz
+        dz1, dz2, dz3 = 1.0, 2.0 * fz, 3.0 * fz * fz
+        for ch in range(n_channels):
+            for i in range(box):
+                xco = i - x_shift[m]
+                xi = int(np.floor(xco))
+                xi = 0 if xi < 0 else (nix - 1 if xi > nix - 1 else xi)
+                fx = xco - xi
+                px0, px1, px2, px3 = 1.0, fx, fx * fx, fx * fx * fx
+                dx1, dx2, dx3 = 1.0, 2.0 * fx, 3.0 * fx * fx
+                for j in range(box):
+                    yco = j - y_shift[m]
+                    yi = int(np.floor(yco))
+                    yi = 0 if yi < 0 else (niy - 1 if yi > niy - 1 else yi)
+                    fy = yco - yi
+                    py0, py1, py2, py3 = 1.0, fy, fy * fy, fy * fy * fy
+                    dy1, dy2, dy3 = 1.0, 2.0 * fy, 3.0 * fy * fy
+                    phi = gx = gy = gz = 0.0
+                    for zp in range(4):
+                        pzv = (
+                            pz0
+                            if zp == 0
+                            else (
+                                pz1 if zp == 1 else (pz2 if zp == 2 else pz3)
+                            )
+                        )
+                        dzv = (
+                            0.0
+                            if zp == 0
+                            else (
+                                dz1 if zp == 1 else (dz2 if zp == 2 else dz3)
+                            )
+                        )
+                        for yp in range(4):
+                            pyv = (
+                                py0
+                                if yp == 0
+                                else (
+                                    py1
+                                    if yp == 1
+                                    else (py2 if yp == 2 else py3)
+                                )
+                            )
+                            dyv = (
+                                0.0
+                                if yp == 0
+                                else (
+                                    dy1
+                                    if yp == 1
+                                    else (dy2 if yp == 2 else dy3)
+                                )
+                            )
+                            for xp in range(4):
+                                cf = coeff[ch, zi, yi, xi, zp, yp, xp]
+                                pxv = (
+                                    px0
+                                    if xp == 0
+                                    else (
+                                        px1
+                                        if xp == 1
+                                        else (px2 if xp == 2 else px3)
+                                    )
+                                )
+                                dxv = (
+                                    0.0
+                                    if xp == 0
+                                    else (
+                                        dx1
+                                        if xp == 1
+                                        else (dx2 if xp == 2 else dx3)
+                                    )
+                                )
+                                phi += cf * pzv * pyv * pxv
+                                gx += cf * pzv * pyv * dxv
+                                gy += cf * pzv * dyv * pxv
+                                gz += cf * dzv * pyv * pxv
+                    mu = o + a * phi
+                    if mu < mu_floor:
+                        mu = mu_floor
+                    w = 1.0 / mu
+                    # d(mu)/d(param); the CRLB diagonal is sign-invariant per
+                    # parameter, so native-coordinate vs shift sign is irrelevant.
+                    d0, d1, d2, d3 = a * gx, a * gy, a * gz, phi
+                    f00 += d0 * d0 * w
+                    f01 += d0 * d1 * w
+                    f02 += d0 * d2 * w
+                    f03 += d0 * d3 * w
+                    f04 += d0 * w
+                    f11 += d1 * d1 * w
+                    f12 += d1 * d2 * w
+                    f13 += d1 * d3 * w
+                    f14 += d1 * w
+                    f22 += d2 * d2 * w
+                    f23 += d2 * d3 * w
+                    f24 += d2 * w
+                    f33 += d3 * d3 * w
+                    f34 += d3 * w
+                    f44 += w
+        fisher[m, 0, 0] = f00
+        fisher[m, 0, 1] = fisher[m, 1, 0] = f01
+        fisher[m, 0, 2] = fisher[m, 2, 0] = f02
+        fisher[m, 0, 3] = fisher[m, 3, 0] = f03
+        fisher[m, 0, 4] = fisher[m, 4, 0] = f04
+        fisher[m, 1, 1] = f11
+        fisher[m, 1, 2] = fisher[m, 2, 1] = f12
+        fisher[m, 1, 3] = fisher[m, 3, 1] = f13
+        fisher[m, 1, 4] = fisher[m, 4, 1] = f14
+        fisher[m, 2, 2] = f22
+        fisher[m, 2, 3] = fisher[m, 3, 2] = f23
+        fisher[m, 2, 4] = fisher[m, 4, 2] = f24
+        fisher[m, 3, 3] = f33
+        fisher[m, 3, 4] = fisher[m, 4, 3] = f34
+        fisher[m, 4, 4] = f44
+
+
+@numba.njit(parallel=True, cache=True, fastmath=True)
+def _spline_fisher_2d(
+    coeff, box, amp, x_shift, y_shift, offset, finite, mu_floor, fisher
+):
+    """2D analogue of :func:`_spline_fisher_3d`. ``coeff`` is
+    ``(n_channels, niy, nix, 4, 4)``; parameter order [x, y, amplitude, offset].
+    """
+    n_channels, niy, nix = coeff.shape[0], coeff.shape[1], coeff.shape[2]
+    n_locs = amp.shape[0]
+    for m in numba.prange(n_locs):
+        if not finite[m]:
+            continue
+        a = amp[m]
+        o = offset[m]
+        f00 = f01 = f02 = f03 = 0.0
+        f11 = f12 = f13 = 0.0
+        f22 = f23 = 0.0
+        f33 = 0.0
+        for ch in range(n_channels):
+            for i in range(box):
+                xco = i - x_shift[m]
+                xi = int(np.floor(xco))
+                xi = 0 if xi < 0 else (nix - 1 if xi > nix - 1 else xi)
+                fx = xco - xi
+                px0, px1, px2, px3 = 1.0, fx, fx * fx, fx * fx * fx
+                dx1, dx2, dx3 = 1.0, 2.0 * fx, 3.0 * fx * fx
+                for j in range(box):
+                    yco = j - y_shift[m]
+                    yi = int(np.floor(yco))
+                    yi = 0 if yi < 0 else (niy - 1 if yi > niy - 1 else yi)
+                    fy = yco - yi
+                    py0, py1, py2, py3 = 1.0, fy, fy * fy, fy * fy * fy
+                    dy1, dy2, dy3 = 1.0, 2.0 * fy, 3.0 * fy * fy
+                    phi = gx = gy = 0.0
+                    for yp in range(4):
+                        pyv = (
+                            py0
+                            if yp == 0
+                            else (
+                                py1 if yp == 1 else (py2 if yp == 2 else py3)
+                            )
+                        )
+                        dyv = (
+                            0.0
+                            if yp == 0
+                            else (
+                                dy1 if yp == 1 else (dy2 if yp == 2 else dy3)
+                            )
+                        )
+                        for xp in range(4):
+                            cf = coeff[ch, yi, xi, yp, xp]
+                            pxv = (
+                                px0
+                                if xp == 0
+                                else (
+                                    px1
+                                    if xp == 1
+                                    else (px2 if xp == 2 else px3)
+                                )
+                            )
+                            dxv = (
+                                0.0
+                                if xp == 0
+                                else (
+                                    dx1
+                                    if xp == 1
+                                    else (dx2 if xp == 2 else dx3)
+                                )
+                            )
+                            phi += cf * pyv * pxv
+                            gx += cf * pyv * dxv
+                            gy += cf * dyv * pxv
+                    mu = o + a * phi
+                    if mu < mu_floor:
+                        mu = mu_floor
+                    w = 1.0 / mu
+                    d0, d1, d2 = a * gx, a * gy, phi
+                    f00 += d0 * d0 * w
+                    f01 += d0 * d1 * w
+                    f02 += d0 * d2 * w
+                    f03 += d0 * w
+                    f11 += d1 * d1 * w
+                    f12 += d1 * d2 * w
+                    f13 += d1 * w
+                    f22 += d2 * d2 * w
+                    f23 += d2 * w
+                    f33 += w
+        fisher[m, 0, 0] = f00
+        fisher[m, 0, 1] = fisher[m, 1, 0] = f01
+        fisher[m, 0, 2] = fisher[m, 2, 0] = f02
+        fisher[m, 0, 3] = fisher[m, 3, 0] = f03
+        fisher[m, 1, 1] = f11
+        fisher[m, 1, 2] = fisher[m, 2, 1] = f12
+        fisher[m, 1, 3] = fisher[m, 3, 1] = f13
+        fisher[m, 2, 2] = f22
+        fisher[m, 2, 3] = fisher[m, 3, 2] = f23
+        fisher[m, 3, 3] = f33
+
+
+def _spline_coeff_reshaped(calibration: dict) -> np.ndarray:
+    """Raw calibration coefficients as ``(n_channels, niz, niy, nix, 4, 4, 4)``
+    (3D) or ``(n_channels, niy, nix, 4, 4)`` (2D), float64 for the numba kernels.
+    The flat C-order buffer is the Gpuspline-binding layout (see
+    :func:`_spline_model_and_grad`)."""
+    model = calibration["model"]
+    coeff = np.ascontiguousarray(calibration["coefficients"], dtype=np.float64)
+    if model == "spline-3d-multichannel":
+        _, nix, niy, niz, n_channels = coeff.shape
+        return np.stack(
+            [
+                np.ascontiguousarray(coeff[..., c]).reshape(
+                    niz, niy, nix, 4, 4, 4
+                )
+                for c in range(n_channels)
+            ]
+        )
+    if model == "spline-2d":
+        _, nix, niy = coeff.shape
+        return coeff.reshape(niy, nix, 4, 4)[None]
+    _, nix, niy, niz = coeff.shape
+    return coeff.reshape(niz, niy, nix, 4, 4, 4)[None]
+
+
 def _spline_crlb(
     theta: lib.FloatArray2D,
     calibration: dict,
@@ -2355,10 +2705,11 @@ def _spline_crlb(
     the fitted parameters, using the cubic-spline PSF model - the method of Li
     et al. (Nat. Methods 2018) and Gpufit's spline model. Mirrors
     ``gaussmle._mlefit_sigmaxy_crlb`` (Poisson Fisher matrix, ``pinv``,
-    diagonal) but derives the model ``mu = offset + amplitude * Phi`` and its
-    spatial derivatives from ``gpuspline.spline_values``: no analytic spline
-    derivative exists in Python, so ``dPhi/dx``, ``dPhi/dy`` and ``dPhi/dz``
-    are central differences over that evaluator.
+    diagonal), with the model ``mu = offset + amplitude * Phi`` and its analytic
+    spatial derivatives. The Fisher matrices are built by a parallel numba
+    kernel (:func:`_spline_fisher_3d` / :func:`_spline_fisher_2d`; the readable
+    NumPy reference is :func:`_spline_model_and_grad`) and inverted in one
+    batched ``pinv``.
 
     Parameters
     ----------
@@ -2369,14 +2720,12 @@ def _spline_crlb(
         so ``mu`` is an expected photon count and the Poisson Fisher matrix
         applies directly.
     calibration : dict
-        The spline PSF calibration (see ``io.load_spline_calibration``); the
-        raw ``coefficients`` are passed straight to ``gpuspline.spline_values``.
+        The spline PSF calibration (see ``io.load_spline_calibration``).
     box : int
         Fit box side length (camera pixels).
     progress_callback : callable, "console" or None, optional
-        Per-localization progress (this loop is the slow part). ``"console"``
-        shows a tqdm bar; a callable is invoked with the cumulative number of
-        localizations processed.
+        Progress over localization chunks. ``"console"`` shows a tqdm bar; a
+        callable is invoked with the cumulative number of localizations done.
 
     Returns
     -------
@@ -2388,112 +2737,70 @@ def _spline_crlb(
     """
     model = calibration["model"]
     is_3d = model != "spline-2d"
-    is_multichannel = model == "spline-3d-multichannel"
-    dxy = np.float32(_SPLINE_CRLB_DXY)
-    dz = np.float32(_SPLINE_CRLB_DZ)
+    n_params = 5 if is_3d else 4
 
     theta = np.asarray(theta, dtype=np.float64)
     n_locs = len(theta)
-    n_params = 5 if is_3d else 4
 
-    coefficients = np.ascontiguousarray(
-        calibration["coefficients"], dtype=np.float32
-    )
-    n_channels = coefficients.shape[-1] if is_multichannel else 1
-    nz = int(calibration["n_data"][2]) if is_3d else 1
-    grid = np.arange(box, dtype=np.float32)
-
-    amplitude = theta[:, 0]
-    x_shift = theta[:, 1]
-    y_shift = theta[:, 2]
-    offset = theta[:, -1]
-    z_shift = theta[:, 3] if is_3d else None
+    coeff = _spline_coeff_reshaped(calibration)
+    amplitude = np.ascontiguousarray(theta[:, 0])
+    x_shift = np.ascontiguousarray(theta[:, 1])
+    y_shift = np.ascontiguousarray(theta[:, 2])
+    offset = np.ascontiguousarray(theta[:, -1])
+    # Native z sampling coordinate = -z_shift (single-frame Gpufit
+    # "position = pixel_index - parameter", pixel_index_z = 0). The kernel
+    # clamps the z-interval, so no pre-clamping is needed here.
+    z_eval = np.ascontiguousarray(-theta[:, 3]) if is_3d else None
     finite = np.isfinite(theta).all(axis=1)
 
-    # Fisher information per localization (float64, as in gaussmle). Skipped
-    # (non-converged) rows are left as the identity so the batched pinv stays
-    # well-defined; they are overwritten with NaN afterwards.
-    fisher = np.tile(np.eye(n_params), (n_locs, 1, 1))
-
-    def _phi(coeffs_c, xc, yc, z_eval):
-        # Evaluate the spline model image (box, box) at the given lateral
-        # coordinates and z-slice. Clip laterally to the template extent so a
-        # bad fit's large shift cannot make the spline extrapolate; a no-op for
-        # converged fits (|shift| << 1 px).
-        xc = np.clip(xc, 0.0, box - 1).astype(np.float32)
-        yc = np.clip(yc, 0.0, box - 1).astype(np.float32)
-        if is_3d:
-            zc = np.array([z_eval], dtype=np.float32)
-            return gs.spline_values(coeffs_c, xc, yc, zc)[:, :, 0].astype(
-                np.float64
-            )
-        return gs.spline_values(coeffs_c, xc, yc).astype(np.float64)
+    # Fisher per localization (float64). Non-converged rows stay the identity so
+    # the batched pinv is well-defined; they become NaN below.
+    fisher = np.tile(np.eye(n_params), (max(n_locs, 1), 1, 1))
 
     use_tqdm = progress_callback == "console"
     do_callback = callable(progress_callback)
-    step = max(1, n_locs // 100)
-    iterator = range(n_locs)
+    # One kernel call spans all localizations; chunk only to report progress.
+    chunk = (
+        max(1, min(n_locs, 100_000)) if (use_tqdm or do_callback) else n_locs
+    )
+    starts = range(0, n_locs, chunk) if n_locs else []
     if use_tqdm:
-        iterator = tqdm(iterator, desc="Computing spline CRLB")
+        starts = tqdm(starts, desc="Computing spline CRLB")
 
-    for i in iterator:
-        if finite[i]:
-            amp = amplitude[i]
-            off = offset[i]
-            xc = grid - np.float32(x_shift[i])
-            yc = grid - np.float32(y_shift[i])
-            if is_3d:
-                # Native z sampling coordinate = -z_shift (single-frame Gpufit
-                # "position = pixel_index - parameter", pixel_index_z = 0),
-                # clamped so the +/- dz z-stencil stays inside the stack.
-                z_eval = float(np.clip(-z_shift[i], dz, nz - 1 - dz))
-            else:
-                z_eval = 0.0
-            info = np.zeros((n_params, n_params), dtype=np.float64)
-            # The multichannel model shares (amplitude, x, y, z, offset) across
-            # channels, so the total Fisher information is the sum of the
-            # per-channel Poisson Fisher matrices (Li et al. 2018).
-            for c in range(n_channels):
-                coeffs_c = (
-                    np.ascontiguousarray(coefficients[..., c])
-                    if is_multichannel
-                    else coefficients
-                )
-                phi = _phi(coeffs_c, xc, yc, z_eval)
-                # d(model)/d(param). The CRLB diagonal is invariant to the sign
-                # of each derivative (I -> D I D with D = diag(+-1) leaves the
-                # diagonal of the inverse unchanged), so the central-difference
-                # and native_z signs do not matter - only the axis association
-                # and the z-slice magnitude do.
-                dpx = (
-                    _phi(coeffs_c, xc - dxy, yc, z_eval)
-                    - _phi(coeffs_c, xc + dxy, yc, z_eval)
-                ) / (2.0 * _SPLINE_CRLB_DXY)
-                dpy = (
-                    _phi(coeffs_c, xc, yc - dxy, z_eval)
-                    - _phi(coeffs_c, xc, yc + dxy, z_eval)
-                ) / (2.0 * _SPLINE_CRLB_DXY)
-                cols = [amp * dpx, amp * dpy]
-                if is_3d:
-                    dpz = (
-                        _phi(coeffs_c, xc, yc, z_eval + dz)
-                        - _phi(coeffs_c, xc, yc, z_eval - dz)
-                    ) / (2.0 * _SPLINE_CRLB_DZ)
-                    cols.append(amp * dpz)
-                cols.append(phi)  # d(model)/d(amplitude)
-                cols.append(np.ones_like(phi))  # d(model)/d(offset)
-                mu = off + amp * phi
-                deriv = np.stack([col.reshape(-1) for col in cols], axis=1)
-                weight = 1.0 / np.maximum(
-                    mu.reshape(-1), _SPLINE_CRLB_MU_FLOOR
-                )
-                info += (deriv * weight[:, None]).T @ deriv
-            fisher[i] = info
-        if do_callback and ((i + 1) % step == 0 or i + 1 == n_locs):
-            progress_callback(i + 1)
+    for start in starts:
+        stop = min(start + chunk, n_locs)
+        sl = slice(start, stop)
+        if is_3d:
+            _spline_fisher_3d(
+                coeff,
+                box,
+                amplitude[sl],
+                x_shift[sl],
+                y_shift[sl],
+                z_eval[sl],
+                offset[sl],
+                finite[sl],
+                _SPLINE_CRLB_MU_FLOOR,
+                fisher[sl],
+            )
+        else:
+            _spline_fisher_2d(
+                coeff,
+                box,
+                amplitude[sl],
+                x_shift[sl],
+                y_shift[sl],
+                offset[sl],
+                finite[sl],
+                _SPLINE_CRLB_MU_FLOOR,
+                fisher[sl],
+            )
+        if do_callback:
+            progress_callback(stop)
 
     with np.errstate(invalid="ignore", divide="ignore"):
         crlb = np.diagonal(np.linalg.pinv(fisher), axis1=1, axis2=2).copy()
+    crlb = crlb[:n_locs]
     crlb[~finite] = np.nan
     crlb = np.where(crlb > 0.0, crlb, np.nan)
     return crlb
