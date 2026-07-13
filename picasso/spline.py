@@ -21,6 +21,19 @@ The frame -> z-step binning mirrors ``picasso.zfit.calibrate_z`` so that
 multiple fields of view per z position (``frame_order``, ``frames_per_step``,
 ``frame_bounds``) are supported.
 
+Bead alignment and preparation is done according to Li et al. (2018);
+spline fitting follows Gpufit, see References.
+
+References
+----------
+- Li, Y., Mund, M., Hoess, P., Deschamps, J., Matti, U., Nijmeijer, B.,
+  Sabinina, V. J., Ellenberg, J., Schoen, I. & Ries, J. "Real-time 3D
+  single-molecule localization using experimental point spread functions."
+  Nature Methods 15, 367-369 (2018).
+- Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
+  "Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
+  Scientific Reports 7, 15722 (2017).
+
 :authors: Rafal Kowalewski
 :copyright: Copyright (c) 2016-2026 Jungmann Lab, MPI of Biochemistry
 """
@@ -34,6 +47,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from scipy.interpolate import make_smoothing_spline
 from scipy.ndimage import shift as _ndi_shift, zoom as _ndi_zoom
 
 from . import io, lib, gausslq, localize, __version__
@@ -434,25 +448,49 @@ def _register_and_average(
     return mean_volume
 
 
+def _smooth_z(volume: np.ndarray) -> np.ndarray:
+    """Regularize a PSF volume by smoothing each voxel's axial profile.
+
+    Following Li et al. (Nat. Methods 2018), the ``(box, box, n_steps)`` bead
+    average is denoised along z with a smoothing cubic B-spline applied
+    independently to every lateral voxel's intensity-vs-z curve. The spline's
+    penalty is chosen automatically by generalized cross-validation
+    (``scipy.interpolate.make_smoothing_spline``), so it removes shot noise
+    without washing out the real axial variation that encodes z. Returns the
+    smoothed volume (same shape/dtype); the volume is returned unchanged if
+    there are too few z-steps to fit a cubic smoothing spline.
+    """
+    box, _, n_steps = volume.shape
+    if n_steps < 5:  # a cubic smoothing spline needs a few points to be stable
+        return volume
+    z = np.arange(n_steps, dtype=np.float64)
+    smoothed = np.empty_like(volume, dtype=np.float64)
+    for i in range(box):
+        for j in range(box):
+            profile = volume[i, j, :].astype(np.float64)
+            try:
+                smoothed[i, j, :] = make_smoothing_spline(z, profile)(z)
+            except Exception:
+                # a degenerate (e.g. constant) profile keeps its raw values
+                smoothed[i, j, :] = profile
+    return smoothed.astype(volume.dtype, copy=False)
+
+
 def _normalize_template(
     volume: np.ndarray, z_center: int
 ) -> tuple[np.ndarray, float, float, float]:
     """Normalize a PSF volume to a unit-peak template ``(psf - bg) / amp``.
 
-    Background is the mean of the 1-pixel border across all slices; amplitude
-    is the peak of the (background-subtracted) in-focus slice. Returns
+    Background is the minimum of the (z-smoothed) volume - as in Li et al.
+    (Nat. Methods 2018), which eliminates the background by subtracting the
+    minimum of the bead stack; amplitude is the peak of the
+    (background-subtracted) in-focus slice. Returns
     ``(template, background, amplitude, photon_scale)`` where ``photon_scale``
     is the integral of the in-focus normalized slice (used to convert a fitted
-    amplitude into integrated photons)."""
-    border = np.concatenate(
-        [
-            volume[0, :, :].ravel(),
-            volume[-1, :, :].ravel(),
-            volume[:, 0, :].ravel(),
-            volume[:, -1, :].ravel(),
-        ]
-    )
-    background = float(np.mean(border))
+    amplitude into integrated photons). Unit-peak scaling is kept (rather than
+    the paper's central-slice-sum) so the Gpufit spline fit's amplitude
+    initialization (``spot_max - spot_min``) stays valid without change."""
+    background = float(np.min(volume))
     focus = volume[:, :, z_center] - background
     amplitude = float(np.max(focus))
     if amplitude <= 0:
@@ -638,6 +676,9 @@ def build_psf_template(
     mean_volume, registered = _register_and_average(
         volumes, z_center, return_registered=True
     )
+    # regularize the averaged PSF by smoothing along z (paper's smoothing
+    # B-spline), then (re)locate focus and normalize on the cleaned volume
+    mean_volume = _smooth_z(mean_volume)
     z_center, effective_sigma = _focus_step(mean_volume)
     template, background, amplitude, photon_scale = _normalize_template(
         mean_volume, z_center
