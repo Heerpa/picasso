@@ -3595,6 +3595,10 @@ class Window(QtWidgets.QMainWindow):
         rect = self.view.viewport().rect()
         visible_scene_rect = self.view.mapToScene(rect).boundingRect()
         width = visible_scene_rect.width()
+        # the view may not be laid out yet (e.g. slow/network loads), in
+        # which case ``width`` is 0 and there is nothing to draw
+        if width <= 0:
+            return
         width_nm = width * scene_pixelsize
         optimal_scalebar = width_nm / 8
 
@@ -3613,6 +3617,10 @@ class Window(QtWidgets.QMainWindow):
         length_displaypxl = int(
             round(self.view.width() * (scalebar / scene_pixelsize) / width)
         )
+        # when zoomed in far enough the scale bar rounds down to 0 nm /
+        # 0 display pixels; skip drawing to avoid a division by zero below
+        if scalebar <= 0 or length_displaypxl <= 0:
+            return
         height_displaypxl = 10
 
         # draw a rectangle
