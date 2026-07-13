@@ -1874,8 +1874,8 @@ def locs_from_fits_gpufit(
     log_likelihood: lib.FloatArray1D | None = None,
     iterations: lib.FloatArray1D | None = None,
 ) -> pd.DataFrame:
-    """Convert the fit results from GPU-based fitting into a data frame
-    array of localizations.
+    """Convert the fit results from GPU-based fitting (Gaussian) into a
+    data frame array of localizations.
 
     Parameters
     ----------
@@ -2341,17 +2341,8 @@ def locs_from_fits_spline(
 ) -> pd.DataFrame:
     """Convert spline fit results into a localizations data frame.
 
-    ``theta`` columns are ``[amplitude, x_shift, y_shift, offset]`` (2D) or
-    ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D). For the 3D model
-    the ``z`` and ``lpz`` columns are added.
-
-    Note: Gpufit returns no CRLB for the spline models, so ``lpx``/``lpy`` are
-    approximated from the fitted photon count and the calibration's stored
-    ``effective_sigma`` (Mortensen precision, as for the Gaussian fits). No
-    axial CRLB is available yet, so ``lpz`` is approximated with the lateral
-    precision and ``d_zcalib`` is reported as 0 (both must stay finite:
-    ``lib.ensure_sanity`` drops any row with a NaN on save).
-    """
+    ``theta`` coshiflumns are ``[amplitude, x_t, y_shift, offset]`` (2D) or
+    ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D)."""
     model = calibration["model"]
     is_3d = model != "spline-2d"
     box_offset = int(box / 2)
