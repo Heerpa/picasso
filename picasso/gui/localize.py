@@ -4248,7 +4248,20 @@ class Window(QtWidgets.QMainWindow):
 
     def on_fit_progress(self, curr: int, total: int) -> None:
         """Update the status bar with the fitting progress."""
-        if self.parameters_dialog.gpufit_checkbox.isChecked():
+        worker = getattr(self, "fit_worker", None)
+        if isinstance(worker, MultichannelSplineFitWorker):
+            # extraction, GPU fit and per-spot CRLB share this callback
+            message = f"Fitting multichannel spline: {curr:,} / {total:,} ..."
+            self.status_bar.showMessage(message)
+        elif getattr(worker, "method", "").startswith("spline"):
+            # the spline fit itself is a single GPU call; this callback tracks
+            # the per-spot Cramer-Rao precision (CRLB) computation that follows
+            message = (
+                f"Computing localization precision (CRLB): "
+                f"{curr:,} / {total:,} ..."
+            )
+            self.status_bar.showMessage(message)
+        elif self.parameters_dialog.gpufit_checkbox.isChecked():
             self.status_bar.showMessage("Fitting spots by GPUfit...")
         else:
             message = f"Fitting spot {curr:,} / {total:,} ..."

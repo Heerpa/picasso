@@ -68,6 +68,16 @@ plt.style.use("ggplot")
 
 
 MAX_LOCS = int(1e6)
+
+# Spline CRLB (Cramer-Rao lower bound) computation. The Poisson Fisher
+# information for the cubic-spline PSF model needs the model's spatial
+# derivatives; there is no Python spline-derivative routine, so they are
+# obtained by central differences over ``gpuspline.spline_values`` (the same
+# evaluator used to build the model). See ``_spline_crlb``.
+_SPLINE_CRLB_DXY = 1e-2  # lateral finite-difference step (camera pixels)
+_SPLINE_CRLB_DZ = 1e-2  # axial finite-difference step (spline z-slices)
+_SPLINE_CRLB_MU_FLOOR = 1e-3  # photons; floors 1 / mu in the Fisher weight
+
 # The columns under base are always available and the keys such as "3D
 # only" will be displayed in the save columns dialog in the GUI for
 # clarity
@@ -1651,6 +1661,8 @@ def fit2D(
             progress_callback(1)
         # "spline-mle-gpu" uses Gpufit's Poisson maximum-likelihood estimator,
         # "spline-gpu" least squares (as in the reference pyGpufit examples).
+        # The GPU fit itself is a single call; progress_callback then tracks
+        # the per-spot CRLB / precision computation in locs_from_fits_spline.
         locs = _fit2d_spline_gpu(
             spots=spots,
             identifications=identifications,
@@ -1658,6 +1670,7 @@ def fit2D(
             em=em,
             calibration=spline_calibration,
             mle=fitting_method == "spline-mle-gpu",
+            progress_callback=progress_callback,
         )
     elif fitting_method == "gaussmle":
         locs = _fit2d_gaussmle(
@@ -2328,6 +2341,164 @@ def fit_spots_gpufit_spline(
     return parameters
 
 
+def _spline_crlb(
+    theta: lib.FloatArray2D,
+    calibration: dict,
+    box: int,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> lib.FloatArray2D:
+    """Cramer-Rao lower bounds for spline-fitted localizations.
+
+    Evaluates the diagonal of the inverse Poisson Fisher-information matrix at
+    the fitted parameters, using the cubic-spline PSF model - the method of Li
+    et al. (Nat. Methods 2018) and Gpufit's spline model. Mirrors
+    ``gaussmle._mlefit_sigmaxy_crlb`` (Poisson Fisher matrix, ``pinv``,
+    diagonal) but derives the model ``mu = offset + amplitude * Phi`` and its
+    spatial derivatives from ``gpuspline.spline_values``: no analytic spline
+    derivative exists in Python, so ``dPhi/dx``, ``dPhi/dy`` and ``dPhi/dz``
+    are central differences over that evaluator.
+
+    Parameters
+    ----------
+    theta : lib.FloatArray2D
+        Fitted parameters, columns ``[amplitude, x_shift, y_shift, offset]``
+        (2D) or ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D and 3D
+        multichannel). Photon units (spots are gain-converted before fitting),
+        so ``mu`` is an expected photon count and the Poisson Fisher matrix
+        applies directly.
+    calibration : dict
+        The spline PSF calibration (see ``io.load_spline_calibration``); the
+        raw ``coefficients`` are passed straight to ``gpuspline.spline_values``.
+    box : int
+        Fit box side length (camera pixels).
+    progress_callback : callable, "console" or None, optional
+        Per-localization progress (this loop is the slow part). ``"console"``
+        shows a tqdm bar; a callable is invoked with the cumulative number of
+        localizations processed.
+
+    Returns
+    -------
+    crlb : lib.FloatArray2D
+        ``(n_locs, n_params)`` array of CRLB variances (float64) in native
+        parameter order ``[x_shift, y_shift, (z_shift,) amplitude, offset]``
+        (pixels, (z-slices,) photons, photons). Non-converged fits and
+        numerically singular problems are NaN.
+    """
+    model = calibration["model"]
+    is_3d = model != "spline-2d"
+    is_multichannel = model == "spline-3d-multichannel"
+    dxy = np.float32(_SPLINE_CRLB_DXY)
+    dz = np.float32(_SPLINE_CRLB_DZ)
+
+    theta = np.asarray(theta, dtype=np.float64)
+    n_locs = len(theta)
+    n_params = 5 if is_3d else 4
+
+    coefficients = np.ascontiguousarray(
+        calibration["coefficients"], dtype=np.float32
+    )
+    n_channels = coefficients.shape[-1] if is_multichannel else 1
+    nz = int(calibration["n_data"][2]) if is_3d else 1
+    grid = np.arange(box, dtype=np.float32)
+
+    amplitude = theta[:, 0]
+    x_shift = theta[:, 1]
+    y_shift = theta[:, 2]
+    offset = theta[:, -1]
+    z_shift = theta[:, 3] if is_3d else None
+    finite = np.isfinite(theta).all(axis=1)
+
+    # Fisher information per localization (float64, as in gaussmle). Skipped
+    # (non-converged) rows are left as the identity so the batched pinv stays
+    # well-defined; they are overwritten with NaN afterwards.
+    fisher = np.tile(np.eye(n_params), (n_locs, 1, 1))
+
+    def _phi(coeffs_c, xc, yc, z_eval):
+        # Evaluate the spline model image (box, box) at the given lateral
+        # coordinates and z-slice. Clip laterally to the template extent so a
+        # bad fit's large shift cannot make the spline extrapolate; a no-op for
+        # converged fits (|shift| << 1 px).
+        xc = np.clip(xc, 0.0, box - 1).astype(np.float32)
+        yc = np.clip(yc, 0.0, box - 1).astype(np.float32)
+        if is_3d:
+            zc = np.array([z_eval], dtype=np.float32)
+            return gs.spline_values(coeffs_c, xc, yc, zc)[:, :, 0].astype(
+                np.float64
+            )
+        return gs.spline_values(coeffs_c, xc, yc).astype(np.float64)
+
+    use_tqdm = progress_callback == "console"
+    do_callback = callable(progress_callback)
+    step = max(1, n_locs // 100)
+    iterator = range(n_locs)
+    if use_tqdm:
+        iterator = tqdm(iterator, desc="Computing spline CRLB")
+
+    for i in iterator:
+        if finite[i]:
+            amp = amplitude[i]
+            off = offset[i]
+            xc = grid - np.float32(x_shift[i])
+            yc = grid - np.float32(y_shift[i])
+            if is_3d:
+                # Native z sampling coordinate = -z_shift (single-frame Gpufit
+                # "position = pixel_index - parameter", pixel_index_z = 0),
+                # clamped so the +/- dz z-stencil stays inside the stack.
+                z_eval = float(np.clip(-z_shift[i], dz, nz - 1 - dz))
+            else:
+                z_eval = 0.0
+            info = np.zeros((n_params, n_params), dtype=np.float64)
+            # The multichannel model shares (amplitude, x, y, z, offset) across
+            # channels, so the total Fisher information is the sum of the
+            # per-channel Poisson Fisher matrices (Li et al. 2018).
+            for c in range(n_channels):
+                coeffs_c = (
+                    np.ascontiguousarray(coefficients[..., c])
+                    if is_multichannel
+                    else coefficients
+                )
+                phi = _phi(coeffs_c, xc, yc, z_eval)
+                # d(model)/d(param). The CRLB diagonal is invariant to the sign
+                # of each derivative (I -> D I D with D = diag(+-1) leaves the
+                # diagonal of the inverse unchanged), so the central-difference
+                # and native_z signs do not matter - only the axis association
+                # and the z-slice magnitude do.
+                dpx = (
+                    _phi(coeffs_c, xc - dxy, yc, z_eval)
+                    - _phi(coeffs_c, xc + dxy, yc, z_eval)
+                ) / (2.0 * _SPLINE_CRLB_DXY)
+                dpy = (
+                    _phi(coeffs_c, xc, yc - dxy, z_eval)
+                    - _phi(coeffs_c, xc, yc + dxy, z_eval)
+                ) / (2.0 * _SPLINE_CRLB_DXY)
+                cols = [amp * dpx, amp * dpy]
+                if is_3d:
+                    dpz = (
+                        _phi(coeffs_c, xc, yc, z_eval + dz)
+                        - _phi(coeffs_c, xc, yc, z_eval - dz)
+                    ) / (2.0 * _SPLINE_CRLB_DZ)
+                    cols.append(amp * dpz)
+                cols.append(phi)  # d(model)/d(amplitude)
+                cols.append(np.ones_like(phi))  # d(model)/d(offset)
+                mu = off + amp * phi
+                deriv = np.stack([col.reshape(-1) for col in cols], axis=1)
+                weight = 1.0 / np.maximum(
+                    mu.reshape(-1), _SPLINE_CRLB_MU_FLOOR
+                )
+                info += (deriv * weight[:, None]).T @ deriv
+            fisher[i] = info
+        if do_callback and ((i + 1) % step == 0 or i + 1 == n_locs):
+            progress_callback(i + 1)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        crlb = np.diagonal(np.linalg.pinv(fisher), axis1=1, axis2=2).copy()
+    crlb[~finite] = np.nan
+    crlb = np.where(crlb > 0.0, crlb, np.nan)
+    return crlb
+
+
 def locs_from_fits_spline(
     identifications: pd.DataFrame,
     theta: lib.FloatArray2D,
@@ -2336,11 +2507,18 @@ def locs_from_fits_spline(
     calibration: dict,
     log_likelihood: lib.FloatArray1D | None = None,
     iterations: lib.FloatArray1D | None = None,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
 ) -> pd.DataFrame:
     """Convert spline fit results into a localizations data frame.
 
-    ``theta`` coshiflumns are ``[amplitude, x_t, y_shift, offset]`` (2D) or
-    ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D)."""
+    ``theta`` columns are ``[amplitude, x_shift, y_shift, offset]`` (2D) or
+    ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D). Localization
+    precisions (``lpx``, ``lpy``, ``lpz``) and the ``photons`` / ``bg``
+    uncertainties are the Cramer-Rao lower bounds from :func:`_spline_crlb`;
+    ``progress_callback`` is forwarded to it (that per-localization loop is the
+    slow part)."""
     model = calibration["model"]
     is_3d = model != "spline-2d"
     box_offset = int(box / 2)
@@ -2356,7 +2534,17 @@ def locs_from_fits_spline(
 
     photon_scale = float(calibration.get("photon_scale", 1.0))
     photons = amplitude * photon_scale
-    lpx = np.float32(0.01)
+
+    # CRLB variances in native order [x_shift, y_shift, (z_shift,) amplitude,
+    # offset]; amplitude/offset are always the last two columns.
+    crlb = _spline_crlb(
+        theta, calibration, box, progress_callback=progress_callback
+    )
+    with np.errstate(invalid="ignore"):
+        lpx = np.sqrt(crlb[:, 0]) / oversampling
+        lpy = np.sqrt(crlb[:, 1]) / oversampling
+        photons_unc = np.sqrt(crlb[:, -2]) * photon_scale
+        bg_unc = np.sqrt(crlb[:, -1])
 
     columns = {
         "frame": identifications["frame"].astype(np.uint32),
@@ -2364,8 +2552,8 @@ def locs_from_fits_spline(
         "y": y.astype(np.float32),
         "photons": photons.astype(np.float32),
         "bg": offset.astype(np.float32),
-        "lpx": lpx,  # TODO: correct
-        "lpy": lpx,  # TODO: correct
+        "lpx": lpx.astype(np.float32),
+        "lpy": lpy.astype(np.float32),
         "net_gradient": identifications["net_gradient"].astype(np.float32),
     }
     if is_3d:
@@ -2380,7 +2568,12 @@ def locs_from_fits_spline(
         z_offset_nm = (z_center - z_init) * z_step_nm  # raw stage nm, no mag
         z = z_position + z_offset_nm
         columns["z"] = z.astype(np.float32)
-        columns["lpz"] = lpx  # TODO: correct
+        with np.errstate(invalid="ignore"):
+            # var(z_shift) -> nm via the same z-step scaling used for z
+            lpz = np.sqrt(crlb[:, 2]) * z_step_nm * magnification_factor
+        columns["lpz"] = lpz.astype(np.float32)
+    columns["photons_unc"] = photons_unc.astype(np.float32)
+    columns["bg_unc"] = bg_unc.astype(np.float32)
     if log_likelihood is not None:
         columns["log_likelihood"] = log_likelihood.astype(np.float32)
     if iterations is not None:
@@ -2397,10 +2590,14 @@ def _fit2d_spline_gpu(
     em: bool,
     calibration: dict,
     mle: bool = False,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
 ) -> pd.DataFrame:
     """Fit an experimentally measured cubic-spline PSF on the GPU. For a 3D
     calibration the localizations contain the fitted ``z`` directly. See
-    ``fit2D`` for more details."""
+    ``fit2D`` for more details. ``progress_callback`` tracks the per-spot CRLB
+    computation in ``locs_from_fits_spline``."""
     theta, log_likelihood, iterations = fit_spots_gpufit_spline(
         spots, calibration, mle=mle, return_stats=True
     )
@@ -2412,6 +2609,7 @@ def _fit2d_spline_gpu(
         calibration,
         log_likelihood=log_likelihood,
         iterations=iterations,
+        progress_callback=progress_callback,
     )
     return locs
 
@@ -2596,6 +2794,7 @@ def fit_spline_multichannel(
         calibration,
         log_likelihood=log_likelihood,
         iterations=iterations,
+        progress_callback=progress_callback,
     )
 
 

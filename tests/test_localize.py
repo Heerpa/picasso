@@ -1474,6 +1474,85 @@ def _fake_spline_calibration(model="spline-3d", box=BOX, n_channels=2):
     return calib
 
 
+# ---------------------------------------------------------------------------
+# Analytic stand-in for gpuspline.spline_values, so the spline CRLB path can be
+# exercised WITHOUT the compiled splines library (e.g. on macOS, where only the
+# Windows splines.dll is vendored). It ignores the coefficient table and
+# returns a unit-peak, astigmatic Gaussian on the Cartesian product of the
+# coordinate arrays - exactly the interface the real spline_values exposes. A
+# known analytic model lets us check _spline_crlb's finite-difference Fisher
+# CRLB against a closed-form reference.
+# ---------------------------------------------------------------------------
+_FAKE_SPLINE_S0 = 1.6
+_FAKE_SPLINE_ASTIG = 0.01  # per-slice sigma change (astigmatism)
+
+
+def _fake_spline_sxsy(native_z, z_focus, s0):
+    dz = native_z - z_focus
+    return s0 * (1.0 + _FAKE_SPLINE_ASTIG * dz), s0 * (
+        1.0 - _FAKE_SPLINE_ASTIG * dz
+    )
+
+
+class _FakeSplineGS:
+    """Stand-in for ``picasso.localize.gs`` (the gpuspline module). ``s0`` is
+    the Gaussian sigma; keep it small enough that the PSF is contained in the
+    box (real calibrations are), else the boundary-clip in ``_spline_crlb``
+    biases the edge derivatives."""
+
+    def __init__(self, box=BOX, nz=21, s0=_FAKE_SPLINE_S0):
+        self.center = (box - 1) / 2.0
+        self.z_focus = (nz - 1) / 2.0
+        self.s0 = s0
+
+    def spline_values(self, coefficients, x, y=None, z=None):
+        x = np.asarray(x, dtype=np.float64)
+        if z is None:  # 2D: isotropic (astigmatism only encodes z)
+            y = np.asarray(y, dtype=np.float64)
+            gx = np.exp(-0.5 * ((x - self.center) / self.s0) ** 2)
+            gy = np.exp(-0.5 * ((y - self.center) / self.s0) ** 2)
+            return np.outer(gx, gy).astype(np.float32)
+        y = np.asarray(y, dtype=np.float64)
+        z = np.asarray(z, dtype=np.float64)
+        out = np.zeros((x.size, y.size, z.size), dtype=np.float32)
+        for k, zz in enumerate(z):
+            sx, sy = _fake_spline_sxsy(zz, self.z_focus, self.s0)
+            gx = np.exp(-0.5 * ((x - self.center) / sx) ** 2)
+            gy = np.exp(-0.5 * ((y - self.center) / sy) ** 2)
+            out[:, :, k] = np.outer(gx, gy)
+        return out
+
+
+def _install_fake_gs(monkeypatch, box=BOX, nz=21, s0=_FAKE_SPLINE_S0):
+    """Point ``localize.gs`` at the analytic fake for the duration of a test
+    (``gs`` is unbound when the compiled splines library is unavailable)."""
+    fake = _FakeSplineGS(box=box, nz=nz, s0=s0)
+    monkeypatch.setattr(localize, "gs", fake, raising=False)
+    return fake
+
+
+def _analytic_gauss_crlb_2d(amp, xs, ys, off, box=BOX, s0=_FAKE_SPLINE_S0):
+    """Poisson CRLB variances ``[xs, ys, amp, off]`` for the isotropic 2D
+    Gaussian the fake produces, from its analytic derivatives - the reference
+    for the finite-difference ``_spline_crlb``. Pixel px samples native px-xs;
+    emitter at native center + shift."""
+    grid = np.arange(box)
+    center = (box - 1) / 2.0
+    ux = (grid[:, None] - xs) - center
+    uy = (grid[None, :] - ys) - center
+    phi = np.exp(-0.5 * ((ux / s0) ** 2 + (uy / s0) ** 2))
+    mu = off + amp * phi
+    cols = [
+        amp * phi * ux / s0**2,  # d mu / d xs
+        amp * phi * uy / s0**2,  # d mu / d ys
+        phi,  # d mu / d amplitude
+        np.ones_like(phi),  # d mu / d offset
+    ]
+    deriv = np.stack([c.reshape(-1) for c in cols], axis=1)
+    weight = 1.0 / np.maximum(mu.reshape(-1), localize._SPLINE_CRLB_MU_FLOOR)
+    return np.diag(np.linalg.pinv((deriv * weight[:, None]).T @ deriv))
+
+
 class TestSplineCalibrationIO:
     """Round-trip of the spline PSF calibration through HDF5 (no GPU)."""
 
@@ -1556,14 +1635,18 @@ class TestSplineHelpers:
         init_3d = localize._initial_parameters_spline(spots, calib_3d)
         assert init_3d.shape == (len(spots), 5)
         assert init_3d.dtype == np.float32
-        # z_shift initialised to the calibration's in-focus slice
-        np.testing.assert_allclose(init_3d[:, 3], calib_3d["z_center"])
+        # z_shift is initialised to -z_init (the in-focus slice), so that the
+        # Gpufit model's native z = -z_shift starts at the focus (see
+        # _initial_parameters_spline / spline.calibrate_spline). z_init defaults
+        # to z_center for this calibration.
+        np.testing.assert_allclose(init_3d[:, 3], -calib_3d["z_center"])
 
         calib_2d = _fake_spline_calibration(model="spline-2d")
         init_2d = localize._initial_parameters_spline(spots, calib_2d)
         assert init_2d.shape == (len(spots), 4)
 
-    def test_locs_from_fits_spline_3d(self):
+    def test_locs_from_fits_spline_3d(self, monkeypatch):
+        _install_fake_gs(monkeypatch)
         calib = _fake_spline_calibration(model="spline-3d")
         n = 5
         ids = pd.DataFrame(
@@ -1598,11 +1681,14 @@ class TestSplineHelpers:
         # when absent):
         # z = (z_shift + z_center) * z_step_nm = (2) * 20 = 40 nm
         np.testing.assert_allclose(locs["z"], 40.0)
-        # lpz mirrors the (finite) lateral precision for the spline model
-        np.testing.assert_allclose(locs["lpz"], locs["lpx"])
-        assert np.all(np.isfinite(locs["lpz"]))
+        # lpx/lpy/lpz are now real Cramer-Rao bounds (finite, positive), not
+        # the former 0.01 placeholder, and the CRLB uncertainty columns exist.
+        for col in ("lpx", "lpy", "lpz", "photons_unc", "bg_unc"):
+            assert col in locs.columns
+            assert np.all(np.isfinite(locs[col])) and np.all(locs[col] > 0)
 
-    def test_locs_from_fits_spline_2d_has_no_z(self):
+    def test_locs_from_fits_spline_2d_has_no_z(self, monkeypatch):
+        _install_fake_gs(monkeypatch)
         calib = _fake_spline_calibration(model="spline-2d")
         n = 3
         ids = pd.DataFrame(
@@ -1618,7 +1704,12 @@ class TestSplineHelpers:
         theta[:, 3] = 8.0
         locs = localize.locs_from_fits_spline(ids, theta, BOX, False, calib)
         assert "z" not in locs.columns
+        assert "lpz" not in locs.columns
         np.testing.assert_allclose(locs["photons"], 3000.0)
+        # 2D still reports lateral + photon/bg CRLB uncertainties
+        for col in ("lpx", "lpy", "photons_unc", "bg_unc"):
+            assert col in locs.columns
+            assert np.all(np.isfinite(locs[col])) and np.all(locs[col] > 0)
 
     @pytest.mark.skipif(
         localize.GPUFIT_INSTALLED,
@@ -1671,7 +1762,9 @@ class TestSplineHelpers:
         )
         init = localize._initial_parameters_spline(spots, calib)
         assert init.shape == (4, 5)
-        np.testing.assert_allclose(init[:, 3], calib["z_center"])
+        # z_shift initialised to -z_init (= -z_center here); see the
+        # single-channel test above.
+        np.testing.assert_allclose(init[:, 3], -calib["z_center"])
 
     def test_get_spots_multichannel_identity(
         self, movie, real_identifications
@@ -1751,10 +1844,25 @@ class TestSplineCoefficients:
         x = np.arange(box, dtype=np.float32)
         y = np.arange(box, dtype=np.float32)
         z = np.arange(nz, dtype=np.float32)
-        # spline_values wants the flat (per-interval) coefficient array
-        coeffs_flat = calib["coefficients"].reshape(64, -1)
-        values = gs.spline_values(coeffs_flat, x, y, z)
+        # spline_values reads coefficients.shape[3], [2], [1]; it needs the full
+        # (64, nix, niy, niz) table - a reshape to (64, -1) raises IndexError.
+        # This is exactly what _spline_crlb passes.
+        values = gs.spline_values(calib["coefficients"], x, y, z)
         np.testing.assert_allclose(values, template, atol=1e-3)
+
+    def test_spline_crlb_real_coefficients(self):
+        """_spline_crlb runs on a real Gpuspline calibration and yields finite,
+        positive precisions (exercises the actual spline_values path, not the
+        analytic fake used by TestSplineCRLB)."""
+        calib, _, amplitude, offset = _synthetic_spline_3d_calibration()
+        box = calib["n_data"][0]
+        z_focus = calib["z_center"]
+        # a centred molecule a few slices below focus
+        theta = np.array(
+            [[amplitude, 0.0, 0.0, -(z_focus - 5.0), offset]], np.float64
+        )
+        crlb = localize._spline_crlb(theta, calib, box)[0]
+        assert np.all(np.isfinite(crlb)) and np.all(crlb > 0)
 
 
 @pytest.mark.skipif(
@@ -1775,8 +1883,41 @@ class TestSplineGpufit:
         spots = np.stack([spot] * 4)
         theta = localize.fit_spots_gpufit_spline(spots, calib)
         assert theta.shape == (len(spots), 5)
-        # recovered z shift should sit near the taken slice
-        np.testing.assert_allclose(theta[:, 3], z_slice, atol=2.0)
+        # The fitted z_shift maps to the taken native slice with magnitude
+        # ~= z_slice; the sign encodes the native_z = -z_shift convention
+        # (see test_spline_crlb_native_z_reconstruction), so we check the
+        # magnitude here to stay convention-agnostic.
+        np.testing.assert_allclose(np.abs(theta[:, 3]), z_slice, atol=2.0)
+
+    def test_spline_crlb_native_z_reconstruction(self):
+        """Definitive check of the native_z = -z_shift convention that
+        ``_spline_crlb`` relies on for lpz: re-evaluating the spline at
+        ``-z_shift`` must reproduce the fitted spot better than at ``+z_shift``.
+        """
+        calib, template, amplitude, offset = _synthetic_spline_3d_calibration()
+        z_slice = int(calib["z_center"])
+        spot = (amplitude * template[:, :, z_slice] + offset).astype(
+            np.float32
+        )
+        amp, xs, ys, zs, off = localize.fit_spots_gpufit_spline(
+            np.stack([spot]), calib
+        )[0]
+        box, _, nz = calib["n_data"]
+        grid = np.arange(box, dtype=np.float32)
+
+        def model(native_z):
+            zc = np.array([np.clip(native_z, 0.0, nz - 1)], np.float32)
+            phi = localize.gs.spline_values(
+                calib["coefficients"],
+                grid - np.float32(xs),
+                grid - np.float32(ys),
+                zc,
+            )[:, :, 0]
+            return off + amp * phi
+
+        res_minus = float(np.mean((model(-zs) - spot) ** 2))
+        res_plus = float(np.mean((model(+zs) - spot) ** 2))
+        assert res_minus < res_plus
 
     def test_fit_spots_spline_box_mismatch(self):
         calib, _, _, _ = _synthetic_spline_3d_calibration(box=BOX)
@@ -1784,3 +1925,122 @@ class TestSplineGpufit:
         spots = np.zeros((2, wrong_box, wrong_box), dtype=np.float32)
         with pytest.raises(ValueError):
             localize.fit_spots_gpufit_spline(spots, calib)
+
+
+@pytest.mark.skipif(
+    not localize.GPUSPLINE_INSTALLED,
+    reason="Gpuspline not available",
+)
+class TestSplineCRLBReal:
+    """The CRLB path on a real Gpuspline-built calibration (CPU, no GPU fit)."""
+
+    def test_crlb_finite_across_z(self):
+        calib, _, amplitude, offset = _synthetic_spline_3d_calibration()
+        box, _, nz = calib["n_data"]
+        z_focus = calib["z_center"]
+        thetas = np.array(
+            [
+                [amplitude, 0.1, -0.1, -(z_focus - dz), offset]
+                for dz in (-6.0, 0.0, 6.0)
+            ],
+            np.float64,
+        )
+        crlb = localize._spline_crlb(thetas, calib, box)
+        assert np.all(np.isfinite(crlb)) and np.all(crlb > 0)
+
+
+class TestSplineCRLB:
+    """Cramer-Rao lower bounds for spline-fitted localizations, using an
+    analytic Gaussian stand-in for gpuspline (see ``_FakeSplineGS``). These run
+    everywhere - no compiled splines library or GPU required."""
+
+    def test_crlb_2d_matches_analytic(self, monkeypatch):
+        # The finite-difference Poisson Fisher CRLB must match the closed-form
+        # CRLB of the same isotropic Gaussian model. Use a narrow sigma so the
+        # PSF is contained in the small test box (BOX=7) and the boundary clip
+        # is a no-op - the regime real (box-matched) calibrations operate in.
+        s0 = 0.9
+        _install_fake_gs(monkeypatch, s0=s0)
+        calib = _fake_spline_calibration(model="spline-2d")
+        amp, off = 3000.0, 15.0
+        # centred emitter: xc = grid stays in [0, box-1] so no pixel is clipped
+        theta = np.array([[amp, 0.0, 0.0, off]], np.float64)
+        crlb = localize._spline_crlb(theta, calib, BOX)[0]
+        ref = _analytic_gauss_crlb_2d(amp, 0.0, 0.0, off, s0=s0)
+        np.testing.assert_allclose(crlb, ref, rtol=2e-2)
+
+    def test_astigmatic_lpx_below_lpy(self, monkeypatch):
+        # Off-focus the fake PSF is astigmatic (sx != sy); below focus sx < sy,
+        # so lpx < lpy. This guards the x/y axis association (transpose).
+        _install_fake_gs(monkeypatch)
+        calib = _fake_spline_calibration(model="spline-3d")
+        # native_z = -z_shift = 4, i.e. 6 slices below the focus (z_focus=10)
+        theta = np.array([[5000.0, 0.2, -0.1, -4.0, 20.0]], np.float64)
+        ids = pd.DataFrame(
+            {"frame": [0], "x": [50], "y": [60], "net_gradient": [1000.0]}
+        )
+        locs = localize.locs_from_fits_spline(ids, theta, BOX, False, calib)
+        lpx, lpy = float(locs["lpx"].iloc[0]), float(locs["lpy"].iloc[0])
+        assert np.isfinite(lpx) and np.isfinite(lpy)
+        assert not np.isclose(lpx, lpy, rtol=0.05)
+        assert lpx < lpy
+
+    def test_lpz_finite_and_columns(self, monkeypatch):
+        _install_fake_gs(monkeypatch)
+        calib = _fake_spline_calibration(model="spline-3d")
+        theta = np.array([[5000.0, 0.0, 0.0, -4.0, 20.0]], np.float64)
+        ids = pd.DataFrame(
+            {"frame": [0], "x": [50], "y": [60], "net_gradient": [1000.0]}
+        )
+        locs = localize.locs_from_fits_spline(ids, theta, BOX, False, calib)
+        assert np.isfinite(locs["lpz"].iloc[0]) and locs["lpz"].iloc[0] > 0
+        for col in ("lpz", "photons_unc", "bg_unc"):
+            assert col in locs.columns
+
+    def test_multichannel_sums_fisher(self, monkeypatch):
+        # Two identical channels double the Fisher information, halving the
+        # variance versus a single channel.
+        _install_fake_gs(monkeypatch)
+        calib_1ch = _fake_spline_calibration(model="spline-3d")
+        calib_2ch = _fake_spline_calibration(
+            model="spline-3d-multichannel", n_channels=2
+        )
+        theta = np.array([[5000.0, 0.1, -0.1, -6.0, 20.0]], np.float64)
+        crlb_1 = localize._spline_crlb(theta, calib_1ch, BOX)[0]
+        crlb_2 = localize._spline_crlb(theta, calib_2ch, BOX)[0]
+        np.testing.assert_allclose(crlb_2, crlb_1 / 2.0, rtol=1e-4)
+
+    def test_nan_theta_row_isolated(self, monkeypatch):
+        _install_fake_gs(monkeypatch)
+        calib = _fake_spline_calibration(model="spline-2d")
+        theta = np.array(
+            [[3000.0, 0.1, 0.0, 15.0], [np.nan, 0.0, 0.0, 10.0]], np.float64
+        )
+        crlb = localize._spline_crlb(theta, calib, BOX)
+        assert np.all(np.isfinite(crlb[0]))
+        assert np.all(np.isnan(crlb[1]))
+
+    def test_low_signal_stays_finite(self, monkeypatch):
+        # offset = 0 drives some model pixels to <= 0; the MU_FLOOR guard keeps
+        # the Fisher weight (1 / mu) finite.
+        _install_fake_gs(monkeypatch)
+        calib = _fake_spline_calibration(model="spline-2d")
+        theta = np.array([[500.0, 0.0, 0.0, 0.0]], np.float64)
+        crlb = localize._spline_crlb(theta, calib, BOX)[0]
+        assert np.all(np.isfinite(crlb))
+
+    def test_progress_callback_and_console(self, monkeypatch):
+        _install_fake_gs(monkeypatch)
+        calib = _fake_spline_calibration(model="spline-2d")
+        n = 25
+        rng = np.random.default_rng(0)
+        theta = np.zeros((n, 4), np.float64)
+        theta[:, 0] = 3000.0
+        theta[:, 1:3] = rng.uniform(-0.5, 0.5, (n, 2))
+        theta[:, 3] = 15.0
+        seen = []
+        localize._spline_crlb(theta, calib, BOX, progress_callback=seen.append)
+        assert seen and seen[-1] == n
+        assert seen == sorted(seen)  # non-decreasing cumulative counts
+        # the tqdm ("console") path must not raise
+        localize._spline_crlb(theta, calib, BOX, progress_callback="console")
