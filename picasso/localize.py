@@ -2150,11 +2150,6 @@ def _initial_parameters_spline(
 
     - x_shift/y_shift are the emitter's lateral offset from the (centered)
       template, i.e. 0 for a spot centered in its ROI.
-    - z_shift is initialized to ``-z_center``. A single camera plane is fitted,
-      so ``point_index_z == 0`` and the model samples the spline z axis at
-      ``-z_shift``; ``-z_center`` therefore starts the fit at the in-focus
-      slice. A positive ``+z_center`` would sample the spline at a negative
-      (out-of-range) z, collapsing the fit (amplitude -> 0, z pinned).
 
     For the multichannel model ``spots`` is channel-stacked
     ``(n, box, box, n_channels)``; amplitude/offset are estimated across all
@@ -2171,7 +2166,10 @@ def _initial_parameters_spline(
     if model == "spline-2d":
         initial[:, 3] = spot_min  # offset
     else:
-        initial[:, 3] = -float(calibration.get("z_center", 0.0))  # z_shift
+        z_init = float(
+            calibration.get("z_init", calibration.get("z_center", 0.0))
+        )
+        initial[:, 3] = -z_init  # z_shift (in-focus start; see docstring)
         initial[:, 4] = spot_min  # offset
     return initial
 
@@ -2358,7 +2356,7 @@ def locs_from_fits_spline(
 
     photon_scale = float(calibration.get("photon_scale", 1.0))
     photons = amplitude * photon_scale
-    lpx = 0.01
+    lpx = np.float32(0.01)
 
     columns = {
         "frame": identifications["frame"].astype(np.uint32),
@@ -2366,20 +2364,23 @@ def locs_from_fits_spline(
         "y": y.astype(np.float32),
         "photons": photons.astype(np.float32),
         "bg": offset.astype(np.float32),
-        "lpx": lpx.astype(np.float32),  # TODO: correct
-        "lpy": lpx.astype(np.float32),  # TODO: correct
+        "lpx": lpx,  # TODO: correct
+        "lpy": lpx,  # TODO: correct
         "net_gradient": identifications["net_gradient"].astype(np.float32),
     }
     if is_3d:
         z_shift = np.asarray(theta[:, 3])
         z_center = float(calibration.get("z_center", 0.0))
+        z_init = float(calibration.get("z_init", z_center))
         z_step_nm = float(calibration.get("z_step_nm", 1.0))
         magnification_factor = float(
             calibration.get("magnification_factor", 1.0)
         )
-        z = -(z_shift + z_center) * z_step_nm * magnification_factor
+        z_position = (z_shift + z_init) * z_step_nm * magnification_factor
+        z_offset_nm = (z_center - z_init) * z_step_nm  # raw stage nm, no mag
+        z = z_position + z_offset_nm
         columns["z"] = z.astype(np.float32)
-        columns["lpz"] = lpx.astype(np.float32)  # TODO: correct
+        columns["lpz"] = lpx  # TODO: correct
     if log_likelihood is not None:
         columns["log_likelihood"] = log_likelihood.astype(np.float32)
     if iterations is not None:

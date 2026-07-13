@@ -1593,10 +1593,11 @@ class TestSplineHelpers:
         )
         np.testing.assert_allclose(locs["photons"], 5000.0)
         np.testing.assert_allclose(locs["bg"], 12.0)
-        # z is inverted (as in the astigmatism fit) and scaled by the
-        # magnification factor (default 1.0 when absent):
-        # z = -(z_shift + z_center) * z_step_nm = -(2) * 20 = -40 nm
-        np.testing.assert_allclose(locs["z"], -40.0)
+        # z follows the astigmatism (zfit / z_of_step) convention - it rises
+        # with stage z - and is scaled by the magnification factor (default 1.0
+        # when absent):
+        # z = (z_shift + z_center) * z_step_nm = (2) * 20 = 40 nm
+        np.testing.assert_allclose(locs["z"], 40.0)
         # lpz mirrors the (finite) lateral precision for the spline model
         np.testing.assert_allclose(locs["lpz"], locs["lpx"])
         assert np.all(np.isfinite(locs["lpz"]))

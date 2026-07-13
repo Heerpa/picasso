@@ -398,6 +398,18 @@ def _axial_intensity_focus(template: np.ndarray) -> float:
     return float(k)
 
 
+def _scan_center_index(z_of_step: np.ndarray) -> float:
+    """Find the z position where z == 0 using linear interpolation."""
+    zos = np.asarray(z_of_step, dtype=float)
+    n = len(zos)
+    if n < 2:
+        return 0.0
+    dz = (zos[-1] - zos[0]) / (n - 1)
+    if dz == 0.0:
+        return 0.0
+    return float(-zos[0] / dz)  # solve zos[0] + k * dz == 0
+
+
 def _reference_frame_bounds(
     step_of_frame: np.ndarray, step_range: np.ndarray
 ) -> tuple[int, int]:
@@ -562,14 +574,14 @@ def calibrate_spline(
     correct_z_bias : bool, optional
         If True, define z = 0 at the axial intensity peak of the averaged PSF
         (the peak of the diagnostic plot's axial intensity profile) instead of
-        the sharpest (smallest-sigma) slice, correcting a potential z bias in
-        the raw stage scan. Analogous to the astigmatism calibration pinning
-        z = 0 to the sx == sy crossing (see ``picasso.zfit.calibrate_z``); only
-        meaningful for a PSF with a single, well-defined intensity focus (e.g.
-        astigmatism). Default False.
+        at the raw stage-scan center (``z_of_step == 0``). Analogous to the
+        astigmatism calibration pinning z = 0 to the sx == sy crossing
+        (see ``picasso.zfit.calibrate_z``); only meaningful for a PSF
+        with a single, well-defined intensity focus (e.g. astigmatism).
+        Default is False.
     path : str, optional
         Where to save the calibration (HDF5) and a diagnostic PNG. If None,
-        nothing is written. Default None.
+        nothing is written. Default is None.
     progress_callback : callable, optional
         Called with an integer step count (0..3) as the calibration proceeds.
 
@@ -606,9 +618,26 @@ def calibrate_spline(
     )
     template = built["template"]  # (box, box, n_steps)
     z_center = built["z_center"]
-    # z origin used at fit time: the sharpest slice by default, or the axial
-    # intensity peak when correcting for a stage-scan z bias (astigmatism)
-    z_origin = built["z_focus"] if correct_z_bias else float(z_center)
+    # Two distinct z references (see also ``localize._initial_parameters_spline``
+    # / ``locs_from_fits_spline``):
+    #  - z_init: the sharpest (in-focus) slice. The fit's z_shift is initialized
+    #    to -z_init. This is the numerically sound, convention-INDEPENDENT start
+    #    and must NOT depend on ``correct_z_bias`` - otherwise the two
+    #    calibrations start the fit from different z, converge to different
+    #    (x, y, z) minima (an astigmatic PSF has flat gradients off-focus), and
+    #    the z=0 shift leaks into x/y instead of being a clean constant.
+    #  - z_origin: the z = 0 reference used only when converting the fitted
+    #    z_shift to physical z (output). Without correction it is the raw
+    #    stage-scan zero (the scan center); ``correct_z_bias`` moves it to the
+    #    axial intensity focus. The difference is the raw-scan z bias (the
+    #    focus's offset from the scan center, ~100s of nm), applied as a
+    #    constant shift of the output z and nothing else.
+    z_init = float(z_center)
+    z_origin = (
+        built["z_focus"]
+        if correct_z_bias
+        else _scan_center_index(built["z_of_step"])
+    )
 
     if callable(progress_callback):
         progress_callback(1)
@@ -651,6 +680,7 @@ def calibrate_spline(
         # are already in camera pixels
         "oversampling": 1.0,
         "z_center": float(z_origin),
+        "z_init": float(z_init),
         "z_step_nm": float(d),
         "magnification_factor": float(magnification_factor),
         "correct_z_bias": bool(correct_z_bias),
@@ -896,7 +926,15 @@ def calibrate_spline_multichannel(
         coefficients[..., c] = np.reshape(coeff_c, [64] + n_intervals)
 
     ref = per_channel[0]
-    z_origin = ref["z_focus"] if correct_z_bias else float(ref["z_center"])
+    # z_init (sharpest slice, fit initialization) vs z_origin (output z = 0
+    # reference: raw stage-scan zero, or the intensity focus with
+    # correct_z_bias); see ``calibrate_spline`` for why they must be decoupled.
+    z_init = float(ref["z_center"])
+    z_origin = (
+        ref["z_focus"]
+        if correct_z_bias
+        else _scan_center_index(ref["z_of_step"])
+    )
     pixelsize = camera_infos[0].get("Pixelsize", 130)
     calibration = {
         "model": "spline-3d-multichannel",
@@ -907,6 +945,7 @@ def calibrate_spline_multichannel(
         "channel_transforms": [t.tolist() for t in transforms],
         "oversampling": 1.0,
         "z_center": float(z_origin),
+        "z_init": float(z_init),
         "z_step_nm": float(d),
         "magnification_factor": float(magnification_factor),
         "correct_z_bias": bool(correct_z_bias),
@@ -1063,16 +1102,10 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
     # Stage-equivalent fitted z (theta column 3 is z_shift), so the RMSD is in
     # stage nm and directly comparable to ``z_of_step`` - as in
     # ``zfit.calibrate_z``, which divides the localization z by the
-    # magnification factor before comparing to the stage positions. Note the
-    # sign: ``locs_from_fits_spline`` reports the *physical* z as
-    # ``-(z_shift + z_center) * z_step_nm * mag`` with the spline's z-axis
-    # deliberately inverted (see the "invert z" handling), so the physical z
-    # runs opposite to stage travel. The stage-equivalent that lines up with
-    # ``z_of_step`` is therefore ``-z_physical / mag = (z_shift + z_center) *
-    # z_step_nm`` - i.e. no leading minus here.
+    # magnification factor before comparing to the stage positions.
     z_step_nm = float(calibration.get("z_step_nm", 1.0))
-    z_center = float(calibration.get("z_center", 0.0))
-    z_fit = (theta[:, 3] + z_center) * z_step_nm  # (n_spots,)
+    z_init = float(calibration.get("z_init", calibration.get("z_center", 0.0)))
+    z_fit = (theta[:, 3] + z_init) * z_step_nm  # (n_spots,)
     deviation = z_fit - z_of_step[spot_step_idx]  # (n_spots,)
 
     n_steps = len(z_of_step)
@@ -1124,33 +1157,28 @@ def _save_diagnostic_plot(
     vmax = float(template.max()) or 1.0
     img_kw = dict(cmap="hot", vmin=0.0, vmax=vmax)
 
-    # z = 0 reference the fitter (localize) uses: the calibration's z origin
-    # (a fractional step index). With ``correct_z_bias`` it is the axial
-    # intensity peak; otherwise the sharpest (in-focus) slice. Shift the
-    # plotted z so this origin lands at z = 0 - matching the z that
-    # ``locs_from_fits_spline`` reports - and mark/label/outline it there.
+    # z = 0 reference the fitter (localize) uses
     correct_z_bias = bool(calibration.get("correct_z_bias", False))
     z_origin = float(calibration.get("z_center", z_center))
-    shifted = correct_z_bias and n_steps > 1
-    if shifted:
+    if n_steps > 1:
         dz_step = (float(z_of_step[-1]) - float(z_of_step[0])) / (n_steps - 1)
         z_ref_nm = (
             float(z_of_step[0]) + z_origin * dz_step
         )  # stage nm at origin
-        origin_idx = int(np.clip(round(z_origin), 0, n_steps - 1))
-        x_label = "z (nm, 0 at intensity focus)"
     else:
         z_ref_nm = 0.0
-        origin_idx = z_center
-        x_label = "Stage position (nm)"
     z_plot = np.asarray(z_of_step, dtype=float) - z_ref_nm
-    # position of the z = 0 marker in the (shifted) plot coordinates: exactly 0
-    # when shifted to the intensity focus, else the sharpest slice's position
-    z_focus_marker = 0.0 if shifted else float(z_plot[origin_idx])
+    # After the shift the fitter's z = 0 reference sits at 0; the bottom profile
+    # plots mark it with a vertical line. The in-focus (sharpest) slice is
+    # outlined in the xy row and marked by the cyan line in the cross-sections
+    z_origin_marker = 0.0
+    outline_idx = int(np.clip(z_center, 0, n_steps - 1))
+    z_outline_nm = float(z_plot[outline_idx])
+    x_label = "Stage position (nm)"
     z_lo, z_hi = float(z_plot[-1]), float(z_plot[0])  # z decreases
 
     # slice indices for each projection
-    z_idx = _even_slice_indices(n_steps, n_slices, forced=origin_idx)
+    z_idx = _even_slice_indices(n_steps, n_slices, forced=outline_idx)
     y_idx = _even_slice_indices(box, n_slices, forced=c)
     x_idx = _even_slice_indices(box, n_slices, forced=c)
 
@@ -1172,7 +1200,9 @@ def _save_diagnostic_plot(
     xy_ext = [lat_lo, lat_hi, lat_hi, lat_lo]
     xy_kw = dict(extent=xy_ext, origin="upper", **img_kw)
 
-    z_focus_px = z_focus_marker / ps
+    z_outline_px = (
+        z_outline_nm / ps
+    )  # cyan cross-section line at the sharpest slice
     # (image, title, imshow_kwargs, w_px, h_px, highlight, hline)
     xy_panels = [
         (
@@ -1181,7 +1211,7 @@ def _save_diagnostic_plot(
             xy_kw,
             box,
             box,
-            k == origin_idx,
+            k == outline_idx,
             None,
         )
         for k in z_idx
@@ -1195,7 +1225,7 @@ def _save_diagnostic_plot(
             box,
             z_span_px,
             False,
-            z_focus_px,
+            z_outline_px,
         )
         for y in y_idx
     ]
@@ -1207,7 +1237,7 @@ def _save_diagnostic_plot(
             box,
             z_span_px,
             False,
-            z_focus_px,
+            z_outline_px,
         )
         for x in x_idx
     ]
@@ -1317,7 +1347,7 @@ def _save_diagnostic_plot(
         ]
     )
     ax.plot(z_plot, template.max(axis=(0, 1)), ".-")
-    ax.axvline(z_focus_marker, color="0.3", lw=1.0)
+    ax.axvline(z_origin_marker, color="0.3", lw=1.0)
     ax.set_xlabel(x_label)
     ax.set_ylabel("Peak pixel value (norm.)")
 
@@ -1336,7 +1366,7 @@ def _save_diagnostic_plot(
             # delivers vs z (lower is better; rises with defocus). Analogous to
             # the "mean z precision" panel in ``zfit.calibrate_z``.
             ax2.plot(z_plot, precision["rmsd_z"], ".-", color="tab:red")
-            ax2.axvline(z_focus_marker, color="0.3", lw=1.0)
+            ax2.axvline(z_origin_marker, color="0.3", lw=1.0)
             ax2.set_xlabel(x_label)
             ax2.set_ylabel("z RMSD (nm)")
             ax2.set_ylim(bottom=0.0)
@@ -1351,7 +1381,7 @@ def _save_diagnostic_plot(
             ax2.plot(
                 z_plot, gof["residual_profile_pct"], ".-", color="tab:red"
             )
-            ax2.axvline(z_focus_marker, color="0.3", lw=1.0)
+            ax2.axvline(z_origin_marker, color="0.3", lw=1.0)
             ax2.set_xlabel(x_label)
             ax2.set_ylabel("RMSE (% of peak)")
             ax2.set_ylim(bottom=0.0)
