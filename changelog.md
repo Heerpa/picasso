@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 13-JUL-2026 CEST
+Last change: 14-JUL-2026 CEST
 
 ## 0.11.0
 
@@ -51,6 +51,7 @@ Last change: 13-JUL-2026 CEST
 - Background color for multichannel data can be adjusted
 - "Apply to all sequentially" available for drift correction algorithms
 - "Apply to all sequentially" available in Apply expression to localizations
+- G5M now supports 3D localizations fit with the experimental spline PSF, not only astigmatism.
 - G5M accepts `group_input` as the cluster id columns (useful if `group` is overwritten after clustering)
 - Re-grouping localizations (picking, DBSCAN/HDBSCAN/SMLM clustering) now preserves the previous grouping in the `group_input` column instead of discarding it, so the original cluster ids remain available (e.g. for G5M)
 - Updated G5M documentation - drift correction importance

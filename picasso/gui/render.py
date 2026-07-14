@@ -3097,8 +3097,21 @@ class G5MDialog(lib.Dialog):
             QtCore.Qt.Orientation.Horizontal,
             self,
         )
-        if self.flag_3D:  # 3d calibration
-            self.buttons.buttons()[0].setEnabled(False)
+        if self.flag_3D:  # 3d data - choose astigmatism vs spline
+            # mode selector: astigmatism needs a calibration, spline
+            # recovers z (and lpz) directly and needs none
+            self.z_mode = QtWidgets.QComboBox()
+            self.z_mode.setToolTip(
+                "Fitting mode of the input 3D localizations.\n"
+                "'Astigmatism (Gaussian)' couples the x/y widths via the\n"
+                "3D calibration; 'Spline PSF' uses a plain diagonal 3D\n"
+                "model and reads z/lpz directly from the localizations."
+            )
+            self.z_mode.addItems(["Astigmatism (Gaussian)", "Spline PSF"])
+            z_mode_label = QtWidgets.QLabel("3D fit mode:")
+            grid.addWidget(z_mode_label, grid.rowCount(), 0)
+            grid.addWidget(self.z_mode, grid.rowCount() - 1, 1)
+
             self.load_calib_button = QtWidgets.QPushButton(
                 "Load 3D calibration"
             )
@@ -3109,7 +3122,12 @@ class G5MDialog(lib.Dialog):
             )
             self.load_calib_button.clicked.connect(self.load_calibration)
             grid.addWidget(self.load_calib_button, grid.rowCount(), 0, 1, 2)
-            self.automatic_load_calibration()
+
+            self.z_mode.currentIndexChanged.connect(self.handle_z_mode)
+            # default to spline if the locs were fit with a spline PSF
+            if self._locs_are_spline():
+                self.z_mode.setCurrentIndex(1)
+            self.handle_z_mode(self.z_mode.currentIndex())
 
         vbox.addWidget(self.buttons)  # these must be added at the end
         self.buttons.accepted.connect(self.accept)
@@ -3144,21 +3162,30 @@ class G5MDialog(lib.Dialog):
             "postprocess_check": dialog.postprocess_check.isChecked(),
         }
         if dialog.flag_3D:
-            params["calibration"] = dialog.calibration
+            mode = (
+                "spline"
+                if dialog.z_mode.currentIndex() == 1
+                else "astigmatism"
+            )
+            params["mode"] = mode
             params["pixelsize"] = px
-            if "Magnification factor" not in dialog.calibration.keys():
-                mag_factor, ok = QtWidgets.QInputDialog.getDouble(
-                    parent,
-                    "Input Dialog",
-                    "Enter magnification factor",
-                    0.79,
-                    0.1,
-                    10,
-                    2,
-                )
-                if not ok:
-                    return None, False
-                params["calibration"]["Magnification factor"] = mag_factor
+            if mode == "astigmatism":
+                params["calibration"] = dialog.calibration
+                if "Magnification factor" not in dialog.calibration.keys():
+                    mag_factor, ok = QtWidgets.QInputDialog.getDouble(
+                        parent,
+                        "Input Dialog",
+                        "Enter magnification factor",
+                        0.79,
+                        0.1,
+                        10,
+                        2,
+                    )
+                    if not ok:
+                        return None, False
+                    params["calibration"]["Magnification factor"] = mag_factor
+            else:  # spline - no calibration needed
+                params["calibration"] = None
         return (
             params,
             result == QtWidgets.QDialog.DialogCode.Accepted,
@@ -3175,6 +3202,32 @@ class G5MDialog(lib.Dialog):
             self.max_sigma_label.setText("Max. \u03c3 (nm):")
             self.min_sigma.setValue(5.0)
             self.max_sigma.setValue(20.0)
+
+    def handle_z_mode(self, idx: int) -> None:
+        """Switch between astigmatism (needs a calibration) and spline
+        (no calibration needed) 3D fitting modes."""
+        if idx == 1:  # spline PSF - no calibration required
+            self.load_calib_button.setEnabled(False)
+            self.buttons.buttons()[0].setEnabled(True)
+        else:  # astigmatism - require a calibration
+            self.load_calib_button.setEnabled(True)
+            # OK stays disabled until a calibration is loaded
+            self.buttons.buttons()[0].setEnabled(self.calibration is not None)
+            if self.calibration is None:
+                self.automatic_load_calibration()
+
+    def _locs_are_spline(self) -> bool:
+        """Return True if the loaded localizations were fit with a
+        spline PSF (based on the localization metadata)."""
+        ch = self.channel if self.channel != len(self.window.view.locs) else 0
+        infos = self.window.view.infos[ch]
+        fit_method = lib.get_from_metadata(infos, "Fit method")
+        if fit_method is not None and str(fit_method).startswith("spline"):
+            return True
+        return (
+            lib.get_from_metadata(infos, "Spline calibration model")
+            is not None
+        )
 
     def load_calibration(self) -> None:
         """Load the calibration file selected by the user."""
@@ -3602,7 +3655,12 @@ class TestClustererDialog(lib.Dialog):
             params["G5M"][
                 "postprocess"
             ] = self.test_g5m_params.postprocess_check.isChecked()
-            params["G5M"]["calibration"] = self.test_g5m_params.calibration
+            if self.test_g5m_params.z_mode.currentIndex() == 1:  # spline
+                params["G5M"]["mode"] = "spline"
+                params["G5M"]["calibration"] = None
+            else:  # astigmatism
+                params["G5M"]["mode"] = "astigmatism"
+                params["G5M"]["calibration"] = self.test_g5m_params.calibration
             params["G5M"]["asynch"] = False
             params["G5M"]["callback_parent"] = None
 
@@ -4008,8 +4066,22 @@ class TestG5MParams(QtWidgets.QWidget):
             "- p_val < 0.015"
         )
 
+        # 3D fit mode (only consulted for 3D data): astigmatism needs a
+        # calibration, spline recovers z/lpz directly and needs none
+        self.z_mode = QtWidgets.QComboBox()
+        self.z_mode.setToolTip(
+            "Fitting mode of the input 3D localizations.\n"
+            "'Astigmatism (Gaussian)' couples the x/y widths via the 3D\n"
+            "calibration; 'Spline PSF' uses a plain diagonal 3D model and\n"
+            "reads z/lpz directly from the localizations (no calibration)."
+        )
+        self.z_mode.addItems(["Astigmatism (Gaussian)", "Spline PSF"])
+        z_mode_label = QtWidgets.QLabel("3D fit mode (3D only):")
+        grid.addWidget(z_mode_label, grid.rowCount(), 0)
+        grid.addWidget(self.z_mode, grid.rowCount() - 1, 1)
+
         load_calib_button = QtWidgets.QPushButton(
-            "Load 3D calibration (3D only)"
+            "Load 3D calibration (astigmatism only)"
         )
         load_calib_button.clicked.connect(self.load_calibration)
         grid.addWidget(load_calib_button, grid.rowCount(), 0, 1, 2)
@@ -8000,6 +8072,7 @@ class View(QtWidgets.QLabel):
             sigma_bounds=params["sigma_bounds"],
             bootstrap_check=params["bootstrap_check"],
             calibration=params.get("calibration", None),
+            mode=params.get("mode", "astigmatism"),
             postprocess=params["postprocess_check"],
             max_locs_per_cluster=params["max_locs_per_cluster"][channel],
             asynch=params["multiprocessing_check"],

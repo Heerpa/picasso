@@ -507,10 +507,18 @@ class G5M(metaclass=ABCMeta):
         if self.calibration is None:
             cx = np.array([])
             cy = np.array([])
-            mag_factor = None
+            # float sentinel; unused when cx/cy are empty, but required
+            # so the njit m-step's mag_factor stays typed as a float
+            mag_factor = 0.79
         else:
-            cx = self.calibration["X Coefficients"]
-            cy = self.calibration["Y Coefficients"]
+            # convert to numpy arrays so the njit m-step can use .size
+            # (calibration coefficients come from YAML as Python lists)
+            cx = np.asarray(
+                self.calibration["X Coefficients"], dtype=np.float64
+            )
+            cy = np.asarray(
+                self.calibration["Y Coefficients"], dtype=np.float64
+            )
             mag_factor = self.calibration["Magnification factor"]
         (w, m, c, pc), converged, valid_idx = _fit_G5M(
             X,
@@ -1222,7 +1230,11 @@ def _m_step_3D(
     next step, sigma bound are imposed and then the ratio of the spot
     width and height is extracted from calibration, based on the z
     position, for each component and imposed on the covariances' x and
-    y values."""
+    y values.
+
+    When ``cx``/``cy`` are empty (spline fitting), the astigmatism
+    coupling step is skipped and the x/y/z covariances stay independent
+    (plain diagonal 3D model), bounded by the local loc. precisions."""
     resp = np.exp(log_resp)
     weights, means, covs = _estimate_gaussian_parameters_3D(X, resp)
 
@@ -1276,17 +1288,22 @@ def _m_step_3D(
         max_cov_z,
     )
 
-    z_position_calib = means[:, 2] / mag_factor
-    spot_width = _poly1d(cx, z_position_calib)
-    spot_height = _poly1d(cy, z_position_calib)
-    ratio = spot_width / spot_height
+    # impose the astigmatism coupling between the x and y covariances
+    # only when calibration polynomials are provided (astigmatism mode).
+    # For spline fitting cx/cy are empty and the covariances stay
+    # independent (plain diagonal 3D model).
+    if cx.size > 0 and cy.size > 0:
+        z_position_calib = means[:, 2] / mag_factor
+        spot_width = _poly1d(cx, z_position_calib)
+        spot_height = _poly1d(cy, z_position_calib)
+        ratio = spot_width / spot_height
 
-    covs_xy = np.empty((covs.shape[0], 2))
-    covs_xy[:, 0] = covs[:, 0]
-    covs_xy[:, 1] = covs[:, 1]
-    mean_xy_covs = _mean_along_axis1(covs_xy, (covs_xy.shape[0],))
-    covs[:, 0] = mean_xy_covs * ratio
-    covs[:, 1] = mean_xy_covs / ratio
+        covs_xy = np.empty((covs.shape[0], 2))
+        covs_xy[:, 0] = covs[:, 0]
+        covs_xy[:, 1] = covs[:, 1]
+        mean_xy_covs = _mean_along_axis1(covs_xy, (covs_xy.shape[0],))
+        covs[:, 0] = mean_xy_covs * ratio
+        covs[:, 1] = mean_xy_covs / ratio
     weights /= weights.sum()
     precisions_cholesky = 1.0 / np.sqrt(covs)
     return weights, means, covs, precisions_cholesky
@@ -1297,9 +1314,10 @@ def _find_optimal_G5M_3D(
     min_locs: int,
     sigma_bounds: tuple[float, float],
     *,
-    calibration: dict,
+    calibration: dict | None,
     lp: lib.FloatArray2D,
     loc_prec_handle: Literal["local", "abs"] = "local",
+    mode: Literal["astigmatism", "spline"] = "astigmatism",
     max_rounds_without_best_bic: int = MAX_ROUNDS_WITHOUT_BEST_BIC,
 ) -> G5M_3D:
     """Find optimal G5M for given 3D data X.
@@ -1315,9 +1333,10 @@ def _find_optimal_G5M_3D(
         components. If local loc. prec. is used, the bounds specify the
         margin of error in units of localization precision. Else,
         absolute bounds on sigma.
-    calibration: dict
-        Calibration dictionary with the following keys:
-        "X Coefficients", "Y Coefficients" and "Magnification factor".
+    calibration: dict or None
+        Astigmatism calibration dictionary with the keys "X
+        Coefficients", "Y Coefficients" and "Magnification factor".
+        Required for ``mode="astigmatism"``, may be None for spline.
         See https://picassosr.readthedocs.io/en/latest/localize.html#d-calibration.  # noqa: E501
     lp : lib.FloatArray2D
         Localization precision for each localization in x, y and z. Only
@@ -1327,6 +1346,9 @@ def _find_optimal_G5M_3D(
         of points around each component are used to bound sigmas. Else,
         sigma_bounds specifies the absolute bounds on sigmas. Default
         is "local".
+    mode : {"astigmatism", "spline"}, optional
+        Fitting mode of the input localizations. Default is
+        "astigmatism".
     max_rounds_without_best_bic : int, optional
         Maximum number of rounds without BIC improvement to terminate
         the search for optimal G5M n_components. Default is
@@ -1343,16 +1365,17 @@ def _find_optimal_G5M_3D(
         "Localization precisions (lp) must have the shape of (N, 3) "
         "where N is the number of localizations."
     )
-    for key in [
-        "X Coefficients",
-        "Y Coefficients",
-        "Magnification factor",
-    ]:
-        assert key in calibration, (
-            "Calibration dictionary must contain the keys 'X "
-            "Coefficients', 'Y Coefficients' and 'Magnification "
-            "factor'"
-        )
+    if mode == "astigmatism":
+        for key in [
+            "X Coefficients",
+            "Y Coefficients",
+            "Magnification factor",
+        ]:
+            assert calibration is not None and key in calibration, (
+                "Calibration dictionary must contain the keys 'X "
+                "Coefficients', 'Y Coefficients' and 'Magnification "
+                "factor'"
+            )
 
     n_components = 1
     rounds_without_best_bic = 0
@@ -1370,6 +1393,7 @@ def _find_optimal_G5M_3D(
             min_locs=min_locs,
             sigma_bounds=sigma_bounds,
             calibration=calibration,
+            mode=mode,
         ).fit(X, lp=lp, loc_prec_handle=loc_prec_handle)
         if g5m is None or not _check_G5M_resolution_3D(
             g5m.means, g5m.weights, g5m.precisions_cholesky
@@ -1395,12 +1419,13 @@ def _find_optimal_G5M_3D(
 
 def _run_g5m_group_3D(
     locs_group: pd.DataFrame,
-    calibration: dict,
+    calibration: dict | None,
     *,
     min_locs: int = MIN_LOCS,
     loc_prec_handle: Literal["local", "abs"] = "local",
     sigma_bounds: tuple[float, float] = (MIN_SIGMA_FACTOR, MAX_SIGMA_FACTOR),
     pixelsize: float = 130.0,
+    mode: Literal["astigmatism", "spline"] = "astigmatism",
     max_rounds_without_best_bic: int = MAX_ROUNDS_WITHOUT_BEST_BIC,
     bootstrap_check: bool = False,
     max_locs_per_cluster: int = np.inf,
@@ -1412,9 +1437,10 @@ def _run_g5m_group_3D(
     ----------
     locs_group : pd.DataFrame
         Localizations.
-    calibration : dict
-        Calibration dictionary with the following keys:
-        "X Coefficients", "Y Coefficients" and "Magnification factor".
+    calibration : dict or None
+        Astigmatism calibration dictionary with the keys "X
+        Coefficients", "Y Coefficients" and "Magnification factor".
+        Required for ``mode="astigmatism"``, may be None for spline.
         See https://picassosr.readthedocs.io/en/latest/localize.html#d-calibration.  # noqa: E501
     min_locs : int, optional
         Minimum number of localizations per component. Default is
@@ -1432,6 +1458,10 @@ def _run_g5m_group_3D(
         (`MIN_SIGMA_FACTOR`, `MAX_SIGMA_FACTOR`).
     pixelsize : float, optional
         Camera pixel size in nm. Default is 130.0.
+    mode : {"astigmatism", "spline"}, optional
+        Fitting mode of the input localizations. "spline" uses a plain
+        diagonal 3D model and reads lpz directly from the locs. Default
+        is "astigmatism".
     max_rounds_without_best_bic : int, optional
         Maximum number of rounds without BIC improvement to terminate
         the search for optimal G5M n_components. Default is
@@ -1460,9 +1490,15 @@ def _run_g5m_group_3D(
     assert (
         len(sigma_bounds) == 2
     ), "sigma_bounds must be a tuple of two values."
-    # make sure lpz is available (assume gauss least-squares used for
-    # localization)
+    # make sure lpz is available. For astigmatism (assume gauss
+    # least-squares used for localization) it can be derived from the
+    # calibration; spline fitting already provides lpz directly.
     if "lpz" not in locs_group.columns:
+        if mode == "spline":
+            raise ValueError(
+                "Spline mode requires an 'lpz' column in the "
+                "localizations (produced by the spline 3D fit)."
+            )
         locs_group = locs_group.copy()
         locs_group["lpz"] = zfit.axial_localization_precision(
             locs_group, [{"Pixelsize": pixelsize}], calibration, "gausslq"
@@ -1487,6 +1523,7 @@ def _run_g5m_group_3D(
         lp=lp,
         loc_prec_handle=loc_prec_handle,
         calibration=calibration,
+        mode=mode,
         max_rounds_without_best_bic=max_rounds_without_best_bic,
     )
     if g5m is None or len(g5m.valid_idx) == 0:
@@ -1496,7 +1533,8 @@ def _run_g5m_group_3D(
 
 
 class G5M_3D(G5M):
-    """G5M for 3D data (astigmatism). See ``G5M`` for more details.
+    """G5M for 3D data (astigmatism or spline). See ``G5M`` for more
+    details.
 
     Parameters
     ----------
@@ -1509,10 +1547,17 @@ class G5M_3D(G5M):
         components. If local loc. prec. is used, the bounds specify the
         margin of error in units of localization precision. Else,
         absolute bounds on sigma.
-    calibration : dict
-        Calibration dictionary with the following keys:
-        "X Coefficients", "Y Coefficients" and "Magnification factor".
+    calibration : dict or None
+        Astigmatism calibration dictionary with the keys "X
+        Coefficients", "Y Coefficients" and "Magnification factor".
+        Required for ``mode="astigmatism"`` and ignored (may be None)
+        for ``mode="spline"``.
         See https://picassosr.readthedocs.io/en/latest/localize.html#d-calibration.  # noqa: E501
+    mode : {"astigmatism", "spline"}, optional
+        Fitting mode of the input localizations. "astigmatism" couples
+        the x/y covariances via the calibration polynomials; "spline"
+        uses a plain diagonal 3D model (independent x/y/z covariances).
+        Default is "astigmatism".
     means_init : np.ndarray or None, optional
         Initial means (mu) of the Gaussian components. If None, the
         means are initialized using kmeans++. Default is None.
@@ -1524,19 +1569,25 @@ class G5M_3D(G5M):
         min_locs: int,
         sigma_bounds: tuple[float, float],
         *,
-        calibration: dict,
+        calibration: dict | None,
+        mode: Literal["astigmatism", "spline"] = "astigmatism",
         means_init: np.ndarray | None = None,
     ) -> None:
-        for key in [
-            "X Coefficients",
-            "Y Coefficients",
-            "Magnification factor",
-        ]:
-            assert key in calibration, (
-                "Calibration dictionary must contain the keys 'X "
-                "Coefficients', 'Y Coefficients' and 'Magnification "
-                "factor'"
-            )
+        assert mode in [
+            "astigmatism",
+            "spline",
+        ], "mode must be 'astigmatism' or 'spline'."
+        if mode == "astigmatism":
+            for key in [
+                "X Coefficients",
+                "Y Coefficients",
+                "Magnification factor",
+            ]:
+                assert calibration is not None and key in calibration, (
+                    "Calibration dictionary must contain the keys 'X "
+                    "Coefficients', 'Y Coefficients' and 'Magnification "
+                    "factor'"
+                )
         super().__init__(
             n_components=n_components,
             min_locs=min_locs,
@@ -1544,6 +1595,7 @@ class G5M_3D(G5M):
             means_init=means_init,
         )
         self.calibration = calibration
+        self.mode = mode
         self.n_dimensions = 3
 
     def estimate_log_prob(self, X: lib.FloatArray2D) -> lib.FloatArray2D:
@@ -1557,10 +1609,13 @@ class G5M_3D(G5M):
 
     def n_parameters(self) -> int:
         """Return the number of free parameters in the model. Note that
-        the astigmatism-modification reduces the number of free
-        parameters for each component by one."""
+        in astigmatism mode the modification reduces the number of free
+        parameters for each component by one (cov. in y depends on cov.
+        in x), whereas in spline mode all three covariances are free."""
         n_valid = len(self.valid_idx)
-        cov_params = n_valid * 2  # cov. in y depends on cov. in x
+        # astigmatism: cov. in y depends on cov. in x (2 free per comp.);
+        # spline: x/y/z covariances are independent (3 free per comp.)
+        cov_params = n_valid * (3 if self.mode == "spline" else 2)
         mean_params = 3 * n_valid
         weight_params = n_valid - 1
         return int(cov_params + mean_params + weight_params)
@@ -2175,6 +2230,7 @@ def _run_g5m_in_clusters(
     bootstrap_check: bool,
     calibration: dict | None,
     max_locs_per_cluster: int,
+    mode: Literal["astigmatism", "spline"] = "astigmatism",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run G5M for a given group of localizations clusters. See ``g5m``
     for parameters explanation.
@@ -2206,6 +2262,7 @@ def _run_g5m_in_clusters(
                 loc_prec_handle=loc_prec_handle,
                 sigma_bounds=sigma_bounds,
                 pixelsize=pixelsize,
+                mode=mode,
                 max_rounds_without_best_bic=max_rounds_without_best_bic,
                 bootstrap_check=bootstrap_check,
                 max_locs_per_cluster=max_locs_per_cluster,
@@ -2238,6 +2295,7 @@ def _run_g5m_parallel(
     bootstrap_check: bool = False,
     calibration: dict | None = None,
     max_locs_per_cluster: int = np.inf,
+    mode: Literal["astigmatism", "spline"] = "astigmatism",
 ) -> list:
     """Run G5M in parallel using multiprocessing. See ``g5m`` for
     parameters explanation.
@@ -2277,6 +2335,7 @@ def _run_g5m_parallel(
                 bootstrap_check,
                 calibration,
                 max_locs_per_cluster,
+                mode,
             )
         )
     return fs
@@ -2296,6 +2355,7 @@ def _g5m(
     n_steps: int,
     progress: Any,
     callback_parent: Any,
+    mode: Literal["astigmatism", "spline"] = "astigmatism",
 ) -> tuple[list[pd.DataFrame], list[pd.DataFrame]]:
     """Run G5M with or without multiprocessing. The function returns the
     centers of the G5M components and localizations with assigned cluster
@@ -2311,6 +2371,7 @@ def _g5m(
             bootstrap_check=bootstrap_check,
             calibration=calibration,
             max_locs_per_cluster=max_locs_per_cluster,
+            mode=mode,
         )
 
         # display progress
@@ -2340,6 +2401,7 @@ def _g5m(
                     loc_prec_handle=loc_prec_handle,
                     sigma_bounds=sigma_bounds,
                     pixelsize=pixelsize,
+                    mode=mode,
                     max_rounds_without_best_bic=max_rounds_without_best_bic,
                     bootstrap_check=bootstrap_check,
                     max_locs_per_cluster=max_locs_per_cluster,
@@ -2383,6 +2445,7 @@ def g5m(
     max_rounds_without_best_bic: int = MAX_ROUNDS_WITHOUT_BEST_BIC,
     bootstrap_check: bool = False,
     calibration: dict | None = None,
+    mode: Literal["astigmatism", "spline"] = "astigmatism",
     postprocess: bool = True,
     max_locs_per_cluster: int = np.inf,
     asynch: bool = True,
@@ -2424,9 +2487,16 @@ def g5m(
         using bootstrapping. If False, the standard, single Gaussian SEM
         is used as approximation. Default is False.
     calibration : dict, optional
-        Calibration dictionary with x and y coefficients and
-        magnification factor. Only required for 3D data. Default is
-        None.
+        Astigmatism calibration dictionary with x and y coefficients and
+        magnification factor. Only required for 3D data fit with
+        ``mode="astigmatism"``. Ignored for spline. Default is None.
+    mode : {"astigmatism", "spline"}, optional
+        Fitting mode of the input 3D localizations. "astigmatism"
+        couples the x/y covariances via the calibration polynomials and
+        requires ``calibration``; "spline" uses a plain diagonal 3D
+        model (independent x/y/z covariances) and reads z/lpz directly
+        from the localizations, requiring no calibration. Ignored for 2D
+        data. Default is "astigmatism".
     postprocess : bool, optional
         If True, the G5M components are postprocessed to remove likely
         sticky events (mean frame, std frame, n_events filtering).
@@ -2484,15 +2554,21 @@ def g5m(
         locs = locs.copy()
         locs["group"] = locs[group_column].to_numpy()
 
+    assert mode in [
+        "astigmatism",
+        "spline",
+    ], "mode must be 'astigmatism' or 'spline'."
+
     pixelsize = lib.get_from_metadata(info, "Pixelsize")
     if pixelsize is None:
         raise ValueError("Camera pixel size must be provided in info.")
 
-    # check that calibration is provided for 3D data
-    if "z" in locs.columns and calibration is None:
+    # astigmatism 3D data requires a calibration; spline 3D data recovers
+    # z (and lpz) directly, so no calibration is needed
+    if "z" in locs.columns and mode == "astigmatism" and calibration is None:
         raise ValueError(
-            "Calibration dictionary must be provided for 3D data. "
-            "The dictionary must specify 'X Coefficients' and 'Y "
+            "Calibration dictionary must be provided for astigmatism 3D "
+            "data. The dictionary must specify 'X Coefficients' and 'Y "
             "Coefficients' and 'Magnification factor'. See "
             "https://picassosr.readthedocs.io/en/latest/localize.html#d-calibration"  # noqa: E501
         )
@@ -2525,6 +2601,7 @@ def g5m(
         n_steps=n_steps,
         progress=progress,
         callback_parent=callback_parent,
+        mode=mode,
     )
     # stack centers to form a pd.DataFrame in the format of localizations
     if len(centers):
@@ -2560,9 +2637,13 @@ def g5m(
         ]
         new_info["Sigma bounds method"] = "Abs"
     if "z" in locs.columns:
-        new_info["X Coefficients"] = calibration["X Coefficients"]
-        new_info["Y Coefficients"] = calibration["Y Coefficients"]
-        new_info["Magnification factor"] = calibration["Magnification factor"]
+        new_info["Fit mode"] = mode
+        if mode == "astigmatism":
+            new_info["X Coefficients"] = calibration["X Coefficients"]
+            new_info["Y Coefficients"] = calibration["Y Coefficients"]
+            new_info["Magnification factor"] = calibration[
+                "Magnification factor"
+            ]
     info = info + [new_info]
     if postprocess:
         # filter out by mean frame, std frame, p_val and n_events

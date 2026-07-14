@@ -2521,6 +2521,7 @@ def _g5m(
     max_rounds: int = 3,
     bootstrap_sem: bool = False,
     calibration: str = "",
+    mode: Literal["astigmatism", "spline"] = "astigmatism",
     postprocess: bool = True,
     max_locs: int = 100000,
     asynch: bool = True,
@@ -2546,12 +2547,17 @@ def _g5m(
         print("------------------------------------------")
         print(f"Processing {path}")
         locs, info = load_locs(path)
-        if "z" in locs.columns:
-            if calibration != "":
-                with open(calibration, "r") as f:
-                    calib = yaml.full_load(f)
-        else:
-            calib = None
+        calib = None
+        # astigmatism 3D data needs a calibration; spline 3D data
+        # recovers z directly and needs none
+        if "z" in locs.columns and mode == "astigmatism":
+            if calibration == "":
+                raise ValueError(
+                    "A calibration file (-c/--calibration) is required "
+                    "for astigmatism 3D data."
+                )
+            with open(calibration, "r") as f:
+                calib = yaml.full_load(f)
         mols, _, g5m_info = g5m(
             locs,
             info,
@@ -2561,6 +2567,7 @@ def _g5m(
             max_rounds_without_best_bic=max_rounds,
             bootstrap_check=bootstrap_sem,
             calibration=calib,
+            mode=mode,
             postprocess=postprocess,
             max_locs_per_cluster=max_locs,
             asynch=asynch,
@@ -3309,7 +3316,22 @@ def main():  # noqa: C901
         "--calibration",
         type=str,
         default="",
-        help="path to calibration file, used only for 3D data",
+        help=(
+            "path to astigmatism calibration file, used and required "
+            "only for astigmatism 3D data"
+        ),
+    )
+    g5m_parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["astigmatism", "spline"],
+        default="astigmatism",
+        help=(
+            "fitting mode of the input 3D localizations: 'astigmatism' "
+            "(couples x/y widths via the calibration, requires -c) or "
+            "'spline' (plain diagonal 3D model, reads z/lpz from the "
+            "locs, no calibration needed); ignored for 2D data"
+        ),
     )
     g5m_parser.add_argument(
         "-p",
@@ -3676,6 +3698,7 @@ def main():  # noqa: C901
                 args.max_rounds,
                 args.bootstrap_sem,
                 args.calibration,
+                args.mode,
                 args.postprocess,
                 args.max_locs,
                 args.asynch,

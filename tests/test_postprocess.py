@@ -1255,3 +1255,48 @@ class TestG5M3D:
         )
         assert len(mols) > 0
         assert "p_val" in mols.columns
+
+    def test_g5m_3d_spline_no_calibration(self, dbscan_locs_3d, info):
+        # spline mode uses the plain diagonal 3D model and reads lpz
+        # directly from the locs, so no calibration is required
+        mols, _, out_info = g5m.g5m(
+            dbscan_locs_3d,
+            info,
+            min_locs=5,
+            bootstrap_check=False,
+            mode="spline",
+            calibration=None,
+            asynch=False,
+        )
+        assert len(mols) > 0
+        assert "z" in mols.columns
+        assert "p_val" in mols.columns
+        assert (mols["p_val"] >= 0).all() and (mols["p_val"] <= 1).all()
+        # info records the fit mode but no astigmatism coefficients
+        assert out_info[-1]["Fit mode"] == "spline"
+        assert "X Coefficients" not in out_info[-1]
+
+    def test_g5m_3d_spline_requires_lpz(self, dbscan_locs_3d, info):
+        locs_no_lpz = dbscan_locs_3d.drop(columns=["lpz"])
+        with pytest.raises(ValueError):
+            g5m.g5m(
+                locs_no_lpz,
+                info,
+                min_locs=5,
+                mode="spline",
+                calibration=None,
+                asynch=False,
+            )
+
+    def test_g5m_3d_astigmatism_requires_calibration(
+        self, dbscan_locs_3d, info
+    ):
+        with pytest.raises(ValueError):
+            g5m.g5m(
+                dbscan_locs_3d,
+                info,
+                min_locs=5,
+                mode="astigmatism",
+                calibration=None,
+                asynch=False,
+            )
