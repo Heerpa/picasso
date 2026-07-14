@@ -4257,7 +4257,7 @@ class Window(QtWidgets.QMainWindow):
             # the spline fit itself is a single GPU call; this callback tracks
             # the per-spot Cramer-Rao precision (CRLB) computation that follows
             message = (
-                f"Computing localization precision (CRLB): "
+                f"Computing localization precision: "
                 f"{curr:,} / {total:,} ..."
             )
             self.status_bar.showMessage(message)

@@ -1573,6 +1573,28 @@ def _ref_crlb(splines, box, amp, xs, ys, ze, off):
     return np.diag(np.linalg.pinv((deriv * weight[:, None]).T @ deriv))
 
 
+def _ref_crlb_lsq(splines, box, amp, xs, ys, ze, off):
+    """Closed-form unweighted-least-squares sandwich covariance ``J⁻¹ M J⁻¹``
+    (Poisson pixel variance ``σ² = μ``) ``[x, y, (z,) amp, off]`` for one
+    localization of the separable Gaussian spline."""
+    gz = splines[2]
+    phi, dx, dy, dz = _ref_model_grad(
+        splines, box, [xs], [ys], None if gz is None else [ze]
+    )
+    cols = [amp * dx, amp * dy]
+    if gz is not None:
+        cols.append(amp * dz)
+    cols += [phi, np.ones_like(phi)]
+    deriv = np.stack([c.reshape(-1) for c in cols], axis=1)
+    mu = np.maximum(
+        (off + amp * phi).reshape(-1), localize._SPLINE_CRLB_MU_FLOOR
+    )
+    j = deriv.T @ deriv  # Σ g gᵀ (Gauss-Newton normal matrix)
+    m = (deriv * mu[:, None]).T @ deriv  # Σ μ g gᵀ (sandwich meat)
+    j_inv = np.linalg.pinv(j)
+    return np.diag(j_inv @ m @ j_inv)
+
+
 class TestSplineCalibrationIO:
     """Round-trip of the spline PSF calibration through HDF5 (no GPU)."""
 
@@ -2045,6 +2067,49 @@ class TestSplineCRLB:
         ref = _ref_crlb(splines, BOX, amp, 0.1, -0.1, None, off)
         np.testing.assert_allclose(crlb, ref, rtol=1e-2)
         assert crlb[0] < crlb[1]
+
+    def test_lsq_sandwich_matches_reference_3d(self):
+        # mle=False must return the unweighted-least-squares sandwich covariance.
+        calib, splines = _gauss_spline_calibration(
+            model="spline-3d", sx=1.0, sy=1.4
+        )
+        amp, off, z_shift = 4000.0, 20.0, -6.0
+        theta = np.array([[amp, 0.2, -0.15, z_shift, off]])
+        var = localize._spline_crlb(theta, calib, BOX, mle=False)[0]
+        ref = _ref_crlb_lsq(splines, BOX, amp, 0.2, -0.15, -z_shift, off)
+        np.testing.assert_allclose(var, ref, rtol=1e-2)
+        assert var[0] < var[1]  # lpx < lpy
+        assert np.isfinite(var[2]) and var[2] > 0  # finite lpz
+
+    def test_lsq_sandwich_matches_reference_2d(self):
+        calib, splines = _gauss_spline_calibration(
+            model="spline-2d", sx=1.0, sy=1.3
+        )
+        amp, off = 3000.0, 15.0
+        theta = np.array([[amp, 0.1, -0.1, off]])
+        var = localize._spline_crlb(theta, calib, BOX, mle=False)[0]
+        ref = _ref_crlb_lsq(splines, BOX, amp, 0.1, -0.1, None, off)
+        np.testing.assert_allclose(var, ref, rtol=1e-2)
+        assert var[0] < var[1]
+
+    def test_lsq_variance_geq_crlb(self):
+        # Least squares is not efficient for Poisson data: with background the
+        # sandwich covariance is strictly above the Cramer-Rao (MLE) bound.
+        calib, _ = _gauss_spline_calibration(model="spline-2d", sx=1.0, sy=1.3)
+        theta = np.array([[3000.0, 0.1, -0.1, 40.0]])
+        crlb = localize._spline_crlb(theta, calib, BOX, mle=True)[0]
+        lsq = localize._spline_crlb(theta, calib, BOX, mle=False)[0]
+        assert np.all(np.isfinite(lsq))
+        # allow tiny numerical slack, then require the x/y positions to be worse
+        assert np.all(lsq >= crlb * (1 - 1e-6))
+        assert lsq[0] > crlb[0] and lsq[1] > crlb[1]
+
+    def test_lsq_nan_theta_row_isolated(self):
+        calib, _ = _gauss_spline_calibration(model="spline-2d")
+        theta = np.array([[3000.0, 0.1, 0.0, 15.0], [np.nan, 0.0, 0.0, 10.0]])
+        var = localize._spline_crlb(theta, calib, BOX, mle=False)
+        assert np.all(np.isfinite(var[0]))
+        assert np.all(np.isnan(var[1]))
 
     def test_multichannel_sums_fisher(self):
         # Two identical channels double the Fisher information -> half variance.

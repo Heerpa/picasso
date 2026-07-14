@@ -2348,7 +2348,7 @@ def _spline_model_and_grad(
     differentiating that polynomial term-by-term (the closed form Gpufit uses on
     the GPU). This is the readable reference for the tricubic evaluation; the
     production CRLB uses the equivalent parallel numba kernels
-    (:func:`_spline_fisher_3d` / :func:`_spline_fisher_2d`). It is kept for tests
+    (:func:`_spline_infomats_3d` / :func:`_spline_infomats_2d`). It is kept for tests
     and to validate the coefficient layout against ``gpuspline.spline_values``.
 
     ``coeff`` is one channel's raw calibration coefficient table, ``(16, nix,
@@ -2422,14 +2422,32 @@ def _spline_model_and_grad(
 
 
 @numba.njit(parallel=True, cache=True, fastmath=True)
-def _spline_fisher_3d(
-    coeff, box, amp, x_shift, y_shift, z_eval, offset, finite, mu_floor, fisher
+def _spline_infomats_3d(
+    coeff,
+    box,
+    amp,
+    x_shift,
+    y_shift,
+    z_eval,
+    offset,
+    finite,
+    mu_floor,
+    mle,
+    bread,
+    meat,
 ):
-    """Fill ``fisher`` (n, 5, 5) with the per-localization Poisson Fisher matrix
-    of the 3D cubic-spline model. Parallel per-spot numba kernel; the readable
-    reference is :func:`_spline_model_and_grad`. ``coeff`` is
+    """Fill the per-localization information matrices of the 3D cubic-spline
+    model. Parallel per-spot numba kernel; the readable reference is
+    :func:`_spline_model_and_grad`. ``coeff`` is
     ``(n_channels, niz, niy, nix, 4, 4, 4)``. Non-converged rows are skipped
     (left as preset by the caller). Parameter order [x, y, z, amplitude, offset].
+
+    With ``mle`` True, ``bread`` (n, 5, 5) receives the Poisson Fisher matrix
+    ``I = Σ g gᵀ / μ`` (its inverse is the MLE Cramer-Rao bound) and ``meat``
+    is left untouched (weight 0). With ``mle`` False, the two matrices form the
+    unweighted-least-squares sandwich covariance ``J⁻¹ M J⁻¹``: ``bread`` = the
+    Gauss-Newton normal matrix ``J = Σ g gᵀ`` and ``meat`` = ``M = Σ μ g gᵀ``
+    (Poisson pixel variance ``σ² = μ``). ``g = ∂μ/∂θ``.
     """
     n_channels, niz, niy, nix = (
         coeff.shape[0],
@@ -2443,11 +2461,18 @@ def _spline_fisher_3d(
             continue
         a = amp[m]
         o = offset[m]
+        # bread accumulators (f*): Fisher when mle else Gauss-Newton normal J.
         f00 = f01 = f02 = f03 = f04 = 0.0
         f11 = f12 = f13 = f14 = 0.0
         f22 = f23 = f24 = 0.0
         f33 = f34 = 0.0
         f44 = 0.0
+        # meat accumulators (s*): least-squares sandwich M = Σ μ g gᵀ (0 if mle).
+        s00 = s01 = s02 = s03 = s04 = 0.0
+        s11 = s12 = s13 = s14 = 0.0
+        s22 = s23 = s24 = 0.0
+        s33 = s34 = 0.0
+        s44 = 0.0
         # z basis (one slice per localization)
         zc = z_eval[m]
         zi = int(np.floor(zc))
@@ -2532,47 +2557,95 @@ def _spline_fisher_3d(
                     mu = o + a * phi
                     if mu < mu_floor:
                         mu = mu_floor
-                    w = 1.0 / mu
+                    # bread weight wa (1/μ Fisher, else 1) and meat weight wb
+                    # (μ for the least-squares sandwich, else unused).
+                    if mle:
+                        wa = 1.0 / mu
+                        wb = 0.0
+                    else:
+                        wa = 1.0
+                        wb = mu
                     # d(mu)/d(param); the CRLB diagonal is sign-invariant per
                     # parameter, so native-coordinate vs shift sign is irrelevant.
                     d0, d1, d2, d3 = a * gx, a * gy, a * gz, phi
-                    f00 += d0 * d0 * w
-                    f01 += d0 * d1 * w
-                    f02 += d0 * d2 * w
-                    f03 += d0 * d3 * w
-                    f04 += d0 * w
-                    f11 += d1 * d1 * w
-                    f12 += d1 * d2 * w
-                    f13 += d1 * d3 * w
-                    f14 += d1 * w
-                    f22 += d2 * d2 * w
-                    f23 += d2 * d3 * w
-                    f24 += d2 * w
-                    f33 += d3 * d3 * w
-                    f34 += d3 * w
-                    f44 += w
-        fisher[m, 0, 0] = f00
-        fisher[m, 0, 1] = fisher[m, 1, 0] = f01
-        fisher[m, 0, 2] = fisher[m, 2, 0] = f02
-        fisher[m, 0, 3] = fisher[m, 3, 0] = f03
-        fisher[m, 0, 4] = fisher[m, 4, 0] = f04
-        fisher[m, 1, 1] = f11
-        fisher[m, 1, 2] = fisher[m, 2, 1] = f12
-        fisher[m, 1, 3] = fisher[m, 3, 1] = f13
-        fisher[m, 1, 4] = fisher[m, 4, 1] = f14
-        fisher[m, 2, 2] = f22
-        fisher[m, 2, 3] = fisher[m, 3, 2] = f23
-        fisher[m, 2, 4] = fisher[m, 4, 2] = f24
-        fisher[m, 3, 3] = f33
-        fisher[m, 3, 4] = fisher[m, 4, 3] = f34
-        fisher[m, 4, 4] = f44
+                    f00 += d0 * d0 * wa
+                    f01 += d0 * d1 * wa
+                    f02 += d0 * d2 * wa
+                    f03 += d0 * d3 * wa
+                    f04 += d0 * wa
+                    f11 += d1 * d1 * wa
+                    f12 += d1 * d2 * wa
+                    f13 += d1 * d3 * wa
+                    f14 += d1 * wa
+                    f22 += d2 * d2 * wa
+                    f23 += d2 * d3 * wa
+                    f24 += d2 * wa
+                    f33 += d3 * d3 * wa
+                    f34 += d3 * wa
+                    f44 += wa
+                    s00 += d0 * d0 * wb
+                    s01 += d0 * d1 * wb
+                    s02 += d0 * d2 * wb
+                    s03 += d0 * d3 * wb
+                    s04 += d0 * wb
+                    s11 += d1 * d1 * wb
+                    s12 += d1 * d2 * wb
+                    s13 += d1 * d3 * wb
+                    s14 += d1 * wb
+                    s22 += d2 * d2 * wb
+                    s23 += d2 * d3 * wb
+                    s24 += d2 * wb
+                    s33 += d3 * d3 * wb
+                    s34 += d3 * wb
+                    s44 += wb
+        bread[m, 0, 0] = f00
+        bread[m, 0, 1] = bread[m, 1, 0] = f01
+        bread[m, 0, 2] = bread[m, 2, 0] = f02
+        bread[m, 0, 3] = bread[m, 3, 0] = f03
+        bread[m, 0, 4] = bread[m, 4, 0] = f04
+        bread[m, 1, 1] = f11
+        bread[m, 1, 2] = bread[m, 2, 1] = f12
+        bread[m, 1, 3] = bread[m, 3, 1] = f13
+        bread[m, 1, 4] = bread[m, 4, 1] = f14
+        bread[m, 2, 2] = f22
+        bread[m, 2, 3] = bread[m, 3, 2] = f23
+        bread[m, 2, 4] = bread[m, 4, 2] = f24
+        bread[m, 3, 3] = f33
+        bread[m, 3, 4] = bread[m, 4, 3] = f34
+        bread[m, 4, 4] = f44
+        if not mle:
+            meat[m, 0, 0] = s00
+            meat[m, 0, 1] = meat[m, 1, 0] = s01
+            meat[m, 0, 2] = meat[m, 2, 0] = s02
+            meat[m, 0, 3] = meat[m, 3, 0] = s03
+            meat[m, 0, 4] = meat[m, 4, 0] = s04
+            meat[m, 1, 1] = s11
+            meat[m, 1, 2] = meat[m, 2, 1] = s12
+            meat[m, 1, 3] = meat[m, 3, 1] = s13
+            meat[m, 1, 4] = meat[m, 4, 1] = s14
+            meat[m, 2, 2] = s22
+            meat[m, 2, 3] = meat[m, 3, 2] = s23
+            meat[m, 2, 4] = meat[m, 4, 2] = s24
+            meat[m, 3, 3] = s33
+            meat[m, 3, 4] = meat[m, 4, 3] = s34
+            meat[m, 4, 4] = s44
 
 
 @numba.njit(parallel=True, cache=True, fastmath=True)
-def _spline_fisher_2d(
-    coeff, box, amp, x_shift, y_shift, offset, finite, mu_floor, fisher
+def _spline_infomats_2d(
+    coeff,
+    box,
+    amp,
+    x_shift,
+    y_shift,
+    offset,
+    finite,
+    mu_floor,
+    mle,
+    bread,
+    meat,
 ):
-    """2D analogue of :func:`_spline_fisher_3d`. ``coeff`` is
+    """2D analogue of :func:`_spline_infomats_3d`. ``coeff`` is
     ``(n_channels, niy, nix, 4, 4)``; parameter order [x, y, amplitude, offset].
     """
     n_channels, niy, nix = coeff.shape[0], coeff.shape[1], coeff.shape[2]
@@ -2582,10 +2655,16 @@ def _spline_fisher_2d(
             continue
         a = amp[m]
         o = offset[m]
+        # bread accumulators (f*): Fisher when mle else Gauss-Newton normal J.
         f00 = f01 = f02 = f03 = 0.0
         f11 = f12 = f13 = 0.0
         f22 = f23 = 0.0
         f33 = 0.0
+        # meat accumulators (s*): least-squares sandwich M = Σ μ g gᵀ (0 if mle).
+        s00 = s01 = s02 = s03 = 0.0
+        s11 = s12 = s13 = 0.0
+        s22 = s23 = 0.0
+        s33 = 0.0
         for ch in range(n_channels):
             for i in range(box):
                 xco = i - x_shift[m]
@@ -2643,28 +2722,54 @@ def _spline_fisher_2d(
                     mu = o + a * phi
                     if mu < mu_floor:
                         mu = mu_floor
-                    w = 1.0 / mu
+                    if mle:
+                        wa = 1.0 / mu
+                        wb = 0.0
+                    else:
+                        wa = 1.0
+                        wb = mu
                     d0, d1, d2 = a * gx, a * gy, phi
-                    f00 += d0 * d0 * w
-                    f01 += d0 * d1 * w
-                    f02 += d0 * d2 * w
-                    f03 += d0 * w
-                    f11 += d1 * d1 * w
-                    f12 += d1 * d2 * w
-                    f13 += d1 * w
-                    f22 += d2 * d2 * w
-                    f23 += d2 * w
-                    f33 += w
-        fisher[m, 0, 0] = f00
-        fisher[m, 0, 1] = fisher[m, 1, 0] = f01
-        fisher[m, 0, 2] = fisher[m, 2, 0] = f02
-        fisher[m, 0, 3] = fisher[m, 3, 0] = f03
-        fisher[m, 1, 1] = f11
-        fisher[m, 1, 2] = fisher[m, 2, 1] = f12
-        fisher[m, 1, 3] = fisher[m, 3, 1] = f13
-        fisher[m, 2, 2] = f22
-        fisher[m, 2, 3] = fisher[m, 3, 2] = f23
-        fisher[m, 3, 3] = f33
+                    f00 += d0 * d0 * wa
+                    f01 += d0 * d1 * wa
+                    f02 += d0 * d2 * wa
+                    f03 += d0 * wa
+                    f11 += d1 * d1 * wa
+                    f12 += d1 * d2 * wa
+                    f13 += d1 * wa
+                    f22 += d2 * d2 * wa
+                    f23 += d2 * wa
+                    f33 += wa
+                    s00 += d0 * d0 * wb
+                    s01 += d0 * d1 * wb
+                    s02 += d0 * d2 * wb
+                    s03 += d0 * wb
+                    s11 += d1 * d1 * wb
+                    s12 += d1 * d2 * wb
+                    s13 += d1 * wb
+                    s22 += d2 * d2 * wb
+                    s23 += d2 * wb
+                    s33 += wb
+        bread[m, 0, 0] = f00
+        bread[m, 0, 1] = bread[m, 1, 0] = f01
+        bread[m, 0, 2] = bread[m, 2, 0] = f02
+        bread[m, 0, 3] = bread[m, 3, 0] = f03
+        bread[m, 1, 1] = f11
+        bread[m, 1, 2] = bread[m, 2, 1] = f12
+        bread[m, 1, 3] = bread[m, 3, 1] = f13
+        bread[m, 2, 2] = f22
+        bread[m, 2, 3] = bread[m, 3, 2] = f23
+        bread[m, 3, 3] = f33
+        if not mle:
+            meat[m, 0, 0] = s00
+            meat[m, 0, 1] = meat[m, 1, 0] = s01
+            meat[m, 0, 2] = meat[m, 2, 0] = s02
+            meat[m, 0, 3] = meat[m, 3, 0] = s03
+            meat[m, 1, 1] = s11
+            meat[m, 1, 2] = meat[m, 2, 1] = s12
+            meat[m, 1, 3] = meat[m, 3, 1] = s13
+            meat[m, 2, 2] = s22
+            meat[m, 2, 3] = meat[m, 3, 2] = s23
+            meat[m, 3, 3] = s33
 
 
 def _spline_coeff_reshaped(calibration: dict) -> np.ndarray:
@@ -2695,21 +2800,28 @@ def _spline_crlb(
     theta: lib.FloatArray2D,
     calibration: dict,
     box: int,
+    mle: bool = True,
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
 ) -> lib.FloatArray2D:
-    """Cramer-Rao lower bounds for spline-fitted localizations.
+    """Parameter-variance estimates for spline-fitted localizations.
 
-    Evaluates the diagonal of the inverse Poisson Fisher-information matrix at
-    the fitted parameters, using the cubic-spline PSF model - the method of Li
-    et al. (Nat. Methods 2018) and Gpufit's spline model. Mirrors
-    ``gaussmle._mlefit_sigmaxy_crlb`` (Poisson Fisher matrix, ``pinv``,
-    diagonal), with the model ``mu = offset + amplitude * Phi`` and its analytic
-    spatial derivatives. The Fisher matrices are built by a parallel numba
-    kernel (:func:`_spline_fisher_3d` / :func:`_spline_fisher_2d`; the readable
-    NumPy reference is :func:`_spline_model_and_grad`) and inverted in one
-    batched ``pinv``.
+    Evaluates the estimator covariance at the fitted parameters, using the
+    cubic-spline PSF model ``mu = offset + amplitude * Phi`` and its analytic
+    spatial derivatives.
+
+    With ``mle`` True the result is the Cramer-Rao lower bound: the diagonal of
+    the inverse Poisson Fisher-information matrix ``I = Σ g gᵀ / μ`` (``g =
+    ∂μ/∂θ``), which an efficient maximum-likelihood estimator attains. Mirrors
+    ``gaussmle._mlefit_sigmaxy_crlb``.
+
+    With ``mle`` False the result is the covariance of the *unweighted*
+    least-squares estimator (Gpufit's ``spline-gpu`` LSE mode), the Huber
+    sandwich ``J⁻¹ M J⁻¹`` with normal matrix ``J = Σ g gᵀ`` and, for Poisson
+    pixel noise (``σ² = μ``), meat ``M = Σ μ g gᵀ``. This is ≥ the Cramer-Rao
+    bound elementwise (least squares is not efficient for Poisson data), so it
+    is the honest precision for LSQ fits rather than the optimistic MLE floor.
 
     Parameters
     ----------
@@ -2717,12 +2829,16 @@ def _spline_crlb(
         Fitted parameters, columns ``[amplitude, x_shift, y_shift, offset]``
         (2D) or ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D and 3D
         multichannel). Photon units (spots are gain-converted before fitting),
-        so ``mu`` is an expected photon count and the Poisson Fisher matrix
+        so ``mu`` is an expected photon count and the Poisson noise model
         applies directly.
     calibration : dict
         The spline PSF calibration (see ``io.load_spline_calibration``).
     box : int
         Fit box side length (camera pixels).
+    mle : bool, optional
+        If True (default), return the Poisson Cramer-Rao bound (for
+        maximum-likelihood fits). If False, return the least-squares sandwich
+        covariance (for ``spline-gpu`` least-squares fits).
     progress_callback : callable, "console" or None, optional
         Progress over localization chunks. ``"console"`` shows a tqdm bar; a
         callable is invoked with the cumulative number of localizations done.
@@ -2730,7 +2846,7 @@ def _spline_crlb(
     Returns
     -------
     crlb : lib.FloatArray2D
-        ``(n_locs, n_params)`` array of CRLB variances (float64) in native
+        ``(n_locs, n_params)`` array of parameter variances (float64) in native
         parameter order ``[x_shift, y_shift, (z_shift,) amplitude, offset]``
         (pixels, (z-slices,) photons, photons). Non-converged fits and
         numerically singular problems are NaN.
@@ -2753,9 +2869,12 @@ def _spline_crlb(
     z_eval = np.ascontiguousarray(-theta[:, 3]) if is_3d else None
     finite = np.isfinite(theta).all(axis=1)
 
-    # Fisher per localization (float64). Non-converged rows stay the identity so
-    # the batched pinv is well-defined; they become NaN below.
-    fisher = np.tile(np.eye(n_params), (max(n_locs, 1), 1, 1))
+    # Per-localization information matrices (float64). ``bread`` is the Fisher
+    # matrix (mle) or the least-squares normal matrix J; non-converged rows stay
+    # the identity so the batched pinv is well-defined (they become NaN below).
+    # ``meat`` M is only filled for the least-squares sandwich (stays 0 for mle).
+    bread = np.tile(np.eye(n_params), (max(n_locs, 1), 1, 1))
+    meat = np.zeros((max(n_locs, 1), n_params, n_params))
 
     use_tqdm = progress_callback == "console"
     do_callback = callable(progress_callback)
@@ -2771,7 +2890,7 @@ def _spline_crlb(
         stop = min(start + chunk, n_locs)
         sl = slice(start, stop)
         if is_3d:
-            _spline_fisher_3d(
+            _spline_infomats_3d(
                 coeff,
                 box,
                 amplitude[sl],
@@ -2781,10 +2900,12 @@ def _spline_crlb(
                 offset[sl],
                 finite[sl],
                 _SPLINE_CRLB_MU_FLOOR,
-                fisher[sl],
+                mle,
+                bread[sl],
+                meat[sl],
             )
         else:
-            _spline_fisher_2d(
+            _spline_infomats_2d(
                 coeff,
                 box,
                 amplitude[sl],
@@ -2793,13 +2914,22 @@ def _spline_crlb(
                 offset[sl],
                 finite[sl],
                 _SPLINE_CRLB_MU_FLOOR,
-                fisher[sl],
+                mle,
+                bread[sl],
+                meat[sl],
             )
         if do_callback:
             progress_callback(stop)
 
     with np.errstate(invalid="ignore", divide="ignore"):
-        crlb = np.diagonal(np.linalg.pinv(fisher), axis1=1, axis2=2).copy()
+        bread_inv = np.linalg.pinv(bread)
+        if mle:
+            # cov = I⁻¹ (Cramer-Rao bound); bread is the Fisher matrix.
+            cov = bread_inv
+        else:
+            # cov = J⁻¹ M J⁻¹ (unweighted-least-squares sandwich).
+            cov = bread_inv @ meat @ bread_inv
+        crlb = np.diagonal(cov, axis1=1, axis2=2).copy()
     crlb = crlb[:n_locs]
     crlb[~finite] = np.nan
     crlb = np.where(crlb > 0.0, crlb, np.nan)
@@ -2812,6 +2942,7 @@ def locs_from_fits_spline(
     box: int,
     em: bool,
     calibration: dict,
+    mle: bool = True,
     log_likelihood: lib.FloatArray1D | None = None,
     iterations: lib.FloatArray1D | None = None,
     progress_callback: (
@@ -2823,9 +2954,12 @@ def locs_from_fits_spline(
     ``theta`` columns are ``[amplitude, x_shift, y_shift, offset]`` (2D) or
     ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D). Localization
     precisions (``lpx``, ``lpy``, ``lpz``) and the ``photons`` / ``bg``
-    uncertainties are the Cramer-Rao lower bounds from :func:`_spline_crlb`;
-    ``progress_callback`` is forwarded to it (that per-localization loop is the
-    slow part)."""
+    uncertainties come from :func:`_spline_crlb`: the Poisson Cramer-Rao bound
+    for maximum-likelihood fits (``mle`` True) or the least-squares sandwich
+    covariance for ``spline-gpu`` least-squares fits (``mle`` False). ``mle``
+    must match the estimator that produced ``theta``. ``progress_callback`` is
+    forwarded to :func:`_spline_crlb` (that per-localization loop is the slow
+    part)."""
     model = calibration["model"]
     is_3d = model != "spline-2d"
     box_offset = int(box / 2)
@@ -2842,10 +2976,10 @@ def locs_from_fits_spline(
     photon_scale = float(calibration.get("photon_scale", 1.0))
     photons = amplitude * photon_scale
 
-    # CRLB variances in native order [x_shift, y_shift, (z_shift,) amplitude,
-    # offset]; amplitude/offset are always the last two columns.
+    # CRLB / LSQ variances in native order [x_shift, y_shift, (z_shift,)
+    # amplitude, offset]; amplitude/offset are always the last two columns.
     crlb = _spline_crlb(
-        theta, calibration, box, progress_callback=progress_callback
+        theta, calibration, box, mle=mle, progress_callback=progress_callback
     )
     with np.errstate(invalid="ignore"):
         lpx = np.sqrt(crlb[:, 0]) / oversampling
@@ -2914,6 +3048,7 @@ def _fit2d_spline_gpu(
         box,
         em,
         calibration,
+        mle=mle,
         log_likelihood=log_likelihood,
         iterations=iterations,
         progress_callback=progress_callback,
@@ -3099,6 +3234,7 @@ def fit_spline_multichannel(
         box,
         em,
         calibration,
+        mle=mle,
         log_likelihood=log_likelihood,
         iterations=iterations,
         progress_callback=progress_callback,
