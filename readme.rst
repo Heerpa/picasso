@@ -68,7 +68,7 @@ Via PyPI
 GPU fitting (optional)
 ^^^^^^^^^^^^^^^^^^^^^^^
 
-Picasso: Localize can accelerate several of its fitting algorithms on a CUDA-capable NVIDIA GPU via `Gpufit <https://github.com/gpufit/Gpufit>`__. On **Windows** the pre-compiled library is bundled with Picasso and works out of the box. On **Linux** there is no pre-compiled binary, so you have to build ``libGpufit.so`` yourself and copy it into ``picasso/ext/pygpufit/``; see the `GPU fitting on Linux <https://picassosr.readthedocs.io/en/latest/localize.html#gpu-fitting-on-linux>`__ section of the documentation for step-by-step instructions. Without the GPU library, Picasso transparently uses the native fitting algorithms (LQ, MLE Gaussian 2D elliptical fitting)
+Picasso: Localize can accelerate several of its fitting algorithms on a CUDA-capable NVIDIA GPU via `Gpufit <https://github.com/gpufit/Gpufit>`__. On **Windows** the pre-compiled library is bundled with Picasso and works out of the box. On **Linux** there is no pre-compiled binary, so you have to build ``libGpufit.so`` yourself and copy it into ``picasso/ext/pygpufit/``; see the `GPU fitting on Linux <https://picassosr.readthedocs.io/en/latest/localize.html#gpu-fitting-on-linux>`__ section of the documentation for step-by-step instructions. Without the GPU library, Picasso transparently uses the native fitting algorithms (LQ, MLE Gaussian 2D elliptical fitting). A few fit models run **only** on the GPU, namely the rotated elliptical Gaussian and the `experimental PSF (cubic spline) <https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting>`__ model.
 
 For Developers (local, editable installation)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -142,8 +142,9 @@ If you use Picasso in your research, please cite our Nature Protocols publicatio
 - Theoretical lateral localization precision (Gauss LQ). DOI: `10.1038/nmeth.1447 <https://doi.org/10.1038/nmeth.1447>`__
 - Theoretical axial localization precision (Gauss LQ and MLE). DOI: `10.1038/s41467-026-70198-5 <https://doi.org/10.1038/s41467-026-70198-5>`__
 - MLE fitting. DOI: `10.1038/nmeth.1449 <https://doi.org/10.1038/nmeth.1449>`__
-- GPU fitting (LQ). DOI: `10.1038/s41598-017-15313-9 <https://doi.org/10.1038/s41598-017-15313-9>`__. License can be found `here <https://github.com/jungmannlab/picasso/tree/master/picasso/ext/pygpufit>`__.
+- GPU fitting (LQ and MLE, also used for experimental-PSF spline fitting). DOI: `10.1038/s41598-017-15313-9 <https://doi.org/10.1038/s41598-017-15313-9>`__. License can be found `here <https://github.com/jungmannlab/picasso/tree/master/picasso/ext/pygpufit>`__.
 - 3D fitting via astigmatism. DOI: `10.1126/science.1153529 <https://www.science.org/doi/10.1126/science.1153529>`__.
+- Experimental PSF (cubic-spline) fitting. DOIs: `10.1038/nmeth.4661 <https://doi.org/10.1038/nmeth.4661>`__ (Li et al., experimental-PSF localization and bead alignment) and `10.1038/s41598-017-00622-w <https://doi.org/10.1038/s41598-017-00622-w>`__ (Babcock & Zhuang, cubic-spline PSF model).
 - RCC undrifting: DOI: `10.1364/OE.22.015982 <https://doi.org/10.1364/OE.22.015982>`__
 - AIM undrifting. DOI: `10.1126/sciadv.adm776 <https://www.science.org/doi/10.1126/sciadv.adm7765>`__
 - SMLM clusterer. DOIs: `10.1038/s41467-021-22606-1 <https://doi.org/10.1038/s41467-021-22606-1>`__ and `10.1038/s41586-023-05925-9 <https://doi.org/10.1038/s41586-023-05925-9>`__
