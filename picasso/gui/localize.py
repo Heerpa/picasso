@@ -1361,6 +1361,7 @@ class ParametersDialog(lib.Dialog):
     CALIB_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#d-calibration"  # noqa: E501
     IDENT_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#identification-and-fitting-of-single-molecule-spots"  # noqa: E501
     ROI_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#regions-of-interest-rois"  # noqa: E501
+    SPLINE_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting"  # noqa: E501
 
     def __init__(  # noqa: C901
         self, parent: QtWidgets.QMainWindow | None = None
@@ -1847,6 +1848,7 @@ class ParametersDialog(lib.Dialog):
             load_spline_calib.setAutoDefault(False)
             load_spline_calib.clicked.connect(self.load_spline_calib)
             spline_grid.addWidget(load_spline_calib, 0, 1)
+            spline_grid.addWidget(lib.HelpButton(self.SPLINE_URL), 0, 2)
             self.spline_calib_label = QtWidgets.QLabel(
                 "-- no calibration loaded --"
             )
