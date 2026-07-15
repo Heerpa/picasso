@@ -3222,12 +3222,12 @@ class G5MDialog(lib.Dialog):
         ch = self.channel if self.channel != len(self.window.view.locs) else 0
         infos = self.window.view.infos[ch]
         fit_method = lib.get_from_metadata(infos, "Fit method")
-        if fit_method is not None and str(fit_method).startswith("spline"):
+        if fit_method is not None and "spline" in str(fit_method).lower():
             return True
-        return (
-            lib.get_from_metadata(infos, "Spline calibration model")
-            is not None
-        )
+        for key in ("Spline calibration model", "Spline Calibration Model"):
+            if lib.get_from_metadata(infos, key) is not None:
+                return True
+        return False
 
     def load_calibration(self) -> None:
         """Load the calibration file selected by the user."""
