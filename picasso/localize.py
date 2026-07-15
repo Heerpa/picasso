@@ -69,6 +69,9 @@ plt.style.use("ggplot")
 
 MAX_LOCS = int(1e6)
 _SPLINE_CRLB_MU_FLOOR = 1e-3  # photons; floors 1 / mu in the Fisher weight
+_GAUSS_CRLB_MU_FLOOR = (
+    1e-3  # photons; floors 1 / mu in the Poisson Fisher weight
+)
 
 # The columns under base are always available and the keys such as "3D
 # only" will be displayed in the save columns dialog in the GUI for
@@ -88,9 +91,10 @@ LOCALIZATION_COLUMNS = {
         "net_gradient",
     ],
     "3D only": ["z", "d_zcalib", "lpz"],
-    "Rotation only": ["angle"],
+    "Rotation only": ["angle", "angle_unc"],
     "Picked spots only": ["n_id"],
     "MLE only": ["log_likelihood", "iterations"],
+    "Uncertainty": ["photons_unc", "bg_unc", "sx_unc", "sy_unc"],
 }
 # For database:
 MEAN_COLS = LOCALIZATION_COLUMNS["Base"] + LOCALIZATION_COLUMNS["3D only"]
@@ -1871,11 +1875,143 @@ def fit_spots_gpufit(
     return parameters
 
 
+def _gauss_crlb(
+    theta: lib.FloatArray2D,
+    box: int,
+    em: bool,
+    rotated: bool = False,
+) -> lib.FloatArray2D:
+    """Poisson Cramer-Rao lower bound for gpufit MLE Gaussian fits.
+
+    Builds the Fisher information matrix ``I = Σ g gᵀ / μ`` (``g = ∂μ/∂θ``) of
+    the point-sampled Gaussian model gpufit actually optimizes
+    (``GAUSS_2D_ELLIPTIC`` / ``GAUSS_2D_ROTATED``) and returns the diagonal of
+    its inverse — the variance an efficient maximum-likelihood estimator
+    attains. Evaluated at the fitted parameters; the spot data is not needed.
+    Mirrors :func:`_spline_crlb` and ``gaussmle._mlefit_sigmaxy_crlb`` but for
+    the point-sampled Gaussian gpufit fits rather than the erf-integrated CPU
+    model.
+
+    Model (photon units, spots are gain-converted before fitting)::
+
+        mu(i, j) = N / (2 pi sx sy) * E + bg
+
+    where ``i`` indexes the x (column) coordinate, ``j`` the y (row)
+    coordinate, and ``E`` is the (optionally rotated) unit-height Gaussian.
+    Parametrizing the amplitude directly as the total photon count ``N``
+    (Picasso's reported ``photons``) makes the returned variances line up with
+    the reported columns, with the ``N``/``sx``/``sy`` coupling of ``mu`` folded
+    into the derivatives.
+
+    Parameters
+    ----------
+    theta : lib.FloatArray2D
+        Fitted parameters in Picasso/gpufit order ``[photons (total N), x, y,
+        sx, sy, bg]`` (elliptic) or ``[..., bg, angle (radians)]`` (rotated).
+        Positions are box-local (pixel = parameter, matching
+        :func:`_initial_parameters_gpufit`).
+    box : int
+        Fit box side length (pixels).
+    em : bool
+        EMCCD excess noise: doubles every parameter's variance (halves the
+        Fisher weight), as in :func:`gausslq.localization_precision`.
+    rotated : bool, optional
+        If True, ``theta`` carries the seventh (angle) column and the CRLB
+        includes it. Default False.
+
+    Returns
+    -------
+    crlb : lib.FloatArray2D
+        ``(n_locs, n_params)`` parameter variances (float64) in the same column
+        order as ``theta`` (angle variance in rad²). Non-converged and
+        numerically singular fits are NaN.
+    """
+    theta = np.asarray(theta, dtype=np.float64)
+    n_locs = len(theta)
+    n_params = 7 if rotated else 6
+
+    N = theta[:, 0]
+    x = theta[:, 1]
+    y = theta[:, 2]
+    sx = theta[:, 3]
+    sy = theta[:, 4]
+    ang = theta[:, 6] if rotated else None
+    finite = np.isfinite(theta).all(axis=1)
+
+    grid = np.arange(box, dtype=np.float64)
+    crlb = np.full((n_locs, n_params), np.nan)
+    if n_locs == 0:
+        return crlb
+
+    # One kernel spans all localizations; chunk only to bound peak memory of the
+    # (chunk, n_params, box, box) gradient tensor.
+    chunk = max(1, min(n_locs, 50_000))
+    for start in range(0, n_locs, chunk):
+        stop = min(start + chunk, n_locs)
+        sl = slice(start, stop)
+        # Per-pixel coordinates relative to the fitted center. Axis 1 = x
+        # (column) pixel index, axis 2 = y (row) pixel index.
+        Nc = N[sl][:, None, None]
+        sxc = sx[sl][:, None, None]
+        syc = sy[sl][:, None, None]
+        dx = grid[None, :, None] - x[sl][:, None, None]
+        dy = grid[None, None, :] - y[sl][:, None, None]
+
+        if rotated:
+            ct = np.cos(ang[sl])[:, None, None]
+            st = np.sin(ang[sl])[:, None, None]
+            u = dx * ct - dy * st
+            w = dx * st + dy * ct
+            E = np.exp(-0.5 * (u**2 / sxc**2 + w**2 / syc**2))
+            s = Nc / (2.0 * np.pi * sxc * syc) * E  # signal = mu - bg
+            gx = s * (u * ct / sxc**2 + w * st / syc**2)
+            gy = s * (-u * st / sxc**2 + w * ct / syc**2)
+            gsx = s * (u**2 / sxc**3 - 1.0 / sxc)
+            gsy = s * (w**2 / syc**3 - 1.0 / syc)
+            gang = s * (u * w * (1.0 / sxc**2 - 1.0 / syc**2))
+        else:
+            E = np.exp(-0.5 * (dx**2 / sxc**2 + dy**2 / syc**2))
+            s = Nc / (2.0 * np.pi * sxc * syc) * E  # signal = mu - bg
+            gx = s * (dx / sxc**2)
+            gy = s * (dy / syc**2)
+            gsx = s * (dx**2 / sxc**3 - 1.0 / sxc)
+            gsy = s * (dy**2 / syc**3 - 1.0 / syc)
+
+        gN = s / Nc
+        gbg = np.ones_like(s)
+        grads = [gN, gx, gy, gsx, gsy, gbg]
+        if rotated:
+            grads.append(gang)
+        g = np.stack(grads, axis=1)  # (m, n_params, box, box)
+
+        mu = np.maximum(s + theta[sl, 5][:, None, None], _GAUSS_CRLB_MU_FLOOR)
+        gw = g / mu[:, None, :, :]
+        fisher = np.einsum("mpij,mqij->mpq", gw, g)  # (m, n_params, n_params)
+
+        # Non-converged rows carry NaN parameters (hence NaN Fisher); set them to
+        # the identity so the batched pinv stays well-defined, then mask below.
+        bad = ~finite[sl]
+        fisher[bad] = np.eye(n_params)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cov = np.linalg.pinv(fisher)
+            var = np.diagonal(cov, axis1=1, axis2=2).copy()
+        var[bad] = np.nan
+        crlb[sl] = var
+
+    if em:
+        # EMCCD excess noise doubles every pixel's variance, hence the CRLB
+        # (matches the factor-2 in gausslq.localization_precision).
+        crlb *= 2.0
+    crlb = np.where(crlb > 0.0, crlb, np.nan)
+    return crlb
+
+
 def locs_from_fits_gpufit(
     identifications: pd.DataFrame,
     theta: lib.FloatArray2D,
     box: int,
     em: bool,
+    mle: bool = False,
     log_likelihood: lib.FloatArray1D | None = None,
     iterations: lib.FloatArray1D | None = None,
 ) -> pd.DataFrame:
@@ -1900,6 +2036,16 @@ def locs_from_fits_gpufit(
         calculate the offsets for the x and y coordinates.
     em : bool
         Whether EMCCD was used for the localization.
+    mle : bool, optional
+        Whether ``theta`` came from Gpufit's maximum-likelihood
+        estimator. If True, the localization precisions ``lpx`` / ``lpy``
+        and the per-parameter uncertainties (``photons_unc``, ``bg_unc``,
+        ``sx_unc``, ``sy_unc`` and, for the rotated model, ``angle_unc``)
+        are the Poisson Cramer-Rao bound from the Fisher information of
+        the fitted Gaussian model (:func:`_gauss_crlb`), matching the CPU
+        MLE fit output. If False (least squares), ``lpx`` / ``lpy`` use
+        the Mortensen et al. closed form and no per-parameter
+        uncertainties are added. Default is False.
     log_likelihood : lib.FloatArray1D, optional
         The per-spot Poisson log-likelihood (from an MLE fit). If
         provided together with ``iterations``, the ``log_likelihood``
@@ -1915,14 +2061,24 @@ def locs_from_fits_gpufit(
         Data frame containing the localized spots.
     """
     box_offset = int(box / 2)
+    rotated = theta.shape[1] == 7
     x = theta[:, 1] + identifications["x"] - box_offset
     y = theta[:, 2] + identifications["y"] - box_offset
-    lpx = gausslq.localization_precision(
-        theta[:, 0], theta[:, 3], theta[:, 4], theta[:, 5], em=em
-    )
-    lpy = gausslq.localization_precision(
-        theta[:, 0], theta[:, 4], theta[:, 3], theta[:, 5], em=em
-    )
+    if mle:
+        # Poisson Cramer-Rao bound from the Fisher information of the
+        # point-sampled Gaussian model Gpufit optimizes. Columns of ``crlb``
+        # follow ``theta``: [photons, x, y, sx, sy, bg, (angle)].
+        crlb = _gauss_crlb(theta, box, em, rotated=rotated)
+        with np.errstate(invalid="ignore"):
+            lpx = np.sqrt(crlb[:, 1])
+            lpy = np.sqrt(crlb[:, 2])
+    else:
+        lpx = gausslq.localization_precision(
+            theta[:, 0], theta[:, 3], theta[:, 4], theta[:, 5], em=em
+        )
+        lpy = gausslq.localization_precision(
+            theta[:, 0], theta[:, 4], theta[:, 3], theta[:, 5], em=em
+        )
     a = np.maximum(theta[:, 3], theta[:, 4])
     b = np.minimum(theta[:, 3], theta[:, 4])
     ellipticity = (a - b) / a
@@ -1939,15 +2095,21 @@ def locs_from_fits_gpufit(
         "ellipticity": ellipticity.astype(np.float32),
         "net_gradient": identifications["net_gradient"].astype(np.float32),
     }
-    if theta.shape[1] == 7:  # rotated elliptical Gaussian
-        # Gpufit rotates the coordinate grid by the fitted angle, which
-        # rotates the ellipse by the negative angle. Picasso's "angle"
-        # column (see picasso.render) rotates the ellipse itself and is
-        # stored in degrees, hence the sign flip and conversion.
+    if rotated:  # rotated elliptical Gaussian
         # Normalize to [-90, 90) as the ellipse repeats every half turn.
         angle = -np.rad2deg(theta[:, 6])
         angle = np.mod(angle + 90.0, 180.0) - 90.0
         columns["angle"] = angle.astype(np.float32)
+    if mle:
+        with np.errstate(invalid="ignore"):
+            columns["photons_unc"] = np.sqrt(crlb[:, 0]).astype(np.float32)
+            columns["bg_unc"] = np.sqrt(crlb[:, 5]).astype(np.float32)
+            columns["sx_unc"] = np.sqrt(crlb[:, 3]).astype(np.float32)
+            columns["sy_unc"] = np.sqrt(crlb[:, 4]).astype(np.float32)
+            if rotated:
+                columns["angle_unc"] = np.rad2deg(np.sqrt(crlb[:, 6])).astype(
+                    np.float32
+                )
     if log_likelihood is not None:
         columns["log_likelihood"] = log_likelihood.astype(np.float32)
     if iterations is not None:
@@ -1978,6 +2140,7 @@ def _fit2d_gauss_gpu(
         theta,
         box,
         em,
+        mle=mle,
         log_likelihood=log_likelihood,
         iterations=iterations,
     )

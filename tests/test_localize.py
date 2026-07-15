@@ -21,7 +21,7 @@ import pytest
 from scipy.interpolate import CubicSpline
 from PyQt6 import QtWidgets
 
-from picasso import io, localize
+from picasso import gaussmle, io, localize
 from picasso.gui import localize as localize_gui
 
 from tests.conftest import BOX, CALIB_3D, CAMERA_INFO, MIN_NG, PIXELSIZE
@@ -2149,3 +2149,239 @@ class TestSplineCRLB:
         assert seen and seen[-1] == n and seen == sorted(seen)
         # the tqdm ("console") path must not raise
         localize._spline_crlb(theta, calib, BOX, progress_callback="console")
+
+
+def _gauss_model(theta, box, rotated):
+    """Point-sampled Gaussian gpufit optimizes, parametrized by total photons N:
+    mu(i, j) = N / (2 pi sx sy) * E + bg, i = x (column), j = y (row)."""
+    N, x, y, sx, sy, bg = theta[:6]
+    grid = np.arange(box, dtype=np.float64)
+    dx = grid[:, None] - x
+    dy = grid[None, :] - y
+    if rotated:
+        ct, st = np.cos(theta[6]), np.sin(theta[6])
+        u = dx * ct - dy * st
+        w = dx * st + dy * ct
+        E = np.exp(-0.5 * (u**2 / sx**2 + w**2 / sy**2))
+    else:
+        E = np.exp(-0.5 * (dx**2 / sx**2 + dy**2 / sy**2))
+    return N / (2 * np.pi * sx * sy) * E + bg
+
+
+def _ref_gauss_crlb(theta, box, rotated, floor=1e-3):
+    """Finite-difference Poisson Fisher CRLB reference for _gauss_crlb: builds
+    I = sum g gᵀ / mu with numerical gradients g = d mu / d theta and inverts.
+    """
+    n_params = len(theta)
+    mu = np.maximum(_gauss_model(theta, box, rotated), floor)
+    g = np.zeros((n_params,) + mu.shape)
+    for k in range(n_params):
+        h = 1e-6 * max(abs(theta[k]), 1e-3)
+        tp, tm = theta.copy(), theta.copy()
+        tp[k] += h
+        tm[k] -= h
+        g[k] = (
+            _gauss_model(tp, box, rotated) - _gauss_model(tm, box, rotated)
+        ) / (2 * h)
+    return np.diag(np.linalg.pinv(np.einsum("pij,qij->pq", g / mu, g)))
+
+
+class TestGaussCRLB:
+    """Poisson Cramer-Rao lower bounds for gpufit MLE Gaussian fits
+    (localize._gauss_crlb). The analytic Fisher matrix of the point-sampled
+    Gaussian is validated against a finite-difference reference; no GPU is
+    needed since the CRLB is evaluated at given parameters."""
+
+    def test_crlb_matches_reference_elliptic(self):
+        # sx > sy so var_x > var_y - also guards the x/y association.
+        theta = np.array([[500.0, 3.2, 3.7, 1.4, 1.0, 5.0]])
+        crlb = localize._gauss_crlb(theta, BOX, em=False)[0]
+        ref = _ref_gauss_crlb(theta[0], BOX, rotated=False)
+        np.testing.assert_allclose(crlb, ref, rtol=1e-4)
+        assert crlb[1] > crlb[2]  # var_x > var_y
+
+    def test_crlb_matches_reference_rotated(self):
+        theta = np.array([[800.0, 3.4, 3.1, 1.5, 0.9, 4.0, 0.6]])
+        crlb = localize._gauss_crlb(theta, BOX, em=False, rotated=True)[0]
+        ref = _ref_gauss_crlb(theta[0], BOX, rotated=True)
+        np.testing.assert_allclose(crlb, ref, rtol=1e-4)
+        assert np.isfinite(crlb[6]) and crlb[6] > 0  # finite angle variance
+
+    def test_em_doubles_variance(self):
+        theta = np.array([[500.0, 3.2, 3.7, 1.3, 1.1, 5.0]])
+        crlb = localize._gauss_crlb(theta, BOX, em=False)[0]
+        crlb_em = localize._gauss_crlb(theta, BOX, em=True)[0]
+        np.testing.assert_allclose(crlb_em, 2.0 * crlb, rtol=1e-10)
+
+    def test_nan_theta_row_isolated(self):
+        theta = np.array(
+            [
+                [500.0, 3.2, 3.7, 1.3, 1.1, 5.0],
+                [np.nan, 3.0, 3.0, 1.0, 1.0, 5.0],
+            ]
+        )
+        crlb = localize._gauss_crlb(theta, BOX, em=False)
+        assert np.all(np.isfinite(crlb[0]))
+        assert np.all(np.isnan(crlb[1]))
+
+    def test_low_signal_stays_finite(self):
+        # bg = 0 drives outer model pixels to ~0; the MU_FLOOR guard keeps the
+        # Fisher weight (1 / mu) finite.
+        theta = np.array([[300.0, 3.0, 3.0, 1.2, 1.2, 0.0]])
+        assert np.all(
+            np.isfinite(localize._gauss_crlb(theta, BOX, em=False)[0])
+        )
+
+    def test_empty_input(self):
+        assert localize._gauss_crlb(np.zeros((0, 6)), BOX, em=False).shape == (
+            0,
+            6,
+        )
+
+    def test_more_photons_tightens_bound(self):
+        # More photons tighten the position (x, y) and width (sx, sy) bounds.
+        # var(N) itself grows with N (absolute photon-count noise increases).
+        base = [3.2, 3.7, 1.3, 1.1, 5.0]
+        dim = localize._gauss_crlb(np.array([[200.0, *base]]), BOX, em=False)[
+            0
+        ]
+        bright = localize._gauss_crlb(
+            np.array([[4000.0, *base]]), BOX, em=False
+        )[0]
+        assert np.all(bright[1:5] < dim[1:5])
+
+
+class TestSaveableColumns:
+    """Guard the save whitelist: every column a fit path can emit must be
+    registered in ``localize.LOCALIZATION_COLUMNS``. The GUI's
+    ``Window.select_locs_columns`` keeps only whitelisted columns, so any
+    unregistered column (e.g. the MLE ``*_unc`` uncertainties) is silently
+    dropped before the .hdf5 is written. This test builds a representative
+    localizations frame from every ``locs_from_fits_*`` constructor and fails
+    if it produces a column the whitelist does not cover."""
+
+    IDS = pd.DataFrame(
+        {
+            "frame": [0, 1],
+            "x": [10, 20],
+            "y": [15, 25],
+            "net_gradient": [100.0, 120.0],
+        }
+    )
+
+    def _fit_frames(self):
+        """One output frame per fit path Picasso can save (GPU-free: the
+        constructors are pure functions of the fitted parameters)."""
+        ids = self.IDS
+        stats = dict(
+            log_likelihood=np.array([-10.0, -11.0], dtype=np.float32),
+            iterations=np.array([5, 6], dtype=np.int32),
+        )
+        frames = {}
+
+        # gpufit Gaussian, [photons, x, y, sx, sy, bg] (+ angle if rotated)
+        theta_e = np.array(
+            [
+                [500.0, 3.2, 3.7, 1.3, 1.1, 5.0],
+                [800.0, 3.4, 3.1, 1.2, 1.2, 4.0],
+            ],
+            dtype=np.float32,
+        )
+        theta_r = np.array(
+            [
+                [800.0, 3.4, 3.1, 1.5, 0.9, 4.0, 0.6],
+                [900.0, 3.0, 3.5, 1.4, 1.0, 3.0, -0.3],
+            ],
+            dtype=np.float32,
+        )
+        frames["gpufit-mle"] = localize.locs_from_fits_gpufit(
+            ids, theta_e, BOX, em=False, mle=True, **stats
+        )
+        frames["gpufit-mle-rotated"] = localize.locs_from_fits_gpufit(
+            ids, theta_r, BOX, em=False, mle=True, **stats
+        )
+        frames["gpufit-lse"] = localize.locs_from_fits_gpufit(
+            ids, theta_e, BOX, em=False, mle=False
+        )
+        frames["gpufit-lse-rotated"] = localize.locs_from_fits_gpufit(
+            ids, theta_r, BOX, em=False, mle=False
+        )
+
+        # spline PSF, [amplitude, x_shift, y_shift, (z_shift,) offset]
+        calib_2d, _ = _gauss_spline_calibration(model="spline-2d")
+        calib_3d, _ = _gauss_spline_calibration(model="spline-3d")
+        theta_s2 = np.array(
+            [[3000.0, 0.1, -0.1, 15.0], [2800.0, 0.05, -0.05, 14.0]]
+        )
+        theta_s3 = np.array(
+            [[4000.0, 0.2, -0.15, -6.0, 20.0], [3800.0, 0.1, -0.1, -5.0, 18.0]]
+        )
+        frames["spline-2d"] = localize.locs_from_fits_spline(
+            ids,
+            theta_s2,
+            BOX,
+            em=False,
+            calibration=calib_2d,
+            mle=True,
+            **stats,
+        )
+        frames["spline-3d"] = localize.locs_from_fits_spline(
+            ids,
+            theta_s3,
+            BOX,
+            em=False,
+            calibration=calib_3d,
+            mle=True,
+            **stats,
+        )
+
+        # CPU MLE Gaussian, [x, y, photons, bg, sx, sy] with its 6-col CRLB
+        theta_cpu = np.array(
+            [
+                [3.0, 3.0, 500.0, 5.0, 1.2, 1.1],
+                [3.1, 2.9, 600.0, 4.0, 1.0, 1.3],
+            ]
+        )
+        crlbs = np.full((2, 6), 0.01)
+        frames["gaussmle-cpu"] = gaussmle.locs_from_fits(
+            ids,
+            theta_cpu,
+            crlbs,
+            stats["log_likelihood"],
+            stats["iterations"],
+            BOX,
+        )
+        return frames
+
+    def test_all_fit_columns_are_whitelisted(self):
+        saveable = {
+            col
+            for cols in localize.LOCALIZATION_COLUMNS.values()
+            for col in cols
+        }
+        offenders = {
+            name: sorted(set(locs.columns) - saveable)
+            for name, locs in self._fit_frames().items()
+            if set(locs.columns) - saveable
+        }
+        assert not offenders, (
+            "fit paths emit columns missing from LOCALIZATION_COLUMNS (they "
+            f"would be dropped on save): {offenders}"
+        )
+
+    def test_uncertainty_columns_survive_select_locs_columns(self):
+        # Mirror Window.select_locs_columns: keep only whitelisted columns (all
+        # checkboxes default checked). The MLE uncertainties must survive.
+        saveable = {
+            col
+            for cols in localize.LOCALIZATION_COLUMNS.values()
+            for col in cols
+        }
+        frames = self._fit_frames()
+        for expected in ("photons_unc", "bg_unc", "sx_unc", "sy_unc"):
+            locs = frames["gpufit-mle"]
+            kept = [c for c in locs.columns if c in saveable]
+            assert expected in kept, f"{expected} dropped for gpufit-mle"
+        assert "angle_unc" in [
+            c for c in frames["gpufit-mle-rotated"].columns if c in saveable
+        ]

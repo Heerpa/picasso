@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 14-JUL-2026 CEST
+Last change: 15-JUL-2026 CEST
 
 ## 0.11.0
 
@@ -36,6 +36,7 @@ Last change: 14-JUL-2026 CEST
 - Improved zooming in/out via scroll wheel
 - Contrast spin boxes use logarithmic scaling
 - Gpufit's MLE-fitted localizations save log-likelihood and iterations
+- Gpufit's Gaussian MLE-fitted localizations' precisions corrected/included (`lpx`, `photon_unc`, etc)
 - Fixed a gap of roughly one box size in the identified spots along the borders between adjacent (e.g. overlapping) ROIs
 - Fixed handling abortions during identification
 - GPU-accelerated fitting (GPUfit) now documented for Linux: the `libGpufit.so` is not shipped (only the Windows `Gpufit.dll` is), so Linux users must build it themselves. Added build/install instructions to the [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html#gpu-fitting-on-linux), the readme and a README in `picasso/ext/pygpufit/`.
