@@ -144,9 +144,7 @@ def _detect_bead_positions(
     box size - are treated as the same bead); beads whose box would fall
     outside the frame are dropped.
 
-    If ``roi`` is given (one rectangle or a list of them, in the same
-    ``[[y_min, x_min], [y_max, x_max]]`` form as ``localize.identify`` and the
-    GUI's ``view.rois``), only detections inside the ROI(s) are kept; an empty
+    If ``roi`` is given, only detections inside the ROI(s) are kept; an empty
     list or None means the whole frame.
 
     Returns a data frame with integer ``x``/``y`` columns (one row per bead).
@@ -1293,13 +1291,15 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
     Returns
     -------
     precision : dict or None
-        ``{"bias_z", "precision_z", "n_beads", "n_spots"}`` with, per z-step and
-        aligned to ``z_of_step``, the systematic z ``bias_z`` (mean deviation
-        from the true stage position) and the shot-noise ``precision_z`` (std
-        about that mean), both in nm. Returns ``None`` for a 2D calibration (no
-        z), when the per-frame spots are absent, or when GPU spline fitting is
-        unavailable or fails, so the caller can fall back to the model-vs-data
-        RMSE panel.
+        ``{"bias_z", "precision_z", "scatter_fit", "scatter_stage", "n_beads",
+        "n_spots"}``. Per z-step and aligned to ``z_of_step``: the systematic z
+        ``bias_z`` (mean deviation from the true stage position) and the
+        shot-noise ``precision_z`` (std about that mean), both in nm.
+        ``scatter_fit``/``scatter_stage`` are per-spot (subsampled) estimated z
+        and stage position, in raw stage nm, for the fitted-vs-truth scatter.
+        Returns ``None`` for a 2D calibration (no z), when the per-frame spots
+        are absent, or when GPU spline fitting is unavailable or fails, so the
+        caller can fall back to the model-vs-data RMSE panel.
     """
     if not localize.GPUFIT_INSTALLED:
         return None
@@ -1339,9 +1339,22 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
     precision_z = np.array([s for _, s in bias_spread])
     if not np.any(np.isfinite(precision_z)):
         return None
+
+    z_true = z_of_step[spot_step_idx]
+    finite = np.isfinite(z_fit) & np.isfinite(z_true)
+    scatter_fit = z_fit[finite]
+    scatter_stage = z_true[finite]
+    cap = 20000
+    if scatter_fit.size > cap:
+        stride = int(np.ceil(scatter_fit.size / cap))
+        scatter_fit = scatter_fit[::stride]
+        scatter_stage = scatter_stage[::stride]
+
     return {
         "bias_z": bias_z,
         "precision_z": precision_z,
+        "scatter_fit": scatter_fit,
+        "scatter_stage": scatter_stage,
         "n_beads": int(built.get("n_beads", 0)),
         "n_spots": int(np.isfinite(deviation).sum()),
     }
@@ -1359,10 +1372,11 @@ def _save_diagnostic_plot(
     Three montages of ``n_slices`` slices each - xy across z, xz across y, yz
     across x - plus, at the bottom, the axial intensity profile and, when
     ``precision`` is given (from re-fitting the beads, see ``_axial_precision``),
-    two further panels: the systematic axial bias (z offset to the true stage
-    position) and the shot-noise axial precision (z spread), both vs z. Without
-    ``precision`` the bottom row falls back to a single model-vs-data agreement
-    (per-z RMSE) panel. The xz/yz cross-sections are oriented with z on the
+    three further panels: the estimated-z-vs-stage scatter (with the identity
+    line), the systematic axial bias (z offset to the true stage position) and
+    the shot-noise axial precision (z spread). Without ``precision`` the bottom
+    row falls back to a single model-vs-data agreement (per-z RMSE) panel. The
+    xz/yz cross-sections are oriented with z on the
     vertical axis (lateral on the horizontal). Every image panel shares one
     intensity scale, and one camera pixel renders at the same physical size in
     all panels: the z axis of the cross-sections is converted from nm to camera
@@ -1473,7 +1487,7 @@ def _save_diagnostic_plot(
     title_h = 0.5  # room for each row's heading + panel titles
     head_h = 0.16  # heading baseline offset from the top of its band
     row_gap = 0.35
-    prof_h = 1.4
+    prof_h = 1.8
 
     def row_w(panels):
         return sum(p[3] * scale for p in panels) + gap_in * (len(panels) - 1)
@@ -1564,6 +1578,19 @@ def _save_diagnostic_plot(
         ax.set_ylim(bottom=0.0)
         ax.set_title(f"{precision['n_beads']} beads", fontsize=9)
 
+    def _plot_scatter(ax):
+        # per-spot estimated z vs known stage position, with the identity line
+        st = np.asarray(precision["scatter_stage"], dtype=float) - z_ref_nm
+        zf = np.asarray(precision["scatter_fit"], dtype=float) - z_ref_nm
+        lo, hi = float(np.min(z_plot)), float(np.max(z_plot))
+        ax.plot(st, zf, ".k", alpha=0.1, markersize=2)
+        ax.plot([lo, hi], [lo, hi], color="tab:red", lw=1.5, label="identity")
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Estimated z (nm)")
+        ax.legend(loc="best", fontsize=8)
+
     def _plot_gof(ax):
         # amplitude-normalized RMSE between the averaged PSF model and the
         # individual beads, per z-slice: how faithfully one PSF describes the
@@ -1580,22 +1607,24 @@ def _save_diagnostic_plot(
 
     bottom_panels = [("Axial intensity profile", _plot_intensity)]
     if have_prec:
-        bottom_panels.append(
-            ("Axial bias (z offset to stage position)", _plot_bias)
-        )
-        bottom_panels.append(("Axial precision (z spread)", _plot_precision))
+        bottom_panels.append(("Estimated z vs stage", _plot_scatter))
+        bottom_panels.append(("Axial bias", _plot_bias))
+        bottom_panels.append(("Axial precision", _plot_precision))
     elif have_gof:
         bottom_panels.append(("Model–data agreement (per-z RMSE)", _plot_gof))
 
     usable_w = fig_w - 2 * margin
-    prof_gap = 0.7
     n_bp = len(bottom_panels)
-    panel_w = (usable_w - prof_gap * (n_bp - 1)) / n_bp
+    prof_gap = 0.95  # inter-panel gap; must fit a y-label + ticks
+    max_panel_w = 2.6
+    panel_w = min(max_panel_w, (usable_w - prof_gap * (n_bp - 1)) / n_bp)
+    row_w = n_bp * panel_w + (n_bp - 1) * prof_gap
+    x0 = margin + max(0.0, (usable_w - row_w) / 2.0)  # center the group
     head_y = 1.0 - (top + title_h * 0.35) / fig_h
 
     for i, (heading, _) in enumerate(bottom_panels):
         fig.text(
-            (margin + i * (panel_w + prof_gap)) / fig_w,
+            (x0 + i * (panel_w + prof_gap)) / fig_w,
             head_y,
             heading,
             fontsize=11,
@@ -1606,7 +1635,7 @@ def _save_diagnostic_plot(
     for i, (_, plot_fn) in enumerate(bottom_panels):
         ax = fig.add_axes(
             [
-                (margin + i * (panel_w + prof_gap)) / fig_w,
+                (x0 + i * (panel_w + prof_gap)) / fig_w,
                 (fig_h - top - prof_h) / fig_h,
                 panel_w / fig_w,
                 (prof_h - 0.4) / fig_h,
