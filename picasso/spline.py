@@ -130,6 +130,7 @@ def _detect_bead_positions(
     minimum_ng: float,
     box: int,
     ref_frame_bounds: tuple[int, int],
+    roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
     threaded: bool = True,
     min_separation: float | None = None,
 ) -> pd.DataFrame:
@@ -143,6 +144,11 @@ def _detect_bead_positions(
     box size - are treated as the same bead); beads whose box would fall
     outside the frame are dropped.
 
+    If ``roi`` is given (one rectangle or a list of them, in the same
+    ``[[y_min, x_min], [y_max, x_max]]`` form as ``localize.identify`` and the
+    GUI's ``view.rois``), only detections inside the ROI(s) are kept; an empty
+    list or None means the whole frame.
+
     Returns a data frame with integer ``x``/``y`` columns (one row per bead).
     """
     if min_separation is None:
@@ -151,6 +157,7 @@ def _detect_bead_positions(
         movie,
         minimum_ng,
         box,
+        roi=roi,
         frame_bounds=ref_frame_bounds,
         threaded=threaded,
     )
@@ -625,6 +632,7 @@ def build_psf_template(
     threaded: bool = True,
     beads: pd.DataFrame | None = None,
     return_spots: bool = False,
+    roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
 ) -> dict:
     """Build a normalized PSF template volume from a bead z-stack.
 
@@ -645,7 +653,8 @@ def build_psf_template(
     If ``beads`` (a data frame with integer ``x``/``y`` columns) is given, it
     is used instead of detecting beads on this movie - this lets the
     multichannel calibration reuse the same physical beads, mapped into each
-    channel, across all channels.
+    channel, across all channels. Otherwise beads are detected on this movie,
+    restricted to ``roi`` if given (see ``_detect_bead_positions``).
     """
     n_frames = int(movie.shape[0])
     step_of_frame, z_of_step, step_range = _step_of_frame(
@@ -655,7 +664,7 @@ def build_psf_template(
     if beads is None:
         ref_bounds = _reference_frame_bounds(step_of_frame, step_range)
         beads = _detect_bead_positions(
-            movie, minimum_ng, box, ref_bounds, threaded=threaded
+            movie, minimum_ng, box, ref_bounds, roi=roi, threaded=threaded
         )
     if return_spots:
         volumes, spots, steps_of_valid = _bead_volumes(
@@ -730,6 +739,7 @@ def calibrate_spline(
     model: Literal["spline-2d", "spline-3d"] = "spline-3d",
     magnification_factor: float = 0.79,
     correct_z_bias: bool = False,
+    roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
     path: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
 ) -> dict:
@@ -773,6 +783,11 @@ def calibrate_spline(
         (see ``picasso.zfit.calibrate_z``); only meaningful for a PSF
         with a single, well-defined intensity focus (e.g. astigmatism).
         Default is False.
+    roi : tuple or list of tuples, optional
+        Region(s) of interest for bead detection, in the same
+        ``[[y_min, x_min], [y_max, x_max]]`` form as ``localize.identify`` and
+        the GUI's ``view.rois``. Only beads inside the ROI(s) are used for the
+        calibration; None (or an empty list) uses the whole frame. Default None.
     path : str, optional
         Where to save the calibration (HDF5) and a diagnostic PNG. If None,
         nothing is written. Default is None.
@@ -806,6 +821,7 @@ def calibrate_spline(
         frames_per_step=frames_per_step,
         frame_bounds=frame_bounds,
         frame_order=frame_order,
+        roi=roi,
         # keep the individual per-frame spots so the diagnostic PNG can measure
         # the axial precision by fitting each spot (only needed when we plot)
         return_spots=path is not None,
@@ -1006,6 +1022,7 @@ def calibrate_spline_multichannel(
     magnification_factor: float = 0.79,
     correct_z_bias: bool = False,
     max_match_distance: float | None = None,
+    roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
     path: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
 ) -> dict:
@@ -1021,8 +1038,10 @@ def calibrate_spline_multichannel(
     ``localize.fit_spline_multichannel`` / ``get_spots_multichannel``.
 
     Parameters are as in ``calibrate_spline`` but per-channel lists; all movies
-    must share the same frame layout (z scan). Returns a
-    ``"spline-3d-multichannel"`` calibration dict.
+    must share the same frame layout (z scan). ``roi`` (in reference-channel
+    coordinates) restricts which reference-channel beads are calibrated on; the
+    channel-to-channel transform is still estimated from all detected beads.
+    Returns a ``"spline-3d-multichannel"`` calibration dict.
     """
     if not localize.GPUSPLINE_INSTALLED:
         raise ImportError(
@@ -1052,7 +1071,9 @@ def calibrate_spline_multichannel(
     ref_bounds = _reference_frame_bounds(step_of_frame, step_range)
     mid_frame = (ref_bounds[0] + ref_bounds[1]) // 2
 
-    beads_ref = _detect_bead_positions(movies[0], minimum_ng, box, ref_bounds)
+    beads_ref = _detect_bead_positions(
+        movies[0], minimum_ng, box, ref_bounds, roi=roi
+    )
 
     # channel transforms (channel 0 is the identity reference)
     identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
@@ -1217,23 +1238,28 @@ def _place_row(fig, panels, top_in, fig_w_in, fig_h_in, scale, gap_in):
     return top_in + row_h_in
 
 
-def _robust_rmsd(deviation: np.ndarray) -> float:
-    """RMSD of a 1D deviation-to-truth array, robust to the occasional
-    non-converged fit: deviations farther than 5 (scaled) MADs from the median
-    are dropped before the root mean square is taken (the RMSD itself stays
-    referenced to zero deviation, so a genuine consistent bias is retained).
-    Returns NaN if fewer than two finite values are present."""
+def _robust_bias_spread(deviation: np.ndarray) -> tuple[float, float]:
+    """Robust ``(bias, spread)`` of a 1D deviation-to-truth array.
+
+    ``bias`` is the mean deviation (the systematic z offset from the true stage
+    position - e.g. a per-bead/registration offset) and ``spread`` is the
+    standard deviation about that mean (the shot-noise-limited single-frame
+    precision). Splitting the two keeps a consistent bias from masquerading as
+    imprecision (the total RMSD is ``sqrt(bias**2 + spread**2)``). Robust to the
+    occasional non-converged fit: deviations farther than 5 (scaled) MADs from
+    the median are dropped first. Returns ``(nan, nan)`` if fewer than two
+    finite values are present."""
     dev = np.asarray(deviation, dtype=np.float64)
     dev = dev[np.isfinite(dev)]
     if dev.size < 2:
-        return float("nan")
+        return float("nan"), float("nan")
     med = np.median(dev)
     mad = np.median(np.abs(dev - med))
     if mad > 0:
         keep = np.abs(dev - med) <= 5.0 * 1.4826 * mad
         if keep.sum() >= 2:
             dev = dev[keep]
-    return float(np.sqrt(np.mean(dev**2)))
+    return float(np.mean(dev)), float(np.std(dev))
 
 
 def _axial_precision(built: dict, calibration: dict) -> dict | None:
@@ -1241,12 +1267,13 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
 
     Every individual single-frame bead spot (``built["spots"]``) is fitted with
     the calibration's own spline PSF model (the very GPU fitter used at
-    localization time) and the recovered z is compared against the known stage
-    position of its frame. The per-z-step RMSD of that deviation is the
-    calibration's axial precision at that z - the spline analog of the "mean z
-    precision" curve in ``zfit.calibrate_z``, which likewise fits the
-    calibration data back with its own model, per single-frame localization,
-    and reports the RMSD to the true stage position. Fitting the raw per-frame
+    localization time) and the recovered z - referenced to the scan center, the
+    same zero as ``z_of_step`` - is compared against the known stage position of
+    its frame. The per-z-step RMSD of that deviation is the calibration's axial
+    precision at that z - the spline analog of the "mean z precision" curve in
+    ``zfit.calibrate_z``, which likewise fits the calibration data back with its
+    own model, per single-frame localization, and reports the RMSD to the true
+    stage position. Fitting the raw per-frame
     spots (rather than the frame-averaged bead volumes) keeps the realistic,
     single-frame shot-noise regime and gives many samples per z-step. Only z
     has a ground truth (the known stage position), so no lateral precision is
@@ -1266,8 +1293,10 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
     Returns
     -------
     precision : dict or None
-        ``{"rmsd_z", "n_beads", "n_spots"}`` with the per-z-step axial RMSD in
-        nm, aligned to ``z_of_step``. Returns ``None`` for a 2D calibration (no
+        ``{"bias_z", "precision_z", "n_beads", "n_spots"}`` with, per z-step and
+        aligned to ``z_of_step``, the systematic z ``bias_z`` (mean deviation
+        from the true stage position) and the shot-noise ``precision_z`` (std
+        about that mean), both in nm. Returns ``None`` for a 2D calibration (no
         z), when the per-frame spots are absent, or when GPU spline fitting is
         unavailable or fails, so the caller can fall back to the model-vs-data
         RMSE panel.
@@ -1288,28 +1317,31 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
     # stack the normal fitting path consumes.
     spots = np.ascontiguousarray(spots)
     try:
-        theta = localize.fit_spots_gpufit_spline(spots, calibration)
+        # MLE (Poisson) matches the shot-noise statistics of the single-frame
+        # spots and stays closer to the CRLB than least squares, especially for
+        # the dim, defocused spots in the tails.
+        theta = localize.fit_spots_gpufit_spline(spots, calibration, mle=True)
     except Exception:
         return None
     theta = np.asarray(theta)
 
-    # Stage-equivalent fitted z (theta column 3 is z_shift), so the RMSD is in
-    # stage nm and directly comparable to ``z_of_step`` - as in
-    # ``zfit.calibrate_z``, which divides the localization z by the
-    # magnification factor before comparing to the stage positions.
     z_step_nm = float(calibration.get("z_step_nm", 1.0))
-    z_init = float(calibration.get("z_init", calibration.get("z_center", 0.0)))
-    z_fit = (theta[:, 3] + z_init) * z_step_nm  # (n_spots,)
+    scan_center = _scan_center_index(z_of_step)
+    z_fit = (theta[:, 3] + scan_center) * z_step_nm  # (n_spots,)
     deviation = z_fit - z_of_step[spot_step_idx]  # (n_spots,)
 
     n_steps = len(z_of_step)
-    rmsd_z = np.array(
-        [_robust_rmsd(deviation[spot_step_idx == i]) for i in range(n_steps)]
-    )
-    if not np.any(np.isfinite(rmsd_z)):
+    bias_spread = [
+        _robust_bias_spread(deviation[spot_step_idx == i])
+        for i in range(n_steps)
+    ]
+    bias_z = np.array([b for b, _ in bias_spread])
+    precision_z = np.array([s for _, s in bias_spread])
+    if not np.any(np.isfinite(precision_z)):
         return None
     return {
-        "rmsd_z": rmsd_z,
+        "bias_z": bias_z,
+        "precision_z": precision_z,
         "n_beads": int(built.get("n_beads", 0)),
         "n_spots": int(np.isfinite(deviation).sum()),
     }
@@ -1325,12 +1357,12 @@ def _save_diagnostic_plot(
     """Save a PNG summarizing the calibration.
 
     Three montages of ``n_slices`` slices each - xy across z, xz across y, yz
-    across x - plus, at the bottom, the axial intensity profile and a second
-    panel. When ``precision`` is given (empirical axial precision - z RMSD to
-    the true stage position - from re-fitting the beads, see
-    ``_axial_precision``) that panel shows the axial precision vs z; otherwise
-    it falls back to the model-vs-data agreement (per-z RMSE) curve. The
-    xz/yz cross-sections are oriented with z on the
+    across x - plus, at the bottom, the axial intensity profile and, when
+    ``precision`` is given (from re-fitting the beads, see ``_axial_precision``),
+    two further panels: the systematic axial bias (z offset to the true stage
+    position) and the shot-noise axial precision (z spread), both vs z. Without
+    ``precision`` the bottom row falls back to a single model-vs-data agreement
+    (per-z RMSE) panel. The xz/yz cross-sections are oriented with z on the
     vertical axis (lateral on the horizontal). Every image panel shares one
     intensity scale, and one camera pixel renders at the same physical size in
     all panels: the z axis of the cross-sections is converted from nm to camera
@@ -1341,10 +1373,9 @@ def _save_diagnostic_plot(
     z_of_step = np.asarray(built["z_of_step"])
     gof = built.get("gof") or {}
     have_gof = bool(gof.get("n_used"))
-    have_prec = bool(precision) and np.any(np.isfinite(precision["rmsd_z"]))
-    # the second bottom panel: empirical axial precision if available, else the
-    # model-vs-data RMSE curve
-    have_second = have_prec or have_gof
+    have_prec = bool(precision) and np.any(
+        np.isfinite(precision["precision_z"])
+    )
     box, _, n_steps = template.shape
     c = box // 2
     ps = float(calibration.get("pixelsize", 130)) or 130.0  # nm / camera px
@@ -1352,7 +1383,6 @@ def _save_diagnostic_plot(
     img_kw = dict(cmap="hot", vmin=0.0, vmax=vmax)
 
     # z = 0 reference the fitter (localize) uses
-    correct_z_bias = bool(calibration.get("correct_z_bias", False))
     z_origin = float(calibration.get("z_center", z_center))
     if n_steps > 1:
         dz_step = (float(z_of_step[-1]) - float(z_of_step[0])) / (n_steps - 1)
@@ -1408,7 +1438,7 @@ def _save_diagnostic_plot(
             k == outline_idx,
             None,
         )
-        for k in z_idx
+        for k in z_idx[::-1]
     ]
     # rotate 90 deg: transpose so z runs down the rows, lateral across columns
     xz_panels = [
@@ -1499,91 +1529,90 @@ def _save_diagnostic_plot(
         top = _place_row(fig, panels, top, fig_w, fig_h, scale, gap_in)
         top += row_gap
 
-    # bottom row: axial intensity profile and, alongside it, a second panel -
-    # the empirical axial precision (z RMSD vs z) when available, otherwise the
+    # bottom row: the axial intensity profile plus, when available, the
+    # empirical axial bias and precision (two panels); otherwise the single
     # model-vs-data agreement (per-z RMSE) curve.
+    def _plot_intensity(ax):
+        # axial intensity profile: brightest normalized pixel per slice, ~1 at
+        # focus and decaying as the PSF spreads with defocus (a sharpness check)
+        ax.plot(z_plot, template.max(axis=(0, 1)), ".-")
+        ax.axvline(z_origin_marker, color="0.3", lw=1.0)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Peak pixel value (norm.)")
+
+    def _plot_bias(ax):
+        # systematic z offset between the spline-refitted z and the known stage
+        # position at each z-step (signed; ideally ~0). Kept separate from the
+        # precision so a per-bead/registration z offset is not mistaken for
+        # imprecision.
+        ax.axhline(0.0, color="0.6", lw=1.0)
+        ax.plot(z_plot, precision["bias_z"], ".-", color="tab:red")
+        ax.axvline(z_origin_marker, color="0.3", lw=1.0)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("z bias (nm)")
+        ax.set_title(f"{precision['n_beads']} beads", fontsize=9)
+
+    def _plot_precision(ax):
+        # shot-noise spread of the spline-refitted z about its per-step mean -
+        # the single-frame axial precision the calibration delivers (lower is
+        # better; rises with defocus). Analogous to the "mean z precision" panel
+        # in ``zfit.calibrate_z``, but with the systematic bias removed.
+        ax.plot(z_plot, precision["precision_z"], ".-", color="tab:red")
+        ax.axvline(z_origin_marker, color="0.3", lw=1.0)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("z precision (nm)")
+        ax.set_ylim(bottom=0.0)
+        ax.set_title(f"{precision['n_beads']} beads", fontsize=9)
+
+    def _plot_gof(ax):
+        # amplitude-normalized RMSE between the averaged PSF model and the
+        # individual beads, per z-slice: how faithfully one PSF describes the
+        # measured beads (lower is better; rises where beads disagree)
+        ax.plot(z_plot, gof["residual_profile_pct"], ".-", color="tab:red")
+        ax.axvline(z_origin_marker, color="0.3", lw=1.0)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("RMSE (% of peak)")
+        ax.set_ylim(bottom=0.0)
+        ax.set_title(
+            f"median bead R² = {gof['r2_median']:.3f}  (n = {gof['n_used']})",
+            fontsize=9,
+        )
+
+    bottom_panels = [("Axial intensity profile", _plot_intensity)]
+    if have_prec:
+        bottom_panels.append(
+            ("Axial bias (z offset to stage position)", _plot_bias)
+        )
+        bottom_panels.append(("Axial precision (z spread)", _plot_precision))
+    elif have_gof:
+        bottom_panels.append(("Model–data agreement (per-z RMSE)", _plot_gof))
+
     usable_w = fig_w - 2 * margin
     prof_gap = 0.7
-    panel_w = (usable_w - prof_gap) / 2.0 if have_second else usable_w
+    n_bp = len(bottom_panels)
+    panel_w = (usable_w - prof_gap * (n_bp - 1)) / n_bp
     head_y = 1.0 - (top + title_h * 0.35) / fig_h
 
-    # axial intensity profile: brightest normalized pixel per slice, ~1 at
-    # focus and decaying as the PSF spreads with defocus (a sharpness check)
-    fig.text(
-        margin / fig_w,
-        head_y,
-        "Axial intensity profile",
-        fontsize=11,
-        fontweight="bold",
-        va="center",
-    )
-    if have_second:
-        second_head = (
-            "Axial precision (z RMSD to stage position)"
-            if have_prec
-            else "Model–data agreement (per-z RMSE)"
-        )
+    for i, (heading, _) in enumerate(bottom_panels):
         fig.text(
-            (margin + panel_w + prof_gap) / fig_w,
+            (margin + i * (panel_w + prof_gap)) / fig_w,
             head_y,
-            second_head,
+            heading,
             fontsize=11,
             fontweight="bold",
             va="center",
         )
     top += title_h
-    ax = fig.add_axes(
-        [
-            margin / fig_w,
-            (fig_h - top - prof_h) / fig_h,
-            panel_w / fig_w,
-            (prof_h - 0.4) / fig_h,
-        ]
-    )
-    ax.plot(z_plot, template.max(axis=(0, 1)), ".-")
-    ax.axvline(z_origin_marker, color="0.3", lw=1.0)
-    ax.set_xlabel(x_label)
-    ax.set_ylabel("Peak pixel value (norm.)")
-
-    if have_second:
-        ax2 = fig.add_axes(
+    for i, (_, plot_fn) in enumerate(bottom_panels):
+        ax = fig.add_axes(
             [
-                (margin + panel_w + prof_gap) / fig_w,
+                (margin + i * (panel_w + prof_gap)) / fig_w,
                 (fig_h - top - prof_h) / fig_h,
                 panel_w / fig_w,
                 (prof_h - 0.4) / fig_h,
             ]
         )
-        if have_prec:
-            # empirical axial precision: RMSD between the spline-refitted z and
-            # the known stage position at each z-step - what the calibration
-            # delivers vs z (lower is better; rises with defocus). Analogous to
-            # the "mean z precision" panel in ``zfit.calibrate_z``.
-            ax2.plot(z_plot, precision["rmsd_z"], ".-", color="tab:red")
-            ax2.axvline(z_origin_marker, color="0.3", lw=1.0)
-            ax2.set_xlabel(x_label)
-            ax2.set_ylabel("z RMSD (nm)")
-            ax2.set_ylim(bottom=0.0)
-            ax2.set_title(
-                f"{precision['n_beads']} beads",
-                fontsize=9,
-            )
-        else:
-            # amplitude-normalized RMSE between the averaged PSF model and the
-            # individual beads, per z-slice: how faithfully one PSF describes
-            # the measured beads (lower is better; rises where beads disagree)
-            ax2.plot(
-                z_plot, gof["residual_profile_pct"], ".-", color="tab:red"
-            )
-            ax2.axvline(z_origin_marker, color="0.3", lw=1.0)
-            ax2.set_xlabel(x_label)
-            ax2.set_ylabel("RMSE (% of peak)")
-            ax2.set_ylim(bottom=0.0)
-            ax2.set_title(
-                f"median bead R² = {gof['r2_median']:.3f}  "
-                f"(n = {gof['n_used']})",
-                fontsize=9,
-            )
+        plot_fn(ax)
 
     base, _ = os.path.splitext(path)
     fig.savefig(base + ".png", format="png", dpi=200)

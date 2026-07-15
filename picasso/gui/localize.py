@@ -3013,6 +3013,7 @@ class Window(QtWidgets.QMainWindow):
             model=model,
             magnification_factor=magnification_factor,
             correct_z_bias=correct_z_bias,
+            roi=self.view.rois,
             path=path,
         )
         self.spline_calibration_worker.finished.connect(
@@ -4971,6 +4972,7 @@ class SplineCalibrationWorker(QtCore.QThread):
         path: str,
         magnification_factor: float = 0.79,
         correct_z_bias: bool = False,
+        roi=None,
     ) -> None:
         super().__init__()
         self.movie = movie
@@ -4984,6 +4986,7 @@ class SplineCalibrationWorker(QtCore.QThread):
         self.model = model
         self.magnification_factor = magnification_factor
         self.correct_z_bias = correct_z_bias
+        self.roi = roi
         self.path = path
 
     def run(self) -> None:
@@ -5000,6 +5003,7 @@ class SplineCalibrationWorker(QtCore.QThread):
                 model=self.model,
                 magnification_factor=self.magnification_factor,
                 correct_z_bias=self.correct_z_bias,
+                roi=self.roi,
                 path=self.path,
             )
         except Exception as e:  # surface any failure to the GUI
