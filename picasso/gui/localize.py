@@ -1737,6 +1737,12 @@ class ParametersDialog(lib.Dialog):
         # the checkbox applies to both optimizers and sits below the
         # optimizer parameter stack.
         self.gpufit_checkbox = QtWidgets.QCheckBox("Use GPUfit")
+        self.gpufit_checkbox.setToolTip(
+            "Perform fitting on the GPU using Gpufit.\n\n"
+            "Przybylski, A., Thiel, B., Keller-Findeisen, J. et al. "
+            "Gpufit: An open-source toolkit for GPU-accelerated curve "
+            "fitting. Sci Rep 7, 15722 (2017). "
+        )
         self.gpufit_checkbox.setTristate(False)
         self.gpufit_checkbox.setDisabled(True)
         self.gpufit_checkbox.stateChanged.connect(self.on_gpufit_changed)
@@ -1813,6 +1819,22 @@ class ParametersDialog(lib.Dialog):
         if GPUFIT_INSTALLED:
             self.spline_groupbox = spline_groupbox = QtWidgets.QGroupBox(
                 "Experimental PSF (spline)"
+            )
+            spline_groupbox.setToolTip(
+                "Fit an experimentally measured PSF, modelled as a cubic "
+                "spline, on the GPU.\n\n"
+                "Li, Y., Mund, M., Hoess, P. et al. Real-time 3D "
+                "single-molecule localization using experimental point "
+                "spread functions. Nat Methods 15, 367-369 (2018). "
+                "https://doi.org/10.1038/nmeth.4661\n\n"
+                "Babcock, H.P., Zhuang, X. Analyzing Single Molecule "
+                "Localization Microscopy Data Using Cubic Splines. Sci Rep "
+                "7, 552 (2017). https://doi.org/10.1038/s41598-017-00622-w"
+                "\n\n"
+                "Przybylski, A., Thiel, B., Keller-Findeisen, J. et al. "
+                "Gpufit: An open-source toolkit for GPU-accelerated curve "
+                "fitting. Sci Rep 7, 15722 (2017). "
+                "https://doi.org/10.1038/s41598-017-15313-9"
             )
             vbox.addWidget(spline_groupbox)
             spline_grid = QtWidgets.QGridLayout(spline_groupbox)
@@ -2124,7 +2146,17 @@ class ParametersDialog(lib.Dialog):
         if self.spline_calibration_path:
             dialog_directory, _ = os.path.split(self.spline_calibration_path)
         else:
+            # Fall back to the directory of the last-used calibration stored
+            # in the user settings, even if that file no longer exists.
             dialog_directory = None
+            try:
+                last_path = io.load_user_settings()["Localize"].get(
+                    "spline_calibration_path", None
+                )
+                if last_path:
+                    dialog_directory = os.path.dirname(last_path)
+            except Exception:
+                pass
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Load spline PSF calibration",
@@ -2133,6 +2165,22 @@ class ParametersDialog(lib.Dialog):
         )
         if path:
             self.update_spline_calib(path)
+
+    def update_spline_calib_with_config_path(self) -> None:
+        """Retrieve the spline PSF calibration path that corresponds to the
+        selected camera and emission wavelength, from the config."""
+        if self.spline_groupbox is None:  # GPUfit not installed
+            return
+        if "spline-calibrations" not in CONFIG:
+            return
+        camera = self.camera.currentText()
+        fp_calib_lam = CONFIG["spline-calibrations"].get(camera)
+        if fp_calib_lam is not None:
+            em_combo = self.emission_combos[camera]
+            wavelength = int(em_combo.currentText())
+            fp_calib = fp_calib_lam.get(wavelength)
+            if fp_calib is not None:
+                self.update_spline_calib(fp_calib)
 
     def update_spline_calib(self, path: str | None) -> None:
         """Load (or clear) a cubic-spline PSF calibration from an HDF5 file."""
@@ -2273,6 +2321,8 @@ class ParametersDialog(lib.Dialog):
 
         # load 3D calibration
         self.update_z_calib_with_config_path()
+        # load spline PSF calibration
+        self.update_spline_calib_with_config_path()
 
     def update_qe(self) -> None:
         """Update QE. Note that QE is not used in the analysis, the
@@ -2294,6 +2344,7 @@ class ParametersDialog(lib.Dialog):
         """Update QE due to change in emission wavelength."""
         self.update_qe()
         self.update_z_calib_with_config_path()
+        self.update_spline_calib_with_config_path()
 
     def on_mng_spinbox_changed(self, value: int) -> None:
         """Handle change to the min. net gradient spinbox."""
@@ -2711,6 +2762,31 @@ class Window(QtWidgets.QMainWindow):
             bool(settings["Localize"].get("fit_z_gpu", False))
         )
 
+        # Restore the last-used fitting model and optimizer. The model must
+        # be set first, since it repopulates the optimizer combobox.
+        fit_model = settings["Localize"].get("fit_model", None)
+        if fit_model is not None:
+            index = self.parameters_dialog.fit_model.findText(fit_model)
+            if index >= 0:
+                self.parameters_dialog.fit_model.setCurrentIndex(index)
+        fit_optimizer = settings["Localize"].get("fit_optimizer", None)
+        if fit_optimizer is not None:
+            index = self.parameters_dialog.fit_optimizer.findText(
+                fit_optimizer
+            )
+            if index >= 0:
+                self.parameters_dialog.fit_optimizer.setCurrentIndex(index)
+
+        # Restore the last-used spline PSF calibration (only if the spline
+        # controls exist, i.e. GPUfit is installed, and the file still there).
+        spline_path = settings["Localize"].get("spline_calibration_path", None)
+        if (
+            spline_path
+            and self.parameters_dialog.spline_groupbox is not None
+            and os.path.exists(spline_path)
+        ):
+            self.parameters_dialog.update_spline_calib(spline_path)
+
         self.pwd = pwd
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
@@ -2728,6 +2804,15 @@ class Window(QtWidgets.QMainWindow):
         settings["Localize"][
             "fit_z_gpu"
         ] = self.parameters_dialog.fit_z_gpu_checkbox.isChecked()
+        settings["Localize"][
+            "fit_model"
+        ] = self.parameters_dialog.fit_model.currentText()
+        settings["Localize"][
+            "fit_optimizer"
+        ] = self.parameters_dialog.fit_optimizer.currentText()
+        settings["Localize"][
+            "spline_calibration_path"
+        ] = self.parameters_dialog.spline_calibration_path
         settings["Localize"]["Columns to save"] = {
             column: checkbox.isChecked()
             for column, checkbox in (
@@ -2931,8 +3016,8 @@ class Window(QtWidgets.QMainWindow):
         self.abort_action.setEnabled(False)
         analyze_menu.addAction(self.abort_action)
 
-        """ 3D """
-        threed_menu = menu_bar.addMenu("3D")
+        """ Calibration """
+        threed_menu = menu_bar.addMenu("Calibration")
 
         calibrate_z_action = threed_menu.addAction("Calibrate 3D")
         calibrate_z_action.triggered.connect(self.calibrate_z)
@@ -4107,6 +4192,32 @@ class Window(QtWidgets.QMainWindow):
             if fit_afterwards:
                 self.fit(calibrate_z=calibrate_z)
 
+    def _check_spline_box_size(self, spline_calibration: dict) -> bool:
+        """Check that the identification box size matches the box size the
+        spline calibration was built with."""
+        n_data = spline_calibration.get("n_data")
+        if not n_data:
+            return True  # nothing to compare against; let the fit proceed
+        calib_box = int(n_data[0])
+        box = self.parameters["Box Size"]
+        if box == calib_box:
+            return True
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Spline PSF fit — box size",
+            f"The box size used for identification ({box} px) doesn't match "
+            f"this spline calibration, which was built with a box size of "
+            f"{calib_box} px. They need to match for the experimental PSF "
+            f"(spline) fit.\n\n"
+            f"Set the box size to {calib_box} px now?",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.Yes,
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.parameters_dialog.box_spinbox.setValue(calib_box)
+        return False
+
     def fit(self, calibrate_z: bool = False) -> None:
         """Fit identified spots (single molecules).
 
@@ -4136,6 +4247,11 @@ class Window(QtWidgets.QMainWindow):
                         "PSF (spline) > Load calibration), or build one via "
                         "3D > Calibrate spline PSF.",
                     )
+                    self.status_bar.showMessage("")
+                    return
+                # The spline fit requires the box size to match the one the
+                # calibration was built with.
+                if not self._check_spline_box_size(spline_calibration):
                     self.status_bar.showMessage("")
                     return
                 # A 3D spline fit recovers z directly, so the separate

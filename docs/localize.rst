@@ -288,3 +288,14 @@ The calibration depends on the microscope, camera, and emission wavelength used.
          595: /path/to/Camera1-Cy3B-zcalibration.yaml
 
 If the camera names and emission wavelengths match the settings in Micromanager, the correct z-calibration is automatically loaded. In any case an alternative calibration yaml file can be loaded by button.
+
+The same mechanism is available for the experimental PSF (cubic spline) calibration, using a ``spline-calibrations`` field that maps camera and emission wavelength to the path of the spline calibration ``.hdf5`` file:
+
+::
+
+   spline-calibrations:
+      Camera1:
+         525: /path/to/Camera1-GFP-spline-calibration.hdf5
+         595: /path/to/Camera1-Cy3B-spline-calibration.hdf5
+
+As with the z-calibration, the matching spline calibration is loaded automatically when the camera and emission wavelength match the Micromanager settings, and an alternative calibration file can always be loaded via the "Load calibration" button in the "Experimental PSF (spline)" box.
