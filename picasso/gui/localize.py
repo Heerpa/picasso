@@ -4317,62 +4317,74 @@ class Window(QtWidgets.QMainWindow):
             Whether to perform z-calibration during fitting. Default is
             False.
         """
-        if self.movie is not None and self.ready_for_fit:
-            self.status_bar.showMessage("Preparing fit...")
-            model = self.parameters_dialog.fit_model.currentText()
-            optimizer = self.parameters_dialog.fit_optimizer.currentText()
-            method = _fit_code(model, optimizer)
-            eps = self.parameters_dialog.convergence_criterion.value()
-            max_it = self.parameters_dialog.max_it.value()
-            fit_z = self.parameters_dialog.fit_z_checkbox.isChecked()
-            use_gpufit = self.parameters_dialog.gpufit_checkbox.isChecked()
-            spline_calibration = None
-            if method.startswith("spline"):
-                spline_calibration = self.parameters_dialog.spline_calibration
-                if not spline_calibration:
-                    QtWidgets.QMessageBox.warning(
-                        self,
-                        "Spline PSF fit",
-                        "Load a spline PSF calibration first (Experimental "
-                        "PSF (spline) > Load calibration), or build one via "
-                        "3D > Calibrate spline PSF.",
-                    )
-                    self.status_bar.showMessage("")
-                    return
-                # The spline fit requires the box size to match the one the
-                # calibration was built with.
-                if not self._check_spline_box_size(spline_calibration):
-                    self.status_bar.showMessage("")
-                    return
-                # A 3D spline fit recovers z directly, so the separate
-                # astigmatism z-fitting step must not run.
-                fit_z = False
-                if spline_calibration.get("model") == "spline-3d-multichannel":
-                    self._start_multichannel_spline_fit(
-                        spline_calibration, method
-                    )
-                    return
-            self.fit_worker = FitWorker(
-                self.movie,
-                self.info,
-                self.camera_info,
-                self.identifications,
-                self.parameters["Box Size"],
-                method,
-                eps,
-                max_it,
-                fit_z,
-                calibrate_z,
-                use_gpufit,
-                spline_calibration=spline_calibration,
+        if self.movie is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Fit",
+                "Load a movie before fitting.",
             )
-            self.fit_worker.progressMade.connect(self.on_fit_progress)
-            self.fit_worker.cutProgressMade.connect(self.on_cut_progress)
-            self.fit_worker.finished.connect(self.on_fit_finished)
-            self.fit_worker.aborted.connect(self.on_worker_aborted)
-            self._active_worker = self.fit_worker
-            self.abort_action.setEnabled(True)
-            self.fit_worker.start()
+            return
+        if not self.ready_for_fit:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Fit",
+                "No identifications available. Run Identify (or load "
+                "identifications) before fitting.",
+            )
+            return
+        self.status_bar.showMessage("Preparing fit...")
+        model = self.parameters_dialog.fit_model.currentText()
+        optimizer = self.parameters_dialog.fit_optimizer.currentText()
+        method = _fit_code(model, optimizer)
+        eps = self.parameters_dialog.convergence_criterion.value()
+        max_it = self.parameters_dialog.max_it.value()
+        fit_z = self.parameters_dialog.fit_z_checkbox.isChecked()
+        use_gpufit = self.parameters_dialog.gpufit_checkbox.isChecked()
+        spline_calibration = None
+        if method.startswith("spline"):
+            spline_calibration = self.parameters_dialog.spline_calibration
+            if not spline_calibration:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Spline PSF fit",
+                    "Load a spline PSF calibration first (Experimental "
+                    "PSF (spline) > Load calibration), or build one via "
+                    "3D > Calibrate spline PSF.",
+                )
+                self.status_bar.showMessage("")
+                return
+            # The spline fit requires the box size to match the one the
+            # calibration was built with.
+            if not self._check_spline_box_size(spline_calibration):
+                self.status_bar.showMessage("")
+                return
+            # A 3D spline fit recovers z directly, so the separate
+            # astigmatism z-fitting step must not run.
+            fit_z = False
+            if spline_calibration.get("model") == "spline-3d-multichannel":
+                self._start_multichannel_spline_fit(spline_calibration, method)
+                return
+        self.fit_worker = FitWorker(
+            self.movie,
+            self.info,
+            self.camera_info,
+            self.identifications,
+            self.parameters["Box Size"],
+            method,
+            eps,
+            max_it,
+            fit_z,
+            calibrate_z,
+            use_gpufit,
+            spline_calibration=spline_calibration,
+        )
+        self.fit_worker.progressMade.connect(self.on_fit_progress)
+        self.fit_worker.cutProgressMade.connect(self.on_cut_progress)
+        self.fit_worker.finished.connect(self.on_fit_finished)
+        self.fit_worker.aborted.connect(self.on_worker_aborted)
+        self._active_worker = self.fit_worker
+        self.abort_action.setEnabled(True)
+        self.fit_worker.start()
 
     def _start_multichannel_spline_fit(
         self, calibration: dict, method: str
