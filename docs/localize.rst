@@ -131,43 +131,21 @@ Loading runs in the background, so the window stays responsive while the files a
 Camera Config
 -------------
 
-Picasso can remember default cameras and will use saved camera parameters. In order to use camera configs, create a file named ``config.yaml`` in the ``picasso`` folder. See below on how to locate it.
+Picasso can remember default cameras and will use saved camera parameters. To use camera configs, create a file named ``config.yaml`` in your Picasso user folder ``~/.picasso`` (i.e. ``C:\Users\<you>\.picasso`` on Windows, ``/Users/<you>/.picasso`` on macOS, ``/home/<you>/.picasso`` on Linux). This is the same folder that already holds ``settings.yaml``, so the config no longer hides inside the installed package and is identical for every install type (one-click installer, PyPI, source).
 
-To start with a template, modify ``config_template.yaml`` that can be found in the folder by default. Picasso will compare the entries with Micro-Manager-Metadata and match the sensitivity values. If no matching entries can be found (e.g., if the file was not created with Micro-Manager) the config file will still be used to create a dropdown menu to select the different categories. The camera config can also be used to define a default camera that will always be used. Indentions are used for definitions.
+**The config file is never created for you — you have to create it manually.** To locate the folder quickly, open ``Picasso: Localize`` and select ``File`` > ``Open camera config file location...``; this opens ``~/.picasso`` in your file browser (creating the folder if needed), where you place your ``config.yaml``. If a config is already in use, the same menu entry reveals wherever it actually lives.
 
-One click installer (Windows)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+To start with a template, copy ``config_template.yaml`` (bundled inside the ``picasso`` package, next to ``__init__.py``) into ``~/.picasso``, rename it to ``config.yaml``, and edit it. Picasso will compare the entries with Micro-Manager-Metadata and match the sensitivity values. If no matching entries can be found (e.g., if the file was not created with Micro-Manager) the config file will still be used to create a dropdown menu to select the different categories. The camera config can also be used to define a default camera that will always be used. Indentions are used for definitions.
 
-If you downloaded an .exe Picasso file from the `release page <https://github.com/jungmannlab/picasso/releases>`_:
+Backward compatibility (legacy in-package config)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- Navigate to the installation folder, by default, it's ``C:/Picasso``. *Before version 0.8.3, the default location was* ``C:/Program Files/Picasso``.
-- Go to the folder ``_internal/picasso``. *Before version 0.9.6, the folder was simply* ``picasso``.
-- Add your config file there.
+Older Picasso versions read ``config.yaml`` from inside the installed ``picasso`` package folder. That still works: if no ``~/.picasso/config.yaml`` exists, Picasso falls back to a ``config.yaml`` in the package folder and reads it **in place** (it is never moved or copied, so an existing setup keeps working unchanged). ``~/.picasso/config.yaml`` takes precedence when both are present. For reference, the legacy in-package location per install type is:
 
-One click installer (macOS)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-If you downloaded a .dmg Picasso file from the `release page <https://github.com/jungmannlab/picasso/releases>`_:
-
-- Navigate to your Applications folder and right-click on the picasso app, then select "Show Package Contents".
-- Go to the folder ``Contents/Frameworks/picasso``.
-- Add your config file there.
-
-PyPI
-~~~~
-If you installed Picasso using ``pip install picassosr``:
-
-- Activate your conda environment where ``picassosr`` is installed by typing ``conda activate YOUR_ENVIRONMENT``.
-- To find the location of the package, type ``pip show picassosr`` and look for the line starting with ``Location:``.
-- Navigate to this location and go to ``picasso``.
-- Add your config file there.
-
-GitHub
-~~~~~~
-If you cloned the GitHub repository, you can add plugins by following these steps:
-- Find the directory where you cloned the GitHub repository with Picasso.
-- Go to ``picasso/picasso/``.
-- Copy the config file to this folder.
+- **One-click installer (Windows):** the installation folder (by default ``C:/Picasso``; *before version 0.8.3,* ``C:/Program Files/Picasso``), then ``_internal/picasso``.
+- **One-click installer (macOS):** right-click the picasso app in Applications, "Show Package Contents", then ``Contents/Frameworks/picasso``.
+- **PyPI:** run ``pip show picassosr`` and look at the ``Location:`` line; the folder is ``<Location>/picasso``.
+- **GitHub:** ``picasso/picasso/`` inside your cloned repository.
 
 Example: Default Camera
 ~~~~~~~~~~~~~~~~~~~~~~~

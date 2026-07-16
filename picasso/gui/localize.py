@@ -2918,6 +2918,10 @@ class Window(QtWidgets.QMainWindow):
         picasso_settings_action.triggered.connect(
             self.user_settings_dialog.show
         )
+        open_config_action = file_menu.addAction(
+            "Open camera config file location"
+        )
+        open_config_action.triggered.connect(self.open_config_location)
         help_action = file_menu.addAction("Help")
         help_action.triggered.connect(
             lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl(self.DOCS_URL))
@@ -3028,6 +3032,19 @@ class Window(QtWidgets.QMainWindow):
         calibrate_spline_action.triggered.connect(self.calibrate_spline)
 
         self.plugin_menu = menu_bar.addMenu("Plugins")  # do not delete
+
+    def open_config_location(self) -> None:
+        """Open the folder holding the camera config file in the system
+        file browser."""
+        from .. import config_filename, _resolve_config_path
+
+        path = _resolve_config_path()
+        if path is None:
+            # No config yet: point the user at the intended location.
+            path = config_filename()
+        folder = os.path.dirname(path)
+        os.makedirs(folder, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder))
 
     @property
     def camera_info(self) -> dict[str, float]:

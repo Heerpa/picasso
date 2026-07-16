@@ -289,17 +289,19 @@ def load_ims_all(path: str) -> tuple[list[np.memmap], list[list[dict]]]:
 
 
 def save_config(CONFIG: dict) -> None:
-    """Save the camera configuration dictionary to a YAML file. See
-    https://picassosr.readthedocs.io/en/latest/localize.html#camera-config.
+    """Save the camera configuration dictionary to the user config file
+    (``~/.picasso/config.yaml``). See https://picassosr.readthedocs.io/
+    en/latest/localize.html#camera-config.
 
     Parameters
     ----------
     CONFIG : dict
         The camera configuration dictionary to save.
     """
-    this_file = os.path.abspath(__file__)
-    this_directory = os.path.dirname(this_file)
-    with open(os.path.join(this_directory, "config.yaml"), "w") as config_file:
+    from . import config_filename, _user_config_dir
+
+    os.makedirs(_user_config_dir(), exist_ok=True)
+    with open(config_filename(), "w") as config_file:
         yaml.dump(CONFIG, config_file, width=1000)
 
 

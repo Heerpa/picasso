@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 15-JUL-2026 CEST
+Last change: 16-JUL-2026 CEST
 
 ## 0.11.0
 
@@ -8,11 +8,12 @@ Last change: 15-JUL-2026 CEST
 - Localization metadata is now embedded directly in the `.hdf5` file (under the `/metadata` dataset, as a JSON string), making the file self-contained even if moved or renamed without its `.yaml` sidecar. When loading, Picasso looks for the metadata in the `.yaml` file first, then falls back to the embedded copy. Writing the `.yaml` sidecar is still on by default but can be disabled via the new user setting `Save metadata in .yaml` in `~/.picasso/settings.yaml` (also available via any module under File > Picasso settings). See [file formats documentation](https://picassosr.readthedocs.io/en/latest/files.html) for more info.
 - Improved architecture for plugins, see[here](https://picassosr.readthedocs.io/en/latest/plugins.html). Note that the plugins must now be stored in a different location.
 - Plugins can now be easily downloaded from our repository, using Plugins > Browse online plugins
+- `config.yaml` can now be stored in the `.picasso` directory and the location is easily accessible via Localize
 
 #### Localize
-- New fitting algorithms from GPUfit supported: 2D rotated Gaussian
 - New fitting model: **Experimental PSF (cubic spline)** — fits an experimentally measured PSF (a cubic-spline model built from a bead z-stack) on the GPU, via GPUfit's `SPLINE_2D`/`SPLINE_3D`/`SPLINE_3D_MULTICHANNEL` models. The `pygpuspline` binding is vendored under `picasso/ext/pygpuspline`. The bead alignment follows the workflow from Li, et al, Nature Methods, 2018. See the [experimental PSF (cubic-spline) fitting documentation](https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting) for details. *Note this is an experimental feature, do let us know if you find any bugs/unexpected behavior*
-- Multichannel spline PSF fitting (GPUfit's `SPLINE_3D_MULTICHANNEL`, e.g. biplane / 4Pi): several spatially-registered channels are fit simultaneously with shared x, y, z. The calibration stores a per-channel affine transform (estimated from bead correspondences) and per-channel coefficients; at fit time a reference-channel detection is mapped into every channel and the stacked ROIs are fit together. Build a multichannel calibration by passing several channel movies to `picasso spline-calibrate movie_ch0 movie_ch1 ... -s <z_step_nm>`; in Localize, load the channels (*File > Open channels from several movies*), load the multichannel calibration and fit with the *Experimental PSF (cubic spline)* model.
+- New fitting algorithms from GPUfit supported: 2D rotated Gaussian
+- Multichannel spline PSF fitting (GPUfit's `SPLINE_3D_MULTICHANNEL`, e.g. biplane / 4Pi)
 - Picasso relies on package `tifffile` for processing `.tif` files and many other grayscale movie formats, see [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html). **Note:** this is an experimental feature, do not hesitate to let us know if you detect bugs/unexpected behavior or would like to see more file formats in Picasso, see our [GitHub page](https://github.com/jungmannlab/picasso/issues) for contact information.
 - Added support for Zeiss `.czi` and Leica `.lif` movies in Localize (open dialog, drag-and-drop and batch CLI). These read via the optional `czifile` and `liffile` libraries (Python ≥ 3.12); install with `pip install picassosr[czi,lif]`. Multi-channel files prompt for a channel, and a `.lif` file with several acquisitions uses the one with the most frames.
 - Added support for multichannel data, i.e., several movie files in a single Localize window. These can be analyzed sequentially or be treated as a multichannel data for combined localizations, for example, in biplane 3D imaging.
