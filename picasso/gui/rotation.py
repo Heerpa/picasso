@@ -798,6 +798,7 @@ class ViewRotation(QtWidgets.QLabel):
         self.group_color = []
         self.x_render_state = False
         self.x_locs = []
+        self._z_shift = 0.0
         self._size_hint = (512, 512)
         self._mode = "Rotate"
         self._points = []
@@ -1009,12 +1010,25 @@ class ViewRotation(QtWidgets.QLabel):
         if not (self.x_render_state and len(self.locs) == 1):
             return
         if self.x_property in self.locs[0].columns:
+            min_value = self.x_min_val
+            max_value = self.x_max_val
+            # z / lpz are rescaled to camera pixels here (see
+            # _collect_picked_locs), and z is additionally mean-shifted (see
+            # load_locs), whereas the property limits come from the main
+            # window in nm. Map the limits through the same transform so the
+            # color binning matches the main view.
+            if self.x_property in ("z", "lpz"):
+                min_value = min_value / self.pixelsize
+                max_value = max_value / self.pixelsize
+            if self.x_property == "z":
+                min_value -= self._z_shift
+                max_value -= self._z_shift
             self.x_locs = render.split_locs_by_property(
                 self.locs[0],
                 property_name=self.x_property,
                 n_colors=self.x_n_colors,
-                min_value=self.x_min_val,
-                max_value=self.x_max_val,
+                min_value=min_value,
+                max_value=max_value,
             )
         else:
             self.x_render_state = False
@@ -1043,6 +1057,10 @@ class ViewRotation(QtWidgets.QLabel):
         # at z = 0
         all_locs_z = np.concatenate([_["z"].to_numpy() for _ in self.locs])
         z_shift = all_locs_z.mean()
+        # store shift (in camera pixels) so that render-by-property limits,
+        # which are given in the main window's z units (nm), can be mapped
+        # onto the transformed z used here (see _apply_render_property_split)
+        self._z_shift = z_shift
         for i in range(len(self.locs)):
             self.locs[i]["z"] -= z_shift
 

@@ -62,6 +62,7 @@ Last change: 16-JUL-2026 CEST
 - Fixed "Combine all channels" when saving localizations only saving the first channel when channels had differing columns
 - Fixed combined saving of multiple channels with different columns
 - Fixed ind. loc. precision rendering of `lpx = 0` [#685](https://github.com/jungmannlab/picasso/issues/685)
+- Fixed z color rendering in 3D
 
 #### SPINNA
 - Adjustable font sizes and names for the NND plot's title, labels and ticks
