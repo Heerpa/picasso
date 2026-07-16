@@ -4913,18 +4913,32 @@ class SimulationsTab(lib.Dialog):
         n_tar : int
             Number of molecules to be simulated.
         """
-        # find targets counts per structure:
-        t_counts = spinna._find_target_counts(self.targets, self.structures)
-        # extract the row from t_counts that specifies number of the
-        # target in question across structures
         idx = self.targets.index(target)
-        t_counts = t_counts[idx]
-        # find the number of structures to be simulated; note that the
-        # number of targets is kept constant across all simulations in
-        # the fitting, so we can just extract the values from one such
-        # simulation
-        N_str = [self.N_structures_fit[_.title][0] for _ in self.structures]
-        n_tar = (t_counts * N_str).sum()
+        if self.N_structures_fit:
+            # find targets counts per structure:
+            t_counts = spinna._find_target_counts(
+                self.targets, self.structures
+            )
+            # extract the row from t_counts that specifies number of the
+            # target in question across structures
+            t_counts = t_counts[idx]
+            # find the number of structures to be simulated; note that
+            # the number of targets is kept constant across all
+            # simulations in the fitting, so we can just extract the
+            # values from one such simulation
+            N_str = [
+                self.N_structures_fit[_.title][0] for _ in self.structures
+            ]
+            n_tar = (t_counts * N_str).sum()
+        else:
+            # no fitting search space has been generated yet (e.g. when
+            # running a single simulation before fitting), so
+            # N_structures_fit is empty. Derive the number of molecules
+            # directly from the loaded experimental data and labeling
+            # efficiency - this matches the invariant used to build
+            # N_structures_fit (see generate_search_space).
+            le = self.le_spins[idx].value() / 100
+            n_tar = int(len(self.exp_data[target]) / le)
         return n_tar
 
     def display_current_nnd_plot(self) -> None:

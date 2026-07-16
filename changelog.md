@@ -72,6 +72,7 @@ Last change: 16-JUL-2026 CEST
 - Batch analysis allows for specifying fitting mode (brute force/coarse to fine/bayesian)
 - Batch analysis closes unused plots to save RAM
 - Removed the obsolete line of code in `_fill3d` ([#682](https://github.com/jungmannlab/picasso/issues/682)). This should not affect standard functionality of 3D masks; only the usage of `render_hist3d_anisotropic` directly might be affected 
+- Fixed running a single simulation before fitting
 
 #### *Other improvements:*
 - Added import and export of [SMAP](https://github.com/jries/SMAP) localizations (`_sml.mat`). Available in Render and as batch CLI converters `picasso smap2hdf` and `picasso hdf2smap`. Reads single-file MATLAB `-v7` and `-v7.3` saves.
