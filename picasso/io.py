@@ -2580,11 +2580,13 @@ class TiffMap:
             # threads overlap instead of serializing.
             handle = self._handle()
             handle.seek(self._offsets[index])
-            frame = np.fromfile(
-                handle,
-                dtype=self._tif_dtype,
-                count=self.frame_size,
-            ).reshape(self.frame_shape)
+            # ``np.fromfile`` rejects a Python file object on some
+            # numpy/Windows builds ("expected str, bytes or os.PathLike
+            # object, not BufferedReader"); read into a preallocated
+            # array instead, which works with any binary handle.
+            frame = np.empty(self.frame_size, dtype=self._tif_dtype)
+            handle.readinto(frame)
+            frame = frame.reshape(self.frame_shape)
         else:
             # Compressed / tiled / multi-strip pages: let tifffile decode
             # this single page (still lazy - other frames stay on disk).
@@ -2789,11 +2791,13 @@ class STKMovie(AbstractPicassoMovie):
         offset = self._first_data_offset + index * self._frame_bytes
         handle = self._handle()
         handle.seek(offset)
-        frame = np.fromfile(
-            handle,
-            dtype=self._tif_dtype,
-            count=self.height * self.width,
-        ).reshape(self.frame_shape)
+        # ``np.fromfile`` rejects a Python file object on some
+        # numpy/Windows builds ("expected str, bytes or os.PathLike
+        # object, not BufferedReader"); read into a preallocated array
+        # instead, which works with any binary handle.
+        frame = np.empty(self.height * self.width, dtype=self._tif_dtype)
+        handle.readinto(frame)
+        frame = frame.reshape(self.frame_shape)
         if self._byte_order == ">":
             frame = frame.byteswap().view(self._dtype)
         return frame
