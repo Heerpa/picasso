@@ -51,7 +51,7 @@ Last change: 16-JUL-2026 CEST
 - SMAP i/o, see "Other improvements" below
 - Rotation dialog allows for rotations around the localizations or the world (see [3D documentation](https://picassosr.readthedocs.io/en/latest/render.html#d-rotation-window))
 - Background color for multichannel data can be adjusted
-- "Apply to all sequentially" available for drift correction algorithms
+- "Apply to all sequentially" available for drift correction algorithms, including drift from an external file
 - "Apply to all sequentially" available in Apply expression to localizations
 - G5M now supports 3D localizations fit with the experimental spline PSF, not only astigmatism.
 - G5M accepts `group_input` as the cluster id columns (useful if `group` is overwritten after clustering)

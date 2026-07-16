@@ -8820,7 +8820,9 @@ class View(QtWidgets.QLabel):
         if data.shape == (4,):  # try loading FOV
             self.load_fov_drop(data)
         elif data.ndim == 2 and data.shape[1] in [2, 3]:  # try loading drift
-            channel = self.get_channel("Select channel for drift correction")
+            channel = self.get_channel_all_seq(
+                "Select channel for drift correction"
+            )
             if channel is None:
                 return
             self.load_drift_drop(channel, data)
@@ -8840,8 +8842,37 @@ class View(QtWidgets.QLabel):
 
     def load_drift_drop(self, channel: int, drift: FloatArray2D) -> None:
         """Attempts to load a drift .txt file (2 or 3 columns) and apply
-        the drift to localizations. Assumes only one channel is
-        currently loaded."""
+        the drift to localizations. If ``channel`` equals the number of
+        loaded channels, the drift is applied to all channels
+        sequentially (only if every localization channel and the drift
+        file share the same number of frames)."""
+        if channel == len(self.locs_paths):  # apply to all sequentially
+            n_frames_all = [
+                lib.get_from_metadata(info, "Frames") for info in self.infos
+            ]
+            # all channels and the drift file must have the same
+            # number of frames before applying to all channels
+            if len(set(n_frames_all)) > 1 or drift.shape[0] != n_frames_all[0]:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Drift file mismatch",
+                    (
+                        "Cannot apply the drift file to all channels "
+                        "because the localization channels and the drift "
+                        "file do not all have the same number of frames. "
+                        f"The channels have {n_frames_all} frames and the "
+                        f"drift file has {drift.shape[0]} frames."
+                    ),
+                )
+                return
+            for ch in range(len(self.locs_paths)):
+                self._load_drift_drop(ch, drift)
+        else:
+            self._load_drift_drop(channel, drift)
+
+    def _load_drift_drop(self, channel: int, drift: FloatArray2D) -> None:
+        """Apply a loaded drift .txt file (2 or 3 columns) to a single
+        channel after checking its number of frames and dimensions."""
         n_frames = lib.get_from_metadata(self.infos[channel], "Frames")
         n_dim = 3 if hasattr(self.locs[channel], "z") else 2
         if drift.shape[0] != n_frames or drift.shape[1] != n_dim:
@@ -8850,10 +8881,10 @@ class View(QtWidgets.QLabel):
                 "Drift file mismatch",
                 (
                     f"Drift file has {drift.shape[0]} frames and "
-                    f"{drift.shape[1]} dimensions, but the loaded data "
-                    f"has {n_frames} frames and {n_dim} dimensions. "
-                    "Please provide a drift file with the correct number"
-                    " of frames and dimensions."
+                    f"{drift.shape[1]} dimensions, but channel "
+                    f"{channel} has {n_frames} frames and {n_dim} "
+                    "dimensions. Please provide a drift file with the "
+                    "correct number of frames and dimensions."
                 ),
             )
             return
