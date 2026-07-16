@@ -3319,6 +3319,9 @@ class TestClustererDialog(lib.Dialog):
         Channel index for localizations that are tested.
     clusterer_name : QComboBox
         Contains all clusterer types available in Picasso: Render.
+    contrast_slider : QSlider
+        Adjusts the brightness (contrast) of the rendered view. The
+        center position corresponds to automatic contrast.
     display_all_locs : QCheckBox
         If ticked, unclustered locs are displayed in separate channel.
     pick : list
@@ -3434,6 +3437,23 @@ class TestClustererDialog(lib.Dialog):
         self.display_centers.stateChanged.connect(self.view.update_scene)
         parameters_grid.addWidget(self.display_centers, 5, 0, 1, 2)
 
+        # display settings - contrast
+        contrast_layout = QtWidgets.QHBoxLayout()
+        contrast_label = QtWidgets.QLabel("Contrast:")
+        contrast_label.setToolTip("Adjust the brightness of the rendering.")
+        contrast_layout.addWidget(contrast_label)
+        self.contrast_slider = QtWidgets.QSlider(
+            QtCore.Qt.Orientation.Horizontal
+        )
+        self.contrast_slider.setToolTip(
+            "Adjust the brightness of the rendering."
+        )
+        self.contrast_slider.setRange(-100, 100)
+        self.contrast_slider.setValue(0)
+        self.contrast_slider.valueChanged.connect(self.view._apply_contrast)
+        contrast_layout.addWidget(self.contrast_slider)
+        parameters_grid.addLayout(contrast_layout, 6, 0, 1, 2)
+
         # test
         test_button = QtWidgets.QPushButton("Test")
         test_button.setToolTip(
@@ -3441,10 +3461,10 @@ class TestClustererDialog(lib.Dialog):
         )
         test_button.clicked.connect(self.test_clusterer)
         test_button.setDefault(True)
-        parameters_grid.addWidget(test_button, 6, 0, 1, 2)
+        parameters_grid.addWidget(test_button, 7, 0, 1, 2)
 
         projections_layout = QtWidgets.QHBoxLayout()
-        parameters_grid.addLayout(projections_layout, 7, 0, 1, 2)
+        parameters_grid.addLayout(projections_layout, 8, 0, 1, 2)
 
         # display settings - xy, xz, yz projections
         xy_proj = QtWidgets.QPushButton("XY projection")
@@ -3466,7 +3486,7 @@ class TestClustererDialog(lib.Dialog):
         full_fov = QtWidgets.QPushButton("Full FOV")
         full_fov.setToolTip("Reset to the full field of view.")
         full_fov.clicked.connect(self.get_full_fov)
-        parameters_grid.addWidget(full_fov, 8, 0)
+        parameters_grid.addWidget(full_fov, 9, 0)
 
         # apply to all
         apply_to_all_button = QtWidgets.QPushButton("Cluster entire dataset")
@@ -3474,7 +3494,7 @@ class TestClustererDialog(lib.Dialog):
             "Apply the chosen parameters to all localizations."
         )
         apply_to_all_button.clicked.connect(self.apply_to_all)
-        parameters_grid.addWidget(apply_to_all_button, 8, 1)
+        parameters_grid.addWidget(apply_to_all_button, 9, 1)
 
         # view
         view_box = QtWidgets.QGroupBox("View")
@@ -4134,6 +4154,14 @@ class TestClustererView(QtWidgets.QLabel):
         self.viewport = None
         self.locs = None
         self.ang = None
+        # cache of the last rendered raw (grayscale) image and its
+        # auto-contrast limits, so the contrast slider can rescale
+        # without re-rendering the localizations
+        self._raw_image = None
+        self._auto_contrast = None
+        self._render_locs = None
+        self._render_info = None
+        self._render_colors = None
         self._size = 500
         self.setMinimumSize(self._size, self._size)
         self.setMaximumSize(self._size, self._size)
@@ -4187,6 +4215,7 @@ class TestClustererView(QtWidgets.QLabel):
     def update_scene(self) -> None:
         """Render localizations."""
         if not len(self.locs):
+            self._raw_image = None
             self.setText("No clusters found with the current settings.")
             return
 
@@ -4204,15 +4233,46 @@ class TestClustererView(QtWidgets.QLabel):
             self.dialog.window.view.pixelsize / self.get_optimal_oversampling()
         )
         colors = lib.get_colors(len(locs))
-        qimage = render.render_scene(
+        info = [self.view.infos[self.dialog.channels.currentIndex()]] * len(
+            locs
+        )
+        # render the raw (grayscale) image once and cache it together
+        # with its auto-contrast limits; the contrast slider then
+        # rescales the cached image without re-rendering the locs
+        _, _, self._auto_contrast, self._raw_image = render.render_scene(
             locs=locs,
-            info=[self.view.infos[self.dialog.channels.currentIndex()]]
-            * len(locs),
+            info=info,
             disp_px_size=disp_px_size,
             viewport=self.viewport,
             blur_method=blur_method,
             ang=self.ang,
             colors=colors,
+            return_contrast_limits=True,
+            return_raw_image=True,
+        )
+        self._render_locs = locs
+        self._render_info = info
+        self._render_colors = colors
+        self._apply_contrast()
+
+    def _apply_contrast(self) -> None:
+        """Rescale the cached raw image with the contrast slider value
+        and display it. Cheap compared to ``update_scene`` as it reuses
+        the cached raw image instead of re-rendering localizations."""
+        if self._raw_image is None:
+            return
+        vmin, vmax = self._auto_contrast
+        # slider in [-100, 100] maps exponentially to a brightness
+        # factor in [0.25, 4], with 0 (default) leaving auto-contrast
+        # unchanged; brighter means a lower upper contrast limit
+        factor = 2 ** (self.dialog.contrast_slider.value() / 50.0)
+        contrast = (vmin, vmax / factor)
+        qimage = render.render_scene(
+            locs=self._render_locs,
+            info=self._render_info,
+            colors=self._render_colors,
+            contrast=contrast,
+            raw_image_cache=self._raw_image,
         )[0]
         qimage = qimage.scaled(
             self._size,

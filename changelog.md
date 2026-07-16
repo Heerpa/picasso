@@ -57,6 +57,7 @@ Last change: 16-JUL-2026 CEST
 - G5M accepts `group_input` as the cluster id columns (useful if `group` is overwritten after clustering)
 - Re-grouping localizations (picking, DBSCAN/HDBSCAN/SMLM clustering) now preserves the previous grouping in the `group_input` column instead of discarding it, so the original cluster ids remain available (e.g. for G5M)
 - Updated G5M documentation - drift correction importance
+- Test clusterer with a constrast bar
 - Fixed removed plugins menu after removing all localizations
 - Fixed pick similar numba error [#684](https://github.com/jungmannlab/picasso/issues/684)
 - Fixed "Combine all channels" when saving localizations only saving the first channel when channels had differing columns
