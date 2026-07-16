@@ -311,7 +311,7 @@ The same calibration can be built from the command line::
 
 where ``-s/--step`` (the z step in nm) is required. Useful options: ``-b`` box side length (default 13), ``-g`` minimum net gradient, ``-m`` model (``spline-3d`` / ``spline-2d``), ``-fps`` / ``-fo`` frames-per-step and order, ``-mf`` magnification factor, ``-cz`` to set ``z = 0`` at the intensity peak, the camera parameters ``-bl`` / ``-se`` / ``-ga`` / ``-px`` (baseline, sensitivity, gain, pixel size), and ``-o`` for the output path (default ``<movie>_spline_calib.hdf5``).
 
-**The fit box size must equal the box size the calibration was built with.** If they differ, Picasso Localize shows a friendly dialog and offers to set the box size to the calibration's value (you then re-run identification before fitting).
+**The fit box size must not be larger the box size the calibration was built with.** If they differ, Picasso Localize shows a dialog and offers to set the box size to the calibration's value (you then re-run identification before fitting).
 
 Reading the calibration plot
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

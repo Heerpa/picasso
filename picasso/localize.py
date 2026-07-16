@@ -2305,6 +2305,73 @@ def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
     return user_info
 
 
+def crop_spline_calibration(calibration: dict, box: int) -> dict:
+    """Adapt a spline calibration to a smaller lateral fit box.
+
+    This derives a smaller-box calibration by cropping the coefficient
+    interval grid to the **central** ``box x box`` lateral region -
+    centered on the PSF, so a spot centered in its ROI still starts
+    (and converges) at ``x_shift = y_shift = 0`` and the reconstructed
+    x/y carry no global shift. The axial (z) grid is untouched.
+
+    ``box`` must be a positive integer no larger than the calibration's box; a
+    ``box`` equal to the calibration's box returns the calibration unchanged. A
+    smaller box of the opposite parity is allowed - the crop is then off-center
+    by at most half a pixel, a harmless constant shift of all localizations.
+    """
+    model = calibration["model"]
+    n_data = list(calibration["n_data"])
+    cal_box = int(n_data[0])
+    box = int(box)
+    if box == cal_box:
+        return calibration
+    if box <= 0 or box > cal_box:
+        raise ValueError(
+            f"Fit box ({box}) must be a positive integer no larger than the "
+            f"spline calibration's box ({cal_box})."
+        )
+    off = (cal_box - box) // 2  # centered offset (floored for odd size diffs)
+    ni = box - 1  # lateral intervals after cropping
+    lat = slice(off, off + ni)
+    coeff = np.ascontiguousarray(calibration["coefficients"], dtype=np.float32)
+
+    if model == "spline-2d":
+        _, nix, niy = coeff.shape
+        phys = coeff.ravel(order="C").reshape(niy, nix, 4, 4)
+        phys_c = np.ascontiguousarray(phys[lat, lat, :, :])
+        new_coeff = phys_c.ravel(order="C").reshape(16, ni, ni)
+        new_n_intervals = [ni, ni]
+        new_n_data = [box, box]
+    elif model == "spline-3d":
+        _, nix, niy, niz = coeff.shape
+        phys = coeff.ravel(order="C").reshape(niz, niy, nix, 4, 4, 4)
+        phys_c = np.ascontiguousarray(phys[:, lat, lat, :, :, :])
+        new_coeff = phys_c.ravel(order="C").reshape(64, ni, ni, niz)
+        new_n_intervals = [ni, ni, int(niz)]
+        new_n_data = [box, box, int(n_data[2])]
+    elif model == "spline-3d-multichannel":
+        _, nix, niy, niz, n_channels = coeff.shape
+        new_coeff = np.empty((64, ni, ni, niz, n_channels), dtype=np.float32)
+        for c in range(n_channels):
+            sub = np.ascontiguousarray(coeff[..., c])
+            phys = sub.ravel(order="C").reshape(niz, niy, nix, 4, 4, 4)
+            phys_c = np.ascontiguousarray(phys[:, lat, lat, :, :, :])
+            new_coeff[..., c] = phys_c.ravel(order="C").reshape(
+                64, ni, ni, niz
+            )
+        new_n_intervals = [ni, ni, int(niz)]
+        new_n_data = [box, box, int(n_data[2])]
+    else:
+        raise ValueError(f"Unknown spline model '{model}'.")
+
+    cropped = dict(calibration)
+    cropped["coefficients"] = np.ascontiguousarray(new_coeff, dtype=np.float32)
+    cropped["n_intervals"] = new_n_intervals
+    cropped["n_data"] = new_n_data
+    cropped["box"] = box
+    return cropped
+
+
 def _initial_parameters_spline(
     spots: lib.FloatArray3D, calibration: dict
 ) -> lib.FloatArray2D:
@@ -2382,16 +2449,15 @@ def fit_spots_gpufit_spline(
         raise ImportError(
             "GPUfit could not be found, CUDA-capable GPU is required."
         )
+    box = spots.shape[1]
+    # Fit a smaller-than-calibration box against a centered crop of the
+    # calibration (equal box: no-op; larger box: raises). This makes the fitter
+    # self-sufficient - any caller may pass a smaller box without pre-cropping.
+    # NOTE: locs_from_fits_spline must be given the SAME box so its
+    # CRLB/reconstruction crop identically (it does so itself).
+    calibration = crop_spline_calibration(calibration, box)
     model = calibration["model"]
     is_multichannel = model == "spline-3d-multichannel"
-    box = spots.shape[1]
-    n_data = list(calibration["n_data"])
-    if box != n_data[0] or box != n_data[1]:
-        raise ValueError(
-            f"Fit box size ({box}) does not match the spline calibration's "
-            f"lateral data size ({n_data[0]}x{n_data[1]}). Re-run with a box "
-            "size equal to the calibration's, or rebuild the calibration."
-        )
     if is_multichannel:
         # Multichannel spots are channel-stacked (n, box, box, n_channels);
         # the per-fit data is the channels concatenated pixel-major, exactly
@@ -3123,6 +3189,7 @@ def locs_from_fits_spline(
     must match the estimator that produced ``theta``. ``progress_callback`` is
     forwarded to :func:`_spline_crlb` (that per-localization loop is the slow
     part)."""
+    calibration = crop_spline_calibration(calibration, box)
     model = calibration["model"]
     is_3d = model != "spline-2d"
     box_offset = int(box / 2)

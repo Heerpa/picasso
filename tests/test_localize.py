@@ -2004,6 +2004,121 @@ def _ref_crlb_lsq(splines, box, amp, xs, ys, ze, off):
     return np.diag(j_inv @ m @ j_inv)
 
 
+class TestCropSplineCalibration:
+    """``localize.crop_spline_calibration`` — fitting a smaller, PSF-centered
+    box against a larger calibration (no GPU needed).
+
+    The core check evaluates the coefficients through ``_spline_coeff_reshaped``,
+    the exact physical layout both real consumers read (Gpufit's ``user_info``
+    reorder and the CRLB kernel), and asserts the crop equals the *central*
+    lateral intervals of the full calibration — i.e. the crop selects the true
+    piecewise-cubic pieces of the calibrated PSF (a faithful central slice), not
+    a re-interpolation."""
+
+    @staticmethod
+    def _central(reshaped, off, ni, is_2d):
+        # _spline_coeff_reshaped -> (n_ch, niy, nix, 4, 4) (2D) or
+        # (n_ch, niz, niy, nix, 4, 4, 4) (3D); crop the two lateral axes.
+        if is_2d:
+            return reshaped[:, off : off + ni, off : off + ni]
+        return reshaped[:, :, off : off + ni, off : off + ni]
+
+    @pytest.mark.parametrize(
+        "model", ["spline-2d", "spline-3d", "spline-3d-multichannel"]
+    )
+    def test_crop_matches_central_intervals(self, model):
+        cal_box, box = 13, 7
+        calib, _ = _gauss_spline_calibration(model=model, box=cal_box)
+        cropped = localize.crop_spline_calibration(calib, box)
+
+        # metadata is updated consistently with the smaller grid
+        assert cropped["box"] == box
+        assert cropped["n_data"][0] == box and cropped["n_data"][1] == box
+        assert cropped["n_intervals"][0] == box - 1
+        assert cropped["n_intervals"][1] == box - 1
+
+        # the coefficients both consumers read == the full calibration's central
+        # lateral intervals (exact selection: no numerical error)
+        off, ni = (cal_box - box) // 2, box - 1
+        full = localize._spline_coeff_reshaped(calib)
+        crop = localize._spline_coeff_reshaped(cropped)
+        expected = self._central(full, off, ni, model == "spline-2d")
+        assert crop.shape == expected.shape
+        np.testing.assert_array_equal(crop, expected)
+
+    def test_z_grid_and_photon_scale_preserved(self):
+        calib, _ = _gauss_spline_calibration(
+            model="spline-3d", box=13, nz=21, photon_scale=3.7
+        )
+        cropped = localize.crop_spline_calibration(calib, 7)
+        # photon_scale is the full-PSF integral (total photons), not rescaled
+        assert cropped["photon_scale"] == 3.7
+        # the axial grid is untouched (only the lateral box shrinks): the z
+        # data size is preserved and its interval count follows from it
+        assert cropped["n_data"][2] == calib["n_data"][2]
+        assert cropped["n_intervals"][2] == calib["n_data"][2] - 1
+
+    def test_equal_box_returns_calibration_unchanged(self):
+        calib, _ = _gauss_spline_calibration(model="spline-3d", box=BOX)
+        assert localize.crop_spline_calibration(calib, BOX) is calib
+
+    def test_larger_box_rejected(self):
+        calib, _ = _gauss_spline_calibration(model="spline-3d", box=7)
+        with pytest.raises(ValueError, match="no larger than"):
+            localize.crop_spline_calibration(calib, 9)
+
+    def test_smaller_box_any_parity_is_cropped(self):
+        """A smaller box of the opposite parity is allowed - the crop is then
+        off-center by at most half a pixel (a harmless constant shift) - and
+        still yields a valid calibration of the requested box."""
+        calib, _ = _gauss_spline_calibration(model="spline-3d", box=13)
+        cropped = localize.crop_spline_calibration(calib, 8)
+        assert cropped["box"] == 8
+        assert cropped["n_data"][0] == 8 and cropped["n_data"][1] == 8
+        assert (
+            cropped["n_intervals"][0] == 7 and cropped["n_intervals"][1] == 7
+        )
+        # the coefficient grid matches the requested box, and stays consumable
+        # by the shared reshape both the fit and the CRLB use
+        assert cropped["coefficients"].shape[1:3] == (7, 7)
+        reshaped = localize._spline_coeff_reshaped(cropped)
+        assert reshaped.shape[2:4] == (7, 7)
+
+    def test_locs_from_fits_auto_crops_smaller_box(self):
+        """locs_from_fits_spline handles a smaller box than the calibration by
+        cropping internally: passing the full calibration with a small box gives
+        exactly the same localizations as passing a pre-cropped one (CPU only,
+        no GPU). This confirms the fit/CRLB/reconstruction stay consistent."""
+        cal_box, box, n = 13, 7, 4
+        full, _ = _gauss_spline_calibration(model="spline-3d", box=cal_box)
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(n, dtype=np.uint32),
+                "x": np.full(n, 20.0),
+                "y": np.full(n, 30.0),
+                "net_gradient": np.full(n, 1000.0),
+            }
+        )
+        theta = np.zeros((n, 5), dtype=np.float32)
+        theta[:, 0] = 5000.0  # amplitude
+        theta[:, 1] = 0.3  # x_shift
+        theta[:, 2] = -0.4  # y_shift
+        theta[:, 3] = -full["z_center"] + 2.0  # z_shift
+        theta[:, 4] = 12.0  # offset
+
+        auto = localize.locs_from_fits_spline(ids, theta, box, False, full)
+        pre_cal = localize.crop_spline_calibration(full, box)
+        pre = localize.locs_from_fits_spline(ids, theta, box, False, pre_cal)
+
+        for col in ("x", "y", "z", "photons", "bg", "lpx", "lpy", "lpz"):
+            np.testing.assert_array_equal(
+                auto[col].to_numpy(), pre[col].to_numpy()
+            )
+        # the CRLB columns are real (finite, positive) at the smaller box
+        for col in ("lpx", "lpy", "lpz"):
+            assert np.all(np.isfinite(auto[col])) and np.all(auto[col] > 0)
+
+
 class TestSplineCalibrationIO:
     """Round-trip of the spline PSF calibration through HDF5 (no GPU)."""
 

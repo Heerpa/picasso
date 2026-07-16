@@ -4283,23 +4283,25 @@ class Window(QtWidgets.QMainWindow):
             )
 
     def _check_spline_box_size(self, spline_calibration: dict) -> bool:
-        """Check that the identification box size matches the box size the
-        spline calibration was built with."""
+        """Check that the identification box size is not larger than in
+        the spline calibration."""
         n_data = spline_calibration.get("n_data")
         if not n_data:
             return True  # nothing to compare against; let the fit proceed
         calib_box = int(n_data[0])
         box = self.parameters["Box Size"]
-        if box == calib_box:
+        # equal or smaller: supported by fitting against a centered crop
+        if box <= calib_box:
             return True
+        detail = (
+            f"The selected box size ({box} px) is larger than this spline "
+            f"calibration, which was built with a box size of "
+            f"{calib_box} px. Use the box of the same size or smaller."
+        )
         reply = QtWidgets.QMessageBox.question(
             self,
             "Spline PSF fit — box size",
-            f"The box size used for identification ({box} px) doesn't match "
-            f"this spline calibration, which was built with a box size of "
-            f"{calib_box} px. They need to match for the experimental PSF "
-            f"(spline) fit.\n\n"
-            f"Set the box size to {calib_box} px now?",
+            f"{detail}\n\nSet the box size to {calib_box} px now?",
             QtWidgets.QMessageBox.StandardButton.Yes
             | QtWidgets.QMessageBox.StandardButton.No,
             QtWidgets.QMessageBox.StandardButton.Yes,
