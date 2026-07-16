@@ -3032,7 +3032,9 @@ class Window(QtWidgets.QMainWindow):
         """ Calibration """
         threed_menu = menu_bar.addMenu("Calibration")
 
-        calibrate_z_action = threed_menu.addAction("Calibrate 3D")
+        calibrate_z_action = threed_menu.addAction(
+            "Calibrate astigmatism (Gaussian)"
+        )
         calibrate_z_action.triggered.connect(self.calibrate_z)
 
         calibrate_spline_action = threed_menu.addAction("Calibrate spline PSF")
