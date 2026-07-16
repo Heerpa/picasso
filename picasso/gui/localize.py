@@ -2153,17 +2153,7 @@ class ParametersDialog(lib.Dialog):
         if self.spline_calibration_path:
             dialog_directory, _ = os.path.split(self.spline_calibration_path)
         else:
-            # Fall back to the directory of the last-used calibration stored
-            # in the user settings, even if that file no longer exists.
             dialog_directory = None
-            try:
-                last_path = io.load_user_settings()["Localize"].get(
-                    "spline_calibration_path", None
-                )
-                if last_path:
-                    dialog_directory = os.path.dirname(last_path)
-            except Exception:
-                pass
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Load spline PSF calibration",
@@ -2786,16 +2776,6 @@ class Window(QtWidgets.QMainWindow):
             if index >= 0:
                 self.parameters_dialog.fit_optimizer.setCurrentIndex(index)
 
-        # Restore the last-used spline PSF calibration (only if the spline
-        # controls exist, i.e. GPUfit is installed, and the file still there).
-        spline_path = settings["Localize"].get("spline_calibration_path", None)
-        if (
-            spline_path
-            and self.parameters_dialog.spline_groupbox is not None
-            and os.path.exists(spline_path)
-        ):
-            self.parameters_dialog.update_spline_calib(spline_path)
-
         self.pwd = pwd
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
@@ -2819,9 +2799,6 @@ class Window(QtWidgets.QMainWindow):
         settings["Localize"][
             "fit_optimizer"
         ] = self.parameters_dialog.fit_optimizer.currentText()
-        settings["Localize"][
-            "spline_calibration_path"
-        ] = self.parameters_dialog.spline_calibration_path
         settings["Localize"]["Columns to save"] = {
             column: checkbox.isChecked()
             for column, checkbox in (

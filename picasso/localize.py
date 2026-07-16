@@ -2510,49 +2510,6 @@ def fit_spots_gpufit_spline(
         estimator_id=estimator_id,
         user_info=user_info,
     )
-
-    if os.environ.get("PICASSO_SPLINE_DEBUG"):
-        # Temporary diagnostic: set PICASSO_SPLINE_DEBUG=1 to print what Gpufit
-        # actually returns, so we can see which parameters move vs stay stuck.
-        names = (
-            ["amp", "x", "y", "off"]
-            if model == "spline-2d"
-            else ["amp", "x", "y", "z", "off"]
-        )
-        conv = states == 0
-        print("\n[spline-debug] --- fit_spots_gpufit_spline ---")
-        print(f"[spline-debug] model={model} box={box} n_spots={len(spots)}")
-        print(
-            f"[spline-debug] n_data={list(calibration['n_data'])} "
-            f"n_intervals={list(calibration['n_intervals'])} "
-            f"z_center={calibration.get('z_center')} "
-            f"z_step_nm={calibration.get('z_step_nm')} "
-            f"photon_scale={calibration.get('photon_scale')}"
-        )
-        state_counts = {
-            int(s): int((states == s).sum()) for s in np.unique(states)
-        }
-        print(
-            f"[spline-debug] states {state_counts} "
-            "(0=converged,1=max_iter,2=singular,3=neg_curv,4=bad_params) "
-            f"| iters med={np.median(number_iterations):.0f} "
-            f"max={int(number_iterations.max())}"
-        )
-        for j, nm in enumerate(names):
-            i0 = initial_parameters[:, j]
-            pf = parameters[:, j]
-            d = pf - i0
-            print(
-                f"[spline-debug] {nm:>3}: init[{i0.min():.3g},{i0.max():.3g}] "
-                f"fit[{np.nanmin(pf):.3g},{np.nanmedian(pf):.3g},"
-                f"{np.nanmax(pf):.3g}] "
-                f"|Δ|median={np.nanmedian(np.abs(d)):.3g}"
-            )
-        print(
-            f"[spline-debug] chi2 median={np.nanmedian(chi_squares):.4g} "
-            f"| converged {int(conv.sum())}/{len(spots)}\n"
-        )
-
     if return_stats:
         # As in fit_spots_gpufit: Gpufit's MLE chi-square is twice the
         # negative Poisson log-likelihood; for least squares it is a residual
