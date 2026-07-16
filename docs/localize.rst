@@ -10,6 +10,7 @@ Localize allows performing super-resolution reconstruction of image stacks. For 
 - MLE, integrated Gaussian (based on `Smith et al., 2010 <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2862147/>`_.)
 - LQ, Gaussian (least squares).
 - Rotated elliptical Gaussian, least squares or MLE (GPU only, see `GPU fitting`_ below). The fitted in-plane rotation angle is saved in the ``angle`` column, in degrees.
+- Experimental PSF (cubic spline), least squares or MLE (GPU only). Fits an experimentally measured PSF and a 3D calibration recovers ``z`` directly; see `Experimental PSF (cubic-spline) fitting`_ below.
 - Average of ROI (finds summed intensity of spots)
 
 Picasso uses `Gpufit <https://github.com/gpufit/Gpufit>`_ for fitting on CUDA-capable GPUs (see `GPU fitting`_ below). On Windows the pre-compiled library (``Gpufit.dll``) is vendored into Picasso (``picasso/ext/pygpufit/``) and works automatically — no extra install step. On Linux there is no pre-compiled binary; you have to build ``libGpufit.so`` yourself and drop it next to the Windows DLL (see `GPU fitting on Linux`_ below). When no GPU library is available, the GPU fitting option simply does not appear and Picasso uses the accessible CPU algorithms.
@@ -130,43 +131,21 @@ Loading runs in the background, so the window stays responsive while the files a
 Camera Config
 -------------
 
-Picasso can remember default cameras and will use saved camera parameters. In order to use camera configs, create a file named ``config.yaml`` in the ``picasso`` folder. See below on how to locate it.
+Picasso can remember default cameras and will use saved camera parameters. To use camera configs, create a file named ``config.yaml`` in your Picasso user folder ``~/.picasso`` (i.e. ``C:\Users\<you>\.picasso`` on Windows, ``/Users/<you>/.picasso`` on macOS, ``/home/<you>/.picasso`` on Linux). This is the same folder that already holds ``settings.yaml``, so the config no longer hides inside the installed package and is identical for every install type (one-click installer, PyPI, source).
 
-To start with a template, modify ``config_template.yaml`` that can be found in the folder by default. Picasso will compare the entries with Micro-Manager-Metadata and match the sensitivity values. If no matching entries can be found (e.g., if the file was not created with Micro-Manager) the config file will still be used to create a dropdown menu to select the different categories. The camera config can also be used to define a default camera that will always be used. Indentions are used for definitions.
+**The config file is never created for you — you have to create it manually.** To locate the folder quickly, open ``Picasso: Localize`` and select ``File`` > ``Open camera config file location...``; this opens ``~/.picasso`` in your file browser (creating the folder if needed), where you place your ``config.yaml``. If a config is already in use, the same menu entry reveals wherever it actually lives.
 
-One click installer (Windows)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+To start with a template, copy ``config_template.yaml`` (bundled inside the ``picasso`` package, next to ``__init__.py``) into ``~/.picasso``, rename it to ``config.yaml``, and edit it. Picasso will compare the entries with Micro-Manager-Metadata and match the sensitivity values. If no matching entries can be found (e.g., if the file was not created with Micro-Manager) the config file will still be used to create a dropdown menu to select the different categories. The camera config can also be used to define a default camera that will always be used. Indentions are used for definitions.
 
-If you downloaded an .exe Picasso file from the `release page <https://github.com/jungmannlab/picasso/releases>`_:
+Backward compatibility (legacy in-package config)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- Navigate to the installation folder, by default, it's ``C:/Picasso``. *Before version 0.8.3, the default location was* ``C:/Program Files/Picasso``.
-- Go to the folder ``_internal/picasso``. *Before version 0.9.6, the folder was simply* ``picasso``.
-- Add your config file there.
+Older Picasso versions read ``config.yaml`` from inside the installed ``picasso`` package folder. That still works: if no ``~/.picasso/config.yaml`` exists, Picasso falls back to a ``config.yaml`` in the package folder and reads it **in place** (it is never moved or copied, so an existing setup keeps working unchanged). ``~/.picasso/config.yaml`` takes precedence when both are present. For reference, the legacy in-package location per install type is:
 
-One click installer (macOS)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-If you downloaded a .dmg Picasso file from the `release page <https://github.com/jungmannlab/picasso/releases>`_:
-
-- Navigate to your Applications folder and right-click on the picasso app, then select "Show Package Contents".
-- Go to the folder ``Contents/Frameworks/picasso``.
-- Add your config file there.
-
-PyPI
-~~~~
-If you installed Picasso using ``pip install picassosr``:
-
-- Activate your conda environment where ``picassosr`` is installed by typing ``conda activate YOUR_ENVIRONMENT``.
-- To find the location of the package, type ``pip show picassosr`` and look for the line starting with ``Location:``.
-- Navigate to this location and go to ``picasso``.
-- Add your config file there.
-
-GitHub
-~~~~~~
-If you cloned the GitHub repository, you can add plugins by following these steps:
-- Find the directory where you cloned the GitHub repository with Picasso.
-- Go to ``picasso/picasso/``.
-- Copy the config file to this folder.
+- **One-click installer (Windows):** the installation folder (by default ``C:/Picasso``; *before version 0.8.3,* ``C:/Program Files/Picasso``), then ``_internal/picasso``.
+- **One-click installer (macOS):** right-click the picasso app in Applications, "Show Package Contents", then ``Contents/Frameworks/picasso``.
+- **PyPI:** run ``pip show picassosr`` and look at the ``Location:`` line; the folder is ``<Location>/picasso``.
+- **GitHub:** ``picasso/picasso/`` inside your cloned repository.
 
 Example: Default Camera
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -288,3 +267,82 @@ The calibration depends on the microscope, camera, and emission wavelength used.
          595: /path/to/Camera1-Cy3B-zcalibration.yaml
 
 If the camera names and emission wavelengths match the settings in Micromanager, the correct z-calibration is automatically loaded. In any case an alternative calibration yaml file can be loaded by button.
+
+The same mechanism is available for the experimental PSF (cubic spline) calibration, using a ``spline-calibrations`` field that maps camera and emission wavelength to the path of the spline calibration ``.hdf5`` file:
+
+::
+
+   spline-calibrations:
+      Camera1:
+         525: /path/to/Camera1-GFP-spline-calibration.hdf5
+         595: /path/to/Camera1-Cy3B-spline-calibration.hdf5
+
+As with the z-calibration, the matching spline calibration is loaded automatically when the camera and emission wavelength match the Micromanager settings, and an alternative calibration file can always be loaded via the "Load calibration" button in the "Experimental PSF (spline)" box.
+
+Experimental PSF (cubic-spline) fitting
+---------------------------------------
+
+Picasso can fit an **experimentally measured PSF** to every spot. The measured PSF is stored as a cubic spline — a smooth, piecewise-polynomial model built from a bead z-stack — and each spot is fit to that spline on the GPU. This captures aberrations and engineered PSFs (e.g. astigmatism) that a Gaussian cannot describe, and a 3D calibration recovers the axial position ``z`` directly: a single fit returns ``x``, ``y``, ``z``, photons and background, with no separate astigmatism z-calibration step. A 2D calibration models a single focal plane (no ``z``).
+
+*This feature is experimental — please report any unexpected behavior on our `GitHub issues page <https://github.com/jungmannlab/picasso/issues>`_.*
+
+**Requirements.** Fitting runs only on a CUDA-capable NVIDIA GPU through `Gpufit <https://github.com/gpufit/Gpufit>`_ (see `GPU fitting`_ above); if no GPU library is available, the model and its controls do not appear. *Building* a calibration additionally uses Gpuspline, which — despite the name — is a CPU library, so the calibration step needs no GPU but is only distributed on Windows directly. The .so file for Linux needs to be built and distributed by the user.
+
+The method combines three published works: the experimental-PSF localization workflow and bead alignment of `Li et al., Nature Methods 15, 367–369 (2018) <https://doi.org/10.1038/nmeth.4661>`_, the cubic-spline PSF model for single-molecule data introduced by `Babcock & Zhuang, Scientific Reports 7, 552 (2017) <https://doi.org/10.1038/s41598-017-00622-w>`_, and the GPU localization-fitting and calibration-building backend of `Przybylski et al., Scientific Reports 7, 15722 (2017) <https://doi.org/10.1038/s41598-017-15313-9>`_.
+
+Building a spline calibration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A calibration is built from a **bead z-stack**: image a sample of sparse, bright, sub-diffraction beads while scanning the stage through focus in even steps. Picasso detects the beads (once, near focus — they are static in x/y), cuts a box around each, averages them across all beads and fields of view, registers them in 3D, normalizes the result to a clean PSF volume, and computes the cubic-spline coefficients. This is the workflow described in `Li et al., Nature Methods 15, 367–369 (2018) <https://doi.org/10.1038/nmeth.4661>`_, however, PSF scaling was adapted to fit GPUfit's workflow.
+
+In the GUI, load the bead movie and select ``Calibration`` > ``Calibrate spline PSF``. A dialog collects:
+
+- **Calibration step size (nm)** — the axial stage step between consecutive frames (or z-positions).
+- **Number of frames per step size** and **Frame order** — for multi-FOV stacks that image several fields of view at each z-position (as in the 3D astigmatism dialog).
+- **Spline PSF model** — ``3D (recovers z)`` or ``2D (single plane)``.
+- **Magnification factor** (default 0.79) — scales the fitted ``z`` to correct for the refractive-index mismatch, as in the astigmatism fit (Huang et al., 2008). It is stored in the calibration and applied at fit time, not during calibration.
+- **Set z = 0 at max. intensity** — define ``z = 0`` at the axial intensity peak of the averaged PSF instead of the center of the stage scan. Only meaningful for a PSF with a single, well-defined focus (e.g. astigmatism); off by default. This will impact the behavior of magnification factor if the measured calibration data is offset.
+
+The box size and minimum net gradient are taken from the main ``Parameters`` dialog. You are then asked where to save the calibration ``.hdf5``; a **diagnostic plot** (a ``.png`` with the same base name) is written next to it.
+
+The same calibration can be built from the command line::
+
+   picasso spline-calibrate my_beads.tif -s 20
+
+where ``-s/--step`` (the z step in nm) is required. Useful options: ``-b`` box side length (default 13), ``-g`` minimum net gradient, ``-m`` model (``spline-3d`` / ``spline-2d``), ``-fps`` / ``-fo`` frames-per-step and order, ``-mf`` magnification factor, ``-cz`` to set ``z = 0`` at the intensity peak, the camera parameters ``-bl`` / ``-se`` / ``-ga`` / ``-px`` (baseline, sensitivity, gain, pixel size), and ``-o`` for the output path (default ``<movie>_spline_calib.hdf5``).
+
+**The fit box size must not be larger the box size the calibration was built with.** If they differ, Picasso Localize shows a dialog and offers to set the box size to the calibration's value (you then re-run identification before fitting).
+
+Reading the calibration plot
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The diagnostic ``.png`` summarizes the averaged PSF and lets you judge the calibration at a glance. Its title reports the number of beads, the z range, the box and pixel size, and — when available — the model-vs-data agreement (median R² and NRMSE). Every image panel shares one intensity scale, and one camera pixel is drawn at the same physical size in all panels.
+
+- **xy slices (across z)** — the PSF seen face-on at evenly spaced z-planes; the in-focus (sharpest) slice is outlined. A good calibration shows a compact, symmetric spot at focus that changes smoothly and symmetrically with defocus (for astigmatism, orthogonal elongation on either side of focus).
+- **xz and yz cross-sections** — side views with z on the vertical axis; a cyan line marks the sharpest slice. Look for a smooth, symmetric hourglass shape, without double-lobing or abrupt jumps between z-steps.
+- **Axial intensity profile** (always shown) — the brightest normalized pixel per slice versus stage position. Expect a single clean peak, ≈ 1 at focus, decaying smoothly with defocus.
+
+For a 3D calibration, when a GPU is present Picasso also re-fits the individual beads through the new spline model and adds three panels:
+
+- **Estimated z vs stage** — recovered z against the known stage position, with the identity line. Points should be found around the diagonal across the whole z range.
+- **Axial bias** — the mean signed z error per step; ideally flat and near 0 nm.
+- **Axial precision** — the spread of the recovered z per step (nm).
+
+Fitting with the spline PSF
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+1. Open ``Analyze`` > ``Parameters`` and set **Model** to ``Experimental PSF (cubic spline)``.
+2. In the **Experimental PSF (spline)** box, click ``Load calibration`` and choose your ``.hdf5``. The last-used calibration is remembered between sessions, and calibrations can be loaded automatically per camera and emission wavelength via the ``spline-calibrations`` config field described above.
+3. Choose the **Optimizer**: ``Least squares`` or ``MLE`` (Poisson maximum likelihood). Both run on the GPU. ``MLE`` is recommended.
+4. Run ``Analyze`` > ``Localize (Identify & Fit)`` (or ``Fit`` for already-identified spots).
+
+In addition to the usual columns, spline fits report per-localization precisions (``lpx``, ``lpy``, and ``lpz`` for 3D, in nm), ``photons`` and ``bg`` with their uncertainties (``photons_unc``, ``bg_unc``), and, for MLE, ``log_likelihood`` and ``iterations``. A 3D calibration adds the recovered ``z`` (and ``lpz``). The accompanying ``_locs.yaml`` records the spline calibration model and file path used.
+
+Multichannel spline PSF (biplane / 4Pi)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Several spatially-registered channels (e.g. biplane or 4Pi setups) can be fit simultaneously, sharing one ``x``, ``y`` and ``z`` per molecule. Build a multichannel calibration by passing one bead movie per channel::
+
+   picasso spline-calibrate channel0.tif channel1.tif -s 20
+
+The first movie is the reference channel; every other channel is registered to it by an affine transform estimated from matching beads, and the per-channel PSFs and transforms are stored in the calibration. In Localize, load the channels with ``File`` > ``Open channels from several movies`` (or ``Open one multichannel movie``), load the multichannel calibration, and fit with the ``Experimental PSF (cubic spline)`` model.

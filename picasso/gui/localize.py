@@ -31,6 +31,7 @@ from .. import (
     localize,
     lib,
     postprocess,
+    spline,
     __version__,
     zfit,
 )
@@ -38,6 +39,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from playsound3 import playsound
 
 GPUFIT_INSTALLED = localize.GPUFIT_INSTALLED
+GPUSPLINE_INSTALLED = localize.GPUSPLINE_INSTALLED
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
 
@@ -56,15 +58,24 @@ FIT_MODELS = {
             "MLE": "gaussmle-rotated-gpu",
         },
     },
+    "Experimental PSF (cubic spline)": {
+        "optimizers": {
+            "Least squares": "spline-gpu",
+            "MLE": "spline-mle-gpu",
+        },
+        "needs_spline_calibration": True,
+    },
     "Average of ROI": {
         "optimizers": None,
         "code": "avg",
     },
 }
-# The rotated elliptical Gaussian is only implemented in GPUfit (codes
-# ending in "-gpu"), so offer it only when a CUDA-capable GPU is found.
+# The rotated elliptical Gaussian and the cubic-spline PSF are only
+# implemented in GPUfit (codes ending in "-gpu"), so offer them only when a
+# CUDA-capable GPU is found.
 if not GPUFIT_INSTALLED:
     del FIT_MODELS["2D rotated elliptical Gaussian"]
+    del FIT_MODELS["Experimental PSF (cubic spline)"]
 
 
 def _fit_code(model: str, optimizer: str) -> str:
@@ -391,6 +402,11 @@ class View(QtWidgets.QGraphicsView):
 
     def on_scroll(self) -> None:
         """Redraw the frame if scale bar is shown."""
+        # draw_frame() rebuilds the scene, which can change the scrollbar
+        # values and re-fire valueChanged; skip while a draw is in progress
+        # to avoid unbounded re-entrant recursion.
+        if self.window._drawing_frame:
+            return
         if self.window.scalebar_action.isChecked():
             self.window.draw_frame()
 
@@ -987,6 +1003,135 @@ class Calibrate3DDialog(lib.Dialog):
         return step, frames_per_step, frame_order, accepted
 
 
+class CalibrateSplineDialog(lib.Dialog):
+    """Dialog for entering the parameters of a cubic-spline PSF calibration
+    built from a bead z-stack: the z step size, the number of frames acquired
+    per z (stage) position, the acquisition order of those frames, and whether
+    to build a 3D (z-recovering) or 2D (single-plane) spline PSF. The box size
+    and minimum net gradient are taken from the main parameters."""
+
+    def __init__(self, window: QtWidgets.QWidget) -> None:
+        super().__init__(window)
+        self.window = window
+        self.setWindowTitle("Spline PSF Calibration")
+        vbox = QtWidgets.QVBoxLayout(self)
+        grid = QtWidgets.QGridLayout()
+        vbox.addLayout(grid)
+
+        # Step size
+        grid.addWidget(QtWidgets.QLabel("Calibration step size (nm):"), 0, 0)
+        self.step = QtWidgets.QDoubleSpinBox()
+        self.step.setRange(0.01, 1e6)
+        self.step.setDecimals(2)
+        self.step.setValue(5)
+        grid.addWidget(self.step, 0, 1)
+
+        # Number of frames per z (stage) position
+        frames_label = QtWidgets.QLabel("Number of frames per step size:")
+        frames_label.setToolTip(
+            "Number of frames acquired at each z (stage) position.\n"
+            "Acquiring several frames per position (e.g., different fields\n"
+            "of view) increases the number of beads averaged into the PSF."
+        )
+        grid.addWidget(frames_label, 1, 0)
+        self.frames_per_step = QtWidgets.QSpinBox()
+        self.frames_per_step.setRange(1, 100)
+        self.frames_per_step.setValue(1)
+        grid.addWidget(self.frames_per_step, 1, 1)
+
+        # Frame order (only relevant when frames_per_step > 1)
+        self.order_label = QtWidgets.QLabel("Frame order:")
+        grid.addWidget(self.order_label, 2, 0)
+        self.frame_order = QtWidgets.QComboBox()
+        self.frame_order.addItem("Different FOVs first", userData="fov")
+        self.frame_order.addItem("Different z positions first", userData="z")
+        self.frame_order.setToolTip(
+            "Order in which the frames were acquired when more than one\n"
+            "frame per step size is used (see the 3D astigmatism dialog)."
+        )
+        grid.addWidget(self.frame_order, 2, 1)
+
+        # Spline PSF dimensionality
+        grid.addWidget(QtWidgets.QLabel("Spline PSF model:"), 3, 0)
+        self.model = QtWidgets.QComboBox()
+        self.model.addItem("3D (recovers z)", userData="spline-3d")
+        self.model.addItem("2D (single plane)", userData="spline-2d")
+        grid.addWidget(self.model, 3, 1)
+
+        # Magnification factor (applied to the fitted z, as in astigmatism)
+        magnification_label = QtWidgets.QLabel("Magnification factor:")
+        magnification_label.setToolTip(
+            "Factor used to correct for z-position abberation due to\n"
+            "refractive index mismatch, see Huang B, et al. Science. 2008."
+        )
+        grid.addWidget(magnification_label, 4, 0)
+        self.magnification_factor = QtWidgets.QDoubleSpinBox()
+        self.magnification_factor.setRange(0, 1e6)
+        self.magnification_factor.setDecimals(4)
+        self.magnification_factor.setValue(0.79)
+        grid.addWidget(self.magnification_factor, 4, 1)
+
+        # Optional z-bias correction (astigmatism)
+        self.correct_z_bias = QtWidgets.QCheckBox(
+            "Set z = 0 at max. intensity"
+        )
+        self.correct_z_bias.setToolTip(
+            "Define z = 0 at the axial intensity peak of the averaged PSF,\n"
+            "correcting a potential z bias in the raw stage scan.\n"
+            "Only meaningful for a PSF with a single,\n"
+            "well-defined intensity focus (e.g. astigmatism)."
+        )
+        self.correct_z_bias.setChecked(False)
+        grid.addWidget(self.correct_z_bias, 5, 0, 1, 2)
+
+        self.frames_per_step.valueChanged.connect(self._update_order_enabled)
+        self._update_order_enabled(self.frames_per_step.value())
+
+        # OK and Cancel buttons
+        self.buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            QtCore.Qt.Orientation.Horizontal,
+            self,
+        )
+        vbox.addWidget(self.buttons)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+    def _update_order_enabled(self, n_frames: int) -> None:
+        """Enable the frame order choice only if more than one frame is
+        acquired per z position."""
+        enabled = n_frames > 1
+        self.order_label.setEnabled(enabled)
+        self.frame_order.setEnabled(enabled)
+
+    @staticmethod
+    def getCalibrationSpecs(
+        parent: QtWidgets.QWidget | None = None,
+    ) -> tuple[float, int, str, str, float, bool, bool]:
+        """Show the dialog and return the chosen step size, number of frames
+        per step, frame order, spline model, magnification factor, whether to
+        correct the z bias, and whether it was accepted."""
+        dialog = CalibrateSplineDialog(parent)
+        result = dialog.exec()
+        step = dialog.step.value()
+        frames_per_step = dialog.frames_per_step.value()
+        frame_order = dialog.frame_order.currentData()
+        model = dialog.model.currentData()
+        magnification_factor = dialog.magnification_factor.value()
+        correct_z_bias = dialog.correct_z_bias.isChecked()
+        accepted = result == QtWidgets.QDialog.DialogCode.Accepted
+        return (
+            step,
+            frames_per_step,
+            frame_order,
+            model,
+            magnification_factor,
+            correct_z_bias,
+            accepted,
+        )
+
+
 class ROIDialog(lib.Dialog):
     """Sub-dialog for managing several regions of interest (ROIs)
     numerically.
@@ -1221,6 +1366,7 @@ class ParametersDialog(lib.Dialog):
     CALIB_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#d-calibration"  # noqa: E501
     IDENT_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#identification-and-fitting-of-single-molecule-spots"  # noqa: E501
     ROI_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#regions-of-interest-rois"  # noqa: E501
+    SPLINE_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting"  # noqa: E501
 
     def __init__(  # noqa: C901
         self, parent: QtWidgets.QMainWindow | None = None
@@ -1232,6 +1378,12 @@ class ParametersDialog(lib.Dialog):
 
         self.z_calibration = {}
         self.z_calibration_path = None
+        self.spline_calibration = {}
+        self.spline_calibration_path = None
+        # calibration group boxes, toggled by the selected fit model; set up
+        # further below (spline box only exists when GPUfit is available)
+        self.z_groupbox = None
+        self.spline_groupbox = None
 
         self.scroll_area = QtWidgets.QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -1591,6 +1743,12 @@ class ParametersDialog(lib.Dialog):
         # the checkbox applies to both optimizers and sits below the
         # optimizer parameter stack.
         self.gpufit_checkbox = QtWidgets.QCheckBox("Use GPUfit")
+        self.gpufit_checkbox.setToolTip(
+            "Perform fitting on the GPU using Gpufit.\n\n"
+            "Przybylski, A., Thiel, B., Keller-Findeisen, J. et al. "
+            "Gpufit: An open-source toolkit for GPU-accelerated curve "
+            "fitting. Sci Rep 7, 15722 (2017). "
+        )
         self.gpufit_checkbox.setTristate(False)
         self.gpufit_checkbox.setDisabled(True)
         self.gpufit_checkbox.stateChanged.connect(self.on_gpufit_changed)
@@ -1609,8 +1767,10 @@ class ParametersDialog(lib.Dialog):
         # model.
         self.on_fit_model_changed()
 
-        # 3D
-        z_groupbox = QtWidgets.QGroupBox("3D via Astigmatism")
+        # 3D via astigmatism (Gaussian models); shown for non-spline fits
+        self.z_groupbox = z_groupbox = QtWidgets.QGroupBox(
+            "3D via Astigmatism"
+        )
         vbox.addWidget(z_groupbox)
 
         z_grid = QtWidgets.QGridLayout(z_groupbox)
@@ -1658,6 +1818,56 @@ class ParametersDialog(lib.Dialog):
         fit_z_row.addWidget(self.fit_z_checkbox)
         fit_z_row.addWidget(self.fit_z_gpu_checkbox)
         z_grid.addLayout(fit_z_row, 2, 0, 1, 2)
+
+        # Experimental PSF (cubic spline). Only meaningful with GPUfit, which
+        # runs the spline fit; the calibration is loaded here and passed to
+        # the fit when the "Experimental PSF (cubic spline)" model is chosen.
+        if GPUFIT_INSTALLED:
+            self.spline_groupbox = spline_groupbox = QtWidgets.QGroupBox(
+                "Experimental PSF (spline)"
+            )
+            spline_groupbox.setToolTip(
+                "Fit an experimentally measured PSF, modelled as a cubic "
+                "spline, on the GPU.\n\n"
+                "Li, Y., Mund, M., Hoess, P. et al. Real-time 3D "
+                "single-molecule localization using experimental point "
+                "spread functions. Nat Methods 15, 367-369 (2018). "
+                "https://doi.org/10.1038/nmeth.4661\n\n"
+                "Babcock, H.P., Zhuang, X. Analyzing Single Molecule "
+                "Localization Microscopy Data Using Cubic Splines. Sci Rep "
+                "7, 552 (2017). https://doi.org/10.1038/s41598-017-00622-w"
+                "\n\n"
+                "Przybylski, A., Thiel, B., Keller-Findeisen, J. et al. "
+                "Gpufit: An open-source toolkit for GPU-accelerated curve "
+                "fitting. Sci Rep 7, 15722 (2017). "
+                "https://doi.org/10.1038/s41598-017-15313-9"
+            )
+            vbox.addWidget(spline_groupbox)
+            spline_grid = QtWidgets.QGridLayout(spline_groupbox)
+            load_spline_calib = QtWidgets.QPushButton("Load calibration")
+            load_spline_calib.setToolTip(
+                "Load a cubic-spline PSF calibration (.hdf5), built via\n"
+                "3D > Calibrate spline PSF. Used by the 'Experimental PSF\n"
+                "(cubic spline)' fit model."
+            )
+            load_spline_calib.setAutoDefault(False)
+            load_spline_calib.clicked.connect(self.load_spline_calib)
+            spline_grid.addWidget(load_spline_calib, 0, 1)
+            spline_grid.addWidget(lib.HelpButton(self.SPLINE_URL), 0, 2)
+            self.spline_calib_label = QtWidgets.QLabel(
+                "-- no calibration loaded --"
+            )
+            self.spline_calib_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignCenter
+            )
+            self.spline_calib_label.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Ignored,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
+            spline_grid.addWidget(self.spline_calib_label, 0, 0)
+
+        # show the calibration box that matches the initial fit model
+        self._update_calib_group_visibility()
 
         if "Cameras" in CONFIG:
             camera = self.camera.currentText()
@@ -1861,6 +2071,21 @@ class ParametersDialog(lib.Dialog):
             self.fit_optimizer.setCurrentIndex(0)
             self.fit_optimizer.blockSignals(False)
             self.on_fit_optimizer_changed()
+        self._update_calib_group_visibility()
+
+    def _update_calib_group_visibility(self) -> None:
+        """Show only the calibration box relevant to the selected fit model:
+        the astigmatism z-calibration for Gaussian models, or the spline PSF
+        calibration for the experimental-PSF (spline) model. Guarded so the
+        initial ``on_fit_model_changed`` call (before the boxes exist) is a
+        no-op."""
+        needs_spline = FIT_MODELS[self.fit_model.currentText()].get(
+            "needs_spline_calibration", False
+        )
+        if self.z_groupbox is not None:
+            self.z_groupbox.setVisible(not needs_spline)
+        if self.spline_groupbox is not None:
+            self.spline_groupbox.setVisible(needs_spline)
 
     def on_fit_optimizer_changed(self) -> None:
         """Switch the optimizer parameter page and enable/disable the GPU
@@ -1922,6 +2147,71 @@ class ParametersDialog(lib.Dialog):
         )
         if path:
             self.update_z_calib(path)
+
+    def load_spline_calib(self) -> None:
+        """Load a cubic-spline PSF calibration from a user-selected HDF5."""
+        if self.spline_calibration_path:
+            dialog_directory, _ = os.path.split(self.spline_calibration_path)
+        else:
+            dialog_directory = None
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load spline PSF calibration",
+            directory=dialog_directory,
+            filter="*.hdf5",
+        )
+        if path:
+            self.update_spline_calib(path)
+
+    def update_spline_calib_with_config_path(self) -> None:
+        """Retrieve the spline PSF calibration path that corresponds to the
+        selected camera and emission wavelength, from the config."""
+        if self.spline_groupbox is None:  # GPUfit not installed
+            return
+        if "spline-calibrations" not in CONFIG:
+            return
+        camera = self.camera.currentText()
+        fp_calib_lam = CONFIG["spline-calibrations"].get(camera)
+        if fp_calib_lam is not None:
+            em_combo = self.emission_combos[camera]
+            wavelength = int(em_combo.currentText())
+            fp_calib = fp_calib_lam.get(wavelength)
+            if fp_calib is not None:
+                self.update_spline_calib(fp_calib)
+
+    def update_spline_calib(self, path: str | None) -> None:
+        """Load (or clear) a cubic-spline PSF calibration from an HDF5 file."""
+        if path:
+            if os.path.exists(path):
+                try:
+                    self.spline_calibration = io.load_spline_calibration(path)
+                except Exception as e:
+                    self.update_spline_calib(None)
+                    self.spline_calib_label.setText(
+                        "-- invalid calibration --"
+                    )
+                    self.spline_calib_label.setToolTip(str(e))
+                    return
+                self.spline_calibration_path = path
+            else:
+                self.update_spline_calib(None)
+                self.spline_calib_label.setText(
+                    "-- calibration path not found --"
+                )
+                self.spline_calib_label.setToolTip("")
+                return
+            self.spline_calib_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignRight
+            )
+            self.spline_calib_label.setText(os.path.basename(path))
+            self.spline_calib_label.setToolTip(path)
+        else:
+            self.spline_calibration = {}
+            self.spline_calibration_path = None
+            self.spline_calib_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignCenter
+            )
+            self.spline_calib_label.setText("-- no calibration loaded --")
 
     def update_z_calib_with_config_path(self):
         """Retrieve the z calibration path that corresponds to the
@@ -2028,6 +2318,8 @@ class ParametersDialog(lib.Dialog):
 
         # load 3D calibration
         self.update_z_calib_with_config_path()
+        # load spline PSF calibration
+        self.update_spline_calib_with_config_path()
 
     def update_qe(self) -> None:
         """Update QE. Note that QE is not used in the analysis, the
@@ -2049,6 +2341,7 @@ class ParametersDialog(lib.Dialog):
         """Update QE due to change in emission wavelength."""
         self.update_qe()
         self.update_z_calib_with_config_path()
+        self.update_spline_calib_with_config_path()
 
     def on_mng_spinbox_changed(self, value: int) -> None:
         """Handle change to the min. net gradient spinbox."""
@@ -2394,6 +2687,8 @@ class Window(QtWidgets.QMainWindow):
         self.status_bar_frame_indicator = QtWidgets.QLabel()
         self.status_bar.addPermanentWidget(self.status_bar_frame_indicator)
 
+        # re-entrancy guard for draw_frame (see on_scroll)
+        self._drawing_frame = False
         # Holds the curr movie as a numpy memmap in the format
         # (frame, y, x)
         self.movie = None
@@ -2466,6 +2761,21 @@ class Window(QtWidgets.QMainWindow):
             bool(settings["Localize"].get("fit_z_gpu", False))
         )
 
+        # Restore the last-used fitting model and optimizer. The model must
+        # be set first, since it repopulates the optimizer combobox.
+        fit_model = settings["Localize"].get("fit_model", None)
+        if fit_model is not None:
+            index = self.parameters_dialog.fit_model.findText(fit_model)
+            if index >= 0:
+                self.parameters_dialog.fit_model.setCurrentIndex(index)
+        fit_optimizer = settings["Localize"].get("fit_optimizer", None)
+        if fit_optimizer is not None:
+            index = self.parameters_dialog.fit_optimizer.findText(
+                fit_optimizer
+            )
+            if index >= 0:
+                self.parameters_dialog.fit_optimizer.setCurrentIndex(index)
+
         self.pwd = pwd
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
@@ -2483,6 +2793,12 @@ class Window(QtWidgets.QMainWindow):
         settings["Localize"][
             "fit_z_gpu"
         ] = self.parameters_dialog.fit_z_gpu_checkbox.isChecked()
+        settings["Localize"][
+            "fit_model"
+        ] = self.parameters_dialog.fit_model.currentText()
+        settings["Localize"][
+            "fit_optimizer"
+        ] = self.parameters_dialog.fit_optimizer.currentText()
         settings["Localize"]["Columns to save"] = {
             column: checkbox.isChecked()
             for column, checkbox in (
@@ -2586,6 +2902,10 @@ class Window(QtWidgets.QMainWindow):
         picasso_settings_action.triggered.connect(
             self.user_settings_dialog.show
         )
+        open_config_action = file_menu.addAction(
+            "Open camera config file location"
+        )
+        open_config_action.triggered.connect(self.open_config_location)
         help_action = file_menu.addAction("Help")
         help_action.triggered.connect(
             lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl(self.DOCS_URL))
@@ -2686,13 +3006,31 @@ class Window(QtWidgets.QMainWindow):
         self.abort_action.setEnabled(False)
         analyze_menu.addAction(self.abort_action)
 
-        """ 3D """
-        threed_menu = menu_bar.addMenu("3D")
+        """ Calibration """
+        threed_menu = menu_bar.addMenu("Calibration")
 
-        calibrate_z_action = threed_menu.addAction("Calibrate 3D")
+        calibrate_z_action = threed_menu.addAction(
+            "Calibrate astigmatism (Gaussian)"
+        )
         calibrate_z_action.triggered.connect(self.calibrate_z)
 
+        calibrate_spline_action = threed_menu.addAction("Calibrate spline PSF")
+        calibrate_spline_action.triggered.connect(self.calibrate_spline)
+
         self.plugin_menu = menu_bar.addMenu("Plugins")  # do not delete
+
+    def open_config_location(self) -> None:
+        """Open the folder holding the camera config file in the system
+        file browser."""
+        from .. import config_filename, _resolve_config_path
+
+        path = _resolve_config_path()
+        if path is None:
+            # No config yet: point the user at the intended location.
+            path = config_filename()
+        folder = os.path.dirname(path)
+        os.makedirs(folder, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder))
 
     @property
     def camera_info(self) -> dict[str, float]:
@@ -2709,6 +3047,96 @@ class Window(QtWidgets.QMainWindow):
         """Use the loaded movie to obtain z-calibration data for 3D
         fitting using astigmatism."""
         self.localize(calibrate_z=True)
+
+    def calibrate_spline(self) -> None:
+        """Build a cubic-spline PSF calibration from the loaded bead z-stack
+        movie (Gpuspline). Detects beads, averages them into a PSF volume and
+        computes the spline coefficients, saved as an HDF5 calibration."""
+        if self.movie is None:
+            QtWidgets.QMessageBox.information(
+                self, "Spline PSF Calibration", "No file loaded."
+            )
+            return
+        if not GPUSPLINE_INSTALLED:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Spline PSF Calibration",
+                "Gpuspline could not be loaded. See "
+                "picasso/ext/pygpuspline/README.txt for how to add the "
+                "compiled library.",
+            )
+            return
+
+        # identify spots first so the beads are displayed (like the
+        # astigmatic 3D calibration); the calibration is built afterwards.
+        self.identify(calibrate_spline=True)
+
+    def build_spline_calibration(self) -> None:
+        """Prompt for the spline PSF calibration parameters and build the
+        calibration from the loaded bead z-stack in a background thread."""
+        specs = CalibrateSplineDialog.getCalibrationSpecs(self)
+        (
+            step,
+            frames_per_step,
+            frame_order,
+            model,
+            magnification_factor,
+            correct_z_bias,
+            accepted,
+        ) = specs
+        if not accepted:
+            return
+
+        base = os.path.splitext(self.movie_path)[0] if self.movie_path else ""
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save spline PSF calibration",
+            base + "_spline_calib.hdf5",
+            filter="*.hdf5",
+        )
+        if not path:
+            return
+
+        parameters = self.parameters
+        self.spline_calibration_worker = SplineCalibrationWorker(
+            movie=self.movie,
+            info=self.info,
+            camera_info=self.camera_info,
+            box=parameters["Box Size"],
+            minimum_ng=parameters["Min. Net Gradient"],
+            step=step,
+            frames_per_step=frames_per_step,
+            frame_order=frame_order,
+            frame_bounds=self.frame_range,
+            model=model,
+            magnification_factor=magnification_factor,
+            correct_z_bias=correct_z_bias,
+            roi=self.view.rois,
+            path=path,
+        )
+        self.spline_calibration_worker.finished.connect(
+            self.on_spline_calibration_finished
+        )
+        self.spline_calibration_worker.failed.connect(
+            self.on_spline_calibration_failed
+        )
+        self.status_bar.showMessage("Building spline PSF calibration ...")
+        self.spline_calibration_worker.start()
+
+    def on_spline_calibration_finished(self, path: str, n_beads: int) -> None:
+        """Report a successful spline PSF calibration."""
+        self.status_bar.showMessage("")
+        QtWidgets.QMessageBox.information(
+            self,
+            "Spline PSF Calibration",
+            f"Spline PSF calibration built from {n_beads} beads and saved to:"
+            f"\n{path}",
+        )
+
+    def on_spline_calibration_failed(self, message: str) -> None:
+        """Report a failed spline PSF calibration."""
+        self.status_bar.showMessage("")
+        QtWidgets.QMessageBox.critical(self, "Spline PSF Calibration", message)
 
     def show_metadata(self) -> None:
         """Open the metadata dialog."""
@@ -3492,6 +3920,22 @@ class Window(QtWidgets.QMainWindow):
     def draw_frame(self) -> None:
         """Draw the current frame - show the movie frame, apply
         contrast, add identifications and fit markers, if applicable."""
+        if self.movie is None:
+            return
+        # rebuilding the scene can change scrollbar values and re-fire
+        # valueChanged -> on_scroll -> draw_frame; guard against unbounded
+        # re-entrant recursion.
+        if self._drawing_frame:
+            return
+        self._drawing_frame = True
+        try:
+            self._draw_frame()
+        finally:
+            self._drawing_frame = False
+
+    def _draw_frame(self) -> None:
+        """Actual frame-drawing implementation, wrapped by ``draw_frame``
+        with a re-entrancy guard."""
         if self.movie is not None:
             frame = self.movie[self.curr_frame_number]
             frame = frame.astype("float32")
@@ -3517,6 +3961,10 @@ class Window(QtWidgets.QMainWindow):
             pixmap = QtGui.QPixmap.fromImage(image)
             self.scene = Scene(self)
             self.scene.addPixmap(pixmap)
+            # pin the scene rect to the image bounds so overlay items that
+            # extend past the edge (e.g. the fixed-size scale bar text) do
+            # not enlarge the scene and shift/re-center the view
+            self.scene.setSceneRect(QtCore.QRectF(pixmap.rect()))
             self.view.setScene(self.scene)
             # draw the ROI rectangles (in scene/pixel coordinates)
             for i, ((y_min, x_min), (y_max, x_max)) in enumerate(
@@ -3595,6 +4043,10 @@ class Window(QtWidgets.QMainWindow):
         rect = self.view.viewport().rect()
         visible_scene_rect = self.view.mapToScene(rect).boundingRect()
         width = visible_scene_rect.width()
+        # the view may not be laid out yet (e.g. slow/network loads), in
+        # which case ``width`` is 0 and there is nothing to draw
+        if width <= 0:
+            return
         width_nm = width * scene_pixelsize
         optimal_scalebar = width_nm / 8
 
@@ -3610,14 +4062,23 @@ class Window(QtWidgets.QMainWindow):
         else:
             scalebar = int(round(optimal_scalebar))
 
+        # position against the viewport (the drawable area) rather than
+        # the whole view, so the bar is not covered by the scrollbar
+        # gutters (opaque on Windows, overlaid on macOS)
+        viewport_width = self.view.viewport().width()
+        viewport_height = self.view.viewport().height()
         length_displaypxl = int(
-            round(self.view.width() * (scalebar / scene_pixelsize) / width)
+            round(viewport_width * (scalebar / scene_pixelsize) / width)
         )
+        # when zoomed in far enough the scale bar rounds down to 0 nm /
+        # 0 display pixels; skip drawing to avoid a division by zero below
+        if scalebar <= 0 or length_displaypxl <= 0:
+            return
         height_displaypxl = 10
 
         # draw a rectangle
-        x = self.view.width() - length_displaypxl - 40
-        y = self.view.height() - height_displaypxl - 20
+        x = viewport_width - length_displaypxl - 40
+        y = viewport_height - height_displaypxl - 20
         pen = QtGui.QPen(QtCore.Qt.PenStyle.NoPen)
         brush = QtGui.QBrush(QtGui.QColor("white"))
         polygon = self.view.mapToScene(
@@ -3644,13 +4105,18 @@ class Window(QtWidgets.QMainWindow):
         font.setPointSize(20)
         text_item = self.scene.addText(f"{scalebar} nm", font)
         text_item.setDefaultTextColor(QtGui.QColor("white"))
-        # position the text centered below the scale bar
+        # scene units per device pixel (uniform zoom, but keep x/y
+        # separate to be safe)
+        scene_per_px_x = length_scene / length_displaypxl
+        scene_per_px_y = height_scene / height_displaypxl
+        # position the text centered above the scale bar, with a fixed
+        # device-pixel gap so the spacing looks the same at every zoom
         text_rect = text_item.boundingRect()
-        text_width = text_rect.width() / (length_displaypxl / length_scene)
+        text_width = text_rect.width() * scene_per_px_x
+        text_height = text_rect.height() * scene_per_px_y
+        gap = 8 * scene_per_px_y
         text_x = x_scene + (length_scene - text_width) / 2
-        text_y = (
-            y_scene + height_scene - 45 / (height_displaypxl / height_scene)
-        )
+        text_y = y_scene - gap - text_height
         text_item.setPos(text_x, text_y)
         text_item.setFlag(
             QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations,  # noqa: E501
@@ -3694,6 +4160,7 @@ class Window(QtWidgets.QMainWindow):
         self,
         fit_afterwards: bool = False,
         calibrate_z: bool = False,
+        calibrate_spline: bool = False,
     ) -> None:
         """Identify spots in the loaded movie.
 
@@ -3705,11 +4172,15 @@ class Window(QtWidgets.QMainWindow):
         calibrate_z : bool, optional
             Whether to run z-calibration for 3D fitting after
             identification. Default is False.
+        calibrate_spline : bool, optional
+            Whether to build a cubic-spline PSF calibration after
+            identification (see ``build_spline_calibration``). Default is
+            False.
         """
         if self.movie is not None:
             self.status_bar.showMessage("Preparing identification...")
             self.identification_worker = IdentificationWorker(
-                self, fit_afterwards, calibrate_z
+                self, fit_afterwards, calibrate_z, calibrate_spline
             )
             self.identification_worker.progressMade.connect(
                 self.on_identify_progress
@@ -3746,6 +4217,7 @@ class Window(QtWidgets.QMainWindow):
         identifications: pd.DataFrame,
         fit_afterwards: bool,
         calibrate_z: bool,
+        calibrate_spline: bool,
     ) -> None:
         """Handle the completion of the identification process. Save
         the parameters used, and localize/calibrate if requested."""
@@ -3774,8 +4246,46 @@ class Window(QtWidgets.QMainWindow):
                 sound_path = lib.get_sound_notification_path()
                 if sound_path is not None:
                     playsound(sound_path, block=False)
-            if fit_afterwards:
+            if calibrate_spline:
+                self.build_spline_calibration()
+            elif fit_afterwards:
                 self.fit(calibrate_z=calibrate_z)
+        elif calibrate_spline:
+            self.status_bar.showMessage("")
+            QtWidgets.QMessageBox.information(
+                self,
+                "Spline PSF Calibration",
+                "No beads were identified. Lower the minimum net gradient "
+                "or check the selected frame range and try again.",
+            )
+
+    def _check_spline_box_size(self, spline_calibration: dict) -> bool:
+        """Check that the identification box size is not larger than in
+        the spline calibration."""
+        n_data = spline_calibration.get("n_data")
+        if not n_data:
+            return True  # nothing to compare against; let the fit proceed
+        calib_box = int(n_data[0])
+        box = self.parameters["Box Size"]
+        # equal or smaller: supported by fitting against a centered crop
+        if box <= calib_box:
+            return True
+        detail = (
+            f"The selected box size ({box} px) is larger than this spline "
+            f"calibration, which was built with a box size of "
+            f"{calib_box} px. Use the box of the same size or smaller."
+        )
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Spline PSF fit — box size",
+            f"{detail}\n\nSet the box size to {calib_box} px now?",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.Yes,
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.parameters_dialog.box_spinbox.setValue(calib_box)
+        return False
 
     def fit(self, calibrate_z: bool = False) -> None:
         """Fit identified spots (single molecules).
@@ -3786,35 +4296,120 @@ class Window(QtWidgets.QMainWindow):
             Whether to perform z-calibration during fitting. Default is
             False.
         """
-        if self.movie is not None and self.ready_for_fit:
-            self.status_bar.showMessage("Preparing fit...")
-            model = self.parameters_dialog.fit_model.currentText()
-            optimizer = self.parameters_dialog.fit_optimizer.currentText()
-            method = _fit_code(model, optimizer)
-            eps = self.parameters_dialog.convergence_criterion.value()
-            max_it = self.parameters_dialog.max_it.value()
-            fit_z = self.parameters_dialog.fit_z_checkbox.isChecked()
-            use_gpufit = self.parameters_dialog.gpufit_checkbox.isChecked()
-            self.fit_worker = FitWorker(
-                self.movie,
-                self.info,
-                self.camera_info,
-                self.identifications,
-                self.parameters["Box Size"],
-                method,
-                eps,
-                max_it,
-                fit_z,
-                calibrate_z,
-                use_gpufit,
+        if self.movie is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Fit",
+                "Load a movie before fitting.",
             )
-            self.fit_worker.progressMade.connect(self.on_fit_progress)
-            self.fit_worker.cutProgressMade.connect(self.on_cut_progress)
-            self.fit_worker.finished.connect(self.on_fit_finished)
-            self.fit_worker.aborted.connect(self.on_worker_aborted)
-            self._active_worker = self.fit_worker
-            self.abort_action.setEnabled(True)
-            self.fit_worker.start()
+            return
+        if not self.ready_for_fit:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Fit",
+                "No identifications available. Run Identify (or load "
+                "identifications) before fitting.",
+            )
+            return
+        self.status_bar.showMessage("Preparing fit...")
+        model = self.parameters_dialog.fit_model.currentText()
+        optimizer = self.parameters_dialog.fit_optimizer.currentText()
+        method = _fit_code(model, optimizer)
+        eps = self.parameters_dialog.convergence_criterion.value()
+        max_it = self.parameters_dialog.max_it.value()
+        fit_z = self.parameters_dialog.fit_z_checkbox.isChecked()
+        use_gpufit = self.parameters_dialog.gpufit_checkbox.isChecked()
+        spline_calibration = None
+        if method.startswith("spline"):
+            spline_calibration = self.parameters_dialog.spline_calibration
+            if not spline_calibration:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Spline PSF fit",
+                    "Load a spline PSF calibration first (Experimental "
+                    "PSF (spline) > Load calibration), or build one via "
+                    "3D > Calibrate spline PSF.",
+                )
+                self.status_bar.showMessage("")
+                return
+            # The spline fit requires the box size to match the one the
+            # calibration was built with.
+            if not self._check_spline_box_size(spline_calibration):
+                self.status_bar.showMessage("")
+                return
+            # A 3D spline fit recovers z directly, so the separate
+            # astigmatism z-fitting step must not run.
+            fit_z = False
+            if spline_calibration.get("model") == "spline-3d-multichannel":
+                self._start_multichannel_spline_fit(spline_calibration, method)
+                return
+        self.fit_worker = FitWorker(
+            self.movie,
+            self.info,
+            self.camera_info,
+            self.identifications,
+            self.parameters["Box Size"],
+            method,
+            eps,
+            max_it,
+            fit_z,
+            calibrate_z,
+            use_gpufit,
+            spline_calibration=spline_calibration,
+        )
+        self.fit_worker.progressMade.connect(self.on_fit_progress)
+        self.fit_worker.cutProgressMade.connect(self.on_cut_progress)
+        self.fit_worker.finished.connect(self.on_fit_finished)
+        self.fit_worker.aborted.connect(self.on_worker_aborted)
+        self._active_worker = self.fit_worker
+        self.abort_action.setEnabled(True)
+        self.fit_worker.start()
+
+    def _start_multichannel_spline_fit(
+        self, calibration: dict, method: str
+    ) -> None:
+        """Fit a multichannel spline PSF across all loaded channels
+        simultaneously. The first loaded channel is the reference; its
+        identifications are mapped into every channel via the calibration's
+        stored transforms."""
+        n_channels = int(calibration.get("n_channels", 0))
+        if len(self.channels) < n_channels:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Multichannel spline fit",
+                f"This calibration expects {n_channels} channels, but "
+                f"{len(self.channels)} are loaded. Load them with "
+                "'File > Open channels from several movies' in the same "
+                "order as the calibration.",
+            )
+            self.status_bar.showMessage("")
+            return
+        reference = self.channels[0]
+        if reference.identifications is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Multichannel spline fit",
+                "Identify spots in the reference channel (the first loaded "
+                "channel) before running a multichannel spline fit.",
+            )
+            self.status_bar.showMessage("")
+            return
+        movies = [self.channels[c].movie for c in range(n_channels)]
+        camera_infos = [self.camera_info for _ in range(n_channels)]
+        self.fit_worker = MultichannelSplineFitWorker(
+            movies,
+            camera_infos,
+            reference.identifications,
+            self.parameters["Box Size"],
+            calibration,
+            mle=method == "spline-mle-gpu",
+        )
+        self.fit_worker.progressMade.connect(self.on_fit_progress)
+        self.fit_worker.finished.connect(self.on_fit_finished)
+        self.fit_worker.aborted.connect(self.on_worker_aborted)
+        self._active_worker = self.fit_worker
+        self.abort_action.setEnabled(True)
+        self.fit_worker.start()
 
     def fit_z(self) -> None:
         """Fit z coordinates of the fitted localizations based on the
@@ -3851,7 +4446,14 @@ class Window(QtWidgets.QMainWindow):
 
     def on_fit_progress(self, curr: int, total: int) -> None:
         """Update the status bar with the fitting progress."""
-        if self.parameters_dialog.gpufit_checkbox.isChecked():
+        worker = getattr(self, "fit_worker", None)
+        if isinstance(worker, MultichannelSplineFitWorker):
+            # extraction, GPU fit and per-spot CRLB share this callback
+            message = f"Fitting multichannel spline: {curr:,} / {total:,} ..."
+            self.status_bar.showMessage(message)
+        elif getattr(worker, "method", "").startswith("spline"):
+            self.status_bar.showMessage("Calculating localization precision")
+        elif self.parameters_dialog.gpufit_checkbox.isChecked():
             self.status_bar.showMessage("Fitting spots by GPUfit...")
         else:
             message = f"Fitting spot {curr:,} / {total:,} ..."
@@ -4182,6 +4784,15 @@ class Window(QtWidgets.QMainWindow):
             localize_info["Z Calibration"] = (
                 self.parameters_dialog.z_calibration
             )
+        if FIT_MODELS.get(model, {}).get("needs_spline_calibration"):
+            # Record the path and model only; the coefficient table is far
+            # too large to embed in the metadata.
+            localize_info["Spline Calibration Path"] = (
+                self.parameters_dialog.spline_calibration_path
+            )
+            localize_info["Spline Calibration Model"] = (
+                self.parameters_dialog.spline_calibration.get("model")
+            )
         self.extra_info = self.info + [localize_info | self.camera_info]
         self.select_locs_columns()  # save only selected columns
         io.save_locs(path, self.locs, self.extra_info)
@@ -4288,7 +4899,9 @@ class IdentificationWorker(QtCore.QThread):
     progress."""
 
     progressMade = QtCore.pyqtSignal(int, dict)
-    finished = QtCore.pyqtSignal(dict, object, float, pd.DataFrame, bool, bool)
+    finished = QtCore.pyqtSignal(
+        dict, object, float, pd.DataFrame, bool, bool, bool
+    )
     aborted = QtCore.pyqtSignal()
 
     def __init__(
@@ -4296,6 +4909,7 @@ class IdentificationWorker(QtCore.QThread):
         window: QtWidgets.QMainWindow,
         fit_afterwards: bool,
         calibrate_z: bool,
+        calibrate_spline: bool = False,
     ) -> None:
         super().__init__()
         self.window = window
@@ -4305,6 +4919,7 @@ class IdentificationWorker(QtCore.QThread):
         self.parameters = window.parameters
         self.fit_afterwards = fit_afterwards
         self.calibrate_z = calibrate_z
+        self.calibrate_spline = calibrate_spline
 
     def on_progress(self, frame_number: int) -> None:
         self.progressMade.emit(frame_number, self.parameters)
@@ -4335,6 +4950,7 @@ class IdentificationWorker(QtCore.QThread):
             identifications,
             self.fit_afterwards,
             self.calibrate_z,
+            self.calibrate_spline,
         )
 
 
@@ -4359,6 +4975,8 @@ class FitWorker(QtCore.QThread):
             "gausslq-rotated-gpu",
             "gaussmle",
             "gaussmle-rotated-gpu",
+            "spline-gpu",
+            "spline-mle-gpu",
             "avg",
         ],
         eps: float,
@@ -4366,6 +4984,7 @@ class FitWorker(QtCore.QThread):
         fit_z: bool,
         calibrate_z: bool,
         use_gpufit: bool,
+        spline_calibration: dict | None = None,
     ) -> None:
         super().__init__()
         self.movie = movie
@@ -4377,6 +4996,7 @@ class FitWorker(QtCore.QThread):
         self.max_it = max_it
         self.fit_z = fit_z
         self.calibrate_z = calibrate_z
+        self.spline_calibration = spline_calibration
         self.N = len(identifications)
         self._last_cut_emit = 0
         if use_gpufit and method in ("gausslq", "gaussmle"):
@@ -4409,6 +5029,7 @@ class FitWorker(QtCore.QThread):
             eps=self.eps,
             max_it=self.max_it,
             mle_method="sigmaxy",
+            spline_calibration=self.spline_calibration,
             multiprocess=True,
             progress_callback=self.on_progress,
             abort_callback=self.isInterruptionRequested,
@@ -4420,6 +5041,59 @@ class FitWorker(QtCore.QThread):
         self.progressMade.emit(self.N + 1, self.N)
         dt = time.time() - t0
         self.finished.emit(locs, dt, self.fit_z, self.calibrate_z)
+
+
+class MultichannelSplineFitWorker(QtCore.QThread):
+    """Fit a multichannel cubic-spline PSF across several registered channels
+    simultaneously. The reference channel's identifications are mapped into
+    every channel via the calibration's stored affine transforms."""
+
+    progressMade = QtCore.pyqtSignal(int, int)
+    finished = QtCore.pyqtSignal(pd.DataFrame, float, bool, bool)
+    aborted = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        movies: list,
+        camera_infos: list,
+        identifications: pd.DataFrame,
+        box: int,
+        calibration: dict,
+        mle: bool = False,
+    ) -> None:
+        super().__init__()
+        self.movies = movies
+        self.camera_infos = camera_infos
+        self.identifications = identifications
+        self.box = box
+        self.calibration = calibration
+        self.mle = mle
+        self.N = len(identifications)
+
+    def on_progress(self, n_done: int) -> None:
+        self.progressMade.emit(n_done, self.N)
+
+    def run(self) -> None:
+        t0 = time.time()
+        try:
+            locs = localize.fit_spline_multichannel(
+                self.movies,
+                self.camera_infos,
+                self.identifications,
+                self.box,
+                self.calibration,
+                mle=self.mle,
+                progress_callback=self.on_progress,
+            )
+        except Exception as e:
+            print(f"Multichannel spline fit failed: {e}")
+            self.aborted.emit()
+            return
+        self.progressMade.emit(self.N + 1, self.N)
+        dt = time.time() - t0
+        # fit_z / calibrate_z are always False for the multichannel spline
+        # path (z comes from the fit; there is no astigmatism step)
+        self.finished.emit(locs, dt, False, False)
 
 
 class FitZWorker(QtCore.QThread):
@@ -4470,6 +5144,71 @@ class FitZWorker(QtCore.QThread):
         )
         dt = time.time() - t0
         self.finished.emit(locs, dt)
+
+
+class SplineCalibrationWorker(QtCore.QThread):
+    """Build a cubic-spline PSF calibration from a bead z-stack movie in a
+    background thread (bead detection + averaging on the CPU, coefficients via
+    Gpuspline)."""
+
+    finished = QtCore.pyqtSignal(str, int)  # (path, n_beads)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        movie,
+        info: list[dict],
+        camera_info: dict,
+        box: int,
+        minimum_ng: float,
+        step: float,
+        frames_per_step: int,
+        frame_order: str,
+        model: str,
+        path: str,
+        frame_bounds=None,
+        magnification_factor: float = 0.79,
+        correct_z_bias: bool = False,
+        roi=None,
+    ) -> None:
+        super().__init__()
+        self.movie = movie
+        self.info = info
+        self.camera_info = camera_info
+        self.box = box
+        self.minimum_ng = minimum_ng
+        self.step = step
+        self.frames_per_step = frames_per_step
+        self.frame_order = frame_order
+        self.frame_bounds = frame_bounds
+        self.model = model
+        self.magnification_factor = magnification_factor
+        self.correct_z_bias = correct_z_bias
+        self.roi = roi
+        self.path = path
+
+    def run(self) -> None:
+        try:
+            calibration = spline.calibrate_spline(
+                self.movie,
+                info=self.info,
+                camera_info=self.camera_info,
+                box=self.box,
+                minimum_ng=self.minimum_ng,
+                d=self.step,
+                frames_per_step=self.frames_per_step,
+                frame_bounds=self.frame_bounds,
+                frame_order=self.frame_order,
+                model=self.model,
+                magnification_factor=self.magnification_factor,
+                correct_z_bias=self.correct_z_bias,
+                roi=self.roi,
+                path=self.path,
+            )
+        except Exception as e:  # surface any failure to the GUI
+            self.failed.emit(str(e))
+            return
+        self.finished.emit(self.path, int(calibration.get("n_beads", 0)))
 
 
 class QualityWorker(QtCore.QThread):

@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 07-JUL-2026 CEST
+Last change: 16-JUL-2026 CEST
 
 ## 0.11.0
 
@@ -8,9 +8,12 @@ Last change: 07-JUL-2026 CEST
 - Localization metadata is now embedded directly in the `.hdf5` file (under the `/metadata` dataset, as a JSON string), making the file self-contained even if moved or renamed without its `.yaml` sidecar. When loading, Picasso looks for the metadata in the `.yaml` file first, then falls back to the embedded copy. Writing the `.yaml` sidecar is still on by default but can be disabled via the new user setting `Save metadata in .yaml` in `~/.picasso/settings.yaml` (also available via any module under File > Picasso settings). See [file formats documentation](https://picassosr.readthedocs.io/en/latest/files.html) for more info.
 - Improved architecture for plugins, see[here](https://picassosr.readthedocs.io/en/latest/plugins.html). Note that the plugins must now be stored in a different location.
 - Plugins can now be easily downloaded from our repository, using Plugins > Browse online plugins
+- `config.yaml` can now be stored in the `.picasso` directory and the location is easily accessible via Localize
 
 #### Localize
+- New fitting model: **Experimental PSF (cubic spline)** — fits an experimentally measured PSF (a cubic-spline model built from a bead z-stack) on the GPU, via GPUfit's `SPLINE_2D`/`SPLINE_3D`/`SPLINE_3D_MULTICHANNEL` models. The `pygpuspline` binding is vendored under `picasso/ext/pygpuspline`. The bead alignment follows the workflow from Li, et al, Nature Methods, 2018. See the [experimental PSF (cubic-spline) fitting documentation](https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting) for details. *Note this is an experimental feature, do let us know if you find any bugs/unexpected behavior*
 - New fitting algorithms from GPUfit supported: 2D rotated Gaussian
+- Multichannel spline PSF fitting (GPUfit's `SPLINE_3D_MULTICHANNEL`, e.g. biplane / 4Pi)
 - Picasso relies on package `tifffile` for processing `.tif` files and many other grayscale movie formats, see [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html). **Note:** this is an experimental feature, do not hesitate to let us know if you detect bugs/unexpected behavior or would like to see more file formats in Picasso, see our [GitHub page](https://github.com/jungmannlab/picasso/issues) for contact information.
 - Added support for Zeiss `.czi` and Leica `.lif` movies in Localize (open dialog, drag-and-drop and batch CLI). These read via the optional `czifile` and `liffile` libraries (Python ≥ 3.12); install with `pip install picassosr[czi,lif]`. Multi-channel files prompt for a channel, and a `.lif` file with several acquisitions uses the one with the most frames.
 - Added support for multichannel data, i.e., several movie files in a single Localize window. These can be analyzed sequentially or be treated as a multichannel data for combined localizations, for example, in biplane 3D imaging.
@@ -33,8 +36,10 @@ Last change: 07-JUL-2026 CEST
 - Improved zooming in/out via scroll wheel
 - Contrast spin boxes use logarithmic scaling
 - Gpufit's MLE-fitted localizations save log-likelihood and iterations
+- Gpufit's Gaussian MLE-fitted localizations' precisions corrected/included (`lpx`, `photon_unc`, etc)
 - Fixed a gap of roughly one box size in the identified spots along the borders between adjacent (e.g. overlapping) ROIs
 - Fixed handling abortions during identification
+- Fixed zooming in Localize with scale bar + better appearance on Windows
 - GPU-accelerated fitting (GPUfit) now documented for Linux: the `libGpufit.so` is not shipped (only the Windows `Gpufit.dll` is), so Linux users must build it themselves. Added build/install instructions to the [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html#gpu-fitting-on-linux), the readme and a README in `picasso/ext/pygpufit/`.
 
 #### Render
@@ -46,16 +51,19 @@ Last change: 07-JUL-2026 CEST
 - SMAP i/o, see "Other improvements" below
 - Rotation dialog allows for rotations around the localizations or the world (see [3D documentation](https://picassosr.readthedocs.io/en/latest/render.html#d-rotation-window))
 - Background color for multichannel data can be adjusted
-- "Apply to all sequentially" available for drift correction algorithms
+- "Apply to all sequentially" available for drift correction algorithms, including drift from an external file
 - "Apply to all sequentially" available in Apply expression to localizations
+- G5M now supports 3D localizations fit with the experimental spline PSF, not only astigmatism.
 - G5M accepts `group_input` as the cluster id columns (useful if `group` is overwritten after clustering)
 - Re-grouping localizations (picking, DBSCAN/HDBSCAN/SMLM clustering) now preserves the previous grouping in the `group_input` column instead of discarding it, so the original cluster ids remain available (e.g. for G5M)
 - Updated G5M documentation - drift correction importance
+- Test clusterer with a constrast bar
 - Fixed removed plugins menu after removing all localizations
 - Fixed pick similar numba error [#684](https://github.com/jungmannlab/picasso/issues/684)
 - Fixed "Combine all channels" when saving localizations only saving the first channel when channels had differing columns
 - Fixed combined saving of multiple channels with different columns
 - Fixed ind. loc. precision rendering of `lpx = 0` [#685](https://github.com/jungmannlab/picasso/issues/685)
+- Fixed z color rendering in 3D
 
 #### SPINNA
 - Adjustable font sizes and names for the NND plot's title, labels and ticks
@@ -64,6 +72,7 @@ Last change: 07-JUL-2026 CEST
 - Batch analysis allows for specifying fitting mode (brute force/coarse to fine/bayesian)
 - Batch analysis closes unused plots to save RAM
 - Removed the obsolete line of code in `_fill3d` ([#682](https://github.com/jungmannlab/picasso/issues/682)). This should not affect standard functionality of 3D masks; only the usage of `render_hist3d_anisotropic` directly might be affected 
+- Fixed running a single simulation before fitting
 
 #### *Other improvements:*
 - Added import and export of [SMAP](https://github.com/jries/SMAP) localizations (`_sml.mat`). Available in Render and as batch CLI converters `picasso smap2hdf` and `picasso hdf2smap`. Reads single-file MATLAB `-v7` and `-v7.3` saves.

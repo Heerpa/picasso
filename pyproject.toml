@@ -144,8 +144,12 @@ picasso = [
     "gui/icons/*.ico",
     "gui/icons/*.png",
     "config_template.yaml",
-    "ext/pygpufit/Gpufit.dll",
+    "ext/pygpufit/*.dll",
+    "ext/pygpufit/*.so",
     "ext/pygpufit/LICENSE.txt",
+    "ext/pygpuspline/*.dll",
+    "ext/pygpuspline/*.so",
+    "ext/pygpuspline/LICENSE.txt",
 ]
 
 [tool.pytest.ini_options]

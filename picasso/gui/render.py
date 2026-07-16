@@ -3097,8 +3097,21 @@ class G5MDialog(lib.Dialog):
             QtCore.Qt.Orientation.Horizontal,
             self,
         )
-        if self.flag_3D:  # 3d calibration
-            self.buttons.buttons()[0].setEnabled(False)
+        if self.flag_3D:  # 3d data - choose astigmatism vs spline
+            # mode selector: astigmatism needs a calibration, spline
+            # recovers z (and lpz) directly and needs none
+            self.z_mode = QtWidgets.QComboBox()
+            self.z_mode.setToolTip(
+                "Fitting mode of the input 3D localizations.\n"
+                "'Astigmatism (Gaussian)' couples the x/y widths via the\n"
+                "3D calibration; 'Spline PSF' uses a plain diagonal 3D\n"
+                "model and reads z/lpz directly from the localizations."
+            )
+            self.z_mode.addItems(["Astigmatism (Gaussian)", "Spline PSF"])
+            z_mode_label = QtWidgets.QLabel("3D fit mode:")
+            grid.addWidget(z_mode_label, grid.rowCount(), 0)
+            grid.addWidget(self.z_mode, grid.rowCount() - 1, 1)
+
             self.load_calib_button = QtWidgets.QPushButton(
                 "Load 3D calibration"
             )
@@ -3109,7 +3122,12 @@ class G5MDialog(lib.Dialog):
             )
             self.load_calib_button.clicked.connect(self.load_calibration)
             grid.addWidget(self.load_calib_button, grid.rowCount(), 0, 1, 2)
-            self.automatic_load_calibration()
+
+            self.z_mode.currentIndexChanged.connect(self.handle_z_mode)
+            # default to spline if the locs were fit with a spline PSF
+            if self._locs_are_spline():
+                self.z_mode.setCurrentIndex(1)
+            self.handle_z_mode(self.z_mode.currentIndex())
 
         vbox.addWidget(self.buttons)  # these must be added at the end
         self.buttons.accepted.connect(self.accept)
@@ -3144,21 +3162,30 @@ class G5MDialog(lib.Dialog):
             "postprocess_check": dialog.postprocess_check.isChecked(),
         }
         if dialog.flag_3D:
-            params["calibration"] = dialog.calibration
+            mode = (
+                "spline"
+                if dialog.z_mode.currentIndex() == 1
+                else "astigmatism"
+            )
+            params["mode"] = mode
             params["pixelsize"] = px
-            if "Magnification factor" not in dialog.calibration.keys():
-                mag_factor, ok = QtWidgets.QInputDialog.getDouble(
-                    parent,
-                    "Input Dialog",
-                    "Enter magnification factor",
-                    0.79,
-                    0.1,
-                    10,
-                    2,
-                )
-                if not ok:
-                    return None, False
-                params["calibration"]["Magnification factor"] = mag_factor
+            if mode == "astigmatism":
+                params["calibration"] = dialog.calibration
+                if "Magnification factor" not in dialog.calibration.keys():
+                    mag_factor, ok = QtWidgets.QInputDialog.getDouble(
+                        parent,
+                        "Input Dialog",
+                        "Enter magnification factor",
+                        0.79,
+                        0.1,
+                        10,
+                        2,
+                    )
+                    if not ok:
+                        return None, False
+                    params["calibration"]["Magnification factor"] = mag_factor
+            else:  # spline - no calibration needed
+                params["calibration"] = None
         return (
             params,
             result == QtWidgets.QDialog.DialogCode.Accepted,
@@ -3175,6 +3202,32 @@ class G5MDialog(lib.Dialog):
             self.max_sigma_label.setText("Max. \u03c3 (nm):")
             self.min_sigma.setValue(5.0)
             self.max_sigma.setValue(20.0)
+
+    def handle_z_mode(self, idx: int) -> None:
+        """Switch between astigmatism (needs a calibration) and spline
+        (no calibration needed) 3D fitting modes."""
+        if idx == 1:  # spline PSF - no calibration required
+            self.load_calib_button.setEnabled(False)
+            self.buttons.buttons()[0].setEnabled(True)
+        else:  # astigmatism - require a calibration
+            self.load_calib_button.setEnabled(True)
+            # OK stays disabled until a calibration is loaded
+            self.buttons.buttons()[0].setEnabled(self.calibration is not None)
+            if self.calibration is None:
+                self.automatic_load_calibration()
+
+    def _locs_are_spline(self) -> bool:
+        """Return True if the loaded localizations were fit with a
+        spline PSF (based on the localization metadata)."""
+        ch = self.channel if self.channel != len(self.window.view.locs) else 0
+        infos = self.window.view.infos[ch]
+        fit_method = lib.get_from_metadata(infos, "Fit method")
+        if fit_method is not None and "spline" in str(fit_method).lower():
+            return True
+        for key in ("Spline calibration model", "Spline Calibration Model"):
+            if lib.get_from_metadata(infos, key) is not None:
+                return True
+        return False
 
     def load_calibration(self) -> None:
         """Load the calibration file selected by the user."""
@@ -3266,6 +3319,9 @@ class TestClustererDialog(lib.Dialog):
         Channel index for localizations that are tested.
     clusterer_name : QComboBox
         Contains all clusterer types available in Picasso: Render.
+    contrast_slider : QSlider
+        Adjusts the brightness (contrast) of the rendered view. The
+        center position corresponds to automatic contrast.
     display_all_locs : QCheckBox
         If ticked, unclustered locs are displayed in separate channel.
     pick : list
@@ -3381,6 +3437,23 @@ class TestClustererDialog(lib.Dialog):
         self.display_centers.stateChanged.connect(self.view.update_scene)
         parameters_grid.addWidget(self.display_centers, 5, 0, 1, 2)
 
+        # display settings - contrast
+        contrast_layout = QtWidgets.QHBoxLayout()
+        contrast_label = QtWidgets.QLabel("Contrast:")
+        contrast_label.setToolTip("Adjust the brightness of the rendering.")
+        contrast_layout.addWidget(contrast_label)
+        self.contrast_slider = QtWidgets.QSlider(
+            QtCore.Qt.Orientation.Horizontal
+        )
+        self.contrast_slider.setToolTip(
+            "Adjust the brightness of the rendering."
+        )
+        self.contrast_slider.setRange(-100, 100)
+        self.contrast_slider.setValue(0)
+        self.contrast_slider.valueChanged.connect(self.view._apply_contrast)
+        contrast_layout.addWidget(self.contrast_slider)
+        parameters_grid.addLayout(contrast_layout, 6, 0, 1, 2)
+
         # test
         test_button = QtWidgets.QPushButton("Test")
         test_button.setToolTip(
@@ -3388,10 +3461,10 @@ class TestClustererDialog(lib.Dialog):
         )
         test_button.clicked.connect(self.test_clusterer)
         test_button.setDefault(True)
-        parameters_grid.addWidget(test_button, 6, 0, 1, 2)
+        parameters_grid.addWidget(test_button, 7, 0, 1, 2)
 
         projections_layout = QtWidgets.QHBoxLayout()
-        parameters_grid.addLayout(projections_layout, 7, 0, 1, 2)
+        parameters_grid.addLayout(projections_layout, 8, 0, 1, 2)
 
         # display settings - xy, xz, yz projections
         xy_proj = QtWidgets.QPushButton("XY projection")
@@ -3413,7 +3486,7 @@ class TestClustererDialog(lib.Dialog):
         full_fov = QtWidgets.QPushButton("Full FOV")
         full_fov.setToolTip("Reset to the full field of view.")
         full_fov.clicked.connect(self.get_full_fov)
-        parameters_grid.addWidget(full_fov, 8, 0)
+        parameters_grid.addWidget(full_fov, 9, 0)
 
         # apply to all
         apply_to_all_button = QtWidgets.QPushButton("Cluster entire dataset")
@@ -3421,7 +3494,7 @@ class TestClustererDialog(lib.Dialog):
             "Apply the chosen parameters to all localizations."
         )
         apply_to_all_button.clicked.connect(self.apply_to_all)
-        parameters_grid.addWidget(apply_to_all_button, 8, 1)
+        parameters_grid.addWidget(apply_to_all_button, 9, 1)
 
         # view
         view_box = QtWidgets.QGroupBox("View")
@@ -3602,7 +3675,12 @@ class TestClustererDialog(lib.Dialog):
             params["G5M"][
                 "postprocess"
             ] = self.test_g5m_params.postprocess_check.isChecked()
-            params["G5M"]["calibration"] = self.test_g5m_params.calibration
+            if self.test_g5m_params.z_mode.currentIndex() == 1:  # spline
+                params["G5M"]["mode"] = "spline"
+                params["G5M"]["calibration"] = None
+            else:  # astigmatism
+                params["G5M"]["mode"] = "astigmatism"
+                params["G5M"]["calibration"] = self.test_g5m_params.calibration
             params["G5M"]["asynch"] = False
             params["G5M"]["callback_parent"] = None
 
@@ -4008,8 +4086,22 @@ class TestG5MParams(QtWidgets.QWidget):
             "- p_val < 0.015"
         )
 
+        # 3D fit mode (only consulted for 3D data): astigmatism needs a
+        # calibration, spline recovers z/lpz directly and needs none
+        self.z_mode = QtWidgets.QComboBox()
+        self.z_mode.setToolTip(
+            "Fitting mode of the input 3D localizations.\n"
+            "'Astigmatism (Gaussian)' couples the x/y widths via the 3D\n"
+            "calibration; 'Spline PSF' uses a plain diagonal 3D model and\n"
+            "reads z/lpz directly from the localizations (no calibration)."
+        )
+        self.z_mode.addItems(["Astigmatism (Gaussian)", "Spline PSF"])
+        z_mode_label = QtWidgets.QLabel("3D fit mode (3D only):")
+        grid.addWidget(z_mode_label, grid.rowCount(), 0)
+        grid.addWidget(self.z_mode, grid.rowCount() - 1, 1)
+
         load_calib_button = QtWidgets.QPushButton(
-            "Load 3D calibration (3D only)"
+            "Load 3D calibration (astigmatism only)"
         )
         load_calib_button.clicked.connect(self.load_calibration)
         grid.addWidget(load_calib_button, grid.rowCount(), 0, 1, 2)
@@ -4062,6 +4154,14 @@ class TestClustererView(QtWidgets.QLabel):
         self.viewport = None
         self.locs = None
         self.ang = None
+        # cache of the last rendered raw (grayscale) image and its
+        # auto-contrast limits, so the contrast slider can rescale
+        # without re-rendering the localizations
+        self._raw_image = None
+        self._auto_contrast = None
+        self._render_locs = None
+        self._render_info = None
+        self._render_colors = None
         self._size = 500
         self.setMinimumSize(self._size, self._size)
         self.setMaximumSize(self._size, self._size)
@@ -4115,6 +4215,7 @@ class TestClustererView(QtWidgets.QLabel):
     def update_scene(self) -> None:
         """Render localizations."""
         if not len(self.locs):
+            self._raw_image = None
             self.setText("No clusters found with the current settings.")
             return
 
@@ -4132,15 +4233,46 @@ class TestClustererView(QtWidgets.QLabel):
             self.dialog.window.view.pixelsize / self.get_optimal_oversampling()
         )
         colors = lib.get_colors(len(locs))
-        qimage = render.render_scene(
+        info = [self.view.infos[self.dialog.channels.currentIndex()]] * len(
+            locs
+        )
+        # render the raw (grayscale) image once and cache it together
+        # with its auto-contrast limits; the contrast slider then
+        # rescales the cached image without re-rendering the locs
+        _, _, self._auto_contrast, self._raw_image = render.render_scene(
             locs=locs,
-            info=[self.view.infos[self.dialog.channels.currentIndex()]]
-            * len(locs),
+            info=info,
             disp_px_size=disp_px_size,
             viewport=self.viewport,
             blur_method=blur_method,
             ang=self.ang,
             colors=colors,
+            return_contrast_limits=True,
+            return_raw_image=True,
+        )
+        self._render_locs = locs
+        self._render_info = info
+        self._render_colors = colors
+        self._apply_contrast()
+
+    def _apply_contrast(self) -> None:
+        """Rescale the cached raw image with the contrast slider value
+        and display it. Cheap compared to ``update_scene`` as it reuses
+        the cached raw image instead of re-rendering localizations."""
+        if self._raw_image is None:
+            return
+        vmin, vmax = self._auto_contrast
+        # slider in [-100, 100] maps exponentially to a brightness
+        # factor in [0.25, 4], with 0 (default) leaving auto-contrast
+        # unchanged; brighter means a lower upper contrast limit
+        factor = 2 ** (self.dialog.contrast_slider.value() / 50.0)
+        contrast = (vmin, vmax / factor)
+        qimage = render.render_scene(
+            locs=self._render_locs,
+            info=self._render_info,
+            colors=self._render_colors,
+            contrast=contrast,
+            raw_image_cache=self._raw_image,
         )[0]
         qimage = qimage.scaled(
             self._size,
@@ -8000,6 +8132,7 @@ class View(QtWidgets.QLabel):
             sigma_bounds=params["sigma_bounds"],
             bootstrap_check=params["bootstrap_check"],
             calibration=params.get("calibration", None),
+            mode=params.get("mode", "astigmatism"),
             postprocess=params["postprocess_check"],
             max_locs_per_cluster=params["max_locs_per_cluster"][channel],
             asynch=params["multiprocessing_check"],
@@ -8747,7 +8880,9 @@ class View(QtWidgets.QLabel):
         if data.shape == (4,):  # try loading FOV
             self.load_fov_drop(data)
         elif data.ndim == 2 and data.shape[1] in [2, 3]:  # try loading drift
-            channel = self.get_channel("Select channel for drift correction")
+            channel = self.get_channel_all_seq(
+                "Select channel for drift correction"
+            )
             if channel is None:
                 return
             self.load_drift_drop(channel, data)
@@ -8767,8 +8902,37 @@ class View(QtWidgets.QLabel):
 
     def load_drift_drop(self, channel: int, drift: FloatArray2D) -> None:
         """Attempts to load a drift .txt file (2 or 3 columns) and apply
-        the drift to localizations. Assumes only one channel is
-        currently loaded."""
+        the drift to localizations. If ``channel`` equals the number of
+        loaded channels, the drift is applied to all channels
+        sequentially (only if every localization channel and the drift
+        file share the same number of frames)."""
+        if channel == len(self.locs_paths):  # apply to all sequentially
+            n_frames_all = [
+                lib.get_from_metadata(info, "Frames") for info in self.infos
+            ]
+            # all channels and the drift file must have the same
+            # number of frames before applying to all channels
+            if len(set(n_frames_all)) > 1 or drift.shape[0] != n_frames_all[0]:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Drift file mismatch",
+                    (
+                        "Cannot apply the drift file to all channels "
+                        "because the localization channels and the drift "
+                        "file do not all have the same number of frames. "
+                        f"The channels have {n_frames_all} frames and the "
+                        f"drift file has {drift.shape[0]} frames."
+                    ),
+                )
+                return
+            for ch in range(len(self.locs_paths)):
+                self._load_drift_drop(ch, drift)
+        else:
+            self._load_drift_drop(channel, drift)
+
+    def _load_drift_drop(self, channel: int, drift: FloatArray2D) -> None:
+        """Apply a loaded drift .txt file (2 or 3 columns) to a single
+        channel after checking its number of frames and dimensions."""
         n_frames = lib.get_from_metadata(self.infos[channel], "Frames")
         n_dim = 3 if hasattr(self.locs[channel], "z") else 2
         if drift.shape[0] != n_frames or drift.shape[1] != n_dim:
@@ -8777,10 +8941,10 @@ class View(QtWidgets.QLabel):
                 "Drift file mismatch",
                 (
                     f"Drift file has {drift.shape[0]} frames and "
-                    f"{drift.shape[1]} dimensions, but the loaded data "
-                    f"has {n_frames} frames and {n_dim} dimensions. "
-                    "Please provide a drift file with the correct number"
-                    " of frames and dimensions."
+                    f"{drift.shape[1]} dimensions, but channel "
+                    f"{channel} has {n_frames} frames and {n_dim} "
+                    "dimensions. Please provide a drift file with the "
+                    "correct number of frames and dimensions."
                 ),
             )
             return

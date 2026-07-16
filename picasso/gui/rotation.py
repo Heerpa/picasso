@@ -754,8 +754,20 @@ class ViewRotation(QtWidgets.QLabel):
     pixmap : QPixmap
         Pixmap currently displayed.
     _points : list
-        Contains the coordinates of points to measure distances
-        between them.
+        Coordinates of the points of the measurement set currently
+        being drawn (connected by lines with live distances).
+    _point_sets : list
+        Finalized measurement sets, each a list of point coordinates.
+        Kept separate so lines and distances are only drawn within a
+        set, not across sets.
+    _measure_following : bool
+        True while the cursor is followed live and left clicks extend
+        the current set. Set to False (frozen) by the first right click
+        so a new set can be started; a further right click then deletes
+        the last finalized set.
+    _measure_cursor : tuple or None
+        Live cursor position (camera pixels) in Measure mode while the
+        cursor is followed; None otherwise.
     qimage : QImage
         Current image of rendered locs, picks and other drawings.
     _R : scipy.spatial.transform.Rotation
@@ -798,14 +810,20 @@ class ViewRotation(QtWidgets.QLabel):
         self.group_color = []
         self.x_render_state = False
         self.x_locs = []
+        self._z_shift = 0.0
         self._size_hint = (512, 512)
         self._mode = "Rotate"
-        self._points = []
+        self._points = []  # active measurement set being drawn
+        self._point_sets = []  # finalized measurement sets
+        self._measure_following = True  # cursor followed live while True
+        self._measure_cursor = None  # live cursor position in Measure mode
         self._pan = False
         self.block_x = False
         self.block_y = False
         self.block_z = False
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
+        # track the cursor without a pressed button for live measuring
+        self.setMouseTracking(True)
 
     # --- rotation state --- #
     # The codebase's angle convention (see ``render.rotation_matrix``)
@@ -960,6 +978,9 @@ class ViewRotation(QtWidgets.QLabel):
 
         # remove measurement points
         self._points = []
+        self._point_sets = []
+        self._measure_following = True
+        self._measure_cursor = None
 
         # save the pick information
         self.pick = w.view._picks[0]
@@ -1009,12 +1030,25 @@ class ViewRotation(QtWidgets.QLabel):
         if not (self.x_render_state and len(self.locs) == 1):
             return
         if self.x_property in self.locs[0].columns:
+            min_value = self.x_min_val
+            max_value = self.x_max_val
+            # z / lpz are rescaled to camera pixels here (see
+            # _collect_picked_locs), and z is additionally mean-shifted (see
+            # load_locs), whereas the property limits come from the main
+            # window in nm. Map the limits through the same transform so the
+            # color binning matches the main view.
+            if self.x_property in ("z", "lpz"):
+                min_value = min_value / self.pixelsize
+                max_value = max_value / self.pixelsize
+            if self.x_property == "z":
+                min_value -= self._z_shift
+                max_value -= self._z_shift
             self.x_locs = render.split_locs_by_property(
                 self.locs[0],
                 property_name=self.x_property,
                 n_colors=self.x_n_colors,
-                min_value=self.x_min_val,
-                max_value=self.x_max_val,
+                min_value=min_value,
+                max_value=max_value,
             )
         else:
             self.x_render_state = False
@@ -1043,6 +1077,10 @@ class ViewRotation(QtWidgets.QLabel):
         # at z = 0
         all_locs_z = np.concatenate([_["z"].to_numpy() for _ in self.locs])
         z_shift = all_locs_z.mean()
+        # store shift (in camera pixels) so that render-by-property limits,
+        # which are given in the main window's z units (nm), can be mapped
+        # onto the transformed z used here (see _apply_render_property_split)
+        self._z_shift = z_shift
         for i in range(len(self.locs)):
             self.locs[i]["z"] -= z_shift
 
@@ -1301,12 +1339,29 @@ class ViewRotation(QtWidgets.QLabel):
             if not self.window.dataset_dialog.wbackground.isChecked()
             else QtGui.QColor("red")
         )
+        # draw all finalized measurement sets (static, no live cursor)
+        for point_set in self._point_sets:
+            image = render.draw_points(
+                image=image,
+                viewport=self.viewport,
+                points=point_set,
+                pixelsize=self.window.window.view.pixelsize,
+                color=color,
+            )
+        # draw the active set; show the live cursor cross and running
+        # distance only in Measure mode while the cursor is followed
+        cursor = (
+            self._measure_cursor
+            if self._mode == "Measure" and self._measure_following
+            else None
+        )
         return render.draw_points(
             image=image,
             viewport=self.viewport,
             points=self._points,
             pixelsize=self.window.window.view.pixelsize,
             color=color,
+            cursor=cursor,
         )
 
     def rotation_input(self) -> None:
@@ -1495,14 +1550,32 @@ class ViewRotation(QtWidgets.QLabel):
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         """Define actions taken when moving mouse, for example, rotating
-        locs, panning."""
+        locs, panning or live updating the measuring cross."""
+        # live update of the measuring cross and distance
+        if self._mode == "Measure" and self._measure_following:
+            self._measure_cursor = self.map_to_movie(event.pos())
+            if len(self.locs):
+                self.update_scene(use_cache=True)
+            return
+
         if self._mode != "Rotate":
             return
 
         if self._pan:
             self._pan_drag(event)
-        else:
+        # only rotate while the left button is held; mouse tracking is on
+        # so hover events (no button) must not rotate the data
+        elif event.buttons() & QtCore.Qt.MouseButton.LeftButton:
             self._rotate_drag(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        """Hide the live measuring cross when the cursor leaves the
+        canvas."""
+        if self._mode == "Measure" and self._measure_cursor is not None:
+            self._measure_cursor = None
+            if len(self.locs):
+                self.update_scene(use_cache=True)
+        super().leaveEvent(event)
 
     def _rotate_drag(self, event: QtGui.QMouseEvent) -> None:
         """Trackball-style rotation: incremental rotations are composed
@@ -1613,14 +1686,24 @@ class ViewRotation(QtWidgets.QLabel):
         example, stopping rotating locs or panning, add or delete a measure
         point."""
         if self._mode == "Measure":
-            # add point
+            # add a measure point on left click; the first right click
+            # freezes the current set so a new one can be started; a
+            # further right click then deletes the last finalized set
             if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                # start a new set if the previous one was frozen
+                if not self._measure_following:
+                    self._measure_following = True
+                    self.update_cursor()
                 x, y = self.map_to_movie(event.pos())
                 self.add_point((x, y))
                 event.accept()
-            # remove point
             elif event.button() == QtCore.Qt.MouseButton.RightButton:
-                self.remove_points()
+                if self._measure_following:
+                    # freeze the current selection (stop following)
+                    self.finalize_measure_set()
+                else:
+                    # delete the last finalized set of measurements
+                    self.remove_last_measure_set()
                 event.accept()
             else:
                 event.ignore()
@@ -1675,9 +1758,39 @@ class ViewRotation(QtWidgets.QLabel):
             self.update_scene()
 
     def remove_points(self) -> None:
-        """Remove all distance measurement points."""
+        """Remove all distance measurement points and sets."""
         self._points = []
+        self._point_sets = []
+        self._measure_following = True
+        self._measure_cursor = None
+        self.update_cursor()
         self.update_scene()
+
+    def finalize_measure_set(self) -> None:
+        """Freeze the current measurement set so a new one can be
+        started. The cursor is no longer followed until the next left
+        click."""
+        if self._points:
+            self._point_sets.append(self._points)
+            self._points = []
+        self._measure_following = False
+        self._measure_cursor = None
+        self.update_cursor()
+        self.update_scene()
+
+    def remove_last_measure_set(self) -> None:
+        """Delete the most recently finalized measurement set."""
+        if self._point_sets:
+            self._point_sets.pop()
+            self.update_scene()
+
+    def update_cursor(self) -> None:
+        """Change the cursor according to self._mode."""
+        if self._mode == "Measure" and self._measure_following:
+            # hide the OS cursor; the drawn cross marks the position
+            self.setCursor(QtCore.Qt.CursorShape.BlankCursor)
+        else:
+            self.unsetCursor()
 
     def export_current_view(self) -> None:
         """Export current view as .png or .tif."""
@@ -1771,6 +1884,7 @@ class ViewRotation(QtWidgets.QLabel):
             Action defined in Window.__init__: ("Rotate" or "Measure").
         """
         self._mode = action.text()
+        self.update_cursor()
 
     def adjust_viewport_to_view(
         self, viewport: tuple[tuple[float, float], tuple[float, float]]

@@ -289,17 +289,19 @@ def load_ims_all(path: str) -> tuple[list[np.memmap], list[list[dict]]]:
 
 
 def save_config(CONFIG: dict) -> None:
-    """Save the camera configuration dictionary to a YAML file. See
-    https://picassosr.readthedocs.io/en/latest/localize.html#camera-config.
+    """Save the camera configuration dictionary to the user config file
+    (``~/.picasso/config.yaml``). See https://picassosr.readthedocs.io/
+    en/latest/localize.html#camera-config.
 
     Parameters
     ----------
     CONFIG : dict
         The camera configuration dictionary to save.
     """
-    this_file = os.path.abspath(__file__)
-    this_directory = os.path.dirname(this_file)
-    with open(os.path.join(this_directory, "config.yaml"), "w") as config_file:
+    from . import config_filename, _user_config_dir
+
+    os.makedirs(_user_config_dir(), exist_ok=True)
+    with open(config_filename(), "w") as config_file:
         yaml.dump(CONFIG, config_file, width=1000)
 
 
@@ -351,6 +353,82 @@ def load_calibration(path: str) -> dict:
             "be a dictionary."
         )
 
+    return calibration
+
+
+def _json_default(obj):
+    """Coerce numpy scalars/arrays into JSON-serializable Python objects."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    raise TypeError(
+        f"Object of type {type(obj).__name__} is not JSON serializable"
+    )
+
+
+def save_spline_calibration(path: str, calibration: dict) -> None:
+    """Save a cubic-spline PSF calibration to an HDF5 file.
+
+    Unlike the astigmatism calibration (a handful of polynomial coefficients
+    stored as YAML via ``zfit.calibrate_z``), a spline PSF calibration holds a
+    large coefficient table (64 coefficients per interval for a 3D tricubic
+    spline, times the number of intervals), so it is stored in HDF5. The
+    coefficient array goes into the ``coefficients`` dataset; all remaining
+    (scalar / list) metadata is stored as a JSON string in the file attribute
+    ``metadata``.
+
+    Parameters
+    ----------
+    path : str
+        Destination HDF5 path (conventionally ``*_spline_calib.hdf5``).
+    calibration : dict
+        Calibration dictionary. Must contain a numpy array under the key
+        ``"coefficients"``; every other key must be JSON-serializable (numpy
+        scalars/arrays are coerced automatically).
+    """
+    if "coefficients" not in calibration:
+        raise ValueError(
+            "Invalid spline calibration: missing 'coefficients' array."
+        )
+    coefficients = np.ascontiguousarray(
+        calibration["coefficients"], dtype=np.float32
+    )
+    metadata = {
+        key: value
+        for key, value in calibration.items()
+        if key != "coefficients"
+    }
+    with h5py.File(path, "w") as f:
+        f.create_dataset("coefficients", data=coefficients)
+        f.attrs["metadata"] = json.dumps(metadata, default=_json_default)
+
+
+def load_spline_calibration(path: str) -> dict:
+    """Load a cubic-spline PSF calibration saved by
+    ``save_spline_calibration``.
+
+    Parameters
+    ----------
+    path : str
+        Path to the spline calibration HDF5 file.
+
+    Returns
+    -------
+    calibration : dict
+        The calibration dictionary, with the coefficient table restored under
+        the ``"coefficients"`` key (float32 numpy array) and all metadata
+        keys alongside it.
+    """
+    with h5py.File(path, "r") as f:
+        if "coefficients" not in f or "metadata" not in f.attrs:
+            raise ValueError(
+                "Invalid spline calibration file: expected a 'coefficients' "
+                "dataset and a 'metadata' attribute. This does not look like "
+                "a Picasso spline PSF calibration."
+            )
+        calibration = json.loads(f.attrs["metadata"])
+        calibration["coefficients"] = f["coefficients"][:].astype(np.float32)
     return calibration
 
 
@@ -2502,11 +2580,13 @@ class TiffMap:
             # threads overlap instead of serializing.
             handle = self._handle()
             handle.seek(self._offsets[index])
-            frame = np.fromfile(
-                handle,
-                dtype=self._tif_dtype,
-                count=self.frame_size,
-            ).reshape(self.frame_shape)
+            # ``np.fromfile`` rejects a Python file object on some
+            # numpy/Windows builds ("expected str, bytes or os.PathLike
+            # object, not BufferedReader"); read into a preallocated
+            # array instead, which works with any binary handle.
+            frame = np.empty(self.frame_size, dtype=self._tif_dtype)
+            handle.readinto(frame)
+            frame = frame.reshape(self.frame_shape)
         else:
             # Compressed / tiled / multi-strip pages: let tifffile decode
             # this single page (still lazy - other frames stay on disk).
@@ -2711,11 +2791,13 @@ class STKMovie(AbstractPicassoMovie):
         offset = self._first_data_offset + index * self._frame_bytes
         handle = self._handle()
         handle.seek(offset)
-        frame = np.fromfile(
-            handle,
-            dtype=self._tif_dtype,
-            count=self.height * self.width,
-        ).reshape(self.frame_shape)
+        # ``np.fromfile`` rejects a Python file object on some
+        # numpy/Windows builds ("expected str, bytes or os.PathLike
+        # object, not BufferedReader"); read into a preallocated array
+        # instead, which works with any binary handle.
+        frame = np.empty(self.height * self.width, dtype=self._tif_dtype)
+        handle.readinto(frame)
+        frame = frame.reshape(self.frame_shape)
         if self._byte_order == ">":
             frame = frame.byteswap().view(self._dtype)
         return frame
