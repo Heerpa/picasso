@@ -391,6 +391,11 @@ class View(QtWidgets.QGraphicsView):
 
     def on_scroll(self) -> None:
         """Redraw the frame if scale bar is shown."""
+        # draw_frame() rebuilds the scene, which can change the scrollbar
+        # values and re-fire valueChanged; skip while a draw is in progress
+        # to avoid unbounded re-entrant recursion.
+        if self.window._drawing_frame:
+            return
         if self.window.scalebar_action.isChecked():
             self.window.draw_frame()
 
@@ -2394,6 +2399,8 @@ class Window(QtWidgets.QMainWindow):
         self.status_bar_frame_indicator = QtWidgets.QLabel()
         self.status_bar.addPermanentWidget(self.status_bar_frame_indicator)
 
+        # re-entrancy guard for draw_frame (see on_scroll)
+        self._drawing_frame = False
         # Holds the curr movie as a numpy memmap in the format
         # (frame, y, x)
         self.movie = None
@@ -3492,6 +3499,22 @@ class Window(QtWidgets.QMainWindow):
     def draw_frame(self) -> None:
         """Draw the current frame - show the movie frame, apply
         contrast, add identifications and fit markers, if applicable."""
+        if self.movie is None:
+            return
+        # rebuilding the scene can change scrollbar values and re-fire
+        # valueChanged -> on_scroll -> draw_frame; guard against unbounded
+        # re-entrant recursion.
+        if self._drawing_frame:
+            return
+        self._drawing_frame = True
+        try:
+            self._draw_frame()
+        finally:
+            self._drawing_frame = False
+
+    def _draw_frame(self) -> None:
+        """Actual frame-drawing implementation, wrapped by ``draw_frame``
+        with a re-entrancy guard."""
         if self.movie is not None:
             frame = self.movie[self.curr_frame_number]
             frame = frame.astype("float32")
@@ -3517,6 +3540,10 @@ class Window(QtWidgets.QMainWindow):
             pixmap = QtGui.QPixmap.fromImage(image)
             self.scene = Scene(self)
             self.scene.addPixmap(pixmap)
+            # pin the scene rect to the image bounds so overlay items that
+            # extend past the edge (e.g. the fixed-size scale bar text) do
+            # not enlarge the scene and shift/re-center the view
+            self.scene.setSceneRect(QtCore.QRectF(pixmap.rect()))
             self.view.setScene(self.scene)
             # draw the ROI rectangles (in scene/pixel coordinates)
             for i, ((y_min, x_min), (y_max, x_max)) in enumerate(
@@ -3614,8 +3641,13 @@ class Window(QtWidgets.QMainWindow):
         else:
             scalebar = int(round(optimal_scalebar))
 
+        # position against the viewport (the drawable area) rather than
+        # the whole view, so the bar is not covered by the scrollbar
+        # gutters (opaque on Windows, overlaid on macOS)
+        viewport_width = self.view.viewport().width()
+        viewport_height = self.view.viewport().height()
         length_displaypxl = int(
-            round(self.view.width() * (scalebar / scene_pixelsize) / width)
+            round(viewport_width * (scalebar / scene_pixelsize) / width)
         )
         # when zoomed in far enough the scale bar rounds down to 0 nm /
         # 0 display pixels; skip drawing to avoid a division by zero below
@@ -3624,8 +3656,8 @@ class Window(QtWidgets.QMainWindow):
         height_displaypxl = 10
 
         # draw a rectangle
-        x = self.view.width() - length_displaypxl - 40
-        y = self.view.height() - height_displaypxl - 20
+        x = viewport_width - length_displaypxl - 40
+        y = viewport_height - height_displaypxl - 20
         pen = QtGui.QPen(QtCore.Qt.PenStyle.NoPen)
         brush = QtGui.QBrush(QtGui.QColor("white"))
         polygon = self.view.mapToScene(
@@ -3652,13 +3684,18 @@ class Window(QtWidgets.QMainWindow):
         font.setPointSize(20)
         text_item = self.scene.addText(f"{scalebar} nm", font)
         text_item.setDefaultTextColor(QtGui.QColor("white"))
-        # position the text centered below the scale bar
+        # scene units per device pixel (uniform zoom, but keep x/y
+        # separate to be safe)
+        scene_per_px_x = length_scene / length_displaypxl
+        scene_per_px_y = height_scene / height_displaypxl
+        # position the text centered above the scale bar, with a fixed
+        # device-pixel gap so the spacing looks the same at every zoom
         text_rect = text_item.boundingRect()
-        text_width = text_rect.width() / (length_displaypxl / length_scene)
+        text_width = text_rect.width() * scene_per_px_x
+        text_height = text_rect.height() * scene_per_px_y
+        gap = 8 * scene_per_px_y
         text_x = x_scene + (length_scene - text_width) / 2
-        text_y = (
-            y_scene + height_scene - 45 / (height_displaypxl / height_scene)
-        )
+        text_y = y_scene - gap - text_height
         text_item.setPos(text_x, text_y)
         text_item.setFlag(
             QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations,  # noqa: E501
