@@ -3090,6 +3090,13 @@ class Window(QtWidgets.QMainWindow):
             )
             return
 
+        # identify spots first so the beads are displayed (like the
+        # astigmatic 3D calibration); the calibration is built afterwards.
+        self.identify(calibrate_spline=True)
+
+    def build_spline_calibration(self) -> None:
+        """Prompt for the spline PSF calibration parameters and build the
+        calibration from the loaded bead z-stack in a background thread."""
         specs = CalibrateSplineDialog.getCalibrationSpecs(self)
         (
             step,
@@ -3123,6 +3130,7 @@ class Window(QtWidgets.QMainWindow):
             step=step,
             frames_per_step=frames_per_step,
             frame_order=frame_order,
+            frame_bounds=self.frame_range,
             model=model,
             magnification_factor=magnification_factor,
             correct_z_bias=correct_z_bias,
@@ -4175,6 +4183,7 @@ class Window(QtWidgets.QMainWindow):
         self,
         fit_afterwards: bool = False,
         calibrate_z: bool = False,
+        calibrate_spline: bool = False,
     ) -> None:
         """Identify spots in the loaded movie.
 
@@ -4186,11 +4195,15 @@ class Window(QtWidgets.QMainWindow):
         calibrate_z : bool, optional
             Whether to run z-calibration for 3D fitting after
             identification. Default is False.
+        calibrate_spline : bool, optional
+            Whether to build a cubic-spline PSF calibration after
+            identification (see ``build_spline_calibration``). Default is
+            False.
         """
         if self.movie is not None:
             self.status_bar.showMessage("Preparing identification...")
             self.identification_worker = IdentificationWorker(
-                self, fit_afterwards, calibrate_z
+                self, fit_afterwards, calibrate_z, calibrate_spline
             )
             self.identification_worker.progressMade.connect(
                 self.on_identify_progress
@@ -4227,6 +4240,7 @@ class Window(QtWidgets.QMainWindow):
         identifications: pd.DataFrame,
         fit_afterwards: bool,
         calibrate_z: bool,
+        calibrate_spline: bool,
     ) -> None:
         """Handle the completion of the identification process. Save
         the parameters used, and localize/calibrate if requested."""
@@ -4255,8 +4269,18 @@ class Window(QtWidgets.QMainWindow):
                 sound_path = lib.get_sound_notification_path()
                 if sound_path is not None:
                     playsound(sound_path, block=False)
-            if fit_afterwards:
+            if calibrate_spline:
+                self.build_spline_calibration()
+            elif fit_afterwards:
                 self.fit(calibrate_z=calibrate_z)
+        elif calibrate_spline:
+            self.status_bar.showMessage("")
+            QtWidgets.QMessageBox.information(
+                self,
+                "Spline PSF Calibration",
+                "No beads were identified. Lower the minimum net gradient "
+                "or check the selected frame range and try again.",
+            )
 
     def _check_spline_box_size(self, spline_calibration: dict) -> bool:
         """Check that the identification box size matches the box size the
@@ -4890,7 +4914,9 @@ class IdentificationWorker(QtCore.QThread):
     progress."""
 
     progressMade = QtCore.pyqtSignal(int, dict)
-    finished = QtCore.pyqtSignal(dict, object, float, pd.DataFrame, bool, bool)
+    finished = QtCore.pyqtSignal(
+        dict, object, float, pd.DataFrame, bool, bool, bool
+    )
     aborted = QtCore.pyqtSignal()
 
     def __init__(
@@ -4898,6 +4924,7 @@ class IdentificationWorker(QtCore.QThread):
         window: QtWidgets.QMainWindow,
         fit_afterwards: bool,
         calibrate_z: bool,
+        calibrate_spline: bool = False,
     ) -> None:
         super().__init__()
         self.window = window
@@ -4907,6 +4934,7 @@ class IdentificationWorker(QtCore.QThread):
         self.parameters = window.parameters
         self.fit_afterwards = fit_afterwards
         self.calibrate_z = calibrate_z
+        self.calibrate_spline = calibrate_spline
 
     def on_progress(self, frame_number: int) -> None:
         self.progressMade.emit(frame_number, self.parameters)
@@ -4937,6 +4965,7 @@ class IdentificationWorker(QtCore.QThread):
             identifications,
             self.fit_afterwards,
             self.calibrate_z,
+            self.calibrate_spline,
         )
 
 
@@ -5152,6 +5181,7 @@ class SplineCalibrationWorker(QtCore.QThread):
         frame_order: str,
         model: str,
         path: str,
+        frame_bounds=None,
         magnification_factor: float = 0.79,
         correct_z_bias: bool = False,
         roi=None,
@@ -5165,6 +5195,7 @@ class SplineCalibrationWorker(QtCore.QThread):
         self.step = step
         self.frames_per_step = frames_per_step
         self.frame_order = frame_order
+        self.frame_bounds = frame_bounds
         self.model = model
         self.magnification_factor = magnification_factor
         self.correct_z_bias = correct_z_bias
@@ -5181,6 +5212,7 @@ class SplineCalibrationWorker(QtCore.QThread):
                 minimum_ng=self.minimum_ng,
                 d=self.step,
                 frames_per_step=self.frames_per_step,
+                frame_bounds=self.frame_bounds,
                 frame_order=self.frame_order,
                 model=self.model,
                 magnification_factor=self.magnification_factor,
