@@ -4461,13 +4461,7 @@ class Window(QtWidgets.QMainWindow):
             message = f"Fitting multichannel spline: {curr:,} / {total:,} ..."
             self.status_bar.showMessage(message)
         elif getattr(worker, "method", "").startswith("spline"):
-            # the spline fit itself is a single GPU call; this callback tracks
-            # the per-spot Cramer-Rao precision (CRLB) computation that follows
-            message = (
-                f"Computing localization precision: "
-                f"{curr:,} / {total:,} ..."
-            )
-            self.status_bar.showMessage(message)
+            self.status_bar.showMessage("Calculating localization precision")
         elif self.parameters_dialog.gpufit_checkbox.isChecked():
             self.status_bar.showMessage("Fitting spots by GPUfit...")
         else:
