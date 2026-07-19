@@ -21,7 +21,7 @@ import pytest
 from scipy.interpolate import CubicSpline
 from PyQt6 import QtWidgets
 
-from picasso import gaussmle, gausslq, io, localize
+from picasso import gaussmle, gausslq, io, localize, spline
 from picasso.gui import localize as localize_gui
 
 from tests.conftest import BOX, CALIB_3D, CAMERA_INFO, MIN_NG, PIXELSIZE
@@ -3465,6 +3465,201 @@ class TestSplineRatiometric:
             localize.fit_spline_multichannel_ratiometric(
                 [movie, movie], [cam, cam], ids, box, calib
             )
+
+
+# ---------------------------------------------------------------------------
+# Split-FOV multichannel: regions of ONE movie treated as channels
+# ---------------------------------------------------------------------------
+
+
+def _split_fov_bead_movie(dx=2, dy=-1, n_frames=21):
+    """One movie whose left/right 48x48 halves are two channels: the right
+    half is the left (reference) half shifted within its region by ``(dx, dy)``.
+    Returns ``(movie, regions, bead_xy, focus)``."""
+    bead_xy = [(12, 14), (30, 28), (16, 33)]
+    s0 = 1.1
+    focus = n_frames // 2
+    yy, xx = np.mgrid[0:48, 0:48]
+    base = np.zeros((n_frames, 48, 48), dtype=np.float32)
+    for f in range(n_frames):
+        sigma = s0 * (1.0 + 0.07 * abs(f - focus))
+        img = np.full((48, 48), 100.0, dtype=np.float32)
+        for bx, by in bead_xy:
+            img += 3000.0 * np.exp(
+                -((xx - bx) ** 2 + (yy - by) ** 2) / (2 * sigma**2)
+            )
+        base[f] = img
+    base = base.astype(np.uint16)
+    movie = np.zeros((n_frames, 48, 96), dtype=np.uint16)
+    movie[:, :, :48] = base
+    movie[:, :, 48:] = np.roll(base, shift=(dy, dx), axis=(1, 2))
+    regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
+    return movie, regions, bead_xy, focus
+
+
+class TestSplitFovRegionAffines:
+    """Region-local <-> absolute channel-transform conversion (no GPU)."""
+
+    def test_decompose_compose_round_trip(self):
+        regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
+        t0 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        tc = [[1.0, 0.0, 50.0], [0.0, 1.0, -1.0]]  # 48 offset + (2, -1) fine
+        affines = localize.decompose_region_affines(regions, [t0, tc])
+        # region-local affine carries only the fine (2, -1) registration
+        np.testing.assert_allclose(
+            affines[0], [[1, 0, 0], [0, 1, 0]], atol=1e-9
+        )
+        np.testing.assert_allclose(
+            affines[1], [[1, 0, 2], [0, 1, -1]], atol=1e-9
+        )
+        back = localize.compose_region_transforms(regions, affines)
+        np.testing.assert_allclose(back[0], t0, atol=1e-9)
+        np.testing.assert_allclose(back[1], tc, atol=1e-9)
+
+    def test_replace_at_new_positions(self):
+        regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
+        tc = [[1.0, 0.0, 50.0], [0.0, 1.0, -1.0]]
+        affines = localize.decompose_region_affines(
+            regions, [[[1, 0, 0], [0, 1, 0]], tc]
+        )
+        # channels re-placed: reference at (10, 10), channel at (10, 200)
+        new = [[[10, 10], [58, 58]], [[10, 200], [58, 248]]]
+        t = localize.compose_region_transforms(new, affines)
+        # reference is identity at its new spot; channel = new offset + fine
+        np.testing.assert_allclose(t[0], [[1, 0, 0], [0, 1, 0]], atol=1e-9)
+        np.testing.assert_allclose(t[1], [[1, 0, 192], [0, 1, -1]], atol=1e-9)
+
+    def test_rotation_is_position_independent(self):
+        # a small rotation in the linear part survives re-placement unchanged
+        th = np.deg2rad(3.0)
+        L = [[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]]
+        regions = [[[0, 0], [40, 40]], [[0, 50], [40, 90]]]
+        tc = [[L[0][0], L[0][1], 55.0], [L[1][0], L[1][1], 2.0]]
+        affines = localize.decompose_region_affines(
+            regions, [[[1, 0, 0], [0, 1, 0]], tc]
+        )
+        new = [[[5, 5], [45, 45]], [[5, 300], [45, 340]]]
+        t = localize.compose_region_transforms(new, affines)
+        # linear (rotation) part is unchanged by moving the regions
+        np.testing.assert_allclose(np.asarray(t[1])[:, :2], L, atol=1e-9)
+
+
+class TestFitSplineSplitFovValidation:
+    """Argument validation that needs no GPU."""
+
+    def test_requires_split_fov_calibration(self):
+        calib = {"model": "spline-3d-multichannel"}  # no split_fov flag
+        movie = np.zeros((1, 16, 32), np.float32)
+        ids = pd.DataFrame(
+            {"frame": [0], "x": [6], "y": [6], "net_gradient": [1.0]}
+        )
+        with pytest.raises(ValueError, match="split-FOV"):
+            localize.fit_spline_split_fov(movie, CAMERA_INFO, ids, BOX, calib)
+
+
+@pytest.mark.skipif(
+    not (localize.GPUFIT_INSTALLED and localize.GPUSPLINE_INSTALLED),
+    reason="Gpufit (CUDA GPU) + Gpuspline not available",
+)
+class TestFitSplineSplitFov:
+    """End-to-end split-FOV fit on a single movie built + calibrated from the
+    same beads (model matches, so the fit recovers the bead positions)."""
+
+    def _movie_and_calib(self):
+        dx, dy = 2, -1
+        movie, regions, bead_xy, focus = _split_fov_bead_movie(dx, dy)
+        info = [{"Frames": int(movie.shape[0])}]
+        calib = spline.calibrate_spline_split_fov(
+            movie,
+            info=info,
+            camera_info=CAMERA_INFO,
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            regions=regions,
+        )
+        return movie, calib, bead_xy, focus
+
+    def test_fit_returns_locs_in_reference_region(self):
+        movie, calib, bead_xy, focus = self._movie_and_calib()
+        # detect the reference-region beads on the in-focus frames
+        ids, _ = localize.identify(
+            movie,
+            2000.0,
+            BOX,
+            roi=calib["regions"][0],
+            frame_bounds=(focus - 1, focus + 1),
+        )
+        locs = localize.fit_spline_split_fov(
+            movie, CAMERA_INFO, ids, BOX, calib
+        )
+        assert len(locs) > 0
+        # localizations are in the reference region's coordinates
+        assert np.all(locs["x"] >= 0) and np.all(locs["x"] < 48)
+        assert np.all(locs["y"] >= 0) and np.all(locs["y"] < 48)
+        # each fitted spot sits near one of the three reference beads
+        true_x = np.array([b[0] for b in bead_xy])
+        true_y = np.array([b[1] for b in bead_xy])
+        for x, y in zip(locs["x"], locs["y"]):
+            d = np.hypot(true_x - x, true_y - y)
+            assert d.min() < 2.0
+
+    def test_confines_identifications_to_reference_region(self):
+        movie, calib, bead_xy, focus = self._movie_and_calib()
+        # identify over the WHOLE frame -> detections in both halves
+        ids, _ = localize.identify(
+            movie, 2000.0, BOX, frame_bounds=(focus, focus)
+        )
+        assert (ids["x"] >= 48).any()  # some detections are in region 1
+        locs = localize.fit_spline_split_fov(
+            movie, CAMERA_INFO, ids, BOX, calib, confine_to_reference=True
+        )
+        # only the reference-region molecules are fitted (region 1 is the
+        # mapped partner, not an independent detection)
+        assert len(locs) > 0
+        assert np.all(locs["x"] < 48)
+
+    def test_fit_at_repositioned_regions(self):
+        """ROI-agnostic: the same calibration fits data whose split sits at a
+        different position, when the fit-time ROIs are supplied."""
+        movie, calib, bead_xy, focus = self._movie_and_calib()
+        assert "channel_affines" in calib  # ROI-agnostic registration stored
+        # embed the identical split (same inter-channel geometry) at a global
+        # offset in a larger frame
+        oy, ox = 20, 60
+        n, h, w = movie.shape
+        big = np.zeros((n, h + oy + 10, w + ox + 10), dtype=movie.dtype)
+        big[:, oy : oy + h, ox : ox + w] = movie
+        ref_region = [[oy, ox], [oy + 48, ox + 48]]
+        chan_region = [[oy, ox + 48], [oy + 48, ox + 96]]
+        fit_regions = [ref_region, chan_region]
+
+        ids, _ = localize.identify(
+            big,
+            2000.0,
+            BOX,
+            roi=ref_region,
+            frame_bounds=(focus - 1, focus + 1),
+        )
+        locs = localize.fit_spline_split_fov(
+            big, CAMERA_INFO, ids, BOX, calib, regions=fit_regions
+        )
+        assert len(locs) > 0
+        # localizations land near the shifted reference beads
+        tx = np.array([ox + b[0] for b in bead_xy])
+        ty = np.array([oy + b[1] for b in bead_xy])
+        for x, y in zip(locs["x"], locs["y"]):
+            assert np.hypot(tx - x, ty - y).min() < 2.0
+
+        # control: without fit-time regions, the calibration's original
+        # positions no longer match the data -> nothing in the reference region
+        ids_all, _ = localize.identify(
+            big, 2000.0, BOX, frame_bounds=(focus, focus)
+        )
+        locs_orig = localize.fit_spline_split_fov(
+            big, CAMERA_INFO, ids_all, BOX, calib
+        )
+        assert len(locs_orig) < len(locs)
 
 
 # ---------------------------------------------------------------------------

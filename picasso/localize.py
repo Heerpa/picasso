@@ -3604,6 +3604,65 @@ def apply_affine_transform(
     return xy @ transform[:, :2].T + transform[:, 2]
 
 
+def _region_origin_xy(
+    rect: tuple[tuple[int, int], tuple[int, int]] | list,
+) -> np.ndarray:
+    """``(x, y)`` top-left origin of a ``[[y_a, x_a], [y_b, x_b]]`` rectangle."""
+    (ya, xa), (yb, xb) = rect
+    return np.array([float(min(xa, xb)), float(min(ya, yb))], dtype=np.float64)
+
+
+def decompose_region_affines(
+    region_rects: list, transforms: list
+) -> list[np.ndarray]:
+    """Region-local channel affines from absolute channel transforms (split-FOV).
+
+    Each absolute ``transform`` maps reference-channel **absolute** chip
+    coordinates to channel-``c`` **absolute** coordinates. This strips out the
+    region placement and returns the affine ``A_c`` that maps
+    reference-**region-local** coordinates (relative to the reference region's
+    top-left) to channel-``c``-region-local coordinates - the *inter-channel*
+    registration, independent of where the regions sit on the chip (identity for
+    a perfectly aligned, same-orientation split; ``A_0`` is the identity).
+
+    This is the ROI-agnostic form stored in the calibration: the coarse region
+    offset lives in the ROI positions (chosen at fit time), while ``A_c`` carries
+    only the fine sub-pixel/rotation/scale registration. Inverse of
+    :func:`compose_region_transforms`.
+    """
+    o0 = _region_origin_xy(region_rects[0])
+    affines = []
+    for rect, transform in zip(region_rects, transforms):
+        t = np.asarray(transform, dtype=np.float64)
+        linear, offset = t[:, :2], t[:, 2]
+        oc = _region_origin_xy(rect)
+        local_t = offset - oc + linear @ o0
+        affines.append(np.hstack([linear, local_t[:, None]]))
+    return affines
+
+
+def compose_region_transforms(
+    region_rects: list, affines: list
+) -> list[np.ndarray]:
+    """Absolute channel transforms from region-local affines + region positions.
+
+    Inverse of :func:`decompose_region_affines`: given the region rectangles in
+    use (e.g. re-drawn at fit time) and the stored region-local ``affines``,
+    rebuild the absolute reference->channel transforms placed at those regions.
+    Only the region *origins* enter, so fit-time regions may differ in size from
+    the calibration ones - the placement follows their top-left corners.
+    """
+    o0 = _region_origin_xy(region_rects[0])
+    transforms = []
+    for rect, affine in zip(region_rects, affines):
+        a = np.asarray(affine, dtype=np.float64)
+        linear, local_t = a[:, :2], a[:, 2]
+        oc = _region_origin_xy(rect)
+        offset = oc - linear @ o0 + local_t
+        transforms.append(np.hstack([linear, offset[:, None]]))
+    return transforms
+
+
 def get_spots_multichannel(
     movies: list,
     identifications: pd.DataFrame,
@@ -3985,6 +4044,166 @@ def fit_spline_multichannel_ratiometric(
     if len(locs):
         locs.sort_values(by="frame", kind="quicksort", inplace=True)
     return locs
+
+
+def _split_fov_channel_affines(calibration: dict) -> list | None:
+    """Region-local channel affines for a split-FOV calibration.
+
+    Uses the stored ``channel_affines`` when present; otherwise (older
+    calibrations) derives them from the stored absolute ``channel_transforms``
+    and default ``regions`` so those calibrations can also be re-placed at
+    fit time. Returns None if neither is available."""
+    affines = calibration.get("channel_affines")
+    if affines is not None:
+        return [np.asarray(a, dtype=np.float64) for a in affines]
+    regions = calibration.get("regions")
+    transforms = calibration.get("channel_transforms")
+    if regions and transforms:
+        return decompose_region_affines(regions, transforms)
+    return None
+
+
+def fit_spline_split_fov(
+    movie,
+    camera_info: dict,
+    identifications: pd.DataFrame,
+    box: int,
+    calibration: dict,
+    regions: list | None = None,
+    photon_ratios: lib.FloatArray2D | None = None,
+    mle: bool = False,
+    confine_to_reference: bool = True,
+    n_phase_starts: int = 6,
+    progress_callback: Callable[[int], None] | None = None,
+) -> pd.DataFrame:
+    """Fit a split-FOV multichannel spline PSF from a *single* movie whose
+    rectangular sub-regions are the channels.
+
+    The calibration (built by :func:`picasso.spline.calibrate_spline_split_fov`)
+    stores the *inter-channel* registration as region-local ``channel_affines``
+    (see :func:`decompose_region_affines`), independent of where the channels sit
+    on the chip. This function repeats the one ``movie``/``camera_info`` once per
+    channel and delegates to the standard multichannel fitters. The model is
+    chosen exactly as in the GUI ``MultichannelSplineFitWorker``: phase (model
+    12) if the calibration is a phase calibration, ratiometric if photon ratios
+    are present, otherwise the plain linked fit.
+
+    Parameters
+    ----------
+    movie, camera_info
+        The single loaded movie and its camera info dict.
+    identifications : pd.DataFrame
+        Detections; when ``confine_to_reference`` is True (default) they are
+        filtered to the reference region so each molecule yields one spot that is
+        mapped into the other regions via the transforms.
+    regions : list, optional
+        The channel ROIs *for this data* (one ``[[y_min, x_min], [y_max,
+        x_max]]`` per channel, reference first), e.g. re-drawn in the GUI. When
+        given, the absolute channel transforms are rebuilt at these positions via
+        the stored region-local affines - so the same calibration can be applied
+        to data whose split sits at a different position. When omitted, the
+        calibration's own ``regions`` (the calibration-time positions) are used.
+    photon_ratios : optional
+        Candidate per-channel ratios for the ratiometric path (else taken from
+        the calibration).
+
+    Remaining parameters are as in the underlying multichannel fitters. The
+    localizations are in the reference region's coordinates.
+    """
+    if not calibration.get("split_fov"):
+        raise ValueError(
+            "fit_spline_split_fov requires a split-FOV calibration (built with "
+            "spline.calibrate_spline_split_fov / a 'regions' argument)."
+        )
+    calib_regions = calibration.get("regions")
+    if not calib_regions:
+        raise ValueError("Split-FOV calibration is missing 'regions'.")
+    n_channels = len(calib_regions)
+
+    # channels are placed at the fit-time ROIs when given, else at the
+    # calibration positions; the inter-channel affine is the same either way.
+    if regions is not None:
+        if len(regions) != n_channels:
+            raise ValueError(
+                f"Got {len(regions)} regions but the calibration has "
+                f"{n_channels} channels; draw one ROI per channel "
+                "(reference first)."
+            )
+        fit_regions = [_normalize_rect(r) for r in regions]
+        reference = 0  # fit-time ROIs are drawn reference-first
+        affines = _split_fov_channel_affines(calibration)
+        if affines is None:
+            raise ValueError(
+                "Calibration has no channel_affines to re-place at the given "
+                "regions."
+            )
+        transforms = compose_region_transforms(fit_regions, affines)
+    else:
+        fit_regions = [_normalize_rect(r) for r in calib_regions]
+        reference = int(calibration.get("reference", 0))
+        transforms = [
+            np.asarray(t, dtype=np.float64)
+            for t in calibration["channel_transforms"]
+        ]
+    if len(transforms) != n_channels:
+        raise ValueError(
+            f"Calibration has {n_channels} channels but {len(transforms)} "
+            "channel transforms."
+        )
+
+    ids = identifications
+    if confine_to_reference:
+        (y0, x0), (y1, x1) = fit_regions[reference]
+        x = np.asarray(ids["x"], dtype=np.float64)
+        y = np.asarray(ids["y"], dtype=np.float64)
+        inside = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
+        ids = ids.iloc[np.flatnonzero(inside)].reset_index(drop=True)
+
+    # downstream fitters read channel_transforms off the calibration; hand them
+    # the transforms placed at the regions actually in use
+    calibration = dict(calibration)
+    calibration["channel_transforms"] = [
+        np.asarray(t, dtype=np.float64) for t in transforms
+    ]
+
+    movies = [movie] * n_channels
+    camera_infos = [camera_info] * n_channels
+
+    model = calibration.get("model")
+    if model == "spline-3d-phase-multichannel":
+        return fit_spline_phase_multichannel(
+            movies,
+            camera_infos,
+            ids,
+            box,
+            calibration,
+            mle=mle,
+            n_phase_starts=n_phase_starts,
+            progress_callback=progress_callback,
+        )
+    if (
+        photon_ratios is not None
+        or calibration.get("photon_ratios") is not None
+    ):
+        return fit_spline_multichannel_ratiometric(
+            movies,
+            camera_infos,
+            ids,
+            box,
+            calibration,
+            photon_ratios=photon_ratios,
+            mle=mle,
+            progress_callback=progress_callback,
+        )
+    return fit_spline_multichannel(
+        movies,
+        camera_infos,
+        ids,
+        box,
+        calibration,
+        mle=mle,
+        progress_callback=progress_callback,
+    )
 
 
 def _fit2d_gaussmle(

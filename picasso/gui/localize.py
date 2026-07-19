@@ -300,11 +300,98 @@ class View(QtWidgets.QGraphicsView):
         self.rubberband = RubberBand(self)
         self.rois = []
         self.selected_roi = None
+        # Split-FOV region mode: ROIs are equal-size rectangular channels of one
+        # movie. The first region drawn fixes the size (derived live from the
+        # existing regions, so clearing them frees the size again); further
+        # regions snap to it, and an existing region can be dragged (moved) to
+        # fine-tune its registration. Toggled by ``window.set_split_fov_mode``.
+        self.split_fov_mode = False
+        self._moving_roi = None  # index of the region being dragged
+        self._move_anchor = None  # (scene_dy, scene_dx) press offset in region
+
+    def _frame_shape(self) -> tuple[int, int] | None:
+        """(`height`, `width`) of the current movie frame, or None."""
+        movie = getattr(self.window, "movie", None)
+        if movie is None:
+            return None
+        return int(movie.shape[1]), int(movie.shape[2])
+
+    def _region_size(self) -> tuple[int, int] | None:
+        """Shared (`height`, `width`) of the split-FOV regions, taken from the
+        first (reference) region, or None when there are no regions yet.
+
+        Derived live rather than stored so that removing every region - by any
+        means (double-click, the ROI field, the numeric dialog) - frees the
+        size again and the next drawn region can define a new one."""
+        if not self.rois:
+            return None
+        (y_min, x_min), (y_max, x_max) = self.rois[0]
+        return (y_max - y_min, x_max - x_min)
+
+    def _roi_at(self, px: float, py: float) -> int | None:
+        """Index of the smallest region containing scene point (px, py)."""
+        containing = [
+            i
+            for i, ((y_min, x_min), (y_max, x_max)) in enumerate(self.rois)
+            if y_min <= py <= y_max and x_min <= px <= x_max
+        ]
+        if not containing:
+            return None
+        return min(
+            containing,
+            key=lambda i: (
+                (self.rois[i][1][0] - self.rois[i][0][0])
+                * (self.rois[i][1][1] - self.rois[i][0][1])
+            ),
+        )
+
+    def _add_region(self, y0: int, x0: int) -> None:
+        """Append a region of the established size with top-left (y0, x0),
+        clamped inside the frame; selects it. No clipping (channels may abut).
+        """
+        size = self._region_size()
+        if size is None:
+            return
+        h, w = size
+        shape = self._frame_shape()
+        if shape is not None:
+            fh, fw = shape
+            y0 = int(min(max(0, y0), max(0, fh - h)))
+            x0 = int(min(max(0, x0), max(0, fw - w)))
+        self.rois.append([[int(y0), int(x0)], [int(y0 + h), int(x0 + w)]])
+        self.selected_roi = len(self.rois) - 1
+        self.window.parameters_dialog.update_roi_display()
+
+    def _move_region(self, idx: int, y0: int, x0: int) -> None:
+        """Translate region ``idx`` so its top-left is (y0, x0), clamped."""
+        (y_min, x_min), (y_max, x_max) = self.rois[idx]
+        h, w = y_max - y_min, x_max - x_min
+        shape = self._frame_shape()
+        if shape is not None:
+            fh, fw = shape
+            y0 = int(min(max(0, y0), max(0, fh - h)))
+            x0 = int(min(max(0, x0), max(0, fw - w)))
+        self.rois[idx] = [[int(y0), int(x0)], [int(y0 + h), int(x0 + w)]]
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         """Start either a rubber band for selecting a ROI or panning the
         view."""
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            if self.split_fov_mode:
+                scene_pos = self.mapToScene(event.pos())
+                idx = self._roi_at(scene_pos.x(), scene_pos.y())
+                if idx is not None:
+                    # begin moving an existing region
+                    self._moving_roi = idx
+                    self.selected_roi = idx
+                    (y_min, x_min), _ = self.rois[idx]
+                    self._move_anchor = (
+                        scene_pos.y() - y_min,
+                        scene_pos.x() - x_min,
+                    )
+                    self.window.parameters_dialog.update_roi_display()
+                    self.window.draw_frame()
+                    return
             self.roi_origin = QtCore.QPoint(event.pos())
             self.rubberband.setGeometry(
                 QtCore.QRect(self.roi_origin, QtCore.QSize())
@@ -321,6 +408,20 @@ class View(QtWidgets.QGraphicsView):
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         """Update the rubber band or pan the view."""
+        if (
+            self.split_fov_mode
+            and self._moving_roi is not None
+            and event.buttons() == QtCore.Qt.MouseButton.LeftButton
+        ):
+            scene_pos = self.mapToScene(event.pos())
+            dy, dx = self._move_anchor
+            self._move_region(
+                self._moving_roi,
+                int(round(scene_pos.y() - dy)),
+                int(round(scene_pos.x() - dx)),
+            )
+            self.window.draw_frame()
+            return
         if event.buttons() == QtCore.Qt.MouseButton.LeftButton:
             self.rubberband.setGeometry(
                 QtCore.QRect(self.roi_origin, event.pos())
@@ -343,10 +444,21 @@ class View(QtWidgets.QGraphicsView):
         """Add the dragged ROI (clipping against existing ones) or stop
         panning the view."""
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            if self.split_fov_mode and self._moving_roi is not None:
+                # finished dragging an existing region
+                self._moving_roi = None
+                self._move_anchor = None
+                self.window.parameters_dialog.update_roi_display()
+                self.window.draw_frame()
+                return
             self.roi_end = QtCore.QPoint(event.pos())
             self.rubberband.hide()
             dx = abs(self.roi_end.x() - self.roi_origin.x())
             dy = abs(self.roi_end.y() - self.roi_origin.y())
+            if self.split_fov_mode:
+                self._release_split_fov_region(dx, dy)
+                self.window.draw_frame()
+                return
             if dx >= 10 and dy >= 10:
                 roi_points = (
                     self.mapToScene(self.roi_origin),
@@ -366,6 +478,56 @@ class View(QtWidgets.QGraphicsView):
         else:
             event.ignore()
 
+    def _release_split_fov_region(self, dx: int, dy: int) -> None:
+        """Finish a left-drag/click in split-FOV mode: the first region (a real
+        drag) fixes the shared size; later releases drop a same-size region
+        centred on the release point."""
+        self.rubberband.hide()
+        origin = self.mapToScene(self.roi_origin)
+        end = self.mapToScene(self.roi_end)
+        size = self._region_size()
+        if size is None:
+            # no regions yet: this drag defines the shared size (a real drag)
+            if dx < 10 or dy < 10:
+                return
+            y0, y1 = sorted((int(origin.y()), int(end.y())))
+            x0, x1 = sorted((int(origin.x()), int(end.x())))
+            self.rois.append([[y0, x0], [y1, x1]])
+            self.selected_roi = len(self.rois) - 1
+            self.window.parameters_dialog.update_roi_display()
+        else:
+            h, w = size
+            cy = (origin.y() + end.y()) / 2.0
+            cx = (origin.x() + end.x()) / 2.0
+            self._add_region(
+                int(round(cy - h / 2.0)), int(round(cx - w / 2.0))
+            )
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        """Arrow keys nudge the selected split-FOV region by 1 px for
+        pixel-precise channel registration."""
+        deltas = {
+            QtCore.Qt.Key.Key_Left: (0, -1),
+            QtCore.Qt.Key.Key_Right: (0, 1),
+            QtCore.Qt.Key.Key_Up: (-1, 0),
+            QtCore.Qt.Key.Key_Down: (1, 0),
+        }
+        if (
+            self.split_fov_mode
+            and self.selected_roi is not None
+            and self.selected_roi < len(self.rois)
+            and event.key() in deltas
+        ):
+            idx = self.selected_roi
+            (y0, x0), _ = self.rois[idx]
+            ddy, ddx = deltas[event.key()]
+            self._move_region(idx, y0 + ddy, x0 + ddx)
+            self.window.parameters_dialog.update_roi_display()
+            self.window.draw_frame()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
         """Remove the ROI under the cursor on a (left) double click. If
         several ROIs contain the point, the smallest one is removed."""
@@ -373,24 +535,14 @@ class View(QtWidgets.QGraphicsView):
             event.ignore()
             return
         scene_pos = self.mapToScene(event.pos())
-        px, py = scene_pos.x(), scene_pos.y()
-        containing = [
-            i
-            for i, ((y_min, x_min), (y_max, x_max)) in enumerate(self.rois)
-            if y_min <= py <= y_max and x_min <= px <= x_max
-        ]
-        if not containing:
+        idx = self._roi_at(scene_pos.x(), scene_pos.y())
+        if idx is None:
             event.ignore()
             return
-        idx = min(
-            containing,
-            key=lambda i: (
-                (self.rois[i][1][0] - self.rois[i][0][0])
-                * (self.rois[i][1][1] - self.rois[i][0][1])
-            ),
-        )
         del self.rois[idx]
         self.selected_roi = None
+        # In split-FOV mode the shared size is derived from the remaining
+        # regions (see ``_region_size``), so removing all of them frees it.
         self.window.parameters_dialog.update_roi_display()
         self.window.draw_frame()
         event.accept()
@@ -1490,6 +1642,20 @@ class ParametersDialog(lib.Dialog):
         roi_label_layout.addWidget(lib.HelpButton(self.ROI_URL))
         roi_label_layout.addWidget(label)
         roi_label_layout.addStretch(1)
+        # Split-FOV: treat the drawn ROIs as separate channels of one movie.
+        self.split_fov_checkbox = QtWidgets.QCheckBox("Regions = channels")
+        self.split_fov_checkbox.setToolTip(
+            "Split-FOV mode: treat the drawn ROIs as separate channels imaged\n"
+            "side-by-side on one camera (spectral / biplane / 4Pi split\n"
+            "optics). The first region is the reference channel and all\n"
+            "regions are kept the same size: drag once to set the size, click\n"
+            "to drop more regions, drag a region (or use the arrow keys) to\n"
+            "fine-tune its registration. 'Calibrate spline PSF' and the\n"
+            "spline fit then use these regions as channels of this movie."
+        )
+        self.split_fov_checkbox.setTristate(False)
+        self.split_fov_checkbox.stateChanged.connect(self.on_split_fov_changed)
+        roi_label_layout.addWidget(self.split_fov_checkbox)
         identification_grid.addLayout(roi_label_layout, 5, 0)
 
         self._updating_roi_field = False
@@ -2012,6 +2178,10 @@ class ParametersDialog(lib.Dialog):
         if not skip_dialog and self.roi_dialog is not None:
             self.roi_dialog.update_table()
 
+    def on_split_fov_changed(self) -> None:
+        """Toggle split-FOV region mode (ROIs become channels of one movie)."""
+        self.window.set_split_fov_mode(self.split_fov_checkbox.isChecked())
+
     def on_roi_field_changed(self) -> None:
         """Clear the ROIs when the user empties the field."""
         if self._updating_roi_field or self.roi_field.isReadOnly():
@@ -2205,6 +2375,26 @@ class ParametersDialog(lib.Dialog):
             )
             self.spline_calib_label.setText(os.path.basename(path))
             self.spline_calib_label.setToolTip(path)
+            # split-FOV: drop the calibration's channel regions into the view
+            # and enter split-FOV mode, so the registration can be inspected and
+            # fine-tuned on this data (arrow-key nudge / drag) and re-drawn if
+            # the split moved. The fit then uses whatever regions are shown.
+            if self.spline_calibration.get("split_fov"):
+                regions = self.spline_calibration.get("regions") or []
+                self.window.view.rois = [
+                    [
+                        [int(r[0][0]), int(r[0][1])],
+                        [int(r[1][0]), int(r[1][1])],
+                    ]
+                    for r in regions
+                ]
+                self.window.view.selected_roi = None
+                self.split_fov_checkbox.blockSignals(True)
+                self.split_fov_checkbox.setChecked(True)
+                self.split_fov_checkbox.blockSignals(False)
+                self.window.set_split_fov_mode(True)
+                self.update_roi_display()
+                self.window.draw_frame()
         else:
             self.spline_calibration = {}
             self.spline_calibration_path = None
@@ -3017,6 +3207,29 @@ class Window(QtWidgets.QMainWindow):
         calibrate_spline_action = threed_menu.addAction("Calibrate spline PSF")
         calibrate_spline_action.triggered.connect(self.calibrate_spline)
 
+        refine_reg_action = threed_menu.addAction(
+            "Refine split-FOV registration (current data)"
+        )
+        refine_reg_action.setToolTip(
+            "Quickly correct a small (few-pixel) split-FOV misregistration on "
+            "the loaded data by cross-correlating the reference region against "
+            "each channel region (no beads needed). Uses the drawn ROIs when "
+            "shown, else the calibration's regions; updates only the "
+            "registration."
+        )
+        refine_reg_action.triggered.connect(self.refine_split_fov_registration)
+
+        reregister_action = threed_menu.addAction(
+            "Re-register split-FOV channels (bead sample)"
+        )
+        reregister_action.setToolTip(
+            "Re-fit the inter-channel affine of a loaded split-FOV spline "
+            "calibration on a loaded bead/fiducial movie (a full, bead-based "
+            "re-registration, e.g. if the alignment drifted since "
+            "calibration). The PSF templates are kept."
+        )
+        reregister_action.triggered.connect(self.reregister_split_fov)
+
         self.plugin_menu = menu_bar.addMenu("Plugins")  # do not delete
 
     def open_config_location(self) -> None:
@@ -3071,9 +3284,31 @@ class Window(QtWidgets.QMainWindow):
         # astigmatic 3D calibration); the calibration is built afterwards.
         self.identify(calibrate_spline=True)
 
+    def set_split_fov_mode(self, enabled: bool) -> None:
+        """Enable/disable split-FOV region mode, where the drawn ROIs are the
+        channels of one movie. The shared region size is derived live from the
+        existing regions (see ``View._region_size``); enabling the mode only
+        gives the view keyboard focus for arrow-key nudging."""
+        self.view.split_fov_mode = bool(enabled)
+        if enabled:
+            self.view.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self.draw_frame()
+
     def build_spline_calibration(self) -> None:
         """Prompt for the spline PSF calibration parameters and build the
         calibration from the loaded bead z-stack in a background thread."""
+        split_fov = self.view.split_fov_mode
+        regions = list(self.view.rois) if split_fov else None
+        if split_fov and len(regions) < 2:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Spline PSF Calibration",
+                "Split-FOV mode is on: draw at least 2 equal-size regions "
+                "(channels) before calibrating. The first region is the "
+                "reference channel.",
+            )
+            return
+
         specs = CalibrateSplineDialog.getCalibrationSpecs(self)
         (
             step,
@@ -3112,6 +3347,7 @@ class Window(QtWidgets.QMainWindow):
             magnification_factor=magnification_factor,
             correct_z_bias=correct_z_bias,
             roi=self.view.rois,
+            regions=regions,
             path=path,
         )
         self.spline_calibration_worker.finished.connect(
@@ -3967,20 +4203,37 @@ class Window(QtWidgets.QMainWindow):
             self.scene.setSceneRect(QtCore.QRectF(pixmap.rect()))
             self.view.setScene(self.scene)
             # draw the ROI rectangles (in scene/pixel coordinates)
+            split_fov = self.view.split_fov_mode
             for i, ((y_min, x_min), (y_max, x_max)) in enumerate(
                 self.view.rois
             ):
-                color = (
-                    QtGui.QColor("cyan")
-                    if i == self.view.selected_roi
-                    else QtGui.QColor("blue")
-                )
+                if i == self.view.selected_roi:
+                    color = QtGui.QColor("cyan")
+                elif split_fov:
+                    # split-FOV: highlight the reference channel (index 0)
+                    color = (
+                        QtGui.QColor("lime")
+                        if i == 0
+                        else QtGui.QColor("orange")
+                    )
+                else:
+                    color = QtGui.QColor("blue")
                 pen = QtGui.QPen(color)
                 pen.setCosmetic(True)  # constant width regardless of zoom
                 self.scene.addRect(
                     QtCore.QRectF(x_min, y_min, x_max - x_min, y_max - y_min),
                     pen,
                 )
+                if split_fov:
+                    # label each region by its channel index (0 = reference)
+                    text = self.scene.addSimpleText(
+                        "ref" if i == 0 else f"ch{i}"
+                    )
+                    text.setBrush(QtGui.QBrush(color))
+                    text.setPos(float(x_min), float(y_min))
+                    text.setFlag(
+                        QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations
+                    )
             if self.ready_for_fit:
                 identifications_frame = self.identifications[
                     self.identifications.frame == self.curr_frame_number
@@ -4375,6 +4628,9 @@ class Window(QtWidgets.QMainWindow):
         simultaneously. The first loaded channel is the reference; its
         identifications are mapped into every channel via the calibration's
         stored transforms."""
+        if calibration.get("split_fov"):
+            self._start_split_fov_spline_fit(calibration, method)
+            return
         n_channels = int(calibration.get("n_channels", 0))
         if len(self.channels) < n_channels:
             QtWidgets.QMessageBox.warning(
@@ -4418,6 +4674,248 @@ class Window(QtWidgets.QMainWindow):
         self._active_worker = self.fit_worker
         self.abort_action.setEnabled(True)
         self.fit_worker.start()
+
+    def _start_split_fov_spline_fit(
+        self, calibration: dict, method: str
+    ) -> None:
+        """Fit a split-FOV multichannel spline PSF from the single loaded movie.
+        The channels are placed at the drawn ROIs when they match the
+        calibration's channel count (so a moved split can be re-registered by
+        re-drawing), otherwise at the calibration's stored regions. The
+        reference region's identifications are mapped into every region via the
+        stored inter-channel affine (see ``localize.fit_spline_split_fov``)."""
+        if self.identifications is None or len(self.identifications) == 0:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Split-FOV spline fit",
+                "Identify spots first (they are confined to the reference "
+                "region automatically).",
+            )
+            self.status_bar.showMessage("")
+            return
+        n_channels = int(calibration.get("n_channels", 0))
+        # use the drawn ROIs to place the channels when they match the channel
+        # count (reference first); else fall back to the calibration positions
+        regions = None
+        if self.view.split_fov_mode and len(self.view.rois) == n_channels:
+            regions = [list(map(list, r)) for r in self.view.rois]
+        # guard: warn if no identification falls in the reference region (a
+        # moved/rescaled split or wrong ROIs would otherwise fit nothing)
+        ref_rect = (regions or calibration.get("regions"))[
+            0 if regions else int(calibration.get("reference", 0))
+        ]
+        (ry0, rx0), (ry1, rx1) = ref_rect
+        rx = np.asarray(self.identifications["x"], dtype=float)
+        ry = np.asarray(self.identifications["y"], dtype=float)
+        n_in = int(
+            np.count_nonzero(
+                (rx >= min(rx0, rx1))
+                & (rx < max(rx0, rx1))
+                & (ry >= min(ry0, ry1))
+                & (ry < max(ry0, ry1))
+            )
+        )
+        if n_in == 0:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Split-FOV spline fit",
+                f"{len(self.identifications)} spots were identified but none "
+                "fall inside the reference region, so there is nothing to fit. "
+                "The reference region is probably in the wrong place for this "
+                "data: enable 'Regions = channels' and drag the ROIs onto the "
+                "channels (reference first), or run Calibration > Refine "
+                "split-FOV registration.",
+            )
+            self.status_bar.showMessage("")
+            return
+        self.fit_worker = MultichannelSplineFitWorker(
+            [self.movie],
+            [self.camera_info],
+            self.identifications,
+            self.parameters["Box Size"],
+            calibration,
+            mle=method == "spline-mle-gpu",
+            split_fov=True,
+            regions=regions,
+        )
+        self.fit_worker.progressMade.connect(self.on_fit_progress)
+        self.fit_worker.finished.connect(self.on_fit_finished)
+        self.fit_worker.aborted.connect(self.on_worker_aborted)
+        self._active_worker = self.fit_worker
+        self.abort_action.setEnabled(True)
+        self.fit_worker.start()
+
+    def refine_split_fov_registration(self) -> None:
+        """Correct a small split-FOV misregistration on the loaded data by
+        cross-correlation (no beads). Uses the drawn ROIs when shown, else the
+        calibration's regions; updates only the registration in the loaded
+        calibration."""
+        calibration = self.parameters_dialog.spline_calibration
+        if self.movie is None:
+            QtWidgets.QMessageBox.information(
+                self, "Refine split-FOV registration", "No movie loaded."
+            )
+            return
+        if not (calibration and calibration.get("split_fov")):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Refine split-FOV registration",
+                "Load a split-FOV spline calibration first.",
+            )
+            return
+        n_channels = int(calibration.get("n_channels", 0))
+        if self.view.split_fov_mode and len(self.view.rois) == n_channels:
+            regions = [list(map(list, r)) for r in self.view.rois]
+        else:
+            regions = None
+        self.status_bar.showMessage("Refining split-FOV registration ...")
+        QtWidgets.QApplication.setOverrideCursor(
+            QtCore.Qt.CursorShape.WaitCursor
+        )
+        try:
+            _, refinements = spline.refine_split_fov_registration(
+                self.movie,
+                calibration,
+                regions=regions,
+                box=self.parameters["Box Size"],
+            )
+        except Exception as e:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.status_bar.showMessage("")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Refine split-FOV registration",
+                f"Refinement failed: {e}",
+            )
+            return
+        QtWidgets.QApplication.restoreOverrideCursor()
+        self.status_bar.showMessage("")
+        # reflect the (possibly re-placed) regions in the view
+        regions_now = calibration.get("regions") or []
+        self.view.rois = [
+            [[int(r[0][0]), int(r[0][1])], [int(r[1][0]), int(r[1][1])]]
+            for r in regions_now
+        ]
+        self.parameters_dialog.update_roi_display()
+        self.draw_frame()
+        rows = []
+        for r in refinements:
+            dx, dy = r["shift"]
+            note = "" if r["applied"] else "  (weak correlation - skipped)"
+            rows.append(
+                f"ch{r['channel']}: shift ({dx:+.1f}, {dy:+.1f}) px{note}"
+            )
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Refine split-FOV registration",
+            "Registration refined from the current data:\n\n"
+            + "\n".join(rows)
+            + "\n\nThe loaded calibration is updated. Save it to a file?",
+            QtWidgets.QMessageBox.StandardButton.Save
+            | QtWidgets.QMessageBox.StandardButton.Close,
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Save:
+            base = os.path.splitext(
+                self.parameters_dialog.spline_calibration_path or ""
+            )[0]
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Save refined spline calibration",
+                (base or "") + "_refined.hdf5",
+                filter="*.hdf5",
+            )
+            if path:
+                io.save_spline_calibration(path, calibration)
+                self.parameters_dialog.spline_calibration_path = path
+                self.status_bar.showMessage(
+                    f"Saved refined calibration to {path}", 5000
+                )
+
+    def reregister_split_fov(self) -> None:
+        """Re-estimate the inter-channel affine of a loaded split-FOV spline
+        calibration on the current bead movie (globLoc-style re-registration for
+        a drifted / different-day alignment), keeping the PSF templates."""
+        calibration = self.parameters_dialog.spline_calibration
+        if self.movie is None:
+            QtWidgets.QMessageBox.information(
+                self, "Re-register split-FOV", "No movie loaded."
+            )
+            return
+        if not (calibration and calibration.get("split_fov")):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Re-register split-FOV",
+                "Load a split-FOV spline calibration first "
+                "(Experimental PSF (spline) > Load calibration).",
+            )
+            return
+        n_channels = int(calibration.get("n_channels", 0))
+        if self.view.split_fov_mode and len(self.view.rois) == n_channels:
+            regions = [list(map(list, r)) for r in self.view.rois]
+        else:
+            regions = calibration.get("regions")
+        parameters = self.parameters
+        self.status_bar.showMessage("Re-registering split-FOV channels ...")
+        QtWidgets.QApplication.setOverrideCursor(
+            QtCore.Qt.CursorShape.WaitCursor
+        )
+        try:
+            _, reg_info = spline.reestimate_split_fov_transforms(
+                self.movie,
+                calibration,
+                regions,
+                minimum_ng=parameters["Min. Net Gradient"],
+                box=parameters["Box Size"],
+                frame_bounds=self.frame_range,
+            )
+        except Exception as e:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.status_bar.showMessage("")
+            QtWidgets.QMessageBox.critical(
+                self, "Re-register split-FOV", f"Re-registration failed: {e}"
+            )
+            return
+        QtWidgets.QApplication.restoreOverrideCursor()
+        self.status_bar.showMessage("")
+        # per-channel residual RMS summary (camera px)
+        rows = []
+        for r in reg_info:
+            ref = np.asarray(r["ref_xy"], dtype=float)
+            cxy = np.asarray(r["c_xy"], dtype=float)
+            M = np.asarray(r["transform"], dtype=float)
+            resid = cxy - (ref @ M[:, :2].T + M[:, 2])
+            rms = float(np.sqrt(np.mean(np.sum(resid**2, axis=1))))
+            rows.append(
+                f"ch{r['channel']}: {r['n_matches']} beads, "
+                f"RMS {rms:.2f} px"
+            )
+        summary = "\n".join(rows)
+        # offer to save the updated calibration
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Re-register split-FOV",
+            "Channels re-registered on the current data:\n\n"
+            f"{summary}\n\nThe loaded calibration is updated. Save it to a "
+            "file?",
+            QtWidgets.QMessageBox.StandardButton.Save
+            | QtWidgets.QMessageBox.StandardButton.Close,
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Save:
+            base = os.path.splitext(
+                self.parameters_dialog.spline_calibration_path or ""
+            )[0]
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Save re-registered spline calibration",
+                (base or "") + "_reregistered.hdf5",
+                filter="*.hdf5",
+            )
+            if path:
+                io.save_spline_calibration(path, calibration)
+                self.parameters_dialog.spline_calibration_path = path
+                self.status_bar.showMessage(
+                    f"Saved re-registered calibration to {path}", 5000
+                )
 
     def fit_z(self) -> None:
         """Fit z coordinates of the fitted localizations based on the
@@ -5068,6 +5566,8 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         box: int,
         calibration: dict,
         mle: bool = False,
+        split_fov: bool = False,
+        regions: list | None = None,
     ) -> None:
         super().__init__()
         self.movies = movies
@@ -5076,6 +5576,12 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         self.box = box
         self.calibration = calibration
         self.mle = mle
+        # Split-FOV: ``movies``/``camera_infos`` hold a single entry (one loaded
+        # movie); the channels are regions of that movie, handled by
+        # ``fit_spline_split_fov`` (which confines to the reference region).
+        # ``regions`` (optional) places the channels at the current ROIs.
+        self.split_fov = split_fov
+        self.regions = regions
         self.N = len(identifications)
 
     def on_progress(self, n_done: int) -> None:
@@ -5084,7 +5590,20 @@ class MultichannelSplineFitWorker(QtCore.QThread):
     def run(self) -> None:
         t0 = time.time()
         try:
-            if self.calibration.get("model") == "spline-3d-phase-multichannel":
+            if self.split_fov:
+                locs = localize.fit_spline_split_fov(
+                    self.movies[0],
+                    self.camera_infos[0],
+                    self.identifications,
+                    self.box,
+                    self.calibration,
+                    regions=self.regions,
+                    mle=self.mle,
+                    progress_callback=self.on_progress,
+                )
+            elif (
+                self.calibration.get("model") == "spline-3d-phase-multichannel"
+            ):
                 # 4Pi phase model: joint fit over the interference channels
                 # with a phase multi-start; localizations carry z and phase.
                 locs = localize.fit_spline_phase_multichannel(
@@ -5204,6 +5723,7 @@ class SplineCalibrationWorker(QtCore.QThread):
         magnification_factor: float = 0.79,
         correct_z_bias: bool = False,
         roi=None,
+        regions=None,
     ) -> None:
         super().__init__()
         self.movie = movie
@@ -5219,26 +5739,46 @@ class SplineCalibrationWorker(QtCore.QThread):
         self.magnification_factor = magnification_factor
         self.correct_z_bias = correct_z_bias
         self.roi = roi
+        # When set (>= 2 rectangles), the ROIs are treated as channels of one
+        # movie (split-FOV) and a multichannel calibration is built instead.
+        self.regions = regions
         self.path = path
 
     def run(self) -> None:
         try:
-            calibration = spline.calibrate_spline(
-                self.movie,
-                info=self.info,
-                camera_info=self.camera_info,
-                box=self.box,
-                minimum_ng=self.minimum_ng,
-                d=self.step,
-                frames_per_step=self.frames_per_step,
-                frame_bounds=self.frame_bounds,
-                frame_order=self.frame_order,
-                model=self.model,
-                magnification_factor=self.magnification_factor,
-                correct_z_bias=self.correct_z_bias,
-                roi=self.roi,
-                path=self.path,
-            )
+            if self.regions:
+                calibration = spline.calibrate_spline_split_fov(
+                    self.movie,
+                    info=self.info,
+                    camera_info=self.camera_info,
+                    box=self.box,
+                    minimum_ng=self.minimum_ng,
+                    d=self.step,
+                    regions=self.regions,
+                    frames_per_step=self.frames_per_step,
+                    frame_bounds=self.frame_bounds,
+                    frame_order=self.frame_order,
+                    magnification_factor=self.magnification_factor,
+                    correct_z_bias=self.correct_z_bias,
+                    path=self.path,
+                )
+            else:
+                calibration = spline.calibrate_spline(
+                    self.movie,
+                    info=self.info,
+                    camera_info=self.camera_info,
+                    box=self.box,
+                    minimum_ng=self.minimum_ng,
+                    d=self.step,
+                    frames_per_step=self.frames_per_step,
+                    frame_bounds=self.frame_bounds,
+                    frame_order=self.frame_order,
+                    model=self.model,
+                    magnification_factor=self.magnification_factor,
+                    correct_z_bias=self.correct_z_bias,
+                    roi=self.roi,
+                    path=self.path,
+                )
         except Exception as e:  # surface any failure to the GUI
             self.failed.emit(str(e))
             return

@@ -1370,7 +1370,56 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
         base, _ = splitext(files[0])
         out_path = base + "_spline_calib.hdf5"
 
-    if len(files) == 1:
+    # optional candidate per-channel photon ratios for ratiometric color
+    # assignment: "0.7,0.3;0.4,0.6" -> [[0.7, 0.3], [0.4, 0.6]]
+    def _parse_photon_ratios():
+        if getattr(args, "photon_ratios", None):
+            ratios = [
+                [float(v) for v in row.split(",")]
+                for row in args.photon_ratios.split(";")
+                if row.strip()
+            ]
+            print(f"  ratiometric: {len(ratios)} candidate ratios")
+            return ratios
+        return None
+
+    split_fov = getattr(args, "split_fov", None)
+    if split_fov and len(files) == 1:
+        # single movie; several rectangular FOV regions are the channels.
+        # "y0,x0,y1,x1;y0,x0,y1,x1;..." -> [[[y0,x0],[y1,x1]], ...]
+        regions = []
+        for row in split_fov.split(";"):
+            if not row.strip():
+                continue
+            v = [int(t) for t in row.split(",")]
+            if len(v) != 4:
+                raise ValueError(
+                    "Each --split-fov region needs 4 ints y0,x0,y1,x1; got "
+                    f"'{row}'."
+                )
+            regions.append([[v[0], v[1]], [v[2], v[3]]])
+        print(
+            f"Split-FOV calibration from {len(regions)} regions of one movie"
+        )
+        movie, info = load_movie(files[0])
+        calibration = spline.calibrate_spline_split_fov(
+            movie,
+            info=info,
+            camera_info=camera_info,
+            box=args.box_side_length,
+            minimum_ng=args.gradient,
+            d=args.step,
+            regions=regions,
+            reference=getattr(args, "reference", 0) or 0,
+            frames_per_step=args.frames_per_step,
+            frame_order=args.frame_order,
+            magnification_factor=args.magnification_factor,
+            correct_z_bias=args.correct_z_bias,
+            photon_ratios=_parse_photon_ratios(),
+            path=out_path,
+            progress_callback=lambda i: print(f"  step {i}/3"),
+        )
+    elif len(files) == 1:
         movie, info = load_movie(files[0])
         calibration = spline.calibrate_spline(
             movie,
@@ -1395,16 +1444,6 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
             movies.append(movie)
             infos.append(info)
             camera_infos.append(dict(camera_info))
-        # optional candidate per-channel photon ratios for ratiometric color
-        # assignment: "0.7,0.3;0.4,0.6" -> [[0.7, 0.3], [0.4, 0.6]]
-        photon_ratios = None
-        if getattr(args, "photon_ratios", None):
-            photon_ratios = [
-                [float(v) for v in row.split(",")]
-                for row in args.photon_ratios.split(";")
-                if row.strip()
-            ]
-            print(f"  ratiometric: {len(photon_ratios)} candidate ratios")
         calibration = spline.calibrate_spline_multichannel(
             movies,
             infos=infos,
@@ -1416,7 +1455,7 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
             frame_order=args.frame_order,
             magnification_factor=args.magnification_factor,
             correct_z_bias=args.correct_z_bias,
-            photon_ratios=photon_ratios,
+            photon_ratios=_parse_photon_ratios(),
             path=out_path,
             progress_callback=lambda i: print(f"  step {i}/3"),
         )
@@ -2822,6 +2861,26 @@ def main():  # noqa: C901
             "matter; stored in the calibration for "
             "fit_spline_multichannel_ratiometric"
         ),
+    )
+    spline_calib_parser.add_argument(
+        "-sf",
+        "--split-fov",
+        type=str,
+        default="",
+        help=(
+            "single-movie multichannel: treat rectangular field-of-view "
+            "regions of ONE movie as the channels. Regions separated by ';' "
+            "and given as 'y0,x0,y1,x1' (all the same size); the first (or "
+            "--reference) region is the reference channel. e.g. "
+            "'0,0,512,256;0,256,512,512'"
+        ),
+    )
+    spline_calib_parser.add_argument(
+        "-rf",
+        "--reference",
+        type=int,
+        default=0,
+        help="split-fov only: index of the reference region (default 0)",
     )
     spline_calib_parser.add_argument(
         "-bl", "--baseline", type=float, default=0, help="camera baseline"

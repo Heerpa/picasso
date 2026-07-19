@@ -7,6 +7,8 @@ CPU library) and is gated on ``localize.GPUSPLINE_INSTALLED``.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 
@@ -335,6 +337,261 @@ class TestCalibrateSplineMultichannel:
         # channel 1 focus offset ~ delta_steps * d (within ~1 step)
         np.testing.assert_allclose(
             offsets[1], delta_steps * d_nm, atol=1.5 * d_nm
+        )
+
+
+def _synthetic_split_fov_movie(dx=2, dy=-1):
+    """A single movie whose left and right 48x48 halves are two channels.
+
+    The right half (region 1) is the left half (region 0, reference) shifted
+    within its region by ``(dx, dy)`` pixels, so the ref->region-1 affine is a
+    pure translation ``[[1, 0, 48 + dx], [0, 1, dy]]`` in absolute chip
+    coordinates. Returns ``(movie, regions, bead_xy)`` where ``bead_xy`` are the
+    reference-region bead centers.
+    """
+    base, bead_xy, _focus = _synthetic_bead_movie(h=48, w=48)
+    n = base.shape[0]
+    movie = np.zeros((n, 48, 96), dtype=np.uint16)
+    movie[:, :, :48] = base
+    # small shift stays well inside the region, so np.roll wrap-around is moot
+    movie[:, :, 48:] = np.roll(base, shift=(dy, dx), axis=(1, 2))
+    regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
+    return movie, regions, bead_xy
+
+
+class TestSplitFovTransform:
+    """Region-aware channel-transform estimation (no Gpuspline needed)."""
+
+    def test_estimate_region_transform_recovers_shift(self):
+        dx, dy = 2, -1
+        movie, regions, _ = _synthetic_split_fov_movie(dx, dy)
+
+        step_of_frame, _, step_range = spline._step_of_frame(
+            movie.shape[0], 20.0, 1, "fov", None
+        )
+        ref_bounds = spline._reference_frame_bounds(step_of_frame, step_range)
+        mid = (ref_bounds[0] + ref_bounds[1]) // 2
+        ref_roi = spline._normalized_region(regions[0])
+        chan_roi = spline._normalized_region(regions[1])
+        beads_ref = spline._detect_bead_positions(
+            movie, 2000.0, BOX, ref_bounds, roi=ref_roi
+        )
+        # coarse shift = (x0_ref - x0_c, y0_ref - y0_c) = (0 - 48, 0 - 0)
+        transform, n_matches = spline._estimate_channel_transform(
+            movie,
+            movie,
+            beads_ref,
+            2000.0,
+            BOX,
+            ref_bounds,
+            mid,
+            max_distance=float(BOX),
+            channel_roi=chan_roi,
+            coarse_shift=(-48.0, 0.0),
+        )
+        assert n_matches >= 3
+        # ref (x, y) -> region-1 (x + 48 + dx, y + dy)
+        np.testing.assert_allclose(
+            transform,
+            np.array([[1.0, 0.0, 48 + dx], [0.0, 1.0, dy]]),
+            atol=0.6,
+        )
+
+
+@pytest.mark.skipif(
+    not localize.GPUSPLINE_INSTALLED, reason="Gpuspline not available"
+)
+class TestCalibrateSplitFov:
+    """Full split-FOV calibration from one movie with two FOV regions."""
+
+    def test_stores_metadata_and_region_transform(self, tmp_path):
+        from picasso import io
+
+        dx, dy = 2, -1
+        movie, regions, _ = _synthetic_split_fov_movie(dx, dy)
+        info = [{"Frames": int(movie.shape[0])}]
+        path = str(tmp_path / "splitfov_spline_calib.hdf5")
+        calib = spline.calibrate_spline_split_fov(
+            movie,
+            info=info,
+            camera_info=CAMERA_INFO,
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            regions=regions,
+            path=path,
+        )
+        assert calib["model"] == "spline-3d-multichannel"
+        assert calib["n_channels"] == 2
+        assert calib["split_fov"] is True
+        assert calib["reference"] == 0
+        assert len(calib["regions"]) == 2
+        # region-1 transform is the known translation (absolute coords)
+        np.testing.assert_allclose(
+            calib["channel_transforms"][1],
+            [[1.0, 0.0, 48 + dx], [0.0, 1.0, dy]],
+            atol=0.6,
+        )
+        assert calib["coefficients"].shape[-1] == 2
+        # split-FOV metadata survives the HDF5 round-trip
+        loaded = io.load_spline_calibration(path)
+        assert loaded["split_fov"] is True
+        assert len(loaded["regions"]) == 2
+
+    def test_reference_index_is_reordered_first(self, tmp_path):
+        dx, dy = 2, -1
+        movie, regions, _ = _synthetic_split_fov_movie(dx, dy)
+        info = [{"Frames": int(movie.shape[0])}]
+        # pick region 1 as the reference; it must become channel 0 (identity)
+        calib = spline.calibrate_spline_split_fov(
+            movie,
+            info=info,
+            camera_info=CAMERA_INFO,
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            regions=regions,
+            reference=1,
+        )
+        # reference region stored first, transform now maps region-1 -> region-0
+        assert calib["regions"][0] == [[0, 48], [48, 96]]
+        np.testing.assert_allclose(
+            calib["channel_transforms"][1],
+            [[1.0, 0.0, -(48 + dx)], [0.0, 1.0, -dy]],
+            atol=0.7,
+        )
+
+    def test_saves_per_channel_and_registration_diagnostics(self, tmp_path):
+        movie, regions, _ = _synthetic_split_fov_movie(2, -1)
+        info = [{"Frames": int(movie.shape[0])}]
+        path = tmp_path / "splitfov_spline_calib.hdf5"
+        spline.calibrate_spline_split_fov(
+            movie,
+            info=info,
+            camera_info=CAMERA_INFO,
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            regions=regions,
+            path=str(path),
+        )
+        base = str(tmp_path / "splitfov_spline_calib")
+        # one PSF diagnostic per channel + one registration diagnostic
+        assert os.path.exists(base + "_ch0.png")
+        assert os.path.exists(base + "_ch1.png")
+        assert os.path.exists(base + "_registration.png")
+        assert os.path.getsize(base + "_registration.png") > 5000
+
+    def test_unequal_region_sizes_raise(self):
+        movie, regions, _ = _synthetic_split_fov_movie()
+        regions = [[[0, 0], [48, 48]], [[0, 48], [40, 90]]]  # different size
+        info = [{"Frames": int(movie.shape[0])}]
+        with pytest.raises(ValueError, match="same size"):
+            spline.calibrate_spline_split_fov(
+                movie,
+                info=info,
+                camera_info=CAMERA_INFO,
+                box=BOX,
+                minimum_ng=2000.0,
+                d=20.0,
+                regions=regions,
+            )
+
+
+class TestReestimateSplitFovTransforms:
+    """Re-estimating the inter-channel affine on new data (globLoc different-day
+    re-registration). Uses bead detection + affine fit only - no Gpuspline."""
+
+    def test_recovers_new_fine_registration(self):
+        # data whose split has a DIFFERENT fine registration (3, 1) than a
+        # stale calibration; re-estimation must recover it region-locally
+        movie, regions, _ = _synthetic_split_fov_movie(dx=3, dy=1)
+        calib = {
+            "split_fov": True,
+            "n_channels": 2,
+            "box": BOX,
+            "n_data": [BOX, BOX, 1],
+            "z_step_nm": 20.0,
+            # stale registration (wrong fine part) that should be overwritten
+            "regions": [[[0, 0], [48, 48]], [[0, 48], [48, 96]]],
+            "channel_affines": [
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            ],
+            "channel_transforms": [
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                [[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]],
+            ],
+        }
+        updated, reg_info = spline.reestimate_split_fov_transforms(
+            movie, calib, regions, minimum_ng=2000.0, box=BOX
+        )
+        assert reg_info[0]["n_matches"] >= 3
+        # region-local affine now carries the true (3, 1) fine registration
+        np.testing.assert_allclose(
+            updated["channel_affines"][1],
+            [[1.0, 0.0, 3.0], [0.0, 1.0, 1.0]],
+            atol=0.6,
+        )
+        # and the absolute transform is the 48-px region offset + (3, 1)
+        np.testing.assert_allclose(
+            updated["channel_transforms"][1],
+            [[1.0, 0.0, 51.0], [0.0, 1.0, 1.0]],
+            atol=0.6,
+        )
+
+
+class TestRefineSplitFovRegistration:
+    """Cross-correlation refinement of a drifted split-FOV registration from the
+    data itself (no beads, no GPU)."""
+
+    def _shifted_blob_movie(self, sx, sy):
+        from scipy.ndimage import shift as ndi_shift
+
+        yy, xx = np.mgrid[0:48, 0:48]
+        ref = np.full((48, 48), 100.0)
+        for bx, by in [(12, 14), (30, 28), (16, 33), (22, 20), (35, 10)]:
+            ref += 4000 * np.exp(
+                -((xx - bx) ** 2 + (yy - by) ** 2) / (2 * 1.4**2)
+            )
+        chan = ndi_shift(ref - 100.0, shift=(sy, sx), order=1) + 100.0
+        frame = np.zeros((48, 96))
+        frame[:, :48] = ref
+        frame[:, 48:] = chan
+        return np.stack([frame.astype(np.uint16)] * 3)
+
+    def test_recovers_residual_shift(self):
+        sx, sy = 3, -2
+        movie = self._shifted_blob_movie(sx, sy)
+        calib = {
+            "split_fov": True,
+            "n_channels": 2,
+            "regions": [[[0, 0], [48, 48]], [[0, 48], [48, 96]]],
+            # stale: no fine offset recorded
+            "channel_affines": [
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            ],
+            "channel_transforms": [
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                [[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]],
+            ],
+        }
+        _, refinements = spline.refine_split_fov_registration(
+            movie, calib, box=5
+        )
+        assert refinements[0]["applied"]
+        np.testing.assert_allclose(refinements[0]["shift"], (sx, sy), atol=0.3)
+        # region-local affine + absolute transform updated with the drift
+        np.testing.assert_allclose(
+            calib["channel_affines"][1],
+            [[1.0, 0.0, sx], [0.0, 1.0, sy]],
+            atol=0.3,
+        )
+        np.testing.assert_allclose(
+            calib["channel_transforms"][1],
+            [[1.0, 0.0, 48 + sx], [0.0, 1.0, sy]],
+            atol=0.3,
         )
 
 
