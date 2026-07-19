@@ -4340,7 +4340,10 @@ class Window(QtWidgets.QMainWindow):
             # A 3D spline fit recovers z directly, so the separate
             # astigmatism z-fitting step must not run.
             fit_z = False
-            if spline_calibration.get("model") == "spline-3d-multichannel":
+            if spline_calibration.get("model") in (
+                "spline-3d-multichannel",
+                "spline-3d-phase-multichannel",
+            ):
                 self._start_multichannel_spline_fit(spline_calibration, method)
                 return
         self.fit_worker = FitWorker(
@@ -4395,7 +4398,12 @@ class Window(QtWidgets.QMainWindow):
             self.status_bar.showMessage("")
             return
         movies = [self.channels[c].movie for c in range(n_channels)]
-        camera_infos = [self.camera_info for _ in range(n_channels)]
+        # Use each channel's own camera info when available (needed for correct
+        # per-channel photon conversion); fall back to the shared one.
+        camera_infos = [
+            getattr(self.channels[c], "camera_info", None) or self.camera_info
+            for c in range(n_channels)
+        ]
         self.fit_worker = MultichannelSplineFitWorker(
             movies,
             camera_infos,
@@ -5076,15 +5084,41 @@ class MultichannelSplineFitWorker(QtCore.QThread):
     def run(self) -> None:
         t0 = time.time()
         try:
-            locs = localize.fit_spline_multichannel(
-                self.movies,
-                self.camera_infos,
-                self.identifications,
-                self.box,
-                self.calibration,
-                mle=self.mle,
-                progress_callback=self.on_progress,
-            )
+            if self.calibration.get("model") == "spline-3d-phase-multichannel":
+                # 4Pi phase model: joint fit over the interference channels
+                # with a phase multi-start; localizations carry z and phase.
+                locs = localize.fit_spline_phase_multichannel(
+                    self.movies,
+                    self.camera_infos,
+                    self.identifications,
+                    self.box,
+                    self.calibration,
+                    mle=self.mle,
+                    progress_callback=self.on_progress,
+                )
+            elif self.calibration.get("photon_ratios") is not None:
+                # Ratiometric color assignment: the calibration carries
+                # candidate per-channel photon ratios (one per dye/color). Each
+                # localization is assigned the max-likelihood ratio as `color`.
+                locs = localize.fit_spline_multichannel_ratiometric(
+                    self.movies,
+                    self.camera_infos,
+                    self.identifications,
+                    self.box,
+                    self.calibration,
+                    mle=self.mle,
+                    progress_callback=self.on_progress,
+                )
+            else:
+                locs = localize.fit_spline_multichannel(
+                    self.movies,
+                    self.camera_infos,
+                    self.identifications,
+                    self.box,
+                    self.calibration,
+                    mle=self.mle,
+                    progress_callback=self.on_progress,
+                )
         except Exception as e:
             print(f"Multichannel spline fit failed: {e}")
             self.aborted.emit()

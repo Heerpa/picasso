@@ -1395,6 +1395,16 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
             movies.append(movie)
             infos.append(info)
             camera_infos.append(dict(camera_info))
+        # optional candidate per-channel photon ratios for ratiometric color
+        # assignment: "0.7,0.3;0.4,0.6" -> [[0.7, 0.3], [0.4, 0.6]]
+        photon_ratios = None
+        if getattr(args, "photon_ratios", None):
+            photon_ratios = [
+                [float(v) for v in row.split(",")]
+                for row in args.photon_ratios.split(";")
+                if row.strip()
+            ]
+            print(f"  ratiometric: {len(photon_ratios)} candidate ratios")
         calibration = spline.calibrate_spline_multichannel(
             movies,
             infos=infos,
@@ -1406,6 +1416,7 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
             frame_order=args.frame_order,
             magnification_factor=args.magnification_factor,
             correct_z_bias=args.correct_z_bias,
+            photon_ratios=photon_ratios,
             path=out_path,
             progress_callback=lambda i: print(f"  step {i}/3"),
         )
@@ -2797,6 +2808,19 @@ def main():  # noqa: C901
         help=(
             "define z = 0 at the axial intensity peak of the averaged PSF "
             "(astigmatism); corrects a potential z bias in the stage scan"
+        ),
+    )
+    spline_calib_parser.add_argument(
+        "-pr",
+        "--photon-ratios",
+        type=str,
+        default="",
+        help=(
+            "multichannel only: candidate per-channel photon ratios for "
+            "ratiometric color assignment, hypotheses separated by ';' and "
+            "channels by ',' (e.g. '0.7,0.3;0.4,0.6'). Only relative values "
+            "matter; stored in the calibration for "
+            "fit_spline_multichannel_ratiometric"
         ),
     )
     spline_calib_parser.add_argument(

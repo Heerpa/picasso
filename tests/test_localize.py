@@ -3243,3 +3243,721 @@ class TestSaveableColumns:
         assert "angle_unc" in [
             c for c in frames["gpufit-mle-rotated"].columns if c in saveable
         ]
+
+
+# ---------------------------------------------------------------------------
+# Ratiometric multichannel spline fitting (globLoc-style color assignment)
+# ---------------------------------------------------------------------------
+
+
+def _stack_multichannel(
+    calib1, n_channels=2, photon_scale=None, transforms=None
+):
+    """Turn a single-channel 3D spline calibration into a multichannel one by
+    replicating its (real, fit-grade) coefficient block across channels."""
+    identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    calib = dict(calib1)
+    calib["model"] = "spline-3d-multichannel"
+    calib["coefficients"] = np.repeat(
+        np.asarray(calib1["coefficients"])[..., None], n_channels, axis=-1
+    ).astype(np.float32)
+    calib["n_channels"] = n_channels
+    calib["channel_transforms"] = transforms or [identity] * n_channels
+    if photon_scale is not None:
+        calib["photon_scale"] = photon_scale
+    return calib
+
+
+class TestScaleChannelBlocks:
+    """Pure-Python coefficient scaling / photon_scale helpers (no GPU)."""
+
+    def test_scales_each_channel(self):
+        coeff = np.arange(64 * 2 * 2 * 3 * 2, dtype=np.float32).reshape(
+            64, 2, 2, 3, 2
+        )
+        scaled = localize.scale_channel_blocks(coeff, [0.25, 4.0])
+        np.testing.assert_allclose(scaled[..., 0], coeff[..., 0] * 0.25)
+        np.testing.assert_allclose(scaled[..., 1], coeff[..., 1] * 4.0)
+
+    def test_input_not_modified(self):
+        coeff = np.ones((64, 2, 2, 3, 2), dtype=np.float32)
+        before = coeff.copy()
+        localize.scale_channel_blocks(coeff, [2.0, 3.0])
+        np.testing.assert_array_equal(coeff, before)
+
+    def test_ratio_length_mismatch(self):
+        coeff = np.ones((64, 2, 2, 3, 2), dtype=np.float32)
+        with pytest.raises(ValueError):
+            localize.scale_channel_blocks(coeff, [1.0, 2.0, 3.0])
+
+    def test_requires_multichannel_table(self):
+        with pytest.raises(ValueError):
+            localize.scale_channel_blocks(
+                np.ones((64, 2, 2, 3), np.float32), [1.0]
+            )
+
+    def test_photon_scales_scalar_broadcast(self):
+        ps = localize._photon_scales({"photon_scale": 2.5}, 3)
+        np.testing.assert_array_equal(ps, [2.5, 2.5, 2.5])
+
+    def test_photon_scales_array_passthrough(self):
+        ps = localize._photon_scales({"photon_scale": [1.0, 2.0, 3.0]}, 3)
+        np.testing.assert_array_equal(ps, [1.0, 2.0, 3.0])
+
+
+class TestSplinePerChannelPhotonScale:
+    """locs_from_fits_spline maps the shared amplitude to TOTAL photons when
+    photon_scale is a per-channel array (sum). CPU-only (numba CRLB)."""
+
+    def test_total_photons_sum_per_channel(self):
+        calib, _ = _gauss_spline_calibration(
+            model="spline-3d-multichannel",
+            n_channels=2,
+            photon_scale=[2.0, 3.0],
+        )
+        box = calib["n_data"][0]  # box == cal box -> crop is a no-op
+        amp = 100.0
+        theta = np.array(
+            [[amp, 0.0, 0.0, -calib["z_center"], 5.0]], np.float64
+        )
+        ids = pd.DataFrame(
+            {
+                "frame": [0],
+                "x": [box // 2],
+                "y": [box // 2],
+                "net_gradient": [1.0],
+            }
+        )
+        locs = localize.locs_from_fits_spline(
+            ids, theta, box, em=False, calibration=calib, mle=False
+        )
+        # photons = amplitude * (2 + 3)
+        np.testing.assert_allclose(
+            locs["photons"].iloc[0], amp * 5.0, rtol=1e-4
+        )
+
+
+@pytest.mark.skipif(
+    not (localize.GPUFIT_INSTALLED and localize.GPUSPLINE_INSTALLED),
+    reason="Gpufit (CUDA GPU) + Gpuspline not available",
+)
+class TestSplineRatiometric:
+    """End-to-end ratiometric color assignment on a real (Gpuspline) PSF,
+    stacked into two identical channels. The two channels differ only by a
+    known photon split; the fitter must recover it as the winning ratio."""
+
+    CANDS = np.array([[0.9, 0.1], [0.75, 0.25], [0.5, 0.5], [0.25, 0.75]])
+    TRUE_IDX = 1  # [0.75, 0.25]
+
+    def _calib_and_base(self):
+        calib1, template, _, _ = _synthetic_spline_3d_calibration()
+        z_slice = int(calib1["z_center"])
+        base = template[:, :, z_slice].astype(np.float32)
+        calib = _stack_multichannel(calib1, 2, photon_scale=[1.0, 1.0])
+        return calib, base
+
+    def test_core_selection_recovers_true_ratio(self):
+        calib, base = self._calib_and_base()
+        box = calib["n_data"][0]
+        r_true = self.CANDS[self.TRUE_IDX]
+        rng = np.random.default_rng(0)
+        n = 150
+        spots = np.empty((n, box, box, 2), np.float32)
+        for c in range(2):
+            mu = np.clip(20.0 + 3000.0 * r_true[c] * base, 0, None)
+            spots[..., c] = rng.poisson(mu, size=(n, box, box)).astype(
+                np.float32
+            )
+        rn = self.CANDS / self.CANDS.sum(1, keepdims=True)
+        scores = np.full((len(rn), n), np.inf)
+        for k, r in enumerate(rn):
+            ck = dict(calib)
+            ck["coefficients"] = localize.scale_channel_blocks(
+                calib["coefficients"], r
+            )
+            params, states, chi, *_ = localize._run_gpufit_spline(
+                spots, ck, mle=False
+            )
+            fin = np.isfinite(params).all(1) & np.isfinite(chi)
+            scores[k] = np.where(fin, chi, np.inf)
+        best = np.argmin(scores, axis=0)
+        assert (best == self.TRUE_IDX).mean() > 0.95
+
+    def test_entry_point_colors_and_photons(self):
+        calib, base = self._calib_and_base()
+        box = calib["n_data"][0]
+        cam = {"Baseline": 0, "Sensitivity": 1.0, "Gain": 1, "Qe": 1.0}
+        r_true = self.CANDS[self.TRUE_IDX]
+        rng = np.random.default_rng(1)
+        n = 80
+        movies = []
+        for c in range(2):
+            mu = np.clip(20.0 + 3000.0 * r_true[c] * base, 0, None)
+            mov = np.stack(
+                [rng.poisson(mu).astype(np.float32) for _ in range(n)]
+            )
+            movies.append(mov)
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(n),
+                "x": np.full(n, box // 2),
+                "y": np.full(n, box // 2),
+                "net_gradient": np.ones(n),
+            }
+        )
+        locs = localize.fit_spline_multichannel_ratiometric(
+            movies,
+            [cam, cam],
+            ids,
+            box,
+            calib,
+            photon_ratios=self.CANDS,
+        )
+        assert len(locs) == n
+        assert (locs["color"] == self.TRUE_IDX).mean() > 0.9
+        # per-channel photons track the 0.75/0.25 split; total ~= 3000
+        frac0 = locs["photons_ch0"].median() / (
+            locs["photons_ch0"].median() + locs["photons_ch1"].median()
+        )
+        assert abs(frac0 - 0.75) < 0.06
+        for col in ("z", "lpx", "lpy", "lpz", "photons_ch0", "photons_ch1"):
+            assert col in locs.columns
+
+    def test_ratios_from_calibration_when_omitted(self):
+        calib, base = self._calib_and_base()
+        calib["photon_ratios"] = self.CANDS.tolist()
+        box = calib["n_data"][0]
+        cam = {"Baseline": 0, "Sensitivity": 1.0, "Gain": 1, "Qe": 1.0}
+        r_true = self.CANDS[self.TRUE_IDX]
+        rng = np.random.default_rng(2)
+        n = 40
+        movies = []
+        for c in range(2):
+            mu = np.clip(20.0 + 3000.0 * r_true[c] * base, 0, None)
+            movies.append(
+                np.stack(
+                    [rng.poisson(mu).astype(np.float32) for _ in range(n)]
+                )
+            )
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(n),
+                "x": np.full(n, box // 2),
+                "y": np.full(n, box // 2),
+                "net_gradient": np.ones(n),
+            }
+        )
+        # no photon_ratios argument -> taken from the calibration
+        locs = localize.fit_spline_multichannel_ratiometric(
+            movies, [cam, cam], ids, box, calib
+        )
+        assert (locs["color"] == self.TRUE_IDX).mean() > 0.9
+
+    def test_missing_ratios_raises(self):
+        calib, _ = self._calib_and_base()
+        cam = {"Baseline": 0, "Sensitivity": 1.0, "Gain": 1}
+        ids = pd.DataFrame(
+            {"frame": [0], "x": [6], "y": [6], "net_gradient": [1.0]}
+        )
+        box = calib["n_data"][0]
+        movie = np.zeros((1, box, box), np.float32)
+        with pytest.raises(ValueError):
+            localize.fit_spline_multichannel_ratiometric(
+                [movie, movie], [cam, cam], ids, box, calib
+            )
+
+
+# ---------------------------------------------------------------------------
+# 4Pi phase model (Gpufit SPLINE_3D_PHASE_MULTICHANNEL = 12)
+# ---------------------------------------------------------------------------
+
+
+def _fake_phase_calibration(box=BOX, n_channels=2, nz=21):
+    """Structurally valid 4Pi phase calibration with arbitrary coefficients:
+    ``(64, nix, niy, niz, n_channels, 3)`` (the trailing 3 are the mean /
+    modulation / modulation-90deg spline sets). For layout/packing tests."""
+    nix = niy = box - 1
+    niz = nz - 1
+    coeff = np.arange(
+        64 * nix * niy * niz * n_channels * 3, dtype=np.float32
+    ).reshape(64, nix, niy, niz, n_channels, 3)
+    return {
+        "model": "spline-3d-phase-multichannel",
+        "coefficients": coeff,
+        "n_data": [box, box, nz],
+        "n_intervals": [nix, niy, niz],
+        "n_channels": n_channels,
+        "oversampling": 1.0,
+        "z_center": (nz - 1) / 2.0,
+        "z_step_nm": 20.0,
+        "photon_scale": 1.0,
+        "box": box,
+    }
+
+
+class TestSplinePhaseModelLayout:
+    """Pure (no-GPU) packing/parameter layout for model 12."""
+
+    def test_n_channels_from_second_to_last_axis(self):
+        assert (
+            localize._spline_n_channels(_fake_phase_calibration(n_channels=3))
+            == 3
+        )
+
+    def test_pack_user_info_three_sets(self):
+        nc = 2
+        calib = _fake_phase_calibration(n_channels=nc)
+        ui = localize._pack_spline_user_info(calib)
+        nx, ny, _ = calib["n_data"]
+        ix, iy, iz = calib["n_intervals"]
+        # same 7-value header as the (non-phase) multichannel model
+        np.testing.assert_array_equal(
+            ui[:7], np.array([nc, nx, ny, 1, ix, iy, iz], np.float32)
+        )
+        ni = ix * iy * iz
+        # coefficient block = 3 sets x nc channels x ni intervals x 64
+        assert ui.size == 7 + 3 * nc * ni * 64
+        # each of the 3 concatenated blocks is that set reordered exactly like
+        # the multichannel model (mean, modulation, modulation_90deg order)
+        block = ui[7:]
+        per_set = nc * ni * 64
+        for s in range(3):
+            expected = localize._reorder_spline_coefficients_for_gpufit(
+                np.ascontiguousarray(calib["coefficients"][..., s]),
+                "spline-3d-multichannel",
+            )
+            np.testing.assert_array_equal(
+                block[s * per_set : (s + 1) * per_set], expected
+            )
+
+    def test_initial_parameters_six_with_phase_zero(self):
+        calib = _fake_phase_calibration(n_channels=2)
+        spots = (
+            np.random.default_rng(0)
+            .random((5, BOX, BOX, 2))
+            .astype(np.float32)
+        )
+        init = localize._initial_parameters_spline(spots, calib)
+        assert init.shape == (5, 6)
+        np.testing.assert_allclose(init[:, 5], 0.0)  # phase starts at 0
+
+    def test_model_id_maps_to_twelve(self):
+        assert (
+            localize._spline_model_id("spline-3d-phase-multichannel")
+            == localize.gf.ModelID.SPLINE_3D_PHASE_MULTICHANNEL
+        )
+
+    def test_locs_conversion_offset_index_and_phase_column(self):
+        # minimal sane phase calib (flat mean, no modulation) so the CRLB stays
+        # finite; the point is the OUTPUT layout: offset is theta[:, 4] (not the
+        # last column), photons = amp*photon_scale, and a wrapped phase column.
+        box, nz = BOX, 21
+        coeff = np.zeros((64, box - 1, box - 1, nz - 1, 1, 3), np.float32)
+        coeff[0, :, :, :, :, 0] = 1.0  # constant mean spline, zero modulation
+        calib = {
+            "model": "spline-3d-phase-multichannel",
+            "coefficients": coeff,
+            "n_data": [box, box, nz],
+            "n_intervals": [box - 1, box - 1, nz - 1],
+            "n_channels": 1,
+            "oversampling": 1.0,
+            "z_center": 10.0,
+            "z_step_nm": 20.0,
+            "photon_scale": [1.0],
+            "box": box,
+        }
+        theta = np.zeros((2, 6), np.float32)
+        theta[:, 0] = 100.0  # amplitude
+        theta[:, 4] = 5.0  # offset (column 4, NOT the last)
+        theta[:, 5] = 1.3  # phase
+        ids = pd.DataFrame(
+            {
+                "frame": [0, 1],
+                "x": [6, 6],
+                "y": [6, 6],
+                "net_gradient": [1.0, 1.0],
+            }
+        )
+        locs = localize.locs_from_fits_spline(ids, theta, box, False, calib)
+        assert "phase" in locs.columns and "phase_unc" in locs.columns
+        np.testing.assert_allclose(locs["phase"].to_numpy(), 1.3, atol=1e-4)
+        np.testing.assert_allclose(locs["bg"].to_numpy(), 5.0, atol=1e-4)
+        np.testing.assert_allclose(
+            locs["photons"].to_numpy(), 100.0, rtol=1e-4
+        )
+
+
+def _phase_spline_calibration(
+    box=BOX, nz=41, n_channels=1, widths=(1.1, 1.9, 0.8)
+):
+    """4Pi phase calibration from three DISTINCT real Gpuspline sets (mean,
+    modulation, modulation_90deg). Returns (calibration, [coeff_sets])."""
+    gs = localize.gs
+    zc = (nz - 1) / 2.0
+
+    def stack(s0):
+        x = np.arange(box, dtype=np.float32)
+        c = (box - 1) / 2.0
+        t = np.zeros((box, box, nz), np.float32)
+        for k in range(nz):
+            s = s0 * (1.0 + 0.4 * abs(k - zc) / nz)
+            g = np.exp(-0.5 * ((x - c) / s) ** 2)
+            t[:, :, k] = np.outer(g, g)  # isotropic -> swap-invariant
+        return t
+
+    coeffs = []
+    for s0 in widths:
+        t = stack(s0)
+        ni = np.array(t.shape) - 1
+        coeffs.append(
+            np.reshape(gs.spline_coefficients(t), (64, ni[0], ni[1], ni[2]))
+        )
+    nix, niy, niz = coeffs[0].shape[1:]
+    per_set = [np.repeat(c[..., None], n_channels, axis=-1) for c in coeffs]
+    coeff_arr = np.stack(per_set, axis=-1).astype(np.float32)
+    calib = {
+        "model": "spline-3d-phase-multichannel",
+        "coefficients": coeff_arr,
+        "n_data": [box, box, nz],
+        "n_intervals": [int(nix), int(niy), int(niz)],
+        "n_channels": n_channels,
+        "oversampling": 1.0,
+        "z_center": zc,
+        "z_step_nm": 20.0,
+        "photon_scale": 1.0,
+        "box": box,
+    }
+    return calib, coeffs
+
+
+@pytest.mark.skipif(
+    not (localize.GPUFIT_INSTALLED and localize.GPUSPLINE_INSTALLED),
+    reason="Gpufit (CUDA GPU) + Gpuspline not available",
+)
+class TestSplinePhaseModelGpu:
+    """Model 12 wiring proof: with correctly packed 3-set coefficients, the
+    ground-truth parameters are a zero-residual fixed point of the compiled
+    Gpufit phase model (value = amp*(mean + cos p*mod + sin p*mod90) + off)."""
+
+    def test_truth_is_zero_residual_fixed_point(self):
+        calib, coeffs = _phase_spline_calibration(n_channels=1)
+        box = calib["n_data"][0]
+        z0 = calib["z_center"]
+        phis = [
+            localize._spline_model_and_grad(
+                c, box, np.array([0.0]), np.array([0.0]), np.array([float(z0)])
+            )[0][0]
+            for c in coeffs
+        ]
+        mean_phi, mod_phi, mod90_phi = phis
+        A, O, phase = 3000.0, 30.0, 0.7
+        img = (
+            A
+            * (mean_phi + np.cos(phase) * mod_phi + np.sin(phase) * mod90_phi)
+            + O
+        )
+        ui = localize._pack_spline_user_info(calib)
+        n = 8
+        data = np.tile(img.reshape(1, -1), (n, 1)).astype(np.float32)
+        truth = np.array([A, 0.0, 0.0, -z0, O, phase], np.float32)
+        init = np.tile(truth, (n, 1)).astype(np.float32)
+        params, states, chi, _, _ = localize.gf.fit(
+            data,
+            None,
+            localize.gf.ModelID.SPLINE_3D_PHASE_MULTICHANNEL,
+            init,
+            tolerance=1e-6,
+            max_number_iterations=30,
+            estimator_id=localize.gf.EstimatorID.LSE,
+            user_info=ui,
+        )
+        # truth-init on noise-free data must stay put with ~zero residual
+        np.testing.assert_allclose(params[0], truth, atol=1e-2, rtol=1e-3)
+        signal = float(np.abs(img - O).sum())
+        assert float(np.median(chi)) < 1e-2 * signal
+
+
+class TestMultichannelWorkerRouting:
+    """MultichannelSplineFitWorker routes to the ratiometric fitter iff the
+    calibration carries photon_ratios (no GPU; the fit fns are monkeypatched).
+    """
+
+    def _run(self, calibration, monkeypatch):
+        calls = []
+        df = pd.DataFrame({"frame": [0], "x": [0.0], "y": [0.0]})
+        monkeypatch.setattr(
+            localize,
+            "fit_spline_multichannel_ratiometric",
+            lambda *a, **k: (calls.append("ratio"), df)[1],
+        )
+        monkeypatch.setattr(
+            localize,
+            "fit_spline_multichannel",
+            lambda *a, **k: (calls.append("plain"), df)[1],
+        )
+        monkeypatch.setattr(
+            localize,
+            "fit_spline_phase_multichannel",
+            lambda *a, **k: (calls.append("phase"), df)[1],
+        )
+        ids = pd.DataFrame(
+            {"frame": [0], "x": [6], "y": [6], "net_gradient": [1.0]}
+        )
+        worker = localize_gui.MultichannelSplineFitWorker(
+            [None, None], [{}, {}], ids, BOX, calibration, mle=False
+        )
+        result = {}
+        worker.finished.connect(
+            lambda locs, dt, a, b: result.update(locs=locs)
+        )
+        worker.run()
+        return calls, result
+
+    def test_routes_to_ratiometric_with_ratios(self, monkeypatch):
+        calls, result = self._run(
+            {"model": "spline-3d-multichannel", "photon_ratios": [[0.7, 0.3]]},
+            monkeypatch,
+        )
+        assert calls == ["ratio"]
+        assert "locs" in result
+
+    def test_routes_to_plain_without_ratios(self, monkeypatch):
+        calls, _ = self._run({"model": "spline-3d-multichannel"}, monkeypatch)
+        assert calls == ["plain"]
+
+    def test_routes_to_phase_with_phase_model(self, monkeypatch):
+        calls, _ = self._run(
+            {"model": "spline-3d-phase-multichannel"}, monkeypatch
+        )
+        assert calls == ["phase"]
+
+
+# ---------------------------------------------------------------------------
+# 4Pi phase fitting: multi-start, CRLB, and the movie-level entry point
+# ---------------------------------------------------------------------------
+
+
+def _phase_4pi_calibration(box=BOX, nz=41, n_channels=4):
+    """Well-conditioned 4Pi phase calibration (needs Gpuspline): n_channels
+    phase channels at psi_c = c*2pi/n_channels, each with mean = env,
+    modulation = cos(psi_c)*env, modulation_90deg = sin(psi_c)*env, where env is
+    an isotropic Gaussian whose width grows with |z - z_center| (encodes z)."""
+    gs = localize.gs
+    zc = (nz - 1) / 2.0
+    xg = np.arange(box, dtype=np.float32)
+    c0 = (box - 1) / 2.0
+    env = np.zeros((box, box, nz), np.float32)
+    for k in range(nz):
+        s = 1.3 * (1.0 + 0.6 * abs(k - zc) / nz)
+        g = np.exp(-0.5 * ((xg - c0) / s) ** 2)
+        env[:, :, k] = np.outer(g, g)
+    coeff_env = np.reshape(
+        gs.spline_coefficients(env), (64, box - 1, box - 1, nz - 1)
+    )
+    nix, niy, niz = coeff_env.shape[1:]
+    psis = np.arange(n_channels) * (2 * np.pi / n_channels)
+    coeff = np.zeros((64, nix, niy, niz, n_channels, 3), np.float32)
+    for ch in range(n_channels):
+        coeff[..., ch, 0] = coeff_env
+        coeff[..., ch, 1] = np.cos(psis[ch]) * coeff_env
+        coeff[..., ch, 2] = np.sin(psis[ch]) * coeff_env
+    identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    calib = {
+        "model": "spline-3d-phase-multichannel",
+        "coefficients": coeff,
+        "n_data": [box, box, nz],
+        "n_intervals": [int(nix), int(niy), int(niz)],
+        "n_channels": n_channels,
+        "channel_transforms": [identity] * n_channels,
+        "oversampling": 1.0,
+        "z_center": zc,
+        "z_step_nm": 20.0,
+        "photon_scale": [1.0] * n_channels,
+        "box": box,
+    }
+    return calib, psis
+
+
+def _phase_channel_image(calib, ch, z0, phase, A, O):
+    box = calib["n_data"][0]
+    sets = [
+        localize._spline_model_and_grad(
+            calib["coefficients"][..., ch, s],
+            box,
+            np.array([0.0]),
+            np.array([0.0]),
+            np.array([float(z0)]),
+        )[0][0]
+        for s in range(3)
+    ]
+    return (
+        A * (sets[0] + np.cos(phase) * sets[1] + np.sin(phase) * sets[2]) + O
+    )
+
+
+def test_initial_parameters_phase_uses_channel_average(monkeypatch):
+    """The phase model seeds amplitude/offset from the channel-averaged spot
+    (interference cancels), not the brightest channel's 1+cos peak. Pure."""
+    box, nch = BOX, 4
+    calib = {
+        "model": "spline-3d-phase-multichannel",
+        "coefficients": np.zeros(
+            (64, box - 1, box - 1, 20, nch, 3), np.float32
+        ),
+        "z_center": 10.0,
+    }
+    # channel 0 twice as bright as the average; average max-min = 100
+    spots = np.zeros((1, box, box, nch), np.float32)
+    spots[0, box // 2, box // 2, 0] = 200.0  # bright channel
+    spots[0, box // 2, box // 2, 1] = 100.0
+    spots[0, :, :, :] += 10.0  # baseline
+    spots[0, box // 2, box // 2, 0] += 200.0
+    init = localize._initial_parameters_spline(spots, calib)
+    assert init.shape == (1, 6)
+    avg = spots[0].mean(axis=-1)
+    assert init[0, 0] == pytest.approx(avg.max() - avg.min(), rel=1e-5)
+    assert init[0, 4] == pytest.approx(avg.min(), rel=1e-5)
+
+
+@pytest.mark.skipif(
+    not (localize.GPUFIT_INSTALLED and localize.GPUSPLINE_INSTALLED),
+    reason="Gpufit (CUDA GPU) + Gpuspline not available",
+)
+class TestSplinePhaseFit:
+    def _movies(self, calib, z0, phase_true, seed=0, n=60, A=3000.0, O=30.0):
+        box = calib["n_data"][0]
+        rng = np.random.default_rng(seed)
+        movies = []
+        for c in range(calib["n_channels"]):
+            img = _phase_channel_image(calib, c, z0, phase_true, A, O)
+            movies.append(
+                np.stack(
+                    [
+                        rng.poisson(np.clip(img, 0, None)).astype(np.float32)
+                        for _ in range(n)
+                    ]
+                )
+            )
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(n),
+                "x": np.full(n, box // 2),
+                "y": np.full(n, box // 2),
+                "net_gradient": np.ones(n),
+            }
+        )
+        return movies, ids
+
+    def test_multistart_recovers_phase_where_single_start_fails(self):
+        calib, _ = _phase_4pi_calibration()
+        box = calib["n_data"][0]
+        z0 = calib["z_center"] + 5.0
+        phase_true = 3.1  # near pi: a single phase=0 start cannot reach it
+        rng = np.random.default_rng(0)
+        n = 60
+        spots = np.empty((n, box, box, calib["n_channels"]), np.float32)
+        for c in range(calib["n_channels"]):
+            img = _phase_channel_image(calib, c, z0, phase_true, 3000.0, 30.0)
+            for i in range(n):
+                spots[i, :, :, c] = rng.poisson(np.clip(img, 0, None))
+        multi = localize.fit_spots_gpufit_spline_phase(
+            spots, calib, n_phase_starts=8
+        )
+        single = localize.fit_spots_gpufit_spline_phase(
+            spots, calib, n_phase_starts=1
+        )
+
+        def dphi(theta):
+            ok = np.isfinite(theta).all(1)
+            ph = np.median(theta[ok, 5]) % (2 * np.pi)
+            return abs((ph - phase_true + np.pi) % (2 * np.pi) - np.pi)
+
+        assert dphi(multi) < 0.1  # multi-start reaches it
+        assert dphi(single) > 0.3  # single start does not
+
+    def test_phase_entry_point_outputs(self):
+        calib, _ = _phase_4pi_calibration()
+        z0 = calib["z_center"] + 5.0
+        phase_true = 2.0
+        movies, ids = self._movies(calib, z0, phase_true, seed=1)
+        cam = {"Baseline": 0, "Sensitivity": 1.0, "Gain": 1}
+        locs = localize.fit_spline_phase_multichannel(
+            movies,
+            [cam] * calib["n_channels"],
+            ids,
+            calib["n_data"][0],
+            calib,
+            mle=False,
+            n_phase_starts=8,
+        )
+        med = locs.median(numeric_only=True)
+        d = abs(
+            (float(med["phase"]) - phase_true + np.pi) % (2 * np.pi) - np.pi
+        )
+        assert d < 0.06
+        for col in (
+            "z",
+            "phase",
+            "phase_unc",
+            "photons",
+            "lpx",
+            "lpy",
+            "lpz",
+            "photons_unc",
+            "bg_unc",
+        ):
+            assert col in locs.columns
+            assert np.isfinite(float(med[col]))
+        # z reconstruction: (z_shift + z_init)*step*mag, z_init=z_center here
+        exp_z = (-z0 + calib["z_center"]) * calib["z_step_nm"] * 1.0
+        assert abs(float(med["z"]) - exp_z) < 15.0
+
+    def test_phase_crlb_matches_finite_difference(self):
+        calib, _ = _phase_4pi_calibration()
+        box = calib["n_data"][0]
+        zc = calib["z_center"]
+        theta = np.array(
+            [
+                [3000.0, 0.1, -0.2, -(zc + 5), 30.0, 0.6],
+                [2000.0, 0.0, 0.0, -(zc + 7), 25.0, 2.4],
+            ],
+            np.float64,
+        )
+        crlb = localize._spline_phase_crlb(theta, calib, box, mle=True)
+        assert np.all(np.isfinite(crlb)) and np.all(crlb > 0)
+
+        # independent finite-difference Fisher (MLE) for row 0
+        coeff = calib["coefficients"]
+        nch = calib["n_channels"]
+
+        def mu(th):
+            out = np.zeros((box, box, nch))
+            for c in range(nch):
+                s = [
+                    localize._spline_model_and_grad(
+                        coeff[..., c, k], box, th[1:2], th[2:3], -th[3:4]
+                    )[0][0]
+                    for k in range(3)
+                ]
+                out[..., c] = (
+                    th[0]
+                    * (s[0] + np.cos(th[5]) * s[1] + np.sin(th[5]) * s[2])
+                    + th[4]
+                )
+            return out
+
+        th0 = theta[0]
+        eps = np.array([th0[0] * 1e-4, 1e-3, 1e-3, 1e-3, 1e-3, 1e-4])
+        base = np.maximum(mu(th0), localize._SPLINE_CRLB_MU_FLOOR)
+        grads = []
+        for j in range(6):
+            tp = th0.copy()
+            tp[j] += eps[j]
+            tm = th0.copy()
+            tm[j] -= eps[j]
+            grads.append((mu(tp) - mu(tm)) / (2 * eps[j]))
+        order = [1, 2, 3, 0, 4, 5]  # -> [x, y, z, amp, off, phase]
+        G = np.stack([grads[o] for o in order], axis=-1).reshape(-1, 6)
+        fisher = (G / base.reshape(-1, 1)).T @ G
+        fd_crlb = np.diag(np.linalg.inv(fisher))
+        np.testing.assert_allclose(crlb[0], fd_crlb, rtol=0.02)

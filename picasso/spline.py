@@ -1020,6 +1020,7 @@ def calibrate_spline_multichannel(
     magnification_factor: float = 0.79,
     correct_z_bias: bool = False,
     max_match_distance: float | None = None,
+    photon_ratios: np.ndarray | list | None = None,
     roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
     path: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
@@ -1163,7 +1164,12 @@ def calibrate_spline_multichannel(
         "magnification_factor": float(magnification_factor),
         "correct_z_bias": bool(correct_z_bias),
         "effective_sigma": float(ref["effective_sigma"]),
-        "photon_scale": float(ref["photon_scale"]),
+        # Per-channel amplitude->photon conversion
+        "photon_scale": [float(p["photon_scale"]) for p in per_channel],
+        # Per-channel focus offset
+        "plane_offsets": [
+            float((p["z_center"] - ref["z_center"]) * d) for p in per_channel
+        ],
         "box": int(box),
         "pixelsize": float(pixelsize),
         "n_beads": int(ref["n_beads"]),
@@ -1176,11 +1182,192 @@ def calibrate_spline_multichannel(
         "Path": path if path is not None else "N/A",
     }
 
+    if photon_ratios is not None:
+        ratios = np.atleast_2d(np.asarray(photon_ratios, dtype=float))
+        if ratios.shape[1] != n_channels:
+            raise ValueError(
+                f"photon_ratios has {ratios.shape[1]} channels but the "
+                f"calibration has {n_channels}."
+            )
+        calibration["photon_ratios"] = ratios.tolist()
+
     if path is not None:
         io.save_spline_calibration(path, calibration)
 
     if callable(progress_callback):
         progress_callback(3)
+    return calibration
+
+
+def decompose_phase_volumes(
+    volumes: np.ndarray, phases: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Harmonic (phase-stepping) decomposition of PSF volumes into the three
+    spline components of the 4Pi phase model.
+
+    Given ``P`` PSF volumes of the same emitter recorded at known interferometer
+    phases ``phases`` (radians), least-squares fits, per voxel,
+
+        ``I_p = mean + cos(phase_p) * modulation + sin(phase_p) * modulation_90deg``
+
+    which is exactly the intensity the Gpufit phase model (model 12) reconstructs
+    for emitter phase ``phase_p``. Returns ``(mean, modulation,
+    modulation_90deg)``, each of shape ``volumes.shape[1:]``.
+
+    ``P >= 3`` phases are required and they must not be degenerate on the unit
+    circle (e.g. evenly-spaced steps over ``[0, 2*pi)`` are ideal).
+    """
+    volumes = np.asarray(volumes, dtype=np.float64)
+    phases = np.asarray(phases, dtype=np.float64).ravel()
+    n_phases = len(volumes)
+    if n_phases < 3 or len(phases) != n_phases:
+        raise ValueError(
+            "decompose_phase_volumes needs >= 3 volumes and one phase each."
+        )
+    design = np.stack(
+        [np.ones(n_phases), np.cos(phases), np.sin(phases)], axis=1
+    )  # (P, 3)
+    if np.linalg.matrix_rank(design) < 3:
+        raise ValueError(
+            "Degenerate phases: need >= 3 distinct interferometer phases "
+            "spanning the unit circle."
+        )
+    coef, *_ = np.linalg.lstsq(
+        design, volumes.reshape(n_phases, -1), rcond=None
+    )
+    shape = volumes.shape[1:]
+    return (
+        coef[0].reshape(shape),
+        coef[1].reshape(shape),
+        coef[2].reshape(shape),
+    )
+
+
+def calibrate_spline_phase(
+    phase_templates: np.ndarray,
+    phases: np.ndarray,
+    d: float,
+    magnification_factor: float = 0.79,
+    channel_transforms: list | None = None,
+    pixelsize: float = 130.0,
+    z_center_index: int | None = None,
+    path: str | None = None,
+) -> dict:
+    """Build a 4Pi phase (Gpufit model 12) spline calibration from phase-stepped
+    PSF template volumes.
+
+    This is the decomposition + spline half of a 4Pi calibration. The
+    setup-specific front-end (detecting beads and building a background-free,
+    registered PSF template volume from a bead z-stack at each interferometer
+    phase step, and registering the spatial channels) is left to the caller,
+    which can reuse :func:`build_psf_template` per phase-step movie - its
+    ``template`` output is exactly the expected input here.
+
+    Parameters
+    ----------
+    phase_templates : np.ndarray
+        PSF template volumes at each interferometer phase step:
+        ``(n_phase_steps, box, box, n_z)`` for a single spatial channel, or
+        ``(n_phase_steps, box, box, n_z, n_channels)`` for several spatially
+        registered channels. Axes are ``(row=y, col=x, z)`` as returned by
+        ``build_psf_template`` / ``get_spots``.
+    phases : np.ndarray
+        The ``n_phase_steps`` interferometer phases (radians); see
+        :func:`decompose_phase_volumes`.
+    d : float
+        Axial step size between z-slices (nm).
+    magnification_factor, pixelsize, channel_transforms, z_center_index, path
+        As in :func:`calibrate_spline_multichannel`. ``z_center_index`` is the
+        in-focus z-slice (default: the central slice).
+
+    Returns
+    -------
+    calibration : dict
+        A ``"spline-3d-phase-multichannel"`` calibration with coefficients
+        ``(64, n_int_x, n_int_y, n_int_z, n_channels, 3)`` (the trailing 3 are
+        the mean / modulation / modulation-90deg spline sets), ready for
+        ``localize.fit_spline_phase_multichannel``.
+    """
+    if not localize.GPUSPLINE_INSTALLED:
+        raise ImportError(
+            "Gpuspline is required to build a spline PSF calibration but "
+            "could not be loaded. See picasso/ext/pygpuspline/README.txt."
+        )
+    templates = np.asarray(phase_templates, dtype=np.float64)
+    if templates.ndim == 4:
+        templates = templates[..., None]  # single spatial channel
+    if templates.ndim != 5:
+        raise ValueError(
+            "phase_templates must be (n_phase_steps, box, box, n_z) or "
+            "(n_phase_steps, box, box, n_z, n_channels)."
+        )
+    n_phase_steps, box, box2, n_z, n_channels = templates.shape
+    if box != box2:
+        raise ValueError("PSF templates must be square in the lateral axes.")
+    # remove a common background so the model's separate offset is not absorbed
+    templates = templates - float(templates.min())
+    z_center = (
+        (n_z - 1) // 2 if z_center_index is None else int(z_center_index)
+    )
+
+    n_intervals = [box - 1, box - 1, n_z - 1]
+    coefficients = np.zeros(
+        [64] + n_intervals + [n_channels, 3], dtype=np.float32
+    )
+    photon_scales = []
+    gs = localize.gs
+    for c in range(n_channels):
+        mean, mod, mod90 = decompose_phase_volumes(templates[..., c], phases)
+        peak = float(np.max(mean[:, :, z_center]))
+        if peak <= 0:
+            raise ValueError(
+                "Non-positive mean PSF peak; the 4Pi calibration failed "
+                "(check the bead brightness / phase sampling)."
+            )
+        # unit-peak normalize all three together (a common scale is absorbed by
+        # the fitted amplitude); photon_scale from the mean in-focus integral
+        mean, mod, mod90 = mean / peak, mod / peak, mod90 / peak
+        photon_scales.append(
+            float(np.clip(mean[:, :, z_center], 0, None).sum())
+        )
+        for s, vol in enumerate((mean, mod, mod90)):
+            # swap lateral axes (row=y, col=x) -> (x, y) so the spline's fast
+            # axis is x, matching the model's pixel index (see calibrate_spline)
+            vol = np.ascontiguousarray(
+                vol.transpose(1, 0, 2).astype(np.float32)
+            )
+            coeff = gs.spline_coefficients(vol)
+            coefficients[..., c, s] = np.reshape(coeff, [64] + n_intervals)
+
+    if channel_transforms is None:
+        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        channel_transforms = [identity for _ in range(n_channels)]
+
+    calibration = {
+        "model": "spline-3d-phase-multichannel",
+        "coefficients": coefficients,
+        "n_data": [int(box), int(box), int(n_z)],
+        "n_intervals": n_intervals,
+        "n_channels": int(n_channels),
+        "channel_transforms": [
+            np.asarray(t, dtype=float).tolist() for t in channel_transforms
+        ],
+        "oversampling": 1.0,
+        "z_center": float(z_center),
+        "z_init": float(z_center),
+        "z_step_nm": float(d),
+        "magnification_factor": float(magnification_factor),
+        "photon_scale": photon_scales,
+        "box": int(box),
+        "pixelsize": float(pixelsize),
+        "phases": np.asarray(phases, dtype=float).ravel().tolist(),
+        "Generated by": (
+            f"Picasso: v{__version__} Spline PSF calibration (4Pi phase)"
+        ),
+        "Path": path if path is not None else "N/A",
+    }
+    if path is not None:
+        io.save_spline_calibration(path, calibration)
     return calibration
 
 

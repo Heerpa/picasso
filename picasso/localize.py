@@ -2151,12 +2151,11 @@ def _fit2d_gauss_gpu(
 # Cubic-spline PSF fitting (Gpufit SPLINE_2D / SPLINE_3D models)
 #
 # The spline models fit an experimentally measured PSF (a cubic-spline model
-# built from a bead z-stack with Gpuspline) instead of a Gaussian. Unlike the
+# built from a bead z-stack with Gpuspline). Unlike the
 # Gaussian models, they need the spline coefficient table passed through
 # Gpufit's ``user_info`` argument; everything else mirrors ``fit_spots_gpufit``.
-# The 3D model recovers x, y, *z*, photons and background in a single fit, so
-# no separate ``zfit`` step is needed. The coefficients live inside the
-# calibration dict (see ``io.load_spline_calibration``).
+# The coefficients live inside the calibration dict (see
+# ``io.load_spline_calibration``).
 # ----------------------------------------------------------------------
 
 
@@ -2168,10 +2167,29 @@ def _spline_model_id(model: str) -> int:
         return gf.ModelID.SPLINE_3D
     if model == "spline-3d-multichannel":
         return gf.ModelID.SPLINE_3D_MULTICHANNEL
+    if model == "spline-3d-phase-multichannel":
+        return gf.ModelID.SPLINE_3D_PHASE_MULTICHANNEL
     raise ValueError(
         f"Unknown spline calibration model '{model}'. Expected one of "
-        "'spline-2d', 'spline-3d', 'spline-3d-multichannel'."
+        "'spline-2d', 'spline-3d', 'spline-3d-multichannel', "
+        "'spline-3d-phase-multichannel'."
     )
+
+
+def _spline_n_channels(calibration: dict) -> int:
+    """Number of channels a (multi)channel spline calibration encodes.
+
+    Multichannel coefficients are ``(64, nix, niy, niz, n_channels)``; the phase
+    (4Pi) model's are ``(64, nix, niy, niz, n_channels, 3)`` (the trailing 3 are
+    the mean / modulation / modulation-90deg spline sets), so the channel axis
+    is second-to-last there."""
+    model = calibration["model"]
+    coeff = np.asarray(calibration["coefficients"])
+    if model == "spline-3d-phase-multichannel":
+        return int(calibration.get("n_channels", coeff.shape[-2]))
+    if model == "spline-3d-multichannel":
+        return int(calibration.get("n_channels", coeff.shape[-1]))
+    return 1
 
 
 def _reorder_spline_coefficients_for_gpufit(
@@ -2234,6 +2252,20 @@ def _reorder_spline_coefficients_for_gpufit(
                 )
             )
         return np.concatenate(blocks).astype(np.float32)
+    if model == "spline-3d-phase-multichannel":
+        # label (64, nix, niy, niz, n_channels, 3); the phase (4Pi) model reads
+        # THREE concatenated multichannel spline sets in order
+        # [mean, modulation, modulation_90deg] (see spline_3d_phase_
+        # multichannel.cuh). Each set is reordered exactly like the multichannel
+        # model, then the three blocks are concatenated set-major.
+        n_sets = coeff.shape[-1]  # 3
+        blocks = [
+            _reorder_spline_coefficients_for_gpufit(
+                np.ascontiguousarray(coeff[..., s]), "spline-3d-multichannel"
+            )
+            for s in range(n_sets)
+        ]
+        return np.concatenate(blocks).astype(np.float32)
     raise ValueError(f"Unknown spline model '{model}'.")
 
 
@@ -2269,10 +2301,11 @@ def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
     n_intervals = list(calibration["n_intervals"])
     if model == "spline-2d":
         header = [n_data[0], n_data[1], n_intervals[0], n_intervals[1]]
-    elif model == "spline-3d-multichannel":
-        # The multichannel model prepends the number of channels; the
-        # coefficient table is (64, n_int_x, n_int_y, n_int_z, n_channels).
-        n_channels = int(calibration.get("n_channels", coefficients.shape[-1]))
+    elif model in ("spline-3d-multichannel", "spline-3d-phase-multichannel"):
+        # Both multichannel models use the same 7-value header (the phase model
+        # differs only in the coefficient block: 3 concatenated spline sets).
+        # coeffs are (64, ix, iy, iz, n_channels) or (..., n_channels, 3).
+        n_channels = _spline_n_channels(calibration)
         header = [
             n_channels,
             n_data[0],
@@ -2361,6 +2394,21 @@ def crop_spline_calibration(calibration: dict, box: int) -> dict:
             )
         new_n_intervals = [ni, ni, int(niz)]
         new_n_data = [box, box, int(n_data[2])]
+    elif model == "spline-3d-phase-multichannel":
+        _, nix, niy, niz, n_channels, n_sets = coeff.shape
+        new_coeff = np.empty(
+            (64, ni, ni, niz, n_channels, n_sets), dtype=np.float32
+        )
+        for c in range(n_channels):
+            for s in range(n_sets):
+                sub = np.ascontiguousarray(coeff[..., c, s])
+                phys = sub.ravel(order="C").reshape(niz, niy, nix, 4, 4, 4)
+                phys_c = np.ascontiguousarray(phys[:, lat, lat, :, :, :])
+                new_coeff[..., c, s] = phys_c.ravel(order="C").reshape(
+                    64, ni, ni, niz
+                )
+        new_n_intervals = [ni, ni, int(niz)]
+        new_n_data = [box, box, int(n_data[2])]
     else:
         raise ValueError(f"Unknown spline model '{model}'.")
 
@@ -2388,9 +2436,17 @@ def _initial_parameters_spline(
 
     For the multichannel model ``spots`` is channel-stacked
     ``(n, box, box, n_channels)``; amplitude/offset are estimated across all
-    channels."""
+    channels. The 4Pi phase model adds a 6th parameter ``phase`` (radians),
+    initialized at 0; because the model is sinusoidal in phase, a full-range
+    recovery needs a multi-start over phase (a single 0 start converges within
+    roughly (-pi/2, pi/2))."""
     model = calibration["model"]
-    n_parameters = 4 if model == "spline-2d" else 5
+    if model == "spline-2d":
+        n_parameters = 4
+    elif model == "spline-3d-phase-multichannel":
+        n_parameters = 6
+    else:
+        n_parameters = 5
     # spots is (n, box, box) or, for multichannel, (n, box, box, n_channels)
     reduce_axes = tuple(range(1, spots.ndim))
     spot_max = np.amax(spots, axis=reduce_axes)
@@ -2406,7 +2462,104 @@ def _initial_parameters_spline(
         )
         initial[:, 3] = -z_init  # z_shift (in-focus start; see docstring)
         initial[:, 4] = spot_min  # offset
+        # phase (col 5) starts at 0 for the 4Pi phase model
+    if model == "spline-3d-phase-multichannel":
+        avg = np.asarray(spots).mean(axis=-1)
+        initial[:, 0] = np.amax(avg, axis=(1, 2)) - np.amin(avg, axis=(1, 2))
+        initial[:, 4] = np.amin(avg, axis=(1, 2))
     return initial
+
+
+def _run_gpufit_spline(
+    spots: lib.FloatArray3D,
+    calibration: dict,
+    mle: bool = False,
+    initial_parameters: lib.FloatArray2D | None = None,
+    tolerance: float = 1e-2,
+    max_number_iterations: int = 20,
+) -> tuple:
+    """Low-level spline fit: crop the calibration to the spot box, pack the
+    coefficient ``user_info`` and run Gpufit's spline model.
+
+    Returns Gpufit's raw output tuple ``(parameters, states, chi_squares,
+    number_iterations, execution_time)``. :func:`fit_spots_gpufit_spline` wraps
+    this for the common case; :func:`fit_spline_multichannel_ratiometric` uses
+    it directly because it needs the per-fit ``states`` and ``chi_squares`` to
+    rank photon-ratio hypotheses.
+
+    ``initial_parameters`` overrides the default per-spot initialization (used
+    by the 4Pi phase multi-start, which retries each spot from several phase
+    seeds). It must be ``(n_spots, n_parameters)`` matching the model.
+    """
+    if not GPUFIT_INSTALLED:
+        raise ImportError(
+            "GPUfit could not be found, CUDA-capable GPU is required."
+        )
+    box = spots.shape[1]
+    # Fit a smaller-than-calibration box against a centered crop of the
+    # calibration (equal box: no-op; larger box: raises). This makes the fitter
+    # self-sufficient - any caller may pass a smaller box without pre-cropping.
+    # NOTE: locs_from_fits_spline must be given the SAME box so its
+    # CRLB/reconstruction crop identically (it does so itself).
+    calibration = crop_spline_calibration(calibration, box)
+    model = calibration["model"]
+    is_multichannel = model in (
+        "spline-3d-multichannel",
+        "spline-3d-phase-multichannel",
+    )
+    if is_multichannel:
+        # Multichannel spots are channel-stacked (n, box, box, n_channels);
+        # the per-fit data is the channels concatenated pixel-major, exactly
+        # as in the reference splinefit_3d_multi_channel example. The 4Pi phase
+        # model uses the same channel-major data layout.
+        if spots.ndim != 4:
+            raise ValueError(
+                "Multichannel spline fitting expects spots of shape "
+                "(n_spots, box, box, n_channels)."
+            )
+        n_channels = _spline_n_channels(calibration)
+        if spots.shape[3] != n_channels:
+            raise ValueError(
+                f"Spots have {spots.shape[3]} channels but the calibration "
+                f"has {n_channels}."
+            )
+        n_points = box * box * n_channels
+    else:
+        n_points = box * box
+    if mle:
+        spots = np.maximum(spots, 0)
+    if initial_parameters is None:
+        initial_parameters = _initial_parameters_spline(spots, calibration)
+    else:
+        initial_parameters = np.ascontiguousarray(
+            initial_parameters, dtype=np.float32
+        )
+    user_info = _pack_spline_user_info(calibration)
+    model_id = _spline_model_id(model)
+    estimator_id = gf.EstimatorID.MLE if mle else gf.EstimatorID.LSE
+
+    if is_multichannel:
+        # Gpufit's multichannel model is channel-MAJOR: each channel occupies a
+        # contiguous box*box block (channel_id = point_index // (box*box), see
+        # spline_3d_multichannel.cuh). Picasso's spots are (n, box, box,
+        # n_channels) = channel-minor, so move the channel axis in front of the
+        # pixels before flattening.
+        fit_data = np.ascontiguousarray(spots.transpose(0, 3, 1, 2)).reshape(
+            (len(spots), n_points)
+        )
+    else:
+        fit_data = spots.reshape((len(spots), n_points))
+
+    return gf.fit(
+        fit_data,
+        None,
+        model_id,
+        initial_parameters,
+        tolerance=tolerance,
+        max_number_iterations=max_number_iterations,
+        estimator_id=estimator_id,
+        user_info=user_info,
+    )
 
 
 def fit_spots_gpufit_spline(
@@ -2445,70 +2598,8 @@ def fit_spots_gpufit_spline(
     log_likelihood, number_iterations
         Only if ``return_stats`` (log_likelihood is None for least squares).
     """
-    if not GPUFIT_INSTALLED:
-        raise ImportError(
-            "GPUfit could not be found, CUDA-capable GPU is required."
-        )
-    box = spots.shape[1]
-    # Fit a smaller-than-calibration box against a centered crop of the
-    # calibration (equal box: no-op; larger box: raises). This makes the fitter
-    # self-sufficient - any caller may pass a smaller box without pre-cropping.
-    # NOTE: locs_from_fits_spline must be given the SAME box so its
-    # CRLB/reconstruction crop identically (it does so itself).
-    calibration = crop_spline_calibration(calibration, box)
-    model = calibration["model"]
-    is_multichannel = model == "spline-3d-multichannel"
-    if is_multichannel:
-        # Multichannel spots are channel-stacked (n, box, box, n_channels);
-        # the per-fit data is the channels concatenated pixel-major, exactly
-        # as in the reference splinefit_3d_multi_channel example.
-        if spots.ndim != 4:
-            raise ValueError(
-                "Multichannel spline fitting expects spots of shape "
-                "(n_spots, box, box, n_channels)."
-            )
-        n_channels = int(
-            calibration.get(
-                "n_channels",
-                np.asarray(calibration["coefficients"]).shape[-1],
-            )
-        )
-        if spots.shape[3] != n_channels:
-            raise ValueError(
-                f"Spots have {spots.shape[3]} channels but the calibration "
-                f"has {n_channels}."
-            )
-        n_points = box * box * n_channels
-    else:
-        n_points = box * box
-    if mle:
-        spots = np.maximum(spots, 0)
-    initial_parameters = _initial_parameters_spline(spots, calibration)
-    user_info = _pack_spline_user_info(calibration)
-    model_id = _spline_model_id(model)
-    estimator_id = gf.EstimatorID.MLE if mle else gf.EstimatorID.LSE
-
-    if is_multichannel:
-        # Gpufit's multichannel model is channel-MAJOR: each channel occupies a
-        # contiguous box*box block (channel_id = point_index // (box*box), see
-        # spline_3d_multichannel.cuh). Picasso's spots are (n, box, box,
-        # n_channels) = channel-minor, so move the channel axis in front of the
-        # pixels before flattening.
-        fit_data = np.ascontiguousarray(spots.transpose(0, 3, 1, 2)).reshape(
-            (len(spots), n_points)
-        )
-    else:
-        fit_data = spots.reshape((len(spots), n_points))
-
-    parameters, states, chi_squares, number_iterations, exec_time = gf.fit(
-        fit_data,
-        None,
-        model_id,
-        initial_parameters,
-        tolerance=1e-2,
-        max_number_iterations=20,
-        estimator_id=estimator_id,
-        user_info=user_info,
+    parameters, states, chi_squares, number_iterations, exec_time = (
+        _run_gpufit_spline(spots, calibration, mle=mle)
     )
     if return_stats:
         # As in fit_spots_gpufit: Gpufit's MLE chi-square is twice the
@@ -2517,6 +2608,87 @@ def fit_spots_gpufit_spline(
         log_likelihood = -0.5 * chi_squares if mle else None
         return parameters, log_likelihood, number_iterations
     return parameters
+
+
+def fit_spots_gpufit_spline_phase(
+    spots: lib.FloatArray3D,
+    calibration: dict,
+    mle: bool = False,
+    n_phase_starts: int = 6,
+    tolerance: float = 1e-4,
+    max_number_iterations: int = 100,
+    return_stats: bool = False,
+) -> (
+    lib.FloatArray2D
+    | tuple[lib.FloatArray2D, lib.FloatArray1D | None, lib.FloatArray1D]
+):
+    """Fit the 4Pi phase spline model (Gpufit model 12) with a phase
+    multi-start.
+
+    The 6th parameter (interference phase) is periodic and the least-squares
+    objective is sinusoidal in it, so a single cold start (phase = 0) only
+    converges within roughly (-pi/2, pi/2). This retries each spot from
+    ``n_phase_starts`` phase seeds evenly spanning ``[0, 2*pi)`` and keeps, per
+    spot, the seed whose fit best explains the data (lowest chi-square). With
+    ``mle`` the winner is restricted to converged fits (Gpufit's MLE bails on a
+    large fraction with a garbage chi-square); LSE (default) uses the raw
+    residual, which is reliable.
+
+    ``spots`` is channel-stacked ``(n, box, box, n_channels)``. Returns the best
+    per-spot parameters ``[amplitude, x, y, z, offset, phase]`` and, if
+    ``return_stats``, ``(log_likelihood, number_iterations)`` for the winner.
+    """
+    if calibration.get("model") != "spline-3d-phase-multichannel":
+        raise ValueError(
+            "fit_spots_gpufit_spline_phase requires a "
+            "'spline-3d-phase-multichannel' calibration."
+        )
+    if int(n_phase_starts) < 1:
+        raise ValueError("n_phase_starts must be >= 1.")
+    spots_for_init = np.maximum(spots, 0) if mle else spots
+    base_init = _initial_parameters_spline(spots_for_init, calibration)
+    n_spots, n_params = base_init.shape
+
+    # Track, per spot, the best CONVERGED fit and (as a fallback) the best
+    # merely-finite fit across all phase seeds.
+    best_ok_chi = np.full(n_spots, np.inf)
+    best_ok = np.full((n_spots, n_params), np.nan, np.float32)
+    best_ok_it = np.zeros(n_spots, np.int32)
+    best_fin_chi = np.full(n_spots, np.inf)
+    best_fin = np.full((n_spots, n_params), np.nan, np.float32)
+    best_fin_it = np.zeros(n_spots, np.int32)
+
+    starts = np.linspace(0.0, 2.0 * np.pi, int(n_phase_starts), endpoint=False)
+    for phi0 in starts:
+        init_k = base_init.copy()
+        init_k[:, 5] = np.float32(phi0)
+        params, states, chi, nit, _ = _run_gpufit_spline(
+            spots,
+            calibration,
+            mle=mle,
+            initial_parameters=init_k,
+            tolerance=tolerance,
+            max_number_iterations=max_number_iterations,
+        )
+        finite = np.isfinite(params).all(axis=1) & np.isfinite(chi)
+        converged = finite & ((states == 0) if mle else True)
+        fin_better = finite & (chi < best_fin_chi)
+        best_fin_chi[fin_better] = chi[fin_better]
+        best_fin[fin_better] = params[fin_better]
+        best_fin_it[fin_better] = nit[fin_better]
+        ok_better = converged & (chi < best_ok_chi)
+        best_ok_chi[ok_better] = chi[ok_better]
+        best_ok[ok_better] = params[ok_better]
+        best_ok_it[ok_better] = nit[ok_better]
+
+    has_ok = np.isfinite(best_ok_chi)
+    best_params = np.where(has_ok[:, None], best_ok, best_fin)
+    best_chi = np.where(has_ok, best_ok_chi, best_fin_chi)
+    best_it = np.where(has_ok, best_ok_it, best_fin_it)
+    if return_stats:
+        log_likelihood = -0.5 * best_chi if mle else None
+        return best_params, log_likelihood, best_it
+    return best_params
 
 
 def _spline_model_and_grad(
@@ -3122,6 +3294,119 @@ def _spline_crlb(
     return crlb
 
 
+def _spline_phase_crlb(
+    theta: lib.FloatArray2D,
+    calibration: dict,
+    box: int,
+    mle: bool = True,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> lib.FloatArray2D:
+    """Parameter-variance estimates for 4Pi phase-model (model 12) fits.
+
+    The analogue of :func:`_spline_crlb` for the 6-parameter phase model
+    ``mu_c = amp*(mean_c + cos(phase)*mod_c + sin(phase)*mod90_c) + offset``.
+    Reuses the tested :func:`_spline_model_and_grad` for each channel/spline-set's
+    value and native spatial derivatives, then combines them with the phase
+    algebra (validated against a finite-difference Fisher matrix). With ``mle``
+    the Poisson Cramer-Rao bound (diagonal of the inverse Fisher
+    ``I = sum g g^T / mu``); else the unweighted-least-squares sandwich
+    ``J^-1 M J^-1`` with ``M = sum mu g g^T``.
+
+    Returns ``(n_locs, 6)`` variances in native order
+    ``[x_shift, y_shift, z_shift, amplitude, offset, phase]`` (float64); rows
+    that are non-finite or numerically singular are NaN.
+    """
+    coeff = np.ascontiguousarray(calibration["coefficients"], dtype=np.float64)
+    n_channels = coeff.shape[-2]
+    theta = np.asarray(theta, dtype=np.float64)
+    n_locs = len(theta)
+    finite = np.isfinite(theta).all(axis=1)
+
+    bread = np.tile(np.eye(6), (max(n_locs, 1), 1, 1))
+    meat = np.zeros((max(n_locs, 1), 6, 6))
+
+    def _infomat(th):
+        # (k, 6, 6) Fisher (mle) or normal/meat matrices for k localizations
+        amp = th[:, 0]
+        xs = th[:, 1]
+        ys = th[:, 2]
+        z_eval = -th[:, 3]
+        off = th[:, 4]
+        cphi = np.cos(th[:, 5])[:, None, None]
+        sphi = np.sin(th[:, 5])[:, None, None]
+        A = amp[:, None, None]
+        k = len(th)
+        B = np.zeros((k, 6, 6))
+        Me = np.zeros((k, 6, 6))
+        for c in range(n_channels):
+            phi_m, dx_m, dy_m, dz_m = _spline_model_and_grad(
+                coeff[..., c, 0], box, xs, ys, z_eval
+            )
+            phi_o, dx_o, dy_o, dz_o = _spline_model_and_grad(
+                coeff[..., c, 1], box, xs, ys, z_eval
+            )
+            phi_9, dx_9, dy_9, dz_9 = _spline_model_and_grad(
+                coeff[..., c, 2], box, xs, ys, z_eval
+            )
+            temp = phi_m + cphi * phi_o + sphi * phi_9
+            dtx = dx_m + cphi * dx_o + sphi * dx_9
+            dty = dy_m + cphi * dy_o + sphi * dy_9
+            dtz = dz_m + cphi * dz_o + sphi * dz_9
+            mu = np.maximum(
+                A * temp + off[:, None, None], _SPLINE_CRLB_MU_FLOOR
+            )
+            # gradient columns in order [x_shift, y_shift, z_shift, amp, off,
+            # phase]; the shift derivatives are the negative of the native ones.
+            G = np.stack(
+                [
+                    -A * dtx,
+                    -A * dty,
+                    -A * dtz,
+                    temp,
+                    np.ones_like(temp),
+                    A * (-sphi * phi_o + cphi * phi_9),
+                ],
+                axis=-1,
+            )
+            Gr = G.reshape(k, -1, 6)
+            mur = mu.reshape(k, -1)
+            if mle:
+                B += np.einsum("mpi,mp,mpj->mij", Gr, 1.0 / mur, Gr)
+            else:
+                B += np.einsum("mpi,mpj->mij", Gr, Gr)
+                Me += np.einsum("mpi,mp,mpj->mij", Gr, mur, Gr)
+        return B, Me
+
+    use_tqdm = progress_callback == "console"
+    do_callback = callable(progress_callback)
+    chunk = (
+        max(1, min(n_locs, 20_000)) if (use_tqdm or do_callback) else n_locs
+    )
+    starts = range(0, n_locs, chunk) if n_locs else []
+    if use_tqdm:
+        starts = tqdm(starts, desc="Computing spline phase CRLB")
+    for start in starts:
+        stop = min(start + chunk, n_locs)
+        rows = np.arange(start, stop)[finite[start:stop]]
+        if len(rows):
+            B, Me = _infomat(theta[rows])
+            bread[rows] = B
+            meat[rows] = Me
+        if do_callback:
+            progress_callback(stop)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        bread_inv = np.linalg.pinv(bread)
+        cov = bread_inv if mle else bread_inv @ meat @ bread_inv
+        crlb = np.diagonal(cov, axis1=1, axis2=2).copy()
+    crlb = crlb[:n_locs]
+    crlb[~finite] = np.nan
+    crlb = np.where(crlb > 0.0, crlb, np.nan)
+    return crlb
+
+
 def locs_from_fits_spline(
     identifications: pd.DataFrame,
     theta: lib.FloatArray2D,
@@ -3148,6 +3433,9 @@ def locs_from_fits_spline(
     part)."""
     calibration = crop_spline_calibration(calibration, box)
     model = calibration["model"]
+    # The 4Pi phase model (model 12) has 6 parameters
+    # ``[amplitude, x, y, z, offset, phase]``
+    is_phase = model == "spline-3d-phase-multichannel"
     is_3d = model != "spline-2d"
     box_offset = int(box / 2)
     oversampling = float(calibration.get("oversampling", 1.0))
@@ -3155,24 +3443,46 @@ def locs_from_fits_spline(
     amplitude = np.asarray(theta[:, 0])
     x_shift = np.asarray(theta[:, 1])
     y_shift = np.asarray(theta[:, 2])
-    offset = np.asarray(theta[:, -1])
+    offset = np.asarray(theta[:, 4] if is_phase else theta[:, -1])
     center = (box - 1) / 2.0
     x = x_shift / oversampling + center + identifications["x"] - box_offset
     y = y_shift / oversampling + center + identifications["y"] - box_offset
 
-    photon_scale = float(calibration.get("photon_scale", 1.0))
+    # photon_scale converts the fitted (shared) amplitude to a photon count.
+    # A multichannel calibration may store a per-channel array; the shared
+    # amplitude then maps to the TOTAL photons across channels (their sum). A
+    # scalar (single-channel, or older multichannel calibrations) is unchanged.
+    photon_scale_raw = calibration.get("photon_scale", 1.0)
+    if np.ndim(photon_scale_raw) > 0:
+        photon_scale = float(np.sum(np.asarray(photon_scale_raw, dtype=float)))
+    else:
+        photon_scale = float(photon_scale_raw)
     photons = amplitude * photon_scale
 
-    # CRLB / LSQ variances in native order [x_shift, y_shift, (z_shift,)
-    # amplitude, offset]; amplitude/offset are always the last two columns.
-    crlb = _spline_crlb(
-        theta, calibration, box, mle=mle, progress_callback=progress_callback
-    )
+    # CRLB / LSQ variances
+    if is_phase:
+        crlb = _spline_phase_crlb(
+            theta,
+            calibration,
+            box,
+            mle=mle,
+            progress_callback=progress_callback,
+        )
+        amp_var, off_var = crlb[:, 3], crlb[:, 4]
+    else:
+        crlb = _spline_crlb(
+            theta,
+            calibration,
+            box,
+            mle=mle,
+            progress_callback=progress_callback,
+        )
+        amp_var, off_var = crlb[:, -2], crlb[:, -1]
     with np.errstate(invalid="ignore"):
         lpx = np.sqrt(crlb[:, 0]) / oversampling
         lpy = np.sqrt(crlb[:, 1]) / oversampling
-        photons_unc = np.sqrt(crlb[:, -2]) * photon_scale
-        bg_unc = np.sqrt(crlb[:, -1])
+        photons_unc = np.sqrt(amp_var) * photon_scale
+        bg_unc = np.sqrt(off_var)
 
     columns = {
         "frame": identifications["frame"].astype(np.uint32),
@@ -3202,6 +3512,13 @@ def locs_from_fits_spline(
         columns["lpz"] = lpz.astype(np.float32)
     columns["photons_unc"] = photons_unc.astype(np.float32)
     columns["bg_unc"] = bg_unc.astype(np.float32)
+    if is_phase:
+        # interference phase (radians, wrapped to [0, 2*pi)) and its precision
+        columns["phase"] = np.mod(np.asarray(theta[:, 5]), 2.0 * np.pi).astype(
+            np.float32
+        )
+        with np.errstate(invalid="ignore"):
+            columns["phase_unc"] = np.sqrt(crlb[:, 5]).astype(np.float32)
     if log_likelihood is not None:
         columns["log_likelihood"] = log_likelihood.astype(np.float32)
     if iterations is not None:
@@ -3426,6 +3743,248 @@ def fit_spline_multichannel(
         iterations=iterations,
         progress_callback=progress_callback,
     )
+
+
+def fit_spline_phase_multichannel(
+    movies: list,
+    camera_infos: list[dict],
+    identifications: pd.DataFrame,
+    box: int,
+    calibration: dict,
+    mle: bool = False,
+    n_phase_starts: int = 6,
+    progress_callback: Callable[[int], None] | None = None,
+) -> pd.DataFrame:
+    """Fit a 4Pi phase (interference) cubic-spline PSF across the phase channels.
+
+    Ties ``get_spots_multichannel`` (per-channel ROI extraction via the
+    calibration's ``channel_transforms``) to the phase multi-start fitter
+    :func:`fit_spots_gpufit_spline_phase` and :func:`locs_from_fits_spline`. The
+    localizations are in the reference channel's coordinates and carry the
+    fitted ``z`` and interference ``phase`` (plus ``phase_unc``).
+    """
+    if calibration.get("model") != "spline-3d-phase-multichannel":
+        raise ValueError(
+            "fit_spline_phase_multichannel requires a "
+            "'spline-3d-phase-multichannel' calibration."
+        )
+    transforms = calibration["channel_transforms"]
+    if len(movies) != len(transforms):
+        raise ValueError(
+            f"Got {len(movies)} channels but the calibration has "
+            f"{len(transforms)} channel transforms."
+        )
+    spots = get_spots_multichannel(
+        movies,
+        identifications,
+        box,
+        camera_infos,
+        transforms,
+        progress_callback=progress_callback,
+    )
+    theta, log_likelihood, iterations = fit_spots_gpufit_spline_phase(
+        spots,
+        calibration,
+        mle=mle,
+        n_phase_starts=n_phase_starts,
+        return_stats=True,
+    )
+    em = camera_infos[0].get("Gain", 1) > 1
+    return locs_from_fits_spline(
+        identifications,
+        theta,
+        box,
+        em,
+        calibration,
+        mle=mle,
+        log_likelihood=log_likelihood,
+        iterations=iterations,
+        progress_callback=progress_callback,
+    )
+
+
+def scale_channel_blocks(
+    coefficients: np.ndarray, ratios: lib.FloatArray1D
+) -> np.ndarray:
+    """Scale each channel's spline coefficient block by a per-channel factor.
+
+    ``coefficients`` is a multichannel table
+    ``(64, n_int_x, n_int_y, n_int_z, n_channels)``. Because the cubic spline is
+    linear in its coefficients, multiplying channel ``c``'s block by ``r[c]``
+    scales that channel's model exactly: ``mu_c = offset + amplitude * r[c] *
+    phi_c``. This is how a fixed per-channel photon **ratio** is imposed for
+    ratiometric color assignment (and how an unequal biplane photon split is
+    baked in) without changing the compiled Gpufit model. Only the *relative*
+    ratios matter - the shared amplitude absorbs any overall scale.
+
+    Returns a new ``float32`` array; the input is not modified.
+    """
+    coeff = np.array(coefficients, dtype=np.float32, copy=True)
+    if coeff.ndim != 5:
+        raise ValueError(
+            "scale_channel_blocks expects a multichannel coefficient table "
+            "(64, n_int_x, n_int_y, n_int_z, n_channels)."
+        )
+    ratios = np.asarray(ratios, dtype=np.float32)
+    if coeff.shape[-1] != len(ratios):
+        raise ValueError(
+            f"Got {len(ratios)} ratios but the coefficient table has "
+            f"{coeff.shape[-1]} channels."
+        )
+    for c in range(coeff.shape[-1]):
+        coeff[..., c] *= ratios[c]
+    return coeff
+
+
+def _photon_scales(calibration: dict, n_channels: int) -> np.ndarray:
+    """Per-channel ``photon_scale`` as a length-``n_channels`` array.
+
+    Accepts either a per-channel array or a single scalar (broadcast to every
+    channel, i.e. the equal-brightness assumption of older calibrations)."""
+    ps = np.asarray(calibration.get("photon_scale", 1.0), dtype=float).ravel()
+    if ps.size == 1:
+        ps = np.repeat(ps, n_channels)
+    if ps.size != n_channels:
+        raise ValueError(
+            f"photon_scale has {ps.size} entries but the calibration has "
+            f"{n_channels} channels."
+        )
+    return ps
+
+
+def fit_spline_multichannel_ratiometric(
+    movies: list,
+    camera_infos: list[dict],
+    identifications: pd.DataFrame,
+    box: int,
+    calibration: dict,
+    photon_ratios: lib.FloatArray2D | None = None,
+    mle: bool = False,
+    progress_callback: Callable[[int], None] | None = None,
+) -> pd.DataFrame:
+    """Ratiometric multichannel spline fit with photon-ratio color assignment.
+
+    Implements globLoc's ratiometric scheme (Li et al., Nat. Commun. 13, 3133,
+    2022) on top of the existing ``spline-3d-multichannel`` model: for each
+    candidate per-channel photon **ratio** (one per dye/color), the per-channel
+    coefficient blocks are scaled by that ratio (see
+    :func:`scale_channel_blocks`) and the channel-stacked spots are fit. Each
+    spot is then assigned the ratio whose fit best explains the data (lowest
+    residual / highest likelihood); the winning ratio index is the color.
+
+    ``photon_ratios`` is a ``(n_hypotheses, n_channels)`` array; if omitted it
+    is taken from the calibration's ``"photon_ratios"`` field. Only the relative
+    per-channel values matter (the shared amplitude absorbs the overall scale).
+
+    Selection uses the **least-squares** residual by default (``mle=False``).
+    Gpufit's MLE estimator bails out (negative curvature) on a large fraction of
+    fits, so its chi-square is not a reliable cross-hypothesis score; when
+    ``mle=True`` the ranking is therefore restricted to converged fits.
+
+    Returns localizations in the reference channel's coordinates with an added
+    integer ``color`` column (the winning ratio index) and per-channel photon
+    columns ``photons_ch{c}`` (``photons`` is their sum).
+    """
+    if calibration.get("model") != "spline-3d-multichannel":
+        raise ValueError(
+            "fit_spline_multichannel_ratiometric requires a "
+            "'spline-3d-multichannel' calibration."
+        )
+    if photon_ratios is None:
+        photon_ratios = calibration.get("photon_ratios")
+    if photon_ratios is None:
+        raise ValueError(
+            "No photon_ratios given and none stored in the calibration; "
+            "provide a (n_hypotheses, n_channels) array of candidate ratios."
+        )
+    photon_ratios = np.atleast_2d(np.asarray(photon_ratios, dtype=np.float64))
+    transforms = calibration["channel_transforms"]
+    n_channels = len(transforms)
+    if len(movies) != n_channels:
+        raise ValueError(
+            f"Got {len(movies)} channels but the calibration has "
+            f"{n_channels} channel transforms."
+        )
+    if photon_ratios.shape[1] != n_channels:
+        raise ValueError(
+            f"photon_ratios has {photon_ratios.shape[1]} channels but the "
+            f"calibration has {n_channels}."
+        )
+
+    spots = get_spots_multichannel(
+        movies,
+        identifications,
+        box,
+        camera_infos,
+        transforms,
+        progress_callback=progress_callback,
+    )
+    n_spots = len(spots)
+    n_hyp = len(photon_ratios)
+    # Normalize each hypothesis so the shared amplitude keeps a total-photon
+    # meaning; the ranking is unaffected by the overall scale.
+    ratios_norm = photon_ratios / photon_ratios.sum(axis=1, keepdims=True)
+
+    # Fit every hypothesis; keep per-spot parameters, fit state and score.
+    thetas = []
+    scores = np.full((n_hyp, n_spots), np.inf)
+    valid = np.zeros((n_hyp, n_spots), dtype=bool)
+    for k in range(n_hyp):
+        calib_k = dict(calibration)
+        calib_k["coefficients"] = scale_channel_blocks(
+            calibration["coefficients"], ratios_norm[k]
+        )
+        params, states, chi_squares, _n_it, _t = _run_gpufit_spline(
+            spots, calib_k, mle=mle
+        )
+        thetas.append(params)
+        finite = np.isfinite(params).all(axis=1) & np.isfinite(chi_squares)
+        # LSE is robust here; for MLE keep only converged fits (state 0) since
+        # its chi-square is unreliable on the frequent negative-curvature exits.
+        valid[k] = finite & ((states == 0) if mle else True)
+        scores[k] = np.where(finite, chi_squares, np.inf)
+
+    # Per spot: the best VALID hypothesis (lowest residual / chi2), falling back
+    # to the best finite score if none was flagged valid.
+    best_k = np.argmin(np.where(valid, scores, np.inf), axis=0)
+    none_valid = ~valid.any(axis=0)
+    if none_valid.any():
+        best_k[none_valid] = np.argmin(scores[:, none_valid], axis=0)
+
+    # Build localizations per winning-hypothesis group so z-conversion and CRLB
+    # use that hypothesis's (scaled) calibration. Index-aligned column
+    # assignment keeps per-channel photons correct across the internal
+    # frame-sort of locs_from_fits_spline.
+    em = camera_infos[0].get("Gain", 1) > 1
+    parts = []
+    for k in range(n_hyp):
+        rows = np.where(best_k == k)[0]
+        if len(rows) == 0:
+            continue
+        calib_k = dict(calibration)
+        calib_k["coefficients"] = scale_channel_blocks(
+            calibration["coefficients"], ratios_norm[k]
+        )
+        ids_k = identifications.iloc[rows]
+        theta_k = np.asarray(thetas[k])[rows]
+        locs_k = locs_from_fits_spline(
+            ids_k, theta_k, box, em, calib_k, mle=mle
+        )
+        amp = pd.Series(np.asarray(theta_k[:, 0]), index=ids_k.index)
+        ps = _photon_scales(calib_k, n_channels)
+        total = None
+        for c in range(n_channels):
+            pc = amp * float(ratios_norm[k, c]) * float(ps[c])
+            locs_k[f"photons_ch{c}"] = pc.astype(np.float32)
+            total = pc if total is None else total + pc
+        locs_k["photons"] = total.astype(np.float32)
+        locs_k["color"] = np.int32(k)
+        parts.append(locs_k)
+
+    locs = pd.concat(parts) if parts else pd.DataFrame()
+    if len(locs):
+        locs.sort_values(by="frame", kind="quicksort", inplace=True)
+    return locs
 
 
 def _fit2d_gaussmle(

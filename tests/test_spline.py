@@ -286,10 +286,17 @@ class TestCalibrateSplineMultichannel:
             box=BOX,
             minimum_ng=2000.0,
             d=20.0,
+            photon_ratios=[[0.7, 0.3], [0.4, 0.6]],
             path=path,
         )
         assert calib["model"] == "spline-3d-multichannel"
         assert calib["n_channels"] == 2
+        # candidate photon ratios stored for ratiometric color assignment,
+        # and they survive the HDF5 round-trip (JSON metadata)
+        np.testing.assert_allclose(
+            calib["photon_ratios"], [[0.7, 0.3], [0.4, 0.6]]
+        )
+        assert io.load_spline_calibration(path)["photon_ratios"] is not None
         assert calib["coefficients"].shape[0] == 64
         assert calib["coefficients"].shape[-1] == 2
         assert len(calib["channel_transforms"]) == 2
@@ -297,6 +304,112 @@ class TestCalibrateSplineMultichannel:
         loaded = io.load_spline_calibration(path)
         user_info = localize._pack_spline_user_info(loaded)
         assert user_info.dtype == np.float32
+        # co-focal channels: both planes at the same focus
+        np.testing.assert_allclose(
+            calib["plane_offsets"], [0.0, 0.0], atol=25.0
+        )
+        # per-channel photon_scale is stored as a list (one per channel)
+        assert len(calib["photon_scale"]) == 2
+
+    def test_calibrate_biplane_recovers_plane_offset(self, tmp_path):
+        """Biplane: the second channel is the same z-stack with its focus at a
+        different stage step (a frame-axis roll). The calibration must recover
+        a non-zero plane offset of the right magnitude, while keeping the two
+        channels laterally registered (identity transform)."""
+        movie_ref, _, focus = _synthetic_bead_movie(n_frames=21)
+        d_nm = 20.0
+        delta_steps = 3  # channel 1 focuses 3 steps deeper
+        movie_c = np.roll(movie_ref, shift=delta_steps, axis=0)
+        info = [{"Frames": int(movie_ref.shape[0])}]
+        calib = spline.calibrate_spline_multichannel(
+            [movie_ref, movie_c],
+            infos=[info, info],
+            camera_infos=[CAMERA_INFO, CAMERA_INFO],
+            box=BOX,
+            minimum_ng=2000.0,
+            d=d_nm,
+            path=str(tmp_path / "biplane_spline_calib.hdf5"),
+        )
+        offsets = calib["plane_offsets"]
+        assert offsets[0] == 0.0
+        # channel 1 focus offset ~ delta_steps * d (within ~1 step)
+        np.testing.assert_allclose(
+            offsets[1], delta_steps * d_nm, atol=1.5 * d_nm
+        )
+
+
+class TestSplinePhaseCalibration:
+    """4Pi phase calibration: harmonic decomposition + spline build (model 12)."""
+
+    def test_decompose_recovers_components(self):
+        rng = np.random.default_rng(0)
+        shape = (5, 6, 4)
+        mean = rng.random(shape)
+        mod = rng.random(shape)
+        mod90 = rng.random(shape)
+        phases = np.linspace(0, 2 * np.pi, 6, endpoint=False)
+        vols = np.stack(
+            [mean + np.cos(p) * mod + np.sin(p) * mod90 for p in phases]
+        )
+        m, o, n = spline.decompose_phase_volumes(vols, phases)
+        np.testing.assert_allclose(m, mean, atol=1e-9)
+        np.testing.assert_allclose(o, mod, atol=1e-9)
+        np.testing.assert_allclose(n, mod90, atol=1e-9)
+
+    def test_decompose_requires_three_phases(self):
+        with pytest.raises(ValueError):
+            spline.decompose_phase_volumes(np.zeros((2, 3, 3, 3)), [0.0, 1.0])
+
+    def test_decompose_rejects_degenerate_phases(self):
+        with pytest.raises(ValueError):
+            spline.decompose_phase_volumes(
+                np.zeros((3, 3, 3, 3)), [1.0, 1.0, 1.0]
+            )
+
+    @pytest.mark.skipif(
+        not localize.GPUSPLINE_INSTALLED, reason="Gpuspline not available"
+    )
+    def test_calibrate_spline_phase_builds_calibration(self, tmp_path):
+        from picasso import io
+
+        box, nz, nch, P = 13, 21, 4, 6
+        zc = (nz - 1) // 2
+        xg = np.arange(box)
+        c0 = (box - 1) / 2
+        env = np.zeros((box, box, nz), np.float32)
+        for k in range(nz):
+            s = 1.3 * (1 + 0.5 * abs(k - zc) / nz)
+            g = np.exp(-0.5 * ((xg - c0) / s) ** 2)
+            env[:, :, k] = np.outer(g, g)
+        psi_c = np.arange(nch) * (2 * np.pi / nch)
+        psi_p = np.linspace(0, 2 * np.pi, P, endpoint=False)
+        templates = np.zeros((P, box, box, nz, nch), np.float32)
+        for p in range(P):
+            for c in range(nch):
+                templates[p, :, :, :, c] = (
+                    env * (1 + np.cos(psi_p[p] - psi_c[c])) + 10.0
+                )
+        path = str(tmp_path / "phase_calib.hdf5")
+        calib = spline.calibrate_spline_phase(
+            templates, psi_p, d=20.0, z_center_index=zc, path=path
+        )
+        assert calib["model"] == "spline-3d-phase-multichannel"
+        assert calib["coefficients"].shape == (
+            64,
+            box - 1,
+            box - 1,
+            nz - 1,
+            nch,
+            3,
+        )
+        assert calib["n_channels"] == nch
+        assert len(calib["photon_scale"]) == nch
+        assert len(calib["channel_transforms"]) == nch
+        assert len(calib["phases"]) == P
+        # round-trips through HDF5 and drives the phase user_info packer
+        loaded = io.load_spline_calibration(path)
+        ui = localize._pack_spline_user_info(loaded)
+        assert ui.size == 7 + 3 * nch * (box - 1) * (box - 1) * (nz - 1) * 64
 
 
 # ---------------------------------------------------------------------------
