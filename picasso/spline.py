@@ -1007,26 +1007,77 @@ def _estimate_channel_transform(
     ref_xy = beads_ref[["x", "y"]].to_numpy(dtype=np.float64)
     c_xy = beads_c[["x", "y"]].to_numpy(dtype=np.float64)
 
+    # Coarse pre-alignment for bead matching only: the affine below is fit on the
+    # original (untransformed) channel coordinates, so it absorbs whatever
+    # orientation the matching candidate implied. Tries flipping if it
+    # matches more beads
+    flips = (
+        ("none", 1.0, 1.0),
+        ("flip-x", -1.0, 1.0),
+        ("flip-y", 1.0, -1.0),
+        ("flip-xy", -1.0, -1.0),
+    )
+    candidates = []  # (label, channel coords pre-aligned onto the reference)
     if coarse_shift is not None:
-        # split-FOV: the region-origin offset is known exactly, so there is a
-        # single correct pre-alignment direction (no cross-correlation).
-        dx, dy = float(coarse_shift[0]), float(coarse_shift[1])
-        signs = (1.0,)
+        # split-FOV: the two channels are regions of one movie, so the flip is
+        # taken about the channel region (its size == the reference region's)
+        # and the known region-origin offset places it on the reference region.
+        (cy0, cx0), (cy1, cx1) = _normalized_region(channel_roi)
+        h, w = float(cy1 - cy0), float(cx1 - cx0)
+        x0_ref = cx0 + float(coarse_shift[0])
+        y0_ref = cy0 + float(coarse_shift[1])
+        xl = c_xy[:, 0] - cx0
+        yl = c_xy[:, 1] - cy0
+        for label, sx, sy in flips:
+            fx = (w - xl) if sx < 0 else xl
+            fy = (h - yl) if sy < 0 else yl
+            candidates.append(
+                (label, np.column_stack([fx + x0_ref, fy + y0_ref]))
+            )
     else:
-        # coarse translational pre-alignment from a mid (in-focus) frame
+        # separate movies: no known geometry, so for every candidate orientation
+        # the coarse translation is measured directly by cross-correlating the
+        # reference mid-frame against the (identically mirrored) channel
+        # mid-frame
         try:
             img_ref = np.asarray(movie_ref[mid_frame], dtype=np.float32)
             img_c = np.asarray(movie_c[mid_frame], dtype=np.float32)
-            dy, dx = imageprocess.get_image_shift(img_ref, img_c, 5)
         except Exception:
-            dx, dy = 0.0, 0.0
-        # try both shift signs and keep whichever yields more correspondences
-        signs = (1.0, -1.0)
+            img_ref = img_c = None
+        height, width = int(movie_c.shape[1]), int(movie_c.shape[2])
+        ref_centroid = ref_xy.mean(axis=0)
+        for label, sx, sy in flips:
+            # mirror the channel beads about the frame (consistently with the
+            # image flip below) so the same orientation is applied to both
+            fx = (width - 1 - c_xy[:, 0]) if sx < 0 else c_xy[:, 0]
+            fy = (height - 1 - c_xy[:, 1]) if sy < 0 else c_xy[:, 1]
+            flipped = np.column_stack([fx, fy])
+            if img_ref is not None:
+                img_cf = img_c
+                if sx < 0:
+                    img_cf = img_cf[:, ::-1]
+                if sy < 0:
+                    img_cf = img_cf[::-1, :]
+                try:
+                    dy, dx = imageprocess.get_image_shift(img_ref, img_cf, 5)
+                except Exception:
+                    dx = dy = 0.0
+                # the cross-correlation sign convention can go either way, so try
+                # both and let the match count decide
+                for sign in (1.0, -1.0):
+                    candidates.append(
+                        (label, flipped + sign * np.array([dx, dy]))
+                    )
+            else:
+                # a flip plus an arbitrary translation is recovered by aligning
+                # centroids (coarser, needs the bead sets to overlap)
+                candidates.append(
+                    (label, flipped + (ref_centroid - flipped.mean(axis=0)))
+                )
 
     best_ref_idx, best_c_idx = np.array([], int), np.array([], int)
-    for sign in signs:
-        shifted = c_xy + sign * np.array([dx, dy])
-        ri, ci = _match_beads(ref_xy, shifted, max_distance)
+    for _label, aligned in candidates:
+        ri, ci = _match_beads(ref_xy, aligned, max_distance)
         if len(ri) > len(best_ref_idx):
             best_ref_idx, best_c_idx = ri, ci
 

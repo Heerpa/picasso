@@ -266,6 +266,45 @@ class TestMultichannelCalibration:
             atol=0.6,
         )
 
+    def test_estimate_channel_transform_recovers_flip(self):
+        """Separate movies where the channel is a vertically mirrored copy of
+        the reference (a reflected optical path). The flip-aware coarse matching
+        must still register it: all beads match and the affine is a reflection.
+        """
+        movie_ref, _, _ = _synthetic_bead_movie()
+        movie_c = movie_ref[:, ::-1, :]  # mirror in y (up/down)
+
+        step_of_frame, _, step_range = spline._step_of_frame(
+            movie_ref.shape[0], 20.0, 1, "fov", None
+        )
+        ref_bounds = spline._reference_frame_bounds(step_of_frame, step_range)
+        mid = (ref_bounds[0] + ref_bounds[1]) // 2
+        beads_ref = spline._detect_bead_positions(
+            movie_ref, 2000.0, BOX, ref_bounds
+        )
+        n_ref = len(beads_ref)
+        transform, n_matches = spline._estimate_channel_transform(
+            movie_ref,
+            movie_c,
+            beads_ref,
+            2000.0,
+            BOX,
+            ref_bounds,
+            mid,
+            max_distance=float(BOX),
+        )
+        assert n_matches == n_ref
+        # a pure translation could never register a mirror: reflection -> det < 0
+        assert np.linalg.det(np.asarray(transform)[:, :2]) < 0
+        # ref (x, y) -> channel (x, H - 1 - y)
+        h = movie_ref.shape[1]
+        ref_xy = beads_ref[["x", "y"]].to_numpy(float)
+        mapped = localize.apply_affine_transform(ref_xy, transform)
+        np.testing.assert_allclose(mapped[:, 0], ref_xy[:, 0], atol=1.0)
+        np.testing.assert_allclose(
+            mapped[:, 1], h - 1 - ref_xy[:, 1], atol=1.0
+        )
+
 
 @pytest.mark.skipif(
     not localize.GPUSPLINE_INSTALLED, reason="Gpuspline not available"
@@ -339,6 +378,33 @@ class TestCalibrateSplineMultichannel:
             offsets[1], delta_steps * d_nm, atol=1.5 * d_nm
         )
 
+    def test_calibrate_separate_channels_mirrored(self, tmp_path):
+        """Separate-movie channels where channel 1 is a vertical mirror of the
+        reference (reflected optical path). The build must register it (all
+        beads matched) and store a reflection transform, so the per-channel
+        template is built at the real mirrored bead positions."""
+        movie_ref, _, _ = _synthetic_bead_movie()
+        movie_c = movie_ref[:, ::-1, :]  # mirror in y
+        info = [{"Frames": int(movie_ref.shape[0])}]
+        calib = spline.calibrate_spline_multichannel(
+            [movie_ref, movie_c],
+            infos=[info, info],
+            camera_infos=[CAMERA_INFO, CAMERA_INFO],
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            path=str(tmp_path / "mirrored_spline_calib.hdf5"),
+        )
+        assert calib["n_channels"] == 2
+        # channel-1 transform is a reflection (negative determinant), not the
+        # garbage a translation-only match would have produced
+        t1 = np.asarray(calib["channel_transforms"][1])
+        assert np.linalg.det(t1[:, :2]) < 0
+        # the transform maps into the mirrored frame: y -> H - 1 - y
+        h = movie_ref.shape[1]
+        assert abs(t1[1, 1] + 1.0) < 0.1  # y scale ~ -1
+        assert abs(t1[1, 2] - (h - 1)) < 2.0  # y offset ~ H - 1
+
 
 def _synthetic_split_fov_movie(dx=2, dy=-1):
     """A single movie whose left and right 48x48 halves are two channels.
@@ -357,6 +423,24 @@ def _synthetic_split_fov_movie(dx=2, dy=-1):
     movie[:, :, 48:] = np.roll(base, shift=(dy, dx), axis=(1, 2))
     regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
     return movie, regions, bead_xy
+
+
+def _synthetic_split_fov_movie_flipped(axis="y"):
+    """Single movie whose right half is the left half *mirrored* (as biplane /
+    4Pi / spectral splitters do with a reflected optical path).
+
+    ``axis="y"`` flips up/down, ``"x"`` left/right. Returns ``(movie, regions)``.
+    A pure-translation coarse alignment cannot register a mirrored channel, so
+    this exercises the flip-aware matching in ``_estimate_channel_transform``.
+    """
+    base, _bead_xy, _focus = _synthetic_bead_movie(h=48, w=48)
+    n = base.shape[0]
+    movie = np.zeros((n, 48, 96), dtype=np.uint16)
+    movie[:, :, :48] = base
+    flipped = base[:, ::-1, :] if axis == "y" else base[:, :, ::-1]
+    movie[:, :, 48:] = flipped
+    regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
+    return movie, regions
 
 
 class TestSplitFovTransform:
@@ -396,6 +480,56 @@ class TestSplitFovTransform:
             np.array([[1.0, 0.0, 48 + dx], [0.0, 1.0, dy]]),
             atol=0.6,
         )
+
+    @pytest.mark.parametrize("axis", ["y", "x"])
+    def test_estimate_region_transform_recovers_flip(self, axis):
+        """A mirrored channel (biplane/4Pi reflected path) must still register:
+        the flip-aware coarse matching finds all correspondences and the affine
+        encodes the mirror (negative determinant)."""
+        movie, regions = _synthetic_split_fov_movie_flipped(axis)
+
+        step_of_frame, _, step_range = spline._step_of_frame(
+            movie.shape[0], 20.0, 1, "fov", None
+        )
+        ref_bounds = spline._reference_frame_bounds(step_of_frame, step_range)
+        mid = (ref_bounds[0] + ref_bounds[1]) // 2
+        ref_roi = spline._normalized_region(regions[0])
+        chan_roi = spline._normalized_region(regions[1])
+        beads_ref = spline._detect_bead_positions(
+            movie, 2000.0, BOX, ref_bounds, roi=ref_roi
+        )
+        n_ref = len(beads_ref)
+        transform, n_matches = spline._estimate_channel_transform(
+            movie,
+            movie,
+            beads_ref,
+            2000.0,
+            BOX,
+            ref_bounds,
+            mid,
+            max_distance=float(BOX),
+            channel_roi=chan_roi,
+            coarse_shift=(-48.0, 0.0),
+        )
+        # all reference beads are matched (a pure translation would find few)
+        assert n_matches == n_ref
+        # the linear part is a reflection -> negative determinant
+        assert np.linalg.det(np.asarray(transform)[:, :2]) < 0
+        # applying the transform maps ref beads into the channel region, mirrored
+        ref_xy = beads_ref[["x", "y"]].to_numpy(float)
+        mapped = localize.apply_affine_transform(ref_xy, transform)
+        if axis == "y":
+            np.testing.assert_allclose(
+                mapped[:, 0], ref_xy[:, 0] + 48, atol=1.0
+            )
+            np.testing.assert_allclose(
+                mapped[:, 1], 47 - ref_xy[:, 1], atol=1.0
+            )
+        else:
+            np.testing.assert_allclose(
+                mapped[:, 0], 47 - ref_xy[:, 0] + 48, atol=1.0
+            )
+            np.testing.assert_allclose(mapped[:, 1], ref_xy[:, 1], atol=1.0)
 
 
 @pytest.mark.skipif(

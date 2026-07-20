@@ -308,6 +308,10 @@ class View(QtWidgets.QGraphicsView):
         self.split_fov_mode = False
         self._moving_roi = None  # index of the region being dragged
         self._move_anchor = None  # (scene_dy, scene_dx) press offset in region
+        # A double click fires press/release/doubleClick/release; this flag lets
+        # the trailing release be ignored so deleting a region does not
+        # immediately re-add one at the same spot.
+        self._suppress_release = False
 
     def _frame_shape(self) -> tuple[int, int] | None:
         """(`height`, `width`) of the current movie frame, or None."""
@@ -444,6 +448,12 @@ class View(QtWidgets.QGraphicsView):
         """Add the dragged ROI (clipping against existing ones) or stop
         panning the view."""
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            if self._suppress_release:
+                # trailing release of a double click that deleted a region
+                self._suppress_release = False
+                self.rubberband.hide()
+                event.accept()
+                return
             if self.split_fov_mode and self._moving_roi is not None:
                 # finished dragging an existing region
                 self._moving_roi = None
@@ -541,6 +551,8 @@ class View(QtWidgets.QGraphicsView):
             return
         del self.rois[idx]
         self.selected_roi = None
+        # the release that closes this double click must not re-add a region
+        self._suppress_release = True
         # In split-FOV mode the shared size is derived from the remaining
         # regions (see ``_region_size``), so removing all of them frees it.
         self.window.parameters_dialog.update_roi_display()
@@ -3309,6 +3321,22 @@ class Window(QtWidgets.QMainWindow):
             )
             return
 
+        # Separate-channel multichannel: several channels are loaded (separate
+        # files or a multichannel file) and split-FOV mode is off. The first
+        # loaded channel is the reference.
+        multichannel = not split_fov and len(self.channels) > 1
+        if multichannel:
+            n_frames = {int(c.movie.shape[0]) for c in self.channels}
+            if len(n_frames) != 1:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Spline PSF Calibration",
+                    "The loaded channels have different frame counts "
+                    f"({sorted(n_frames)}). A multichannel calibration needs "
+                    "every channel to share the same z-scan layout.",
+                )
+                return
+
         specs = CalibrateSplineDialog.getCalibrationSpecs(self)
         (
             step,
@@ -3333,6 +3361,16 @@ class Window(QtWidgets.QMainWindow):
             return
 
         parameters = self.parameters
+        # Separate-channel multichannel build: pass every channel's movie/info
+        # (reference first) so the worker calls calibrate_spline_multichannel.
+        # Camera info is shared (Localize keeps a single camera-parameter set).
+        movies = infos = camera_infos = None
+        frame_bounds = self.frame_range
+        if multichannel:
+            movies = [c.movie for c in self.channels]
+            infos = [c.info for c in self.channels]
+            camera_infos = [self.camera_info for _ in self.channels]
+            frame_bounds = self.channels[0].frame_range
         self.spline_calibration_worker = SplineCalibrationWorker(
             movie=self.movie,
             info=self.info,
@@ -3342,12 +3380,15 @@ class Window(QtWidgets.QMainWindow):
             step=step,
             frames_per_step=frames_per_step,
             frame_order=frame_order,
-            frame_bounds=self.frame_range,
+            frame_bounds=frame_bounds,
             model=model,
             magnification_factor=magnification_factor,
             correct_z_bias=correct_z_bias,
             roi=self.view.rois,
             regions=regions,
+            movies=movies,
+            infos=infos,
+            camera_infos=camera_infos,
             path=path,
         )
         self.spline_calibration_worker.finished.connect(
@@ -3356,7 +3397,20 @@ class Window(QtWidgets.QMainWindow):
         self.spline_calibration_worker.failed.connect(
             self.on_spline_calibration_failed
         )
-        self.status_bar.showMessage("Building spline PSF calibration ...")
+        if multichannel:
+            msg = (
+                f"Building multichannel spline PSF calibration from "
+                f"{len(self.channels)} channels (reference: "
+                f"{self.channels[0].name}) ..."
+            )
+        elif regions:
+            msg = (
+                f"Building split-FOV spline PSF calibration from "
+                f"{len(regions)} regions ..."
+            )
+        else:
+            msg = "Building spline PSF calibration ..."
+        self.status_bar.showMessage(msg)
         self.spline_calibration_worker.start()
 
     def on_spline_calibration_finished(self, path: str, n_beads: int) -> None:
@@ -5724,6 +5778,9 @@ class SplineCalibrationWorker(QtCore.QThread):
         correct_z_bias: bool = False,
         roi=None,
         regions=None,
+        movies=None,
+        infos=None,
+        camera_infos=None,
     ) -> None:
         super().__init__()
         self.movie = movie
@@ -5742,11 +5799,33 @@ class SplineCalibrationWorker(QtCore.QThread):
         # When set (>= 2 rectangles), the ROIs are treated as channels of one
         # movie (split-FOV) and a multichannel calibration is built instead.
         self.regions = regions
+        # When set (>= 2 movies), the channels are separate movies (separate
+        # files or a multichannel file) registered from bead correspondences;
+        # movies[0]/infos[0] is the reference channel.
+        self.movies = movies
+        self.infos = infos
+        self.camera_infos = camera_infos
         self.path = path
 
     def run(self) -> None:
         try:
-            if self.regions:
+            if self.movies:
+                calibration = spline.calibrate_spline_multichannel(
+                    self.movies,
+                    infos=self.infos,
+                    camera_infos=self.camera_infos,
+                    box=self.box,
+                    minimum_ng=self.minimum_ng,
+                    d=self.step,
+                    frames_per_step=self.frames_per_step,
+                    frame_bounds=self.frame_bounds,
+                    frame_order=self.frame_order,
+                    magnification_factor=self.magnification_factor,
+                    correct_z_bias=self.correct_z_bias,
+                    reference=0,
+                    path=self.path,
+                )
+            elif self.regions:
                 calibration = spline.calibrate_spline_split_fov(
                     self.movie,
                     info=self.info,
