@@ -40,6 +40,106 @@ def _synthetic_bead_movie(n_frames=21, h=48, w=48, box=BOX):
     return movie.astype(np.uint16), bead_xy, focus
 
 
+def _synthetic_multifov_movie(
+    n_fov=3, n_steps=11, h=48, w=48, order="z", box=BOX
+):
+    """A genuine multi-FOV bead z-stack: ``n_fov`` fields, each with beads at
+    *different* positions, each scanned over ``n_steps`` z positions (focus at
+    the centre). Frames are laid out in ``order`` ("z": each FOV is a full z
+    stack, then the next FOV; "fov": the FOVs are interleaved at each z).
+
+    Returns ``(movie, fov_beads, focus)`` where ``fov_beads[k]`` are the bead
+    centres of FOV ``k``. The total number of physical beads is
+    ``sum(len(b) for b in fov_beads)`` - more than any single field holds.
+    """
+    fov_beads = [
+        [(12, 14), (30, 28)],
+        [(18, 33), (35, 12)],
+        [(22, 20), (14, 38), (40, 30)],
+        [(38, 16), (11, 25)],
+    ][:n_fov]
+    s0 = 1.1
+    focus = n_steps // 2
+    yy, xx = np.mgrid[0:h, 0:w]
+
+    def frame_img(fov, k):
+        sigma = s0 * (1.0 + 0.07 * abs(k - focus))
+        img = np.full((h, w), 100.0, dtype=np.float32)
+        for bx, by in fov_beads[fov]:
+            img += 3000.0 * np.exp(
+                -((xx - bx) ** 2 + (yy - by) ** 2) / (2 * sigma**2)
+            )
+        return img
+
+    frames = []
+    if order == "z":
+        for fov in range(n_fov):
+            for k in range(n_steps):
+                frames.append(frame_img(fov, k))
+    else:  # "fov": all FOVs at z0, then all FOVs at z1, ...
+        for k in range(n_steps):
+            for fov in range(n_fov):
+                frames.append(frame_img(fov, k))
+    movie = np.stack(frames).astype(np.uint16)
+    return movie, fov_beads, focus
+
+
+class TestFovOfFrame:
+    def test_z_order(self):
+        # 2 FOVs x 5 steps, z order: each FOV is a full z stack
+        fov = spline._fov_of_frame(10, 2, "z")
+        np.testing.assert_array_equal(fov, [0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
+
+    def test_fov_order(self):
+        # 2 FOVs interleaved at each z position
+        fov = spline._fov_of_frame(10, 2, "fov")
+        np.testing.assert_array_equal(fov, [0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
+
+    def test_single_fov(self):
+        np.testing.assert_array_equal(
+            spline._fov_of_frame(5, 1, "fov"), [0, 0, 0, 0, 0]
+        )
+
+    def test_trailing_frames_marked_invalid(self):
+        # 7 frames, 2 FOVs -> n_steps=3, frame 6 does not complete a step
+        fov = spline._fov_of_frame(7, 2, "z")
+        assert fov[-1] == -1
+
+    def test_fov_and_step_pair_uniquely(self):
+        # every (fov, step) pair maps to exactly one frame, in both orders
+        n_frames, fps = 12, 3
+        for order in ("fov", "z"):
+            step, _, _ = spline._step_of_frame(
+                n_frames, 10.0, fps, order, None
+            )
+            fov = spline._fov_of_frame(n_frames, fps, order)
+            pairs = list(zip(fov.tolist(), step.tolist()))
+            assert len(set(pairs)) == len(pairs) == n_frames
+
+
+class TestMaskToSegments:
+    def test_contiguous_run(self):
+        mask = np.array([0, 1, 1, 1, 0, 0], dtype=bool)
+        assert spline._mask_to_segments(mask) == [(1, 3)]
+
+    def test_multiple_runs(self):
+        mask = np.array([1, 1, 0, 1, 0, 1, 1, 1], dtype=bool)
+        assert spline._mask_to_segments(mask) == [(0, 1), (3, 3), (5, 7)]
+
+    def test_empty(self):
+        assert spline._mask_to_segments(np.zeros(5, dtype=bool)) == []
+
+    def test_reference_segments_split_per_fov_in_z_order(self):
+        # 3 FOVs x 12 steps, z order: the in-focus middle third of each FOV is
+        # a separate segment (not one giant min..max span)
+        n_frames, fps = 36, 3
+        step, _, step_range = spline._step_of_frame(
+            n_frames, 10.0, fps, "z", None
+        )
+        segments = spline._reference_frame_segments(step, step_range)
+        assert len(segments) == fps  # one in-focus block per FOV
+
+
 class TestStepOfFrame:
     def test_one_frame_per_step(self):
         step, z_of_step, step_range = spline._step_of_frame(
@@ -151,6 +251,104 @@ class TestBuildPsfTemplate:
         assert built["effective_sigma"] > 0
 
 
+class TestMultiFov:
+    """Genuine multi-FOV z-stacks: several fields with *different* beads at
+    *different* positions. Beads must be detected and extracted per FOV (each
+    from its own field's frames), never averaged across fields."""
+
+    def test_detects_beads_from_all_fovs_with_labels(self):
+        movie, fov_beads, _ = _synthetic_multifov_movie(n_fov=3, order="z")
+        n_fov = len(fov_beads)
+        n_total = sum(len(b) for b in fov_beads)
+        n_frames = movie.shape[0]
+        step_of_frame, _, step_range = spline._step_of_frame(
+            n_frames, 20.0, n_fov, "z", None
+        )
+        fov_of_frame = spline._fov_of_frame(n_frames, n_fov, "z")
+        segments = spline._reference_frame_segments(step_of_frame, step_range)
+        beads = spline._detect_bead_positions(
+            movie, 2000.0, BOX, segments, fov_of_frame=fov_of_frame
+        )
+        assert "fov" in beads.columns
+        # every field's beads are found (pooling would merge/lose some)
+        assert len(beads) == n_total
+        assert sorted(beads["fov"].unique()) == list(range(n_fov))
+        for k in range(n_fov):
+            assert (beads["fov"] == k).sum() == len(fov_beads[k])
+
+    def test_bead_volume_is_isolated_to_its_own_fov(self):
+        """A bead's volume must come only from its own FOV's frames: a bright
+        contaminant at the same pixel in another FOV must not leak in (the bug
+        that corrupted cross-FOV pixel-averaging)."""
+        import pandas as pd
+
+        n_steps, h, w = 5, 24, 24
+        yy, xx = np.mgrid[0:h, 0:w]
+        bx, by = 10, 10
+
+        def blob(amp, sigma):
+            return amp * np.exp(
+                -((xx - bx) ** 2 + (yy - by) ** 2) / (2 * sigma**2)
+            )
+
+        frames = []
+        # FOV0: real bead, amplitude 3000; FOV1: bright contaminant 12000 at the
+        # SAME pixel (z order: FOV0 stack, then FOV1 stack)
+        for k in range(n_steps):
+            frames.append(blob(3000.0, 1.1 * (1 + 0.1 * abs(k - 2))))
+        for k in range(n_steps):
+            frames.append(blob(12000.0, 1.1))
+        movie = np.stack(frames).astype(np.uint16)
+
+        step_of_frame, _, step_range = spline._step_of_frame(
+            2 * n_steps, 20.0, 2, "z", None
+        )
+        fov_of_frame = spline._fov_of_frame(2 * n_steps, 2, "z")
+        beads = pd.DataFrame({"x": [bx], "y": [by], "fov": [0]})
+        vols = spline._bead_volumes(
+            movie,
+            CAMERA_INFO,
+            beads,
+            BOX,
+            step_of_frame,
+            step_range,
+            fov_of_frame=fov_of_frame,
+        )
+        peak = vols[0].max()
+        # FOV0-only peak ~3000; cross-FOV averaging would give ~7500, and the
+        # raw contaminant is 12000. Must be the isolated FOV0 value.
+        assert peak == pytest.approx(3000.0, rel=0.15)
+        assert peak < 5000.0
+
+    def test_build_template_multifov_is_clean(self):
+        """End-to-end: a multi-FOV stack yields a well-focused template built
+        from all fields' beads (the per-FOV path), for both frame orders."""
+        for order in ("z", "fov"):
+            movie, fov_beads, focus = _synthetic_multifov_movie(
+                n_fov=3, order=order
+            )
+            n_fov = len(fov_beads)
+            n_total = sum(len(b) for b in fov_beads)
+            built = spline.build_psf_template(
+                movie,
+                CAMERA_INFO,
+                box=BOX,
+                minimum_ng=2000.0,
+                d=20.0,
+                frames_per_step=n_fov,
+                frame_order=order,
+            )
+            # beads pooled from all fields
+            assert built["n_beads"] == n_total
+            # focus recovered near the central step; clean normalized template
+            assert abs(built["z_center"] - focus) <= 2
+            tpl = built["template"]
+            assert tpl[:, :, built["z_center"]].max() == pytest.approx(
+                1.0, abs=0.05
+            )
+            assert tpl.min() == pytest.approx(0.0, abs=0.1)
+
+
 @pytest.mark.skipif(
     not localize.GPUSPLINE_INSTALLED, reason="Gpuspline not available"
 )
@@ -235,6 +433,70 @@ class TestMultichannelCalibration:
         assert len(other_idx) == 1
         assert ref_idx.tolist() == [0]  # closest reference wins
 
+
+class TestRansacMatch:
+    """RANSAC bead matching that makes the channel registration robust to the
+    coarse (ROI-origin) pre-alignment - the fix for the ROI-placement
+    hypersensitivity of split-FOV calibrations."""
+
+    @staticmethod
+    def _mirrored_pair():
+        # six reference beads and their images under a known y-mirror + small
+        # rotation + shift (a realistic biplane registration)
+        ref = np.array(
+            [[10, 12], [40, 18], [25, 55], [60, 50], [15, 70], [50, 82]],
+            dtype=float,
+        )
+        theta = np.deg2rad(3.0)
+        rot = np.array(
+            [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]]
+        )
+        flip = np.array([[1.0, 0.0], [0.0, -1.0]])  # mirror in y
+        linear = rot @ flip
+        offset = np.array([7.0, 190.0])
+        c = ref @ linear.T + offset
+        return ref, c, linear, offset
+
+    @pytest.mark.parametrize("overlay_offset", [(0.0, 0.0), (14.0, -11.0)])
+    def test_recovers_transform_despite_bad_overlay(self, overlay_offset):
+        """A wrong coarse overlay (a misplaced ROI) must not change the result:
+        the correct correspondences and transform are recovered regardless."""
+        ref, c, linear, offset = self._mirrored_pair()
+        # the coarse overlay maps c back near ref but is deliberately off; a plain
+        # nearest-neighbour match at this offset would mis-pair some beads
+        inv = np.linalg.inv(linear)
+        aligned = (c - offset) @ inv.T + np.asarray(overlay_offset)
+        ref_idx, c_idx = spline._ransac_match(
+            ref, c, aligned, inlier_tol=3.0, radius=40.0
+        )
+        assert len(ref_idx) == len(ref)  # all beads matched
+        # identity correspondence (c[i] is the image of ref[i]) is recovered
+        order = np.argsort(ref_idx)
+        assert ref_idx[order].tolist() == list(range(len(ref)))
+        assert c_idx[order].tolist() == list(range(len(ref)))
+        # and the transform fit on them matches the truth (mirror -> det < 0)
+        M = localize.estimate_affine_transform(ref[ref_idx], c[c_idx])
+        np.testing.assert_allclose(M[:, :2], linear, atol=0.02)
+        assert np.linalg.det(M[:, :2]) < 0
+
+    def test_rejects_decoy_and_is_overlay_independent(self):
+        """Extra unmatched channel beads (decoys) are rejected, and two very
+        different overlays give the same correspondences."""
+        ref, c, _, offset = self._mirrored_pair()
+        c_dec = np.vstack([c, [[200.0, 5.0], [5.0, 5.0]]])  # 2 decoys
+        results = []
+        for off in [(0.0, 0.0), (18.0, 16.0)]:
+            aligned = np.vstack(
+                [ref + np.asarray(off), [[999.0, 999.0], [-999.0, -999.0]]]
+            )
+            ri, ci = spline._ransac_match(
+                ref, c_dec, aligned, inlier_tol=3.0, radius=45.0
+            )
+            results.append((ri.tolist(), ci.tolist()))
+            assert len(ri) == len(ref)  # decoys excluded
+            assert max(ci) < len(c)  # only real channel beads matched
+        assert results[0] == results[1]  # overlay-independent
+
     def test_estimate_channel_transform_recovers_shift(self):
         movie_ref, _, _ = _synthetic_bead_movie()
         dx, dy = 3, -2  # channel is the reference shifted by (dx, dy)
@@ -243,8 +505,10 @@ class TestMultichannelCalibration:
         step_of_frame, _, step_range = spline._step_of_frame(
             movie_ref.shape[0], 20.0, 1, "fov", None
         )
-        ref_bounds = spline._reference_frame_bounds(step_of_frame, step_range)
-        mid = (ref_bounds[0] + ref_bounds[1]) // 2
+        ref_bounds = spline._reference_frame_segments(
+            step_of_frame, step_range
+        )
+        mid = spline._reference_mid_frame(step_of_frame, step_range)
         beads_ref = spline._detect_bead_positions(
             movie_ref, 2000.0, BOX, ref_bounds
         )
@@ -277,8 +541,10 @@ class TestMultichannelCalibration:
         step_of_frame, _, step_range = spline._step_of_frame(
             movie_ref.shape[0], 20.0, 1, "fov", None
         )
-        ref_bounds = spline._reference_frame_bounds(step_of_frame, step_range)
-        mid = (ref_bounds[0] + ref_bounds[1]) // 2
+        ref_bounds = spline._reference_frame_segments(
+            step_of_frame, step_range
+        )
+        mid = spline._reference_mid_frame(step_of_frame, step_range)
         beads_ref = spline._detect_bead_positions(
             movie_ref, 2000.0, BOX, ref_bounds
         )
@@ -405,6 +671,76 @@ class TestCalibrateSplineMultichannel:
         assert abs(t1[1, 1] + 1.0) < 0.1  # y scale ~ -1
         assert abs(t1[1, 2] - (h - 1)) < 2.0  # y offset ~ H - 1
 
+    @pytest.mark.skipif(
+        not localize.GPUFIT_INSTALLED, reason="Gpufit not available"
+    )
+    def test_axial_precision_multichannel_is_joint(self):
+        """The multichannel axial-precision diagnostic must fit all channels
+        *jointly* (the real pipeline) rather than each plane alone. This checks
+        the joint contract: it stacks every channel's per-frame spots, fits them
+        against the full calibration, tags the result as a joint N-channel fit
+        and returns one bias/precision sample per z-step. (Degeneracy-breaking
+        needs realistic aberrated PSFs; the symmetric synthetic Gaussian here is
+        z-degenerate even jointly, so no tight bias bound is asserted.)"""
+        import pandas as pd
+
+        movie_ref, _, _ = _synthetic_bead_movie()
+        # biplane-style: channel 1 focuses at a different stage step
+        movie_c = np.roll(movie_ref, shift=2, axis=0)
+        info = [{"Frames": int(movie_ref.shape[0])}]
+        calib = spline.calibrate_spline_multichannel(
+            [movie_ref, movie_c],
+            infos=[info, info],
+            camera_infos=[CAMERA_INFO, CAMERA_INFO],
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+        )
+        # rebuild each channel's per-frame spots at its (mapped) bead positions,
+        # exactly as calibrate_spline_multichannel does internally
+        transforms = calib["channel_transforms"]
+        movies = [movie_ref, movie_c]
+        step_of_frame, _, step_range = spline._step_of_frame(
+            movie_ref.shape[0], 20.0, 1, "fov", None
+        )
+        rb = spline._reference_frame_segments(step_of_frame, step_range)
+        beads_ref = spline._detect_bead_positions(movie_ref, 2000.0, BOX, rb)
+        ref_xy = beads_ref[["x", "y"]].to_numpy(float)
+        per_channel = []
+        for c, m in enumerate(movies):
+            if c == 0:
+                beads_c = beads_ref
+            else:
+                mp = localize.apply_affine_transform(ref_xy, transforms[c])
+                beads_c = pd.DataFrame(
+                    {
+                        "x": np.rint(mp[:, 0]).astype(int),
+                        "y": np.rint(mp[:, 1]).astype(int),
+                    }
+                )
+            per_channel.append(
+                spline.build_psf_template(
+                    m,
+                    CAMERA_INFO,
+                    BOX,
+                    2000.0,
+                    20.0,
+                    beads=beads_c,
+                    return_spots=True,
+                )
+            )
+        prec = spline._axial_precision_multichannel(per_channel, calib)
+        assert prec is not None
+        assert prec["joint"] == 2  # tagged as a joint 2-channel fit
+        z = np.asarray(per_channel[0]["z_of_step"], float)
+        # one bias/precision sample per z-step, and the joint fit produced
+        # finite z estimates for a good fraction of spots
+        assert len(prec["bias_z"]) == len(z)
+        assert len(prec["precision_z"]) == len(z)
+        assert np.any(np.isfinite(prec["bias_z"]))
+        assert prec["n_spots"] > 0
+        assert len(prec["scatter_fit"]) == len(prec["scatter_stage"]) > 0
+
 
 def _synthetic_split_fov_movie(dx=2, dy=-1):
     """A single movie whose left and right 48x48 halves are two channels.
@@ -453,8 +789,10 @@ class TestSplitFovTransform:
         step_of_frame, _, step_range = spline._step_of_frame(
             movie.shape[0], 20.0, 1, "fov", None
         )
-        ref_bounds = spline._reference_frame_bounds(step_of_frame, step_range)
-        mid = (ref_bounds[0] + ref_bounds[1]) // 2
+        ref_bounds = spline._reference_frame_segments(
+            step_of_frame, step_range
+        )
+        mid = spline._reference_mid_frame(step_of_frame, step_range)
         ref_roi = spline._normalized_region(regions[0])
         chan_roi = spline._normalized_region(regions[1])
         beads_ref = spline._detect_bead_positions(
@@ -491,8 +829,10 @@ class TestSplitFovTransform:
         step_of_frame, _, step_range = spline._step_of_frame(
             movie.shape[0], 20.0, 1, "fov", None
         )
-        ref_bounds = spline._reference_frame_bounds(step_of_frame, step_range)
-        mid = (ref_bounds[0] + ref_bounds[1]) // 2
+        ref_bounds = spline._reference_frame_segments(
+            step_of_frame, step_range
+        )
+        mid = spline._reference_mid_frame(step_of_frame, step_range)
         ref_roi = spline._normalized_region(regions[0])
         chan_roi = spline._normalized_region(regions[1])
         beads_ref = spline._detect_bead_positions(

@@ -1107,7 +1107,7 @@ class Calibrate3DDialog(lib.Dialog):
         )
         grid.addWidget(frames_label, 1, 0)
         self.frames_per_step = QtWidgets.QSpinBox()
-        self.frames_per_step.setRange(1, 100)
+        self.frames_per_step.setRange(1, 1000)
         self.frames_per_step.setValue(1)
         grid.addWidget(self.frames_per_step, 1, 1)
 
@@ -1199,7 +1199,7 @@ class CalibrateSplineDialog(lib.Dialog):
         )
         grid.addWidget(frames_label, 1, 0)
         self.frames_per_step = QtWidgets.QSpinBox()
-        self.frames_per_step.setRange(1, 100)
+        self.frames_per_step.setRange(1, 1000)
         self.frames_per_step.setValue(1)
         grid.addWidget(self.frames_per_step, 1, 1)
 

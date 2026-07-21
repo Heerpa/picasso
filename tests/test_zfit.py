@@ -962,6 +962,60 @@ class TestCalibrateZFramesPerStep:
                     err_msg=f"N={frames_per_step} order={order}",
                 )
 
+    def test_genuine_multifov_different_fields(self):
+        """Genuine multi-FOV: each field of view holds *different* beads at
+        *different* positions (not repeats of one field). Because the width vs
+        z relation is a property of the optics (independent of lateral
+        position), pooling every field's localizations by z position must
+        recover the same calibration as a single field - which is exactly what
+        ``calibrate_z`` does (it groups per-spot fits by z, no pixel
+        averaging). This is the localization-level analogue of the per-FOV
+        spline fix."""
+        n_fov = 3
+        rng = np.random.default_rng(1)
+        z_total = (self.N_STEPS - 1) * self.D
+        n_frames = self.N_STEPS * n_fov
+        # distinct bead positions per FOV
+        fov_xy = [(8.0, 8.0), (24.0, 12.0), (14.0, 26.0)]
+        rows = []
+        for s in range(self.N_STEPS):
+            z = -(s * self.D - z_total / 2)
+            sx_mean = 1.5 + 1e-3 * z + 1e-5 * z**2
+            sy_mean = 1.5 - 1e-3 * z + 1e-5 * z**2
+            for fov in range(n_fov):
+                frame = fov * self.N_STEPS + s  # "z" order
+                bx, by = fov_xy[fov]
+                for _ in range(15):
+                    rows.append(
+                        {
+                            "frame": frame,
+                            "x": bx,
+                            "y": by,
+                            "sx": sx_mean + rng.normal(0, 0.02),
+                            "sy": sy_mean + rng.normal(0, 0.02),
+                            "photons": 5000.0,
+                            "bg": 10.0,
+                            "lpx": 0.01,
+                            "lpy": 0.01,
+                        }
+                    )
+        locs = pd.DataFrame(rows)
+        info = [
+            {"Frames": n_frames, "Pixelsize": 130, "Width": 32, "Height": 32}
+        ]
+        calib = zfit.calibrate_z(
+            locs,
+            info,
+            self.D,
+            magnification_factor=0.79,
+            frames_per_step=n_fov,
+            frame_order="z",
+        )
+        cx = np.array(calib["X Coefficients"])
+        cy = np.array(calib["Y Coefficients"])
+        assert zfit._get_calib_size(cx, 0.0) == pytest.approx(1.5, abs=0.1)
+        assert zfit._get_calib_size(cy, 0.0) == pytest.approx(1.5, abs=0.1)
+
     def test_number_of_z_positions_drives_the_fit(self, monkeypatch):
         """With ``frames_per_step`` frames per position, the polynomial
         fit sees ``n_frames // frames_per_step`` z positions, not the
