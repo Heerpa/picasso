@@ -90,6 +90,11 @@ class ModelID:
     SPLINE_3D = 10
     SPLINE_3D_MULTICHANNEL = 11
     SPLINE_3D_PHASE_MULTICHANNEL = 12
+    # Two-channel "link-XYZ" sharing: x,y,z are global,
+    # photons and background are free per channel.
+    # Params: [x, y, z, N0, N1, bg0, bg1]. Custom model added to
+    # Gpufit.dll
+    SPLINE_3D_MULTICHANNEL_LINK_XYZ = 15
 
 
 class EstimatorID:

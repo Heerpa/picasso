@@ -43,6 +43,14 @@ GPUSPLINE_INSTALLED = localize.GPUSPLINE_INSTALLED
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
 
+LINK_PHOTONS_TIP = (
+    "2-channel fitting only.\n\n'"
+    "CHECK to link photons + background across both channels. "
+    "Appropriate when the channels share one emission.\n\n"
+    "UNCHECK to decouple: each channel fits a free photon count"
+    " + background, x/y/z shared."
+)
+
 # Fitting models offered in the GUI, decoupled from the optimizer. Each
 # model maps its optimizer labels to the internal ``fit2D`` codes;
 # models without an optimizer (e.g. averaging) declare a fixed ``code``
@@ -1248,6 +1256,17 @@ class CalibrateSplineDialog(lib.Dialog):
         self.correct_z_bias.setChecked(False)
         grid.addWidget(self.correct_z_bias, 5, 0, 1, 2)
 
+        # Multichannel (2-channel) default fit mode. Stored in the calibration
+        # and used to (a) run this calibration's axial-precision diagnostic with
+        # that model and (b) default the fit's "Link photons" toggle. The same
+        # coefficients serve both models, so it can still be flipped at fit time.
+        self.link_photons = QtWidgets.QCheckBox(
+            "Link photon counts across channels"
+        )
+        self.link_photons.setToolTip(LINK_PHOTONS_TIP)
+        self.link_photons.setChecked(True)
+        grid.addWidget(self.link_photons, 6, 0, 1, 2)
+
         self.frames_per_step.valueChanged.connect(self._update_order_enabled)
         self._update_order_enabled(self.frames_per_step.value())
 
@@ -1272,10 +1291,11 @@ class CalibrateSplineDialog(lib.Dialog):
     @staticmethod
     def getCalibrationSpecs(
         parent: QtWidgets.QWidget | None = None,
-    ) -> tuple[float, int, str, str, float, bool, bool]:
+    ) -> tuple[float, int, str, str, float, bool, bool, bool]:
         """Show the dialog and return the chosen step size, number of frames
         per step, frame order, spline model, magnification factor, whether to
-        correct the z bias, and whether it was accepted."""
+        correct the z bias, whether to link photons across channels, and whether
+        it was accepted."""
         dialog = CalibrateSplineDialog(parent)
         result = dialog.exec()
         step = dialog.step.value()
@@ -1284,6 +1304,7 @@ class CalibrateSplineDialog(lib.Dialog):
         model = dialog.model.currentData()
         magnification_factor = dialog.magnification_factor.value()
         correct_z_bias = dialog.correct_z_bias.isChecked()
+        link_photons = dialog.link_photons.isChecked()
         accepted = result == QtWidgets.QDialog.DialogCode.Accepted
         return (
             step,
@@ -1292,6 +1313,7 @@ class CalibrateSplineDialog(lib.Dialog):
             model,
             magnification_factor,
             correct_z_bias,
+            link_photons,
             accepted,
         )
 
@@ -2044,6 +2066,15 @@ class ParametersDialog(lib.Dialog):
             )
             spline_grid.addWidget(self.spline_calib_label, 0, 0)
 
+            self.link_photons_checkbox = QtWidgets.QCheckBox(
+                "Link photon counts across channels"
+            )
+            self.link_photons_checkbox.setToolTip(LINK_PHOTONS_TIP)
+            self.link_photons_checkbox.setTristate(False)
+            self.link_photons_checkbox.setChecked(True)
+            self.link_photons_checkbox.hide()  # shown for 2-channel calibs
+            spline_grid.addWidget(self.link_photons_checkbox, 1, 0, 1, 3)
+
         # show the calibration box that matches the initial fit model
         self._update_calib_group_visibility()
 
@@ -2414,6 +2445,37 @@ class ParametersDialog(lib.Dialog):
                 QtCore.Qt.AlignmentFlag.AlignCenter
             )
             self.spline_calib_label.setText("-- no calibration loaded --")
+        self._update_link_photons_visibility()
+
+    def _update_link_photons_visibility(self) -> None:
+        """Show the 'Link photons across channels' checkbox only for a
+        2-channel (non-phase) multichannel spline calibration - the sole case
+        where photon decoupling (model 15) is available."""
+        # A config auto-load may call update_spline_calib during startup before
+        # the fit UI (and this checkbox) is built; ignore until it exists.
+        if not hasattr(self, "link_photons_checkbox"):
+            return
+        cal = self.spline_calibration or {}
+        # (see _link_photons_enabled for how the state reaches the fit workers)
+        n_channels = int(
+            cal.get("n_channels", len(cal.get("channel_transforms", []) or []))
+        )
+        is_multichannel = cal.get("model") == "spline-3d-multichannel"
+        show = is_multichannel and n_channels == 2
+        if show:
+            # default the toggle to the mode chosen when the calibration was
+            # built (stored as "link_photons"); the user can still flip it.
+            self.link_photons_checkbox.setChecked(
+                bool(cal.get("link_photons", True))
+            )
+        self.link_photons_checkbox.setVisible(show)
+
+    def _link_photons_enabled(self) -> bool:
+        """Whether the multichannel spline fit should link photons across
+        channels (shared amplitude, model 11). True when the checkbox is absent
+        (no GPUfit / non-multichannel) so behaviour is unchanged by default."""
+        cb = getattr(self, "link_photons_checkbox", None)
+        return cb.isChecked() if cb is not None else True
 
     def update_z_calib_with_config_path(self):
         """Retrieve the z calibration path that corresponds to the
@@ -3345,6 +3407,7 @@ class Window(QtWidgets.QMainWindow):
             model,
             magnification_factor,
             correct_z_bias,
+            link_photons,
             accepted,
         ) = specs
         if not accepted:
@@ -3384,6 +3447,7 @@ class Window(QtWidgets.QMainWindow):
             model=model,
             magnification_factor=magnification_factor,
             correct_z_bias=correct_z_bias,
+            link_photons=link_photons,
             roi=self.view.rois,
             regions=regions,
             movies=movies,
@@ -4721,6 +4785,7 @@ class Window(QtWidgets.QMainWindow):
             self.parameters["Box Size"],
             calibration,
             mle=method == "spline-mle-gpu",
+            link_photons=self.parameters_dialog._link_photons_enabled(),
         )
         self.fit_worker.progressMade.connect(self.on_fit_progress)
         self.fit_worker.finished.connect(self.on_fit_finished)
@@ -4791,6 +4856,7 @@ class Window(QtWidgets.QMainWindow):
             mle=method == "spline-mle-gpu",
             split_fov=True,
             regions=regions,
+            link_photons=self.parameters_dialog._link_photons_enabled(),
         )
         self.fit_worker.progressMade.connect(self.on_fit_progress)
         self.fit_worker.finished.connect(self.on_fit_finished)
@@ -5622,6 +5688,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         mle: bool = False,
         split_fov: bool = False,
         regions: list | None = None,
+        link_photons: bool = True,
     ) -> None:
         super().__init__()
         self.movies = movies
@@ -5630,6 +5697,10 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         self.box = box
         self.calibration = calibration
         self.mle = mle
+        # Link photons across channels (shared amplitude, model 11). When False
+        # and the calibration has 2 channels, fit the photon-decoupled model 15
+        # (globLoc link-XYZ): per-channel free photons/background
+        self.link_photons = link_photons
         # Split-FOV: ``movies``/``camera_infos`` hold a single entry (one loaded
         # movie); the channels are regions of that movie, handled by
         # ``fit_spline_split_fov`` (which confines to the reference region).
@@ -5644,6 +5715,9 @@ class MultichannelSplineFitWorker(QtCore.QThread):
     def run(self) -> None:
         t0 = time.time()
         try:
+            n_channels = int(
+                self.calibration.get("n_channels", len(self.movies))
+            )
             if self.split_fov:
                 locs = localize.fit_spline_split_fov(
                     self.movies[0],
@@ -5653,6 +5727,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     self.calibration,
                     regions=self.regions,
                     mle=self.mle,
+                    link_photons=self.link_photons,
                     progress_callback=self.on_progress,
                 )
             elif (
@@ -5667,6 +5742,19 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     self.box,
                     self.calibration,
                     mle=self.mle,
+                    progress_callback=self.on_progress,
+                )
+            elif not self.link_photons and n_channels == 2:
+                # Photon decoupling (globLoc link-XYZ): free per-channel photons
+                # and background, shared x/y/z. Supersedes the ratiometric scan.
+                locs = localize.fit_spline_multichannel(
+                    self.movies,
+                    self.camera_infos,
+                    self.identifications,
+                    self.box,
+                    self.calibration,
+                    mle=self.mle,
+                    link_photons=False,
                     progress_callback=self.on_progress,
                 )
             elif self.calibration.get("photon_ratios") is not None:
@@ -5776,6 +5864,7 @@ class SplineCalibrationWorker(QtCore.QThread):
         frame_bounds=None,
         magnification_factor: float = 0.79,
         correct_z_bias: bool = False,
+        link_photons: bool = True,
         roi=None,
         regions=None,
         movies=None,
@@ -5795,6 +5884,7 @@ class SplineCalibrationWorker(QtCore.QThread):
         self.model = model
         self.magnification_factor = magnification_factor
         self.correct_z_bias = correct_z_bias
+        self.link_photons = link_photons
         self.roi = roi
         # When set (>= 2 rectangles), the ROIs are treated as channels of one
         # movie (split-FOV) and a multichannel calibration is built instead.
@@ -5822,6 +5912,7 @@ class SplineCalibrationWorker(QtCore.QThread):
                     frame_order=self.frame_order,
                     magnification_factor=self.magnification_factor,
                     correct_z_bias=self.correct_z_bias,
+                    link_photons=self.link_photons,
                     reference=0,
                     path=self.path,
                 )
@@ -5839,6 +5930,7 @@ class SplineCalibrationWorker(QtCore.QThread):
                     frame_order=self.frame_order,
                     magnification_factor=self.magnification_factor,
                     correct_z_bias=self.correct_z_bias,
+                    link_photons=self.link_photons,
                     path=self.path,
                 )
             else:

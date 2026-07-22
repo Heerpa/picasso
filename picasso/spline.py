@@ -1150,7 +1150,7 @@ def _ransac_match(
         return empty
 
     # candidate (ref_i, c_j) pairs: c beads near ref_i in the coarse overlay
-    overlay_tree = cKDTree(np.asarray(aligned_c, dtype=np.float64))
+    overlay_tree = KDTree(np.asarray(aligned_c, dtype=np.float64))
     pairs = [
         (i, j)
         for i in range(len(ref_xy))
@@ -1198,14 +1198,12 @@ def _match_beads(
     Returns ``(ref_idx, other_idx)`` index arrays of matched pairs within
     ``max_distance``; each ``other`` bead is used at most once (closest match
     wins)."""
-    from scipy.spatial import cKDTree
-
     ref_xy = np.asarray(ref_xy, dtype=np.float64)
     other_xy = np.asarray(other_xy, dtype=np.float64)
     if len(ref_xy) == 0 or len(other_xy) == 0:
         empty = np.array([], dtype=int)
         return empty, empty
-    tree = cKDTree(other_xy)
+    tree = KDTree(other_xy)
     dist, idx = tree.query(ref_xy, k=1)
     keep = np.where(dist <= max_distance)[0]
     # resolve duplicate targets: assign each target to its closest reference
@@ -1373,6 +1371,7 @@ def calibrate_spline_multichannel(
     correct_z_bias: bool = False,
     max_match_distance: float | None = None,
     photon_ratios: np.ndarray | list | None = None,
+    link_photons: bool = True,
     roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
     regions: list | None = None,
     reference: int = 0,
@@ -1594,6 +1593,7 @@ def calibrate_spline_multichannel(
         "z_step_nm": float(d),
         "magnification_factor": float(magnification_factor),
         "correct_z_bias": bool(correct_z_bias),
+        "link_photons": bool(link_photons),
         "effective_sigma": float(ref["effective_sigma"]),
         # Per-channel amplitude->photon conversion
         "photon_scale": [float(p["photon_scale"]) for p in per_channel],
@@ -2073,6 +2073,7 @@ def calibrate_spline_split_fov(
     correct_z_bias: bool = False,
     max_match_distance: float | None = None,
     photon_ratios: np.ndarray | list | None = None,
+    link_photons: bool = True,
     path: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
 ) -> dict:
@@ -2122,6 +2123,7 @@ def calibrate_spline_split_fov(
         correct_z_bias=correct_z_bias,
         max_match_distance=max_match_distance,
         photon_ratios=photon_ratios,
+        link_photons=link_photons,
         regions=regions,
         reference=reference,
         path=path,
@@ -2679,21 +2681,24 @@ def _axial_precision_from_theta(
     z_of_step: np.ndarray,
     calibration: dict,
     n_beads: int,
+    z_col: int = 3,
 ) -> dict | None:
     """Per-z-step axial bias/precision from fitted spline parameters.
 
     Shared tail of :func:`_axial_precision` (single channel) and
     :func:`_axial_precision_multichannel` (joint fit): converts the fitted z
-    (``theta[:, 3]``) to stage nm, compares it to each spot's known stage
-    position and reduces to a robust per-step bias and spread. Returns the same
-    dict shape both callers emit, or ``None`` if nothing usable remains.
+    (``theta[:, z_col]``) to stage nm, compares it to each spot's known stage
+    position and reduces to a robust per-step bias and spread. ``z_col`` is the
+    z_shift parameter column: 3 for the amplitude-shared models, 2 for the
+    photon-decoupled (link-XYZ) model. Returns the same dict shape both callers
+    emit, or ``None`` if nothing usable remains.
     """
     theta = np.asarray(theta)
     z_of_step = np.asarray(z_of_step, dtype=np.float64)
     spot_step_idx = np.asarray(spot_step_idx)
     z_step_nm = float(calibration.get("z_step_nm", 1.0))
     scan_center = _scan_center_index(z_of_step)
-    z_fit = (theta[:, 3] + scan_center) * z_step_nm  # (n_spots,)
+    z_fit = (theta[:, z_col] + scan_center) * z_step_nm  # (n_spots,)
     deviation = z_fit - z_of_step[spot_step_idx]  # (n_spots,)
 
     n_steps = len(z_of_step)
@@ -2746,13 +2751,25 @@ def _axial_precision_multichannel(
         return None
     # (n_spots, box, box) per channel -> (n_spots, box, box, n_channels)
     spots = np.ascontiguousarray(np.stack(spots_c, axis=-1))
+    # Refit with the model the user chose for this calibration: photon-decoupled
+    # (link-XYZ, model 15) when photons are unlinked and there are 2 channels,
+    # else the shared-amplitude model 11. The reported axial precision then
+    # matches how the data will actually be fitted.
+    n_channels = len(per_channel)
+    link_photons = bool(calibration.get("link_photons", True))
+    if not link_photons and n_channels == 2:
+        fit_cal = localize._as_link_xyz_calibration(calibration)
+        z_col = 2
+    else:
+        fit_cal = calibration
+        z_col = 3
     # z multi-start (like SMAP/globLoc): a single in-focus start leaves the
     # biplane fit degenerate at large |z|; several z seeds recover it.
     n_z = int(calibration["n_data"][2])
     n_z_starts = int(np.clip(n_z // 20, 5, 15))
     try:
         theta = localize.fit_spots_gpufit_spline(
-            spots, calibration, mle=True, n_z_starts=n_z_starts
+            spots, fit_cal, mle=True, n_z_starts=n_z_starts
         )
     except Exception:
         return None
@@ -2762,6 +2779,7 @@ def _axial_precision_multichannel(
         per_channel[0]["z_of_step"],
         calibration,
         int(per_channel[0].get("n_beads", 0)),
+        z_col=z_col,
     )
     if result is not None:
         result["joint"] = int(len(per_channel))

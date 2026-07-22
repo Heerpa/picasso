@@ -2159,6 +2159,29 @@ def _fit2d_gauss_gpu(
 # ----------------------------------------------------------------------
 
 
+_LINK_XYZ_MODEL = "spline-3d-multichannel-link-xyz"
+
+
+def _as_link_xyz_calibration(calibration: dict) -> dict:
+    """Shallow copy of a ``spline-3d-multichannel`` calibration re-tagged for the
+    photon-decoupled (link-XYZ) fit. Validates the 2-channel requirement."""
+    if calibration.get("model") != "spline-3d-multichannel":
+        raise ValueError(
+            "Photon-decoupled (link-XYZ) fitting requires a "
+            "'spline-3d-multichannel' calibration."
+        )
+    n_channels = _spline_n_channels(calibration)
+    if n_channels != 2:
+        raise ValueError(
+            "Photon decoupling (link-XYZ) is only available for 2-channel "
+            f"(biplane / two-color) calibrations; this one has {n_channels}. "
+            "Keep photons linked, or use a 2-channel calibration."
+        )
+    cal = dict(calibration)
+    cal["model"] = _LINK_XYZ_MODEL
+    return cal
+
+
 def _spline_model_id(model: str) -> int:
     """Map a spline calibration ``model`` string to a Gpufit ModelID."""
     if model == "spline-2d":
@@ -2169,6 +2192,8 @@ def _spline_model_id(model: str) -> int:
         return gf.ModelID.SPLINE_3D_MULTICHANNEL
     if model == "spline-3d-phase-multichannel":
         return gf.ModelID.SPLINE_3D_PHASE_MULTICHANNEL
+    if model == _LINK_XYZ_MODEL:
+        return gf.ModelID.SPLINE_3D_MULTICHANNEL_LINK_XYZ
     raise ValueError(
         f"Unknown spline calibration model '{model}'. Expected one of "
         "'spline-2d', 'spline-3d', 'spline-3d-multichannel', "
@@ -2187,7 +2212,7 @@ def _spline_n_channels(calibration: dict) -> int:
     coeff = np.asarray(calibration["coefficients"])
     if model == "spline-3d-phase-multichannel":
         return int(calibration.get("n_channels", coeff.shape[-2]))
-    if model == "spline-3d-multichannel":
+    if model in ("spline-3d-multichannel", _LINK_XYZ_MODEL):
         return int(calibration.get("n_channels", coeff.shape[-1]))
     return 1
 
@@ -2218,6 +2243,10 @@ def _reorder_spline_coefficients_for_gpufit(
     forward ``(x, y[, z])`` order. Returns a flat ``float32`` array ready to
     drop into ``user_info``.
     """
+    # The photon-decoupled (link-XYZ) model reuses the multichannel coefficient
+    # layout verbatim; only the fit's parameter handling differs.
+    if model == _LINK_XYZ_MODEL:
+        model = "spline-3d-multichannel"
     coeff = np.ascontiguousarray(coefficients, dtype=np.float32)
     if model == "spline-2d":
         # label (16, nix, niy); the raw buffer reshapes to (niy, nix, 4, 4)
@@ -2301,10 +2330,16 @@ def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
     n_intervals = list(calibration["n_intervals"])
     if model == "spline-2d":
         header = [n_data[0], n_data[1], n_intervals[0], n_intervals[1]]
-    elif model in ("spline-3d-multichannel", "spline-3d-phase-multichannel"):
+    elif model in (
+        "spline-3d-multichannel",
+        "spline-3d-phase-multichannel",
+        _LINK_XYZ_MODEL,
+    ):
         # Both multichannel models use the same 7-value header (the phase model
         # differs only in the coefficient block: 3 concatenated spline sets).
-        # coeffs are (64, ix, iy, iz, n_channels) or (..., n_channels, 3).
+        # The link-XYZ (photon-decoupled) model shares the plain multichannel
+        # block. coeffs are (64, ix, iy, iz, n_channels) or
+        # (..., n_channels, 3).
         n_channels = _spline_n_channels(calibration)
         header = [
             n_channels,
@@ -2382,7 +2417,7 @@ def crop_spline_calibration(calibration: dict, box: int) -> dict:
         new_coeff = phys_c.ravel(order="C").reshape(64, ni, ni, niz)
         new_n_intervals = [ni, ni, int(niz)]
         new_n_data = [box, box, int(n_data[2])]
-    elif model == "spline-3d-multichannel":
+    elif model in ("spline-3d-multichannel", _LINK_XYZ_MODEL):
         _, nix, niy, niz, n_channels = coeff.shape
         new_coeff = np.empty((64, ni, ni, niz, n_channels), dtype=np.float32)
         for c in range(n_channels):
@@ -2441,6 +2476,24 @@ def _initial_parameters_spline(
     recovery needs a multi-start over phase (a single 0 start converges within
     roughly (-pi/2, pi/2))."""
     model = calibration["model"]
+    if model == _LINK_XYZ_MODEL:
+        # Photon-decoupled (link-XYZ) model: parameters
+        # [x_shift, y_shift, z_shift, N_0..N_{c-1}, bg_0..bg_{c-1}], with the
+        # photon amplitude and background estimated PER CHANNEL (that is the
+        # whole point). spots is (n, box, box, n_channels).
+        n_channels = _spline_n_channels(calibration)
+        per_ch = np.asarray(spots)  # (n, box, box, n_channels)
+        ch_max = np.amax(per_ch, axis=(1, 2))  # (n, n_channels)
+        ch_min = np.amin(per_ch, axis=(1, 2))  # (n, n_channels)
+        z_init = float(
+            calibration.get("z_init", calibration.get("z_center", 0.0))
+        )
+        initial = np.zeros((len(spots), 3 + 2 * n_channels), dtype=np.float32)
+        # x_shift (0), y_shift (1) start at 0 (spot centered); z_shift (2).
+        initial[:, 2] = -z_init
+        initial[:, 3 : 3 + n_channels] = ch_max - ch_min  # per-channel photons
+        initial[:, 3 + n_channels :] = ch_min  # per-channel background
+        return initial
     if model == "spline-2d":
         n_parameters = 4
     elif model == "spline-3d-phase-multichannel":
@@ -2506,6 +2559,7 @@ def _run_gpufit_spline(
     is_multichannel = model in (
         "spline-3d-multichannel",
         "spline-3d-phase-multichannel",
+        _LINK_XYZ_MODEL,
     )
     if is_multichannel:
         # Multichannel spots are channel-stacked (n, box, box, n_channels);
@@ -2566,6 +2620,7 @@ def fit_spots_gpufit_spline(
     spots: lib.FloatArray3D,
     calibration: dict,
     mle: bool = False,
+    n_z_starts: int = 1,
     return_stats: bool = False,
 ) -> (
     lib.FloatArray2D
@@ -2587,6 +2642,13 @@ def fit_spots_gpufit_spline(
         contain ``model``, ``coefficients``, ``n_data`` and ``n_intervals``.
     mle : bool, optional
         Use Gpufit's maximum likelihood (Poisson) estimator. Default False.
+    n_z_starts : int, optional
+        Number of axial (z) seeds for a z multi-start (default 1 = a single
+        in-focus start, the historical behaviour). A biplane / two-channel fit
+        is z-degenerate at large |z| from a single start (the per-plane defocus
+        cancels), so several z seeds spanning the calibration stack are tried
+        and, per spot, the seed whose fit best explains the data (lowest
+        chi-square) is kept. Applies to 3D models only.
     return_stats : bool, optional
         Also return ``(log_likelihood, number_iterations)``. Default False.
 
@@ -2594,20 +2656,73 @@ def fit_spots_gpufit_spline(
     -------
     parameters : lib.FloatArray2D
         Fitted parameters, columns ``[amplitude, x_shift, y_shift, offset]``
-        (2D) or ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D).
+        (2D), ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D / shared
+        multichannel) or ``[x_shift, y_shift, z_shift, N.., bg..]`` (link-XYZ).
     log_likelihood, number_iterations
         Only if ``return_stats`` (log_likelihood is None for least squares).
     """
-    parameters, states, chi_squares, number_iterations, exec_time = (
-        _run_gpufit_spline(spots, calibration, mle=mle)
-    )
+    if int(n_z_starts) <= 1:
+        parameters, states, chi_squares, number_iterations, exec_time = (
+            _run_gpufit_spline(spots, calibration, mle=mle)
+        )
+        if return_stats:
+            # As in fit_spots_gpufit: Gpufit's MLE chi-square is twice the
+            # negative Poisson log-likelihood; for least squares it is a
+            # residual sum of squares, so there is no likelihood to report.
+            log_likelihood = -0.5 * chi_squares if mle else None
+            return parameters, log_likelihood, number_iterations
+        return parameters
+
+    # z multi-start (biplane/two-channel z-degeneracy). The z_shift parameter
+    # column is 2 for the photon-decoupled model, else 3.
+    model = calibration["model"]
+    if model == "spline-2d":
+        raise ValueError("n_z_starts > 1 requires a 3D spline model.")
+    z_col = 2 if model == _LINK_XYZ_MODEL else 3
+    spots_for_init = np.maximum(spots, 0) if mle else spots
+    base_init = _initial_parameters_spline(spots_for_init, calibration)
+    n_spots, n_params = base_init.shape
+
+    best_ok_chi = np.full(n_spots, np.inf)
+    best_ok = np.full((n_spots, n_params), np.nan, np.float32)
+    best_ok_it = np.zeros(n_spots, np.int32)
+    best_fin_chi = np.full(n_spots, np.inf)
+    best_fin = np.full((n_spots, n_params), np.nan, np.float32)
+    best_fin_it = np.zeros(n_spots, np.int32)
+
+    # seeds span the calibration z-stack (z_shift = -z_plane, so [-(n_z-1), 0]).
+    n_z = int(calibration["n_data"][2])
+    seeds = np.linspace(-(n_z - 1), 0.0, int(n_z_starts))
+    for z0 in seeds:
+        init_k = base_init.copy()
+        init_k[:, z_col] = np.float32(z0)
+        params, states, chi, nit, _ = _run_gpufit_spline(
+            spots,
+            calibration,
+            mle=mle,
+            initial_parameters=init_k,
+            tolerance=1e-4,
+            max_number_iterations=100,
+        )
+        finite = np.isfinite(params).all(axis=1) & np.isfinite(chi)
+        converged = finite & ((states == 0) if mle else True)
+        fin_better = finite & (chi < best_fin_chi)
+        best_fin_chi[fin_better] = chi[fin_better]
+        best_fin[fin_better] = params[fin_better]
+        best_fin_it[fin_better] = nit[fin_better]
+        ok_better = converged & (chi < best_ok_chi)
+        best_ok_chi[ok_better] = chi[ok_better]
+        best_ok[ok_better] = params[ok_better]
+        best_ok_it[ok_better] = nit[ok_better]
+
+    has_ok = np.isfinite(best_ok_chi)
+    best_params = np.where(has_ok[:, None], best_ok, best_fin)
+    best_chi = np.where(has_ok, best_ok_chi, best_fin_chi)
+    best_it = np.where(has_ok, best_ok_it, best_fin_it)
     if return_stats:
-        # As in fit_spots_gpufit: Gpufit's MLE chi-square is twice the
-        # negative Poisson log-likelihood; for least squares it is a residual
-        # sum of squares, so there is no likelihood to report.
-        log_likelihood = -0.5 * chi_squares if mle else None
-        return parameters, log_likelihood, number_iterations
-    return parameters
+        log_likelihood = -0.5 * best_chi if mle else None
+        return best_params, log_likelihood, best_it
+    return best_params
 
 
 def fit_spots_gpufit_spline_phase(
@@ -3130,6 +3245,232 @@ def _spline_infomats_2d(
             meat[m, 3, 3] = s33
 
 
+@numba.njit(parallel=True, cache=True, fastmath=True)
+def _spline_infomats_link_xyz_3d(
+    coeff,
+    box,
+    x_shift,
+    y_shift,
+    z_eval,
+    photons,
+    bg,
+    finite,
+    mu_floor,
+    mle,
+    bread,
+    meat,
+):
+    """Per-localization information matrices for the photon-decoupled (link-XYZ)
+    3D cubic-spline model. Parameter order
+    ``[x, y, z, N_0..N_{c-1}, bg_0..bg_{c-1}]`` (P = 3 + 2*n_channels).
+
+    Unlike :func:`_spline_infomats_3d` (shared amplitude/offset), each pixel of
+    channel ``ch`` has ``mu = bg[ch] + N[ch] * phi_ch`` and a block-sparse
+    gradient: the shared x/y/z columns scale by that channel's ``N[ch]``, while
+    only channel ``ch``'s photon column (= phi) and background column (= 1) are
+    non-zero. ``bread``/``meat`` play the same Fisher / least-squares-sandwich
+    roles as in :func:`_spline_infomats_3d`. Rows preset by the caller (identity)
+    for non-converged fits are left untouched; converged rows are zeroed and
+    filled here. CRLB diagonals are invariant to the per-parameter gradient sign,
+    so x/y/z use the unsigned spline derivative."""
+    n_channels = coeff.shape[0]
+    niz = coeff.shape[1]
+    niy = coeff.shape[2]
+    nix = coeff.shape[3]
+    n_locs = x_shift.shape[0]
+    n_params = 3 + 2 * n_channels
+    for m in numba.prange(n_locs):
+        if not finite[m]:
+            continue
+        for a_ in range(n_params):
+            for b_ in range(n_params):
+                bread[m, a_, b_] = 0.0
+                meat[m, a_, b_] = 0.0
+        g = np.zeros(n_params)
+        zc = z_eval[m]
+        zi = int(np.floor(zc))
+        zi = 0 if zi < 0 else (niz - 1 if zi > niz - 1 else zi)
+        fz = zc - zi
+        pz0, pz1, pz2, pz3 = 1.0, fz, fz * fz, fz * fz * fz
+        dz1, dz2, dz3 = 1.0, 2.0 * fz, 3.0 * fz * fz
+        for ch in range(n_channels):
+            nc = photons[m, ch]
+            bgc = bg[m, ch]
+            for i in range(box):
+                xco = i - x_shift[m]
+                xi = int(np.floor(xco))
+                xi = 0 if xi < 0 else (nix - 1 if xi > nix - 1 else xi)
+                fx = xco - xi
+                px0, px1, px2, px3 = 1.0, fx, fx * fx, fx * fx * fx
+                dx1, dx2, dx3 = 1.0, 2.0 * fx, 3.0 * fx * fx
+                for j in range(box):
+                    yco = j - y_shift[m]
+                    yi = int(np.floor(yco))
+                    yi = 0 if yi < 0 else (niy - 1 if yi > niy - 1 else yi)
+                    fy = yco - yi
+                    py0, py1, py2, py3 = 1.0, fy, fy * fy, fy * fy * fy
+                    dy1, dy2, dy3 = 1.0, 2.0 * fy, 3.0 * fy * fy
+                    phi = gx = gy = gz = 0.0
+                    for zp in range(4):
+                        pzv = (
+                            pz0
+                            if zp == 0
+                            else (
+                                pz1 if zp == 1 else (pz2 if zp == 2 else pz3)
+                            )
+                        )
+                        dzv = (
+                            0.0
+                            if zp == 0
+                            else (
+                                dz1 if zp == 1 else (dz2 if zp == 2 else dz3)
+                            )
+                        )
+                        for yp in range(4):
+                            pyv = (
+                                py0
+                                if yp == 0
+                                else (
+                                    py1
+                                    if yp == 1
+                                    else (py2 if yp == 2 else py3)
+                                )
+                            )
+                            dyv = (
+                                0.0
+                                if yp == 0
+                                else (
+                                    dy1
+                                    if yp == 1
+                                    else (dy2 if yp == 2 else dy3)
+                                )
+                            )
+                            for xp in range(4):
+                                cf = coeff[ch, zi, yi, xi, zp, yp, xp]
+                                pxv = (
+                                    px0
+                                    if xp == 0
+                                    else (
+                                        px1
+                                        if xp == 1
+                                        else (px2 if xp == 2 else px3)
+                                    )
+                                )
+                                dxv = (
+                                    0.0
+                                    if xp == 0
+                                    else (
+                                        dx1
+                                        if xp == 1
+                                        else (dx2 if xp == 2 else dx3)
+                                    )
+                                )
+                                phi += cf * pzv * pyv * pxv
+                                gx += cf * pzv * pyv * dxv
+                                gy += cf * pzv * dyv * pxv
+                                gz += cf * dzv * pyv * pxv
+                    mu = bgc + nc * phi
+                    if mu < mu_floor:
+                        mu = mu_floor
+                    if mle:
+                        wa = 1.0 / mu
+                        wb = 0.0
+                    else:
+                        wa = 1.0
+                        wb = mu
+                    for t in range(n_params):
+                        g[t] = 0.0
+                    g[0] = nc * gx
+                    g[1] = nc * gy
+                    g[2] = nc * gz
+                    g[3 + ch] = phi
+                    g[3 + n_channels + ch] = 1.0
+                    for a_ in range(n_params):
+                        ga = g[a_]
+                        if ga == 0.0:
+                            continue
+                        for b_ in range(a_, n_params):
+                            v = ga * g[b_]
+                            bread[m, a_, b_] += v * wa
+                            if not mle:
+                                meat[m, a_, b_] += v * wb
+        for a_ in range(n_params):
+            for b_ in range(a_ + 1, n_params):
+                bread[m, b_, a_] = bread[m, a_, b_]
+                if not mle:
+                    meat[m, b_, a_] = meat[m, a_, b_]
+
+
+def _spline_link_xyz_crlb(
+    theta: lib.FloatArray2D,
+    calibration: dict,
+    box: int,
+    mle: bool = True,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> lib.FloatArray2D:
+    """CRLB / least-squares variances for the photon-decoupled (link-XYZ) fit.
+
+    Same estimator theory as :func:`_spline_crlb`, but for the 7-parameter
+    ``[x, y, z, N_0..N_{c-1}, bg_0..bg_{c-1}]`` model (see
+    :func:`_spline_infomats_link_xyz_3d`). Returns ``(n_locs, 3 + 2*n_channels)``
+    variances in that parameter order."""
+    theta = np.asarray(theta, dtype=np.float64)
+    n_locs = len(theta)
+    n_channels = _spline_n_channels(calibration)
+    n_params = 3 + 2 * n_channels
+
+    coeff = _spline_coeff_reshaped(calibration)
+    x_shift = np.ascontiguousarray(theta[:, 0])
+    y_shift = np.ascontiguousarray(theta[:, 1])
+    # Native z sampling coordinate = -z_shift (see _spline_crlb).
+    z_eval = np.ascontiguousarray(-theta[:, 2])
+    photons = np.ascontiguousarray(theta[:, 3 : 3 + n_channels])
+    bg = np.ascontiguousarray(theta[:, 3 + n_channels : 3 + 2 * n_channels])
+    finite = np.isfinite(theta).all(axis=1)
+
+    bread = np.tile(np.eye(n_params), (max(n_locs, 1), 1, 1))
+    meat = np.zeros((max(n_locs, 1), n_params, n_params))
+
+    use_tqdm = progress_callback == "console"
+    do_callback = callable(progress_callback)
+    chunk = (
+        max(1, min(n_locs, 100_000)) if (use_tqdm or do_callback) else n_locs
+    )
+    starts = range(0, n_locs, chunk) if n_locs else []
+    if use_tqdm:
+        starts = tqdm(starts, desc="Computing spline CRLB")
+    for start in starts:
+        stop = min(start + chunk, n_locs)
+        sl = slice(start, stop)
+        _spline_infomats_link_xyz_3d(
+            coeff,
+            box,
+            x_shift[sl],
+            y_shift[sl],
+            z_eval[sl],
+            photons[sl],
+            bg[sl],
+            finite[sl],
+            _SPLINE_CRLB_MU_FLOOR,
+            mle,
+            bread[sl],
+            meat[sl],
+        )
+        if do_callback:
+            progress_callback(stop)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        bread_inv = np.linalg.pinv(bread)
+        cov = bread_inv if mle else bread_inv @ meat @ bread_inv
+        crlb = np.diagonal(cov, axis1=1, axis2=2).copy()
+    crlb = crlb[:n_locs]
+    crlb[~finite] = np.nan
+    crlb = np.where(crlb > 0.0, crlb, np.nan)
+    return crlb
+
+
 def _spline_coeff_reshaped(calibration: dict) -> np.ndarray:
     """Raw calibration coefficients as ``(n_channels, niz, niy, nix, 4, 4, 4)``
     (3D) or ``(n_channels, niy, nix, 4, 4)`` (2D), float64 for the numba kernels.
@@ -3137,7 +3478,7 @@ def _spline_coeff_reshaped(calibration: dict) -> np.ndarray:
     :func:`_spline_model_and_grad`)."""
     model = calibration["model"]
     coeff = np.ascontiguousarray(calibration["coefficients"], dtype=np.float64)
-    if model == "spline-3d-multichannel":
+    if model in ("spline-3d-multichannel", _LINK_XYZ_MODEL):
         _, nix, niy, niz, n_channels = coeff.shape
         return np.stack(
             [
@@ -3210,6 +3551,16 @@ def _spline_crlb(
         numerically singular problems are NaN.
     """
     model = calibration["model"]
+    if model == _LINK_XYZ_MODEL:
+        # Photon-decoupled model: distinct 7-parameter block structure
+        # [x, y, z, N_0..N_{c-1}, bg_0..bg_{c-1}], handled by its own kernel.
+        return _spline_link_xyz_crlb(
+            theta,
+            calibration,
+            box,
+            mle=mle,
+            progress_callback=progress_callback,
+        )
     is_3d = model != "spline-2d"
     n_params = 5 if is_3d else 4
 
@@ -3407,6 +3758,104 @@ def _spline_phase_crlb(
     return crlb
 
 
+def _locs_from_fits_spline_link_xyz(
+    identifications: pd.DataFrame,
+    theta: lib.FloatArray2D,
+    box: int,
+    calibration: dict,
+    mle: bool = False,
+    log_likelihood: lib.FloatArray1D | None = None,
+    iterations: lib.FloatArray1D | None = None,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> pd.DataFrame:
+    """Localizations from a photon-decoupled (link-XYZ) multichannel spline fit.
+
+    ``theta`` columns are ``[x_shift, y_shift, z_shift, N_0..N_{c-1},
+    bg_0..bg_{c-1}]``. Emits the shared ``x, y, z`` plus per-channel photon and
+    background columns ``photons_ch{c}`` / ``bg_ch{c}``, their totals in
+    ``photons`` / ``bg``, and a continuous ``color`` = photons in channel 0 /
+    total photons (the ratiometric readout that the free photon ratio provides).
+    ``calibration`` is assumed already cropped to ``box``."""
+    n_channels = _spline_n_channels(calibration)
+    oversampling = float(calibration.get("oversampling", 1.0))
+    box_offset = int(box / 2)
+    center = (box - 1) / 2.0
+
+    theta = np.asarray(theta, dtype=np.float64)
+    x_shift = theta[:, 0]
+    y_shift = theta[:, 1]
+    z_shift = theta[:, 2]
+    amp = theta[:, 3 : 3 + n_channels]  # per-channel amplitude
+    bg_ch = theta[
+        :, 3 + n_channels : 3 + 2 * n_channels
+    ]  # per-channel background
+
+    ps = _photon_scales(calibration, n_channels)  # (n_channels,)
+    photons_ch = amp * ps[None, :]  # per-channel photon counts
+    photons = photons_ch.sum(axis=1)
+    bg_total = bg_ch.sum(axis=1)
+
+    ids_x = np.asarray(identifications["x"], dtype=np.float64)
+    ids_y = np.asarray(identifications["y"], dtype=np.float64)
+    x = x_shift / oversampling + center + ids_x - box_offset
+    y = y_shift / oversampling + center + ids_y - box_offset
+
+    crlb = _spline_link_xyz_crlb(
+        theta, calibration, box, mle=mle, progress_callback=progress_callback
+    )  # variances [x, y, z, N_0.., bg_0..]
+    var_amp = crlb[:, 3 : 3 + n_channels]
+    var_bg = crlb[:, 3 + n_channels : 3 + 2 * n_channels]
+    with np.errstate(invalid="ignore"):
+        lpx = np.sqrt(crlb[:, 0]) / oversampling
+        lpy = np.sqrt(crlb[:, 1]) / oversampling
+        # total-photon uncertainty: independent per-channel photon variances add
+        photons_unc = np.sqrt(np.sum(var_amp * (ps[None, :] ** 2), axis=1))
+        bg_unc = np.sqrt(np.sum(var_bg, axis=1))
+
+    z_center = float(calibration.get("z_center", 0.0))
+    z_init = float(calibration.get("z_init", z_center))
+    z_step_nm = float(calibration.get("z_step_nm", 1.0))
+    magnification_factor = float(calibration.get("magnification_factor", 1.0))
+    z = (z_shift + z_init) * z_step_nm * magnification_factor + (
+        z_center - z_init
+    ) * z_step_nm
+    with np.errstate(invalid="ignore"):
+        lpz = np.sqrt(crlb[:, 2]) * z_step_nm * magnification_factor
+        color = np.where(photons > 0, photons_ch[:, 0] / photons, np.nan)
+
+    columns = {
+        "frame": np.asarray(identifications["frame"]).astype(np.uint32),
+        "x": x.astype(np.float32),
+        "y": y.astype(np.float32),
+        "z": z.astype(np.float32),
+        "photons": photons.astype(np.float32),
+        "bg": bg_total.astype(np.float32),
+        "lpx": lpx.astype(np.float32),
+        "lpy": lpy.astype(np.float32),
+        "lpz": lpz.astype(np.float32),
+        "net_gradient": np.asarray(
+            identifications["net_gradient"], dtype=np.float32
+        ),
+        "photons_unc": photons_unc.astype(np.float32),
+        "bg_unc": bg_unc.astype(np.float32),
+        "color": color.astype(np.float32),
+    }
+    for c in range(n_channels):
+        columns[f"photons_ch{c}"] = photons_ch[:, c].astype(np.float32)
+        columns[f"bg_ch{c}"] = bg_ch[:, c].astype(np.float32)
+    if log_likelihood is not None:
+        columns["log_likelihood"] = np.asarray(log_likelihood).astype(
+            np.float32
+        )
+    if iterations is not None:
+        columns["iterations"] = np.asarray(iterations).astype(np.int32)
+    locs = pd.DataFrame(columns)
+    locs.sort_values(by="frame", kind="quicksort", inplace=True)
+    return locs
+
+
 def locs_from_fits_spline(
     identifications: pd.DataFrame,
     theta: lib.FloatArray2D,
@@ -3433,6 +3882,19 @@ def locs_from_fits_spline(
     part)."""
     calibration = crop_spline_calibration(calibration, box)
     model = calibration["model"]
+    if model == _LINK_XYZ_MODEL:
+        # Photon-decoupled model: 7 parameters [x, y, z, N0, N1, bg0, bg1] with
+        # per-channel photons/background and a continuous color readout.
+        return _locs_from_fits_spline_link_xyz(
+            identifications,
+            theta,
+            box,
+            calibration,
+            mle=mle,
+            log_likelihood=log_likelihood,
+            iterations=iterations,
+            progress_callback=progress_callback,
+        )
     # The 4Pi phase model (model 12) has 6 parameters
     # ``[amplitude, x, y, z, offset, phase]``
     is_phase = model == "spline-3d-phase-multichannel"
@@ -3743,6 +4205,7 @@ def fit_spline_multichannel(
     box: int,
     calibration: dict,
     mle: bool = False,
+    link_photons: bool = True,
     progress_callback: Callable[[int], None] | None = None,
 ) -> pd.DataFrame:
     """Fit a multichannel cubic-spline PSF across several registered channels.
@@ -3767,12 +4230,20 @@ def fit_spline_multichannel(
         A ``"spline-3d-multichannel"`` calibration (see ``picasso.spline``).
     mle : bool, optional
         Use Gpufit's maximum-likelihood estimator. Default False.
+    link_photons : bool, optional
+        If True (default), the shared-amplitude model links one photon
+        amplitude and one background across all channels. If False, use
+        the photon-decoupled model x, y, z stay shared but each channel
+        gets a photon count and background. Only available for
+        2-channel calibrations. See :func:`_as_link_xyz_calibration`.
     """
     if calibration.get("model") != "spline-3d-multichannel":
         raise ValueError(
             "fit_spline_multichannel requires a 'spline-3d-multichannel' "
             "calibration."
         )
+    if not link_photons:
+        calibration = _as_link_xyz_calibration(calibration)
     transforms = calibration["channel_transforms"]
     if len(movies) != len(transforms):
         raise ValueError(
@@ -4072,6 +4543,7 @@ def fit_spline_split_fov(
     regions: list | None = None,
     photon_ratios: lib.FloatArray2D | None = None,
     mle: bool = False,
+    link_photons: bool = True,
     confine_to_reference: bool = True,
     n_phase_starts: int = 6,
     progress_callback: Callable[[int], None] | None = None,
@@ -4181,6 +4653,17 @@ def fit_spline_split_fov(
             n_phase_starts=n_phase_starts,
             progress_callback=progress_callback,
         )
+    if not link_photons and n_channels == 2:
+        return fit_spline_multichannel(
+            movies,
+            camera_infos,
+            ids,
+            box,
+            calibration,
+            mle=mle,
+            link_photons=False,
+            progress_callback=progress_callback,
+        )
     if (
         photon_ratios is not None
         or calibration.get("photon_ratios") is not None
@@ -4202,6 +4685,7 @@ def fit_spline_split_fov(
         box,
         calibration,
         mle=mle,
+        link_photons=link_photons,
         progress_callback=progress_callback,
     )
 
