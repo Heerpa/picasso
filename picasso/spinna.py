@@ -3231,6 +3231,8 @@ class SPINNA:
 
         if save:
             props = self.mixer.convert_counts_to_props(N_structures)
+            # convert_counts_to_props squeezes to 1D for a single row
+            props = np.atleast_2d(props)
             df = pd.DataFrame(
                 np.hstack((N_structures, props, scores.reshape(-1, 1))),
                 columns=[
@@ -3390,8 +3392,13 @@ class SPINNA:
         )
         if save:
             # save the results of both the coarse and fine pass
-            props_coarse = self.mixer.convert_counts_to_props(N_coarse)
-            props_fine = self.mixer.convert_counts_to_props(N_fine)
+            # convert_counts_to_props squeezes to 1D for a single row
+            props_coarse = np.atleast_2d(
+                self.mixer.convert_counts_to_props(N_coarse)
+            )
+            props_fine = np.atleast_2d(
+                self.mixer.convert_counts_to_props(N_fine)
+            )
             # get the fine scores ((non)bootstrapped results have
             # different structure)
             if bootstrap:
@@ -3605,7 +3612,10 @@ class SPINNA:
 
     def _save_bayesian_csv(self, N_evaluated, scores_evaluated, path):
         """Write evaluated candidates and their scores to ``path``."""
-        props_eval = self.mixer.convert_counts_to_props(N_evaluated)
+        # convert_counts_to_props squeezes to 1D for a single row
+        props_eval = np.atleast_2d(
+            self.mixer.convert_counts_to_props(N_evaluated)
+        )
         names = self.mixer.get_structure_names()
         df = pd.DataFrame(
             np.hstack(
