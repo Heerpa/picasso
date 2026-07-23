@@ -972,101 +972,154 @@ class TestCalibrateSplitFov:
             )
 
 
-class TestReestimateSplitFovTransforms:
-    """Re-estimating the inter-channel affine on new data (globLoc different-day
-    re-registration). Uses bead detection + affine fit only - no Gpuspline."""
+class TestRefineSplitFovTransformsFromSignal:
+    """Data-driven (no-bead) re-registration of a split-FOV calibration: pair
+    blinking single-molecule signal across channels frame by frame, seeded by
+    only the calibration's flip, over a bounded sample of frames."""
 
-    def test_recovers_new_fine_registration(self):
-        # data whose split has a DIFFERENT fine registration (3, 1) than a
-        # stale calibration; re-estimation must recover it region-locally
-        movie, regions, _ = _synthetic_split_fov_movie(dx=3, dy=1)
+    @staticmethod
+    def _blinking_movie(true_affine, n_frames=150, seed=0):
+        """Two 48x48 regions in a 48x96 frame; each frame has a few emitters in
+        the reference region that also appear in the channel region at the
+        region-local ``true_affine`` mapping (shared signal, as in biplane)."""
+        rng = np.random.RandomState(seed)
+        H, W = 48, 96
+        ref_rect = [[0, 0], [48, 48]]
+        c_rect = [[0, 48], [48, 96]]
+        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        t_true = localize.compose_region_transforms(
+            [ref_rect, c_rect], [identity, true_affine]
+        )[1]
+
+        def render(frame, x, y, amp, sigma=1.2):
+            xi, yi = int(round(x)), int(round(y))
+            for dy in range(-4, 5):
+                for dx in range(-4, 5):
+                    yy, xx = yi + dy, xi + dx
+                    if 0 <= yy < H and 0 <= xx < W:
+                        frame[yy, xx] += amp * np.exp(
+                            -((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma**2)
+                        )
+
+        movie = np.zeros((n_frames, H, W), dtype=np.float32)
+        for f in range(n_frames):
+            for _ in range(rng.randint(3, 6)):
+                x = rng.uniform(10, 38)
+                y = rng.uniform(10, 38)
+                amp = rng.uniform(2500, 4000)
+                render(movie[f], x, y, amp)
+                cx, cy = localize.apply_affine_transform(
+                    np.array([[x, y]]), t_true
+                )[0]
+                render(movie[f], cx, cy, amp)
+        movie = rng.poisson(np.maximum(movie, 0) + 100).astype(np.uint16)
+        return movie, [ref_rect, c_rect]
+
+    def test_recovers_true_affine_from_signal(self):
+        # true fine registration: small rotation + subpixel shift
+        theta = 0.02
+        true_affine = np.array(
+            [
+                [np.cos(theta), -np.sin(theta), 1.5],
+                [np.sin(theta), np.cos(theta), -1.0],
+            ]
+        )
+        movie, regions = self._blinking_movie(true_affine)
+        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        # stale calibration: identity fine registration (drifted from truth)
         calib = {
             "split_fov": True,
             "n_channels": 2,
             "box": BOX,
             "n_data": [BOX, BOX, 1],
-            "z_step_nm": 20.0,
-            # stale registration (wrong fine part) that should be overwritten
             "regions": [[[0, 0], [48, 48]], [[0, 48], [48, 96]]],
-            "channel_affines": [
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            ],
+            "channel_affines": [identity, identity],
             "channel_transforms": [
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
                 [[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]],
             ],
         }
-        updated, reg_info = spline.reestimate_split_fov_transforms(
-            movie, calib, regions, minimum_ng=2000.0, box=BOX
+        updated, reg_info = spline.refine_split_fov_transforms_from_signal(
+            movie, calib, regions, minimum_ng=800.0, box=BOX
         )
-        assert reg_info[0]["n_matches"] >= 3
-        # region-local affine now carries the true (3, 1) fine registration
+        # only ~50 frames are sampled (not all 150), so expect fewer pairs
+        assert reg_info[0]["n_matches"] >= 40
+        assert reg_info[0]["rms"] < 1.0
+        # the region-local affine now matches the true fine registration
         np.testing.assert_allclose(
-            updated["channel_affines"][1],
-            [[1.0, 0.0, 3.0], [0.0, 1.0, 1.0]],
-            atol=0.6,
-        )
-        # and the absolute transform is the 48-px region offset + (3, 1)
-        np.testing.assert_allclose(
-            updated["channel_transforms"][1],
-            [[1.0, 0.0, 51.0], [0.0, 1.0, 1.0]],
-            atol=0.6,
+            updated["channel_affines"][1], true_affine, atol=0.15
         )
 
-
-class TestRefineSplitFovRegistration:
-    """Cross-correlation refinement of a drifted split-FOV registration from the
-    data itself (no beads, no GPU)."""
-
-    def _shifted_blob_movie(self, sx, sy):
-        from scipy.ndimage import shift as ndi_shift
-
-        yy, xx = np.mgrid[0:48, 0:48]
-        ref = np.full((48, 48), 100.0)
-        for bx, by in [(12, 14), (30, 28), (16, 33), (22, 20), (35, 10)]:
-            ref += 4000 * np.exp(
-                -((xx - bx) ** 2 + (yy - by) ** 2) / (2 * 1.4**2)
-            )
-        chan = ndi_shift(ref - 100.0, shift=(sy, sx), order=1) + 100.0
-        frame = np.zeros((48, 96))
-        frame[:, :48] = ref
-        frame[:, 48:] = chan
-        return np.stack([frame.astype(np.uint16)] * 3)
-
-    def test_recovers_residual_shift(self):
-        sx, sy = 3, -2
-        movie = self._shifted_blob_movie(sx, sy)
+    def test_recovers_true_affine_with_mirror(self):
+        # channel is an x-mirror of the reference (as a biplane relay flips it)
+        # plus a small sub-pixel shift; the calibration stores only the mirror,
+        # which is the coarse seed the re-registration is allowed to trust - the
+        # fine rotation/scale/shift must be recovered fresh from the signal
+        w = 48
+        true_affine = np.array([[-1.0, 0.0, w + 0.6], [0.0, 1.0, -0.4]])
+        movie, regions = self._blinking_movie(true_affine)
+        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        mirror = [[-1.0, 0.0, float(w)], [0.0, 1.0, 0.0]]
+        regs = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
+        mirror_transform = localize.compose_region_transforms(
+            regs, [np.array(identity), np.array(mirror)]
+        )[1].tolist()
         calib = {
             "split_fov": True,
             "n_channels": 2,
-            "regions": [[[0, 0], [48, 48]], [[0, 48], [48, 96]]],
-            # stale: no fine offset recorded
-            "channel_affines": [
+            "box": BOX,
+            "n_data": [BOX, BOX, 1],
+            "regions": regs,
+            "channel_affines": [identity, mirror],
+            "channel_transforms": [
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                mirror_transform,
             ],
+        }
+        updated, reg_info = spline.refine_split_fov_transforms_from_signal(
+            movie, calib, regions, minimum_ng=800.0, box=BOX
+        )
+        assert reg_info[0]["n_matches"] >= 40
+        assert reg_info[0]["rms"] < 1.0
+        # the fitted affine stays mirrored (negative determinant) and recovers
+        # the true fine registration on top of the flip
+        linear = np.array(updated["channel_affines"][1])[:, :2]
+        assert np.linalg.det(linear) < 0
+        np.testing.assert_allclose(
+            updated["channel_affines"][1], true_affine, atol=0.2
+        )
+
+    def test_raises_without_shared_signal(self):
+        # channel region has no correlated signal -> no pairs -> raises
+        rng = np.random.RandomState(1)
+        movie = rng.poisson(np.full((60, 48, 96), 100.0)).astype(np.uint16)
+        # a few emitters only in the reference region
+        for f in range(60):
+            for _ in range(4):
+                x, y = rng.uniform(10, 38), rng.uniform(10, 38)
+                xi, yi = int(round(x)), int(round(y))
+                movie[f, yi - 1 : yi + 2, xi - 1 : xi + 2] += 3000
+        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        calib = {
+            "split_fov": True,
+            "n_channels": 2,
+            "box": BOX,
+            "n_data": [BOX, BOX, 1],
+            "regions": [[[0, 0], [48, 48]], [[0, 48], [48, 96]]],
+            "channel_affines": [identity, identity],
             "channel_transforms": [
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
                 [[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]],
             ],
         }
-        _, refinements = spline.refine_split_fov_registration(
-            movie, calib, box=5
-        )
-        assert refinements[0]["applied"]
-        np.testing.assert_allclose(refinements[0]["shift"], (sx, sy), atol=0.3)
-        # region-local affine + absolute transform updated with the drift
-        np.testing.assert_allclose(
-            calib["channel_affines"][1],
-            [[1.0, 0.0, sx], [0.0, 1.0, sy]],
-            atol=0.3,
-        )
-        np.testing.assert_allclose(
-            calib["channel_transforms"][1],
-            [[1.0, 0.0, 48 + sx], [0.0, 1.0, sy]],
-            atol=0.3,
-        )
+        with pytest.raises(ValueError):
+            spline.refine_split_fov_transforms_from_signal(
+                movie,
+                calib,
+                [[[0, 0], [48, 48]], [[0, 48], [48, 96]]],
+                minimum_ng=800.0,
+                box=BOX,
+            )
 
 
 class TestSplinePhaseCalibration:

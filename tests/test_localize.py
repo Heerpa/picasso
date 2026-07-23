@@ -2380,6 +2380,41 @@ class TestSplineHelpers:
         np.testing.assert_array_equal(stacked[..., 0], single)
         np.testing.assert_array_equal(stacked[..., 1], single)
 
+    def test_multichannel_inbounds_ids_drops_edge_spots(self, movie):
+        """A detection whose box falls outside the frame in any channel is
+        dropped, so the joint extractor never reads an out-of-bounds box."""
+        height, width = movie.shape[1], movie.shape[2]
+        r = BOX // 2
+        ids = pd.DataFrame(
+            {
+                "frame": [0, 0, 0, 0],
+                # centred (ok), top edge (box off the top), left edge, and a
+                # spot that only leaves the frame once mapped in channel 1.
+                "x": [width // 2, width // 2, 0, width - r - 1],
+                "y": [height // 2, 0, height // 2, height // 2],
+                "net_gradient": [1.0, 1.0, 1.0, 1.0],
+            }
+        )
+        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        # channel 1 shifts +r in x, pushing the last (near-right-edge) spot out
+        shift = np.array([[1.0, 0.0, float(r + 1)], [0.0, 1.0, 0.0]])
+        kept = localize.multichannel_inbounds_ids(
+            ids, BOX, [movie, movie], [identity, shift]
+        )
+        # only the centred spot survives in both channels
+        assert len(kept) == 1
+        assert int(kept["x"].iloc[0]) == width // 2
+        assert int(kept["y"].iloc[0]) == height // 2
+        # extraction on the filtered ids must not raise
+        stacked = localize.get_spots_multichannel(
+            [movie, movie],
+            kept,
+            BOX,
+            [CAMERA_INFO, CAMERA_INFO],
+            [identity, shift],
+        )
+        assert stacked.shape == (1, BOX, BOX, 2)
+
 
 def _synthetic_spline_3d_calibration(box=BOX, nz=41):
     """Build a 3D spline calibration from a synthetic astigmatic PSF,

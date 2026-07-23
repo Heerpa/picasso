@@ -2364,12 +2364,20 @@ def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
     coefficient_block = _reorder_spline_coefficients_for_gpufit(
         coefficients, model
     )
-    user_info = np.hstack(
-        (
-            np.asarray(header, dtype=np.float32),
-            coefficient_block,
-        )
-    ).astype(np.float32)
+    blocks = [np.asarray(header, dtype=np.float32), coefficient_block]
+    if model in ("spline-3d-multichannel", _LINK_XYZ_MODEL):
+        # Per-channel lateral affine, appended channel-major after the
+        # coefficient block; the globLoc-style joint fit. Requires the
+        # updated CUDA models (spline_3d_multichannel.cuh / ..._link_xyz.cuh).
+        transforms = calibration.get("channel_transforms")
+        n_channels = _spline_n_channels(calibration)
+        if transforms is not None and len(transforms) == n_channels:
+            affine = []
+            for t in transforms:
+                lin = np.asarray(t, dtype=np.float32)[:, :2]
+                affine.extend([lin[0, 0], lin[0, 1], lin[1, 0], lin[1, 1]])
+            blocks.append(np.asarray(affine, dtype=np.float32))
+    user_info = np.hstack(blocks).astype(np.float32)
     return user_info
 
 
@@ -4125,6 +4133,52 @@ def compose_region_transforms(
     return transforms
 
 
+def multichannel_inbounds_ids(
+    identifications: pd.DataFrame,
+    box: int,
+    movies: list,
+    transforms: list,
+) -> pd.DataFrame:
+    """Filter reference detections to those whose full ``box`` fits inside
+    every channel's frame after mapping through the per-channel transforms.
+    """
+    r = box // 2
+    ref_xy = np.column_stack(
+        [
+            np.asarray(identifications["x"], dtype=np.float64),
+            np.asarray(identifications["y"], dtype=np.float64),
+        ]
+    )
+    inside = np.ones(len(ref_xy), dtype=bool)
+    for c, movie in enumerate(movies):
+        xy = (
+            ref_xy if c == 0 else apply_affine_transform(ref_xy, transforms[c])
+        )
+        x = np.rint(xy[:, 0]).astype(np.int64)
+        y = np.rint(xy[:, 1]).astype(np.int64)
+        height, width = int(movie.shape[1]), int(movie.shape[2])
+        inside &= (
+            (x - r >= 0) & (x + r < width) & (y - r >= 0) & (y + r < height)
+        )
+    if inside.all():
+        return identifications
+    n_total = len(inside)
+    n_dropped = int((~inside).sum())
+    # Dropping a few edge detections is normal; dropping a large fraction almost
+    # always means the inter-channel registration is wrong (detections map off
+    # the frame in another channel), so make that visible instead of silently
+    # returning a tiny, edge-clustered subset.
+    if n_total and n_dropped / n_total >= 0.2:
+        warnings.warn(
+            f"Multichannel spot extraction dropped {n_dropped} of {n_total} "
+            f"detections ({100 * n_dropped / n_total:.0f}%) whose box falls "
+            "outside a channel after mapping - the split-FOV registration is "
+            "likely off (re-register the channels or check the drawn ROIs).",
+            stacklevel=2,
+        )
+    return identifications.iloc[np.flatnonzero(inside)].reset_index(drop=True)
+
+
 def get_spots_multichannel(
     movies: list,
     identifications: pd.DataFrame,
@@ -4250,6 +4304,9 @@ def fit_spline_multichannel(
             f"Got {len(movies)} channels but the calibration has "
             f"{len(transforms)} channel transforms."
         )
+    identifications = multichannel_inbounds_ids(
+        identifications, box, movies, transforms
+    )
     spots = get_spots_multichannel(
         movies,
         identifications,
@@ -4304,6 +4361,9 @@ def fit_spline_phase_multichannel(
             f"Got {len(movies)} channels but the calibration has "
             f"{len(transforms)} channel transforms."
         )
+    identifications = multichannel_inbounds_ids(
+        identifications, box, movies, transforms
+    )
     spots = get_spots_multichannel(
         movies,
         identifications,
@@ -4441,6 +4501,9 @@ def fit_spline_multichannel_ratiometric(
             f"calibration has {n_channels}."
         )
 
+    identifications = multichannel_inbounds_ids(
+        identifications, box, movies, transforms
+    )
     spots = get_spots_multichannel(
         movies,
         identifications,

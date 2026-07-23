@@ -43,6 +43,78 @@ GPUSPLINE_INSTALLED = localize.GPUSPLINE_INSTALLED
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
 
+# Distinct box colours for the cross-channel link overlay (grey is kept
+# out of the palette so it reads as "unmatched"). tab20-style hues.
+LINK_COLORS = [
+    QtGui.QColor(*_rgb)
+    for _rgb in (
+        (31, 119, 180),
+        (255, 127, 14),
+        (44, 160, 44),
+        (214, 39, 40),
+        (148, 103, 189),
+        (140, 86, 75),
+        (227, 119, 194),
+        (188, 189, 34),
+        (23, 190, 207),
+        (174, 199, 232),
+        (255, 187, 120),
+        (152, 223, 138),
+        (255, 152, 150),
+        (197, 176, 213),
+        (196, 156, 148),
+        (247, 182, 210),
+        (219, 219, 141),
+        (158, 218, 229),
+    )
+]
+LINK_UNMATCHED_COLOR = QtGui.QColor(150, 150, 150)
+
+
+def _nearest_unique_match(
+    pred_xy: np.ndarray, target_xy: np.ndarray, tol: float
+) -> dict[int, int]:
+    """Nearest-neighbour match within ``tol``.
+
+    ``pred_xy`` are reference points predicted into a channel (via the
+    calibration transform); ``target_xy`` are that channel's own detections.
+    Returns ``{target_index: reference_index}`` with each target and each
+    reference used at most once (closest pair wins) - the display counterpart
+    of the per-frame pairing used in the signal re-registration.
+    """
+    pred_xy = np.asarray(pred_xy, dtype=float)
+    target_xy = np.asarray(target_xy, dtype=float)
+    out: dict[int, int] = {}
+    if len(pred_xy) == 0 or len(target_xy) == 0:
+        return out
+    dists = np.sqrt(
+        ((pred_xy[:, None, :] - target_xy[None, :, :]) ** 2).sum(axis=2)
+    )  # (n_reference, n_target)
+    pairs = []
+    for k in range(dists.shape[0]):
+        j = int(np.argmin(dists[k]))
+        if dists[k, j] <= tol:
+            pairs.append((float(dists[k, j]), k, j))
+    pairs.sort()
+    used_ref: set[int] = set()
+    used_target: set[int] = set()
+    for _d, k, j in pairs:
+        if k in used_ref or j in used_target:
+            continue
+        used_ref.add(k)
+        used_target.add(j)
+        out[j] = k
+    return out
+
+
+def _normalize_rect(
+    rect: list,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """``[[y_a, x_a], [y_b, x_b]]`` -> ``((y_min, x_min), (y_max, x_max))``."""
+    (ya, xa), (yb, xb) = rect
+    return (min(ya, yb), min(xa, xb)), (max(ya, yb), max(xa, xb))
+
+
 LINK_PHOTONS_TIP = (
     "2-channel fitting only.\n\n'"
     "CHECK to link photons + background across both channels. "
@@ -1653,14 +1725,30 @@ class ParametersDialog(lib.Dialog):
         self.mng_max_spinbox.valueChanged.connect(self.on_mng_max_changed)
         hbox.addWidget(self.mng_max_spinbox)
 
-        # preview identifications
+        # preview identifications + cross-channel link colour overlay
+        preview_row = QtWidgets.QHBoxLayout()
         self.preview_checkbox = QtWidgets.QCheckBox("Preview")
         self.preview_checkbox.setToolTip(
             "Show identified spots in the current frame?"
         )
         self.preview_checkbox.setTristate(False)
         self.preview_checkbox.stateChanged.connect(self.on_preview_changed)
-        identification_grid.addWidget(self.preview_checkbox, 4, 0)
+        preview_row.addWidget(self.preview_checkbox)
+        self.link_colors_checkbox = QtWidgets.QCheckBox("Link colors")
+        self.link_colors_checkbox.setToolTip(
+            "Color-code the identification boxes by their cross-channel link "
+            "(needs a loaded multichannel / split-FOV spline calibration).\n\n"
+            "Spots paired across channels - matched by the calibration's\n"
+            "inter-channel transform; unmatched spots are grey.\n"
+            "Identify every channel first."
+        )
+        self.link_colors_checkbox.setTristate(False)
+        self.link_colors_checkbox.stateChanged.connect(
+            self.on_link_colors_changed
+        )
+        preview_row.addWidget(self.link_colors_checkbox)
+        preview_row.addStretch(1)
+        identification_grid.addLayout(preview_row, 4, 0)
 
         # ROIs
         label = QtWidgets.QLabel("ROIs:")
@@ -2631,6 +2719,11 @@ class ParametersDialog(lib.Dialog):
         """Update the frame with/without indentification preview."""
         self.window.draw_frame()
 
+    def on_link_colors_changed(self) -> None:
+        """Redraw with/without cross-channel link colour-coding of the
+        identification boxes."""
+        self.window.draw_frame()
+
     def on_gpufit_changed(self) -> None:
         """Handle changes to the GPU fitting option. Gpufit uses its own
         convergence settings, so the CPU MLE controls are greyed out
@@ -3281,28 +3374,12 @@ class Window(QtWidgets.QMainWindow):
         calibrate_spline_action = threed_menu.addAction("Calibrate spline PSF")
         calibrate_spline_action.triggered.connect(self.calibrate_spline)
 
-        refine_reg_action = threed_menu.addAction(
-            "Refine split-FOV registration (current data)"
+        reregister_signal_action = threed_menu.addAction(
+            "Re-align split-FOV channels (current signal)"
         )
-        refine_reg_action.setToolTip(
-            "Quickly correct a small (few-pixel) split-FOV misregistration on "
-            "the loaded data by cross-correlating the reference region against "
-            "each channel region (no beads needed). Uses the drawn ROIs when "
-            "shown, else the calibration's regions; updates only the "
-            "registration."
+        reregister_signal_action.triggered.connect(
+            self.reregister_split_fov_from_signal
         )
-        refine_reg_action.triggered.connect(self.refine_split_fov_registration)
-
-        reregister_action = threed_menu.addAction(
-            "Re-register split-FOV channels (bead sample)"
-        )
-        reregister_action.setToolTip(
-            "Re-fit the inter-channel affine of a loaded split-FOV spline "
-            "calibration on a loaded bead/fiducial movie (a full, bead-based "
-            "re-registration, e.g. if the alignment drifted since "
-            "calibration). The PSF templates are kept."
-        )
-        reregister_action.triggered.connect(self.reregister_split_fov)
 
         self.plugin_menu = menu_bar.addMenu("Plugins")  # do not delete
 
@@ -4353,13 +4430,16 @@ class Window(QtWidgets.QMainWindow):
                         QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations
                     )
             if self.ready_for_fit:
-                identifications_frame = self.identifications[
-                    self.identifications.frame == self.curr_frame_number
-                ]
                 box = self.last_identification_info["Box Size"]
-                self.draw_identifications(
-                    identifications_frame, box, QtGui.QColor("yellow")
-                )
+                if not self._draw_linked_identifications(
+                    self.curr_frame_number, box
+                ):
+                    identifications_frame = self.identifications[
+                        self.identifications.frame == self.curr_frame_number
+                    ]
+                    self.draw_identifications(
+                        identifications_frame, box, QtGui.QColor("yellow")
+                    )
             else:
                 if self.parameters_dialog.preview_checkbox.isChecked():
                     identifications_frame = localize.identify_by_frame_number(
@@ -4402,6 +4482,190 @@ class Window(QtWidgets.QMainWindow):
             x = identification["x"]
             y = identification["y"]
             self.scene.addRect(x - box_half, y - box_half, box, box, color)
+
+    def _draw_linked_identifications(
+        self, frame_number: int, box: int
+    ) -> bool:
+        """Draw this frame's identification boxes colour-coded by cross-channel
+        link, when 'Link colors' is on and a multichannel / split-FOV spline
+        calibration is loaded.
+
+        Spots paired across channels (matched to the reference channel via the
+        calibration's inter-channel transform, as the signal re-registration
+        does) share a colour; unmatched spots are grey. Returns True if it
+        handled the drawing, False to fall back to plain single-colour boxes.
+        """
+        pdialog = self.parameters_dialog
+        if not getattr(pdialog, "link_colors_checkbox", None):
+            return False
+        if not pdialog.link_colors_checkbox.isChecked():
+            return False
+        cal = pdialog.spline_calibration or {}
+        n_channels = int(cal.get("n_channels", 0))
+        if n_channels < 2:
+            return False
+        tol = 1.5 * float(box)
+        try:
+            if cal.get("split_fov"):
+                boxes = self._linked_boxes_split_fov(
+                    cal, n_channels, frame_number, tol
+                )
+            else:
+                boxes = self._linked_boxes_multichannel(
+                    cal, n_channels, frame_number, tol
+                )
+        except Exception:
+            # a malformed calibration must never break the viewer; fall back
+            return False
+        if boxes is None:
+            return False
+        box_half = int(box / 2)
+        for x, y, color in boxes:
+            self.scene.addRect(x - box_half, y - box_half, box, box, color)
+        return True
+
+    def _linked_boxes_split_fov(
+        self, cal: dict, n_channels: int, frame_number: int, tol: float
+    ) -> list | None:
+        """Colour-coded boxes for a split-FOV calibration: every region lives in
+        one frame, so paired boxes across regions get the same colour. Returns a
+        list of ``(x, y, QColor)`` for all this-frame spots, or None to fall
+        back."""
+        ids = self.identifications
+        if ids is None or len(ids) == 0:
+            return None
+        # place the channels at the drawn ROIs when they match the channel
+        # count (reference first), else the calibration's stored regions
+        if self.view.split_fov_mode and len(self.view.rois) == n_channels:
+            regions = [list(map(list, r)) for r in self.view.rois]
+        else:
+            regions = cal.get("regions")
+        if not regions or len(regions) != n_channels:
+            return None
+        region_rects = [_normalize_rect(r) for r in regions]
+        affines = cal.get("channel_affines")
+        if affines is None:
+            affines = [
+                a.tolist()
+                for a in localize.decompose_region_affines(
+                    cal["regions"], cal["channel_transforms"]
+                )
+            ]
+        transforms = localize.compose_region_transforms(
+            region_rects, [np.asarray(a, dtype=float) for a in affines]
+        )
+        m = np.asarray(ids["frame"]) == frame_number
+        xy = np.column_stack(
+            [np.asarray(ids["x"])[m], np.asarray(ids["y"])[m]]
+        ).astype(float)
+        if len(xy) == 0:
+            return []
+        # assign each spot to the region that contains it (first match wins)
+        region_of = np.full(len(xy), -1, dtype=int)
+        for ci, ((y0, x0), (y1, x1)) in enumerate(region_rects):
+            inside = (
+                (xy[:, 0] >= x0)
+                & (xy[:, 0] < x1)
+                & (xy[:, 1] >= y0)
+                & (xy[:, 1] < y1)
+            )
+            region_of[(region_of < 0) & inside] = ci
+        ref_local = np.where(region_of == 0)[0]
+        ref_xy = xy[ref_local]
+        colors = [LINK_UNMATCHED_COLOR] * len(xy)
+        matched_groups: set[int] = set()
+        for c in range(1, n_channels):
+            chan_local = np.where(region_of == c)[0]
+            if len(chan_local) == 0 or len(ref_xy) == 0:
+                continue
+            pred = localize.apply_affine_transform(ref_xy, transforms[c])
+            matches = _nearest_unique_match(pred, xy[chan_local], tol)
+            for tj, rk in matches.items():
+                colors[chan_local[tj]] = LINK_COLORS[rk % len(LINK_COLORS)]
+                matched_groups.add(rk)
+        # a reference spot is coloured only if it paired in at least one channel
+        for rk, gi in enumerate(ref_local):
+            if rk in matched_groups:
+                colors[gi] = LINK_COLORS[rk % len(LINK_COLORS)]
+        return [(xy[i, 0], xy[i, 1], colors[i]) for i in range(len(xy))]
+
+    def _linked_boxes_multichannel(
+        self, cal: dict, n_channels: int, frame_number: int, tol: float
+    ) -> list | None:
+        """Colour-coded boxes for a multichannel calibration (separate movies /
+        one multichannel file): only the current channel is on screen, so a spot
+        keeps its group colour as the user switches channels. Returns a list of
+        ``(x, y, QColor)`` for the current channel's this-frame spots, or None to
+        fall back."""
+        transforms = cal.get("channel_transforms")
+        if not transforms or len(transforms) < n_channels:
+            return None
+        if len(self.channels) < 2:
+            return None
+        reference = self.channels[0]
+        if reference.identifications is None:
+            return None
+
+        def frame_xy(ids) -> np.ndarray:
+            if ids is None or len(ids) == 0:
+                return np.empty((0, 2), dtype=float)
+            m = np.asarray(ids["frame"]) == frame_number
+            return np.column_stack(
+                [np.asarray(ids["x"])[m], np.asarray(ids["y"])[m]]
+            ).astype(float)
+
+        ref_xy = frame_xy(reference.identifications)
+        c = self.current_channel
+        if c == 0:
+            # colour reference spots by whether they pair in ANY other channel
+            matched_groups: set[int] = set()
+            for c2 in range(1, n_channels):
+                if c2 >= len(self.channels):
+                    continue
+                chan_xy = frame_xy(self.channels[c2].identifications)
+                if len(chan_xy) == 0 or len(ref_xy) == 0:
+                    continue
+                pred = localize.apply_affine_transform(
+                    ref_xy, np.asarray(transforms[c2], dtype=float)
+                )
+                matched_groups.update(
+                    _nearest_unique_match(pred, chan_xy, tol).values()
+                )
+            return [
+                (
+                    ref_xy[rk, 0],
+                    ref_xy[rk, 1],
+                    (
+                        LINK_COLORS[rk % len(LINK_COLORS)]
+                        if rk in matched_groups
+                        else LINK_UNMATCHED_COLOR
+                    ),
+                )
+                for rk in range(len(ref_xy))
+            ]
+        # a non-reference channel: colour its detections by the reference spot
+        # they pair with, so the colour matches that spot's box in channel 0
+        cur_xy = frame_xy(self.identifications)
+        if len(cur_xy) == 0:
+            return []
+        matches = {}
+        if len(ref_xy):
+            pred = localize.apply_affine_transform(
+                ref_xy, np.asarray(transforms[c], dtype=float)
+            )
+            matches = _nearest_unique_match(pred, cur_xy, tol)
+        return [
+            (
+                cur_xy[j, 0],
+                cur_xy[j, 1],
+                (
+                    LINK_COLORS[matches[j] % len(LINK_COLORS)]
+                    if j in matches
+                    else LINK_UNMATCHED_COLOR
+                ),
+            )
+            for j in range(len(cur_xy))
+        ]
 
     def draw_scalebar(self) -> None:
         """Draw a scale bar if the option is checked."""
@@ -4865,106 +5129,22 @@ class Window(QtWidgets.QMainWindow):
         self.abort_action.setEnabled(True)
         self.fit_worker.start()
 
-    def refine_split_fov_registration(self) -> None:
-        """Correct a small split-FOV misregistration on the loaded data by
-        cross-correlation (no beads). Uses the drawn ROIs when shown, else the
-        calibration's regions; updates only the registration in the loaded
-        calibration."""
-        calibration = self.parameters_dialog.spline_calibration
-        if self.movie is None:
-            QtWidgets.QMessageBox.information(
-                self, "Refine split-FOV registration", "No movie loaded."
-            )
-            return
-        if not (calibration and calibration.get("split_fov")):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Refine split-FOV registration",
-                "Load a split-FOV spline calibration first.",
-            )
-            return
-        n_channels = int(calibration.get("n_channels", 0))
-        if self.view.split_fov_mode and len(self.view.rois) == n_channels:
-            regions = [list(map(list, r)) for r in self.view.rois]
-        else:
-            regions = None
-        self.status_bar.showMessage("Refining split-FOV registration ...")
-        QtWidgets.QApplication.setOverrideCursor(
-            QtCore.Qt.CursorShape.WaitCursor
-        )
-        try:
-            _, refinements = spline.refine_split_fov_registration(
-                self.movie,
-                calibration,
-                regions=regions,
-                box=self.parameters["Box Size"],
-            )
-        except Exception as e:
-            QtWidgets.QApplication.restoreOverrideCursor()
-            self.status_bar.showMessage("")
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Refine split-FOV registration",
-                f"Refinement failed: {e}",
-            )
-            return
-        QtWidgets.QApplication.restoreOverrideCursor()
-        self.status_bar.showMessage("")
-        # reflect the (possibly re-placed) regions in the view
-        regions_now = calibration.get("regions") or []
-        self.view.rois = [
-            [[int(r[0][0]), int(r[0][1])], [int(r[1][0]), int(r[1][1])]]
-            for r in regions_now
-        ]
-        self.parameters_dialog.update_roi_display()
-        self.draw_frame()
-        rows = []
-        for r in refinements:
-            dx, dy = r["shift"]
-            note = "" if r["applied"] else "  (weak correlation - skipped)"
-            rows.append(
-                f"ch{r['channel']}: shift ({dx:+.1f}, {dy:+.1f}) px{note}"
-            )
-        reply = QtWidgets.QMessageBox.question(
-            self,
-            "Refine split-FOV registration",
-            "Registration refined from the current data:\n\n"
-            + "\n".join(rows)
-            + "\n\nThe loaded calibration is updated. Save it to a file?",
-            QtWidgets.QMessageBox.StandardButton.Save
-            | QtWidgets.QMessageBox.StandardButton.Close,
-        )
-        if reply == QtWidgets.QMessageBox.StandardButton.Save:
-            base = os.path.splitext(
-                self.parameters_dialog.spline_calibration_path or ""
-            )[0]
-            path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self,
-                "Save refined spline calibration",
-                (base or "") + "_refined.hdf5",
-                filter="*.hdf5",
-            )
-            if path:
-                io.save_spline_calibration(path, calibration)
-                self.parameters_dialog.spline_calibration_path = path
-                self.status_bar.showMessage(
-                    f"Saved refined calibration to {path}", 5000
-                )
-
-    def reregister_split_fov(self) -> None:
+    def reregister_split_fov_from_signal(self) -> None:
         """Re-estimate the inter-channel affine of a loaded split-FOV spline
-        calibration on the current bead movie (globLoc-style re-registration for
-        a drifted / different-day alignment), keeping the PSF templates."""
+        calibration directly from the current blinking data: the signal
+        is read from several tens of frames inside the drawn ROIs, each
+        channel is flipped as the original calibration did, and a new affine is
+        fitted between the paired signal."""
         calibration = self.parameters_dialog.spline_calibration
         if self.movie is None:
             QtWidgets.QMessageBox.information(
-                self, "Re-register split-FOV", "No movie loaded."
+                self, "Re-register split-FOV (signal)", "No movie loaded."
             )
             return
         if not (calibration and calibration.get("split_fov")):
             QtWidgets.QMessageBox.warning(
                 self,
-                "Re-register split-FOV",
+                "Re-align split-FOV (signal)",
                 "Load a split-FOV spline calibration first "
                 "(Experimental PSF (spline) > Load calibration).",
             )
@@ -4974,13 +5154,23 @@ class Window(QtWidgets.QMainWindow):
             regions = [list(map(list, r)) for r in self.view.rois]
         else:
             regions = calibration.get("regions")
+        if not regions or len(regions) != n_channels:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Re-register split-FOV (signal)",
+                f"Draw one ROI per channel (reference first): {n_channels} "
+                "regions are needed for this calibration.",
+            )
+            return
         parameters = self.parameters
-        self.status_bar.showMessage("Re-registering split-FOV channels ...")
+        self.status_bar.showMessage(
+            "Re-registering split-FOV channels from signal ..."
+        )
         QtWidgets.QApplication.setOverrideCursor(
             QtCore.Qt.CursorShape.WaitCursor
         )
         try:
-            _, reg_info = spline.reestimate_split_fov_transforms(
+            _, reg_info = spline.refine_split_fov_transforms_from_signal(
                 self.movie,
                 calibration,
                 regions,
@@ -4992,31 +5182,32 @@ class Window(QtWidgets.QMainWindow):
             QtWidgets.QApplication.restoreOverrideCursor()
             self.status_bar.showMessage("")
             QtWidgets.QMessageBox.critical(
-                self, "Re-register split-FOV", f"Re-registration failed: {e}"
+                self,
+                "Re-register split-FOV (signal)",
+                f"Re-registration failed: {e}",
             )
             return
         QtWidgets.QApplication.restoreOverrideCursor()
         self.status_bar.showMessage("")
-        # per-channel residual RMS summary (camera px)
-        rows = []
-        for r in reg_info:
-            ref = np.asarray(r["ref_xy"], dtype=float)
-            cxy = np.asarray(r["c_xy"], dtype=float)
-            M = np.asarray(r["transform"], dtype=float)
-            resid = cxy - (ref @ M[:, :2].T + M[:, 2])
-            rms = float(np.sqrt(np.mean(np.sum(resid**2, axis=1))))
-            rows.append(
-                f"ch{r['channel']}: {r['n_matches']} beads, "
-                f"RMS {rms:.2f} px"
-            )
-        summary = "\n".join(rows)
-        # offer to save the updated calibration
+        # reflect the regions
+        regions_now = calibration.get("regions") or []
+        self.view.rois = [
+            [[int(r[0][0]), int(r[0][1])], [int(r[1][0]), int(r[1][1])]]
+            for r in regions_now
+        ]
+        self.parameters_dialog.update_roi_display()
+        self.draw_frame()
+        rows = [
+            f"ch{r['channel']}: {r['n_matches']} paired signals, "
+            f"RMS {r['rms']:.2f} px"
+            for r in reg_info
+        ]
         reply = QtWidgets.QMessageBox.question(
             self,
-            "Re-register split-FOV",
-            "Channels re-registered on the current data:\n\n"
-            f"{summary}\n\nThe loaded calibration is updated. Save it to a "
-            "file?",
+            "Re-register split-FOV (signal)",
+            "Channels re-registered from the current signal:\n\n"
+            + "\n".join(rows)
+            + "\n\nThe loaded calibration is updated. Save it to a file?",
             QtWidgets.QMessageBox.StandardButton.Save
             | QtWidgets.QMessageBox.StandardButton.Close,
         )

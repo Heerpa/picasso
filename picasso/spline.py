@@ -2131,39 +2131,99 @@ def calibrate_spline_split_fov(
     )
 
 
-def reestimate_split_fov_transforms(
+def _split_fov_local_affines(
+    calibration: dict, region_rects: list
+) -> list[np.ndarray]:
+    """The stored region-local channel affines (reference first), decomposed
+    from ``channel_transforms`` if ``channel_affines`` is absent."""
+    affines = calibration.get("channel_affines")
+    if affines is None:
+        affines = [
+            a.tolist()
+            for a in localize.decompose_region_affines(
+                calibration["regions"], calibration["channel_transforms"]
+            )
+        ]
+    if len(affines) != len(region_rects):
+        raise ValueError(
+            f"Calibration has {len(affines)} channel affines but "
+            f"{len(region_rects)} regions were given."
+        )
+    return [np.asarray(a, dtype=np.float64) for a in affines]
+
+
+def _frames_in_bounds(
+    n_frames: int, frame_bounds: tuple[int, int] | list | None
+) -> np.ndarray:
+    """Sorted array of the frame indices allowed by ``frame_bounds``.
+
+    ``frame_bounds`` follows :func:`localize.identify`.
+    """
+    n_frames = int(n_frames)
+    if frame_bounds is None:
+        return np.arange(n_frames, dtype=int)
+    segs = frame_bounds
+    first = segs[0] if len(segs) else None
+    if first is None or np.isscalar(first):
+        segs = [frame_bounds]  # a single (min, max) range
+    mask = np.zeros(n_frames, dtype=bool)
+    for lo, hi in segs:
+        lo = 0 if lo is None else max(0, int(lo))
+        hi = n_frames - 1 if hi is None else min(n_frames - 1, int(hi))
+        if hi >= lo:
+            mask[lo : hi + 1] = True
+    return np.nonzero(mask)[0]
+
+
+def refine_split_fov_transforms_from_signal(
     movie,
     calibration: dict,
     regions: list,
     minimum_ng: float,
     box: int | None = None,
     reference: int = 0,
-    frames_per_step: int = 1,
     frame_bounds: tuple[int, int] | list | None = None,
-    frame_order: Literal["fov", "z"] = "fov",
-    max_match_distance: float | None = None,
+    max_frames: int = 50,
+    max_pair_distance: float | None = None,
+    n_iter: int = 4,
+    min_pairs: int = 20,
     update: bool = True,
 ) -> tuple[dict, list]:
-    """Re-estimate the inter-channel registration of a split-FOV calibration on
-    new bead data, keeping the PSF templates.
+    """Re-register a split-FOV spline calibration from the experimental
+    (blinking) data.
 
-    Following globLoc, the channel registration can drift between the
-    calibration and the experiment (e.g. calibrated on a different day). This
-    detects beads in each region of ``movie``, matches reference<->channel and
-    re-fits the per-channel affine, then updates the calibration's *region-local*
-    ``channel_affines`` (and the derived ``channel_transforms``, ``regions``,
-    ``region_size``) - the PSF ``coefficients`` are untouched. Run it on a bead /
-    fiducial sample acquired with the current alignment; the drawn ``regions``
-    (reference first) locate the channels in that movie.
+    The channels of a split-FOV calibration (biplane / 4Pi / ratiometric) share
+    single-molecule signal: the same emitter fluoresces in the reference region
+    and every other region in the same frame. This re-fits the inter-channel
+    affine directly from that signal:
 
-    Returns ``(calibration, reg_info)`` where ``reg_info`` is the per-channel
-    matched-bead diagnostic (as in :func:`calibrate_spline_multichannel`). With
-    ``update=True`` the passed calibration dict is modified in place and also
-    returned; set it False to only compute ``reg_info`` and the transforms.
+    1. Single-molecule positions are detected inside the drawn ``regions`` on a
+       bounded, evenly-spaced sample of ``max_frames`` frames (several tens
+       should be enough shared blinks to fit an affine without scanning the
+       whole movie).
+    2. Each channel is coarsely overlaid on the reference using only the flip
+       the original calibration applied plus the drawn region offset - the
+       stored fine rotation / scale / translation is discarded, so a stale or
+       different-field registration cannot bias the result.
+    3. Reference and channel detections are paired frame by frame at that
+       seed and a fresh affine is fit on the pooled correspondences; a few ICP
+       iterations with a shrinking radius tighten it and a final robust trim
+       drops the coincidental (non-physical) pairs.
+
+    ``regions`` are the channel ROIs in the current data (reference first, e.g.
+    freshly drawn in the GUI). The PSF ``coefficients`` are untouched; only the
+    registration (``channel_affines`` / ``channel_transforms`` / ``regions`` /
+    ``region_size``) is updated. Requires channels that share signal.
+
+    Returns ``(calibration, reg_info)`` where ``reg_info`` lists, per channel,
+    the number of matched pairs, their coordinates, the fitted transform and the
+    residual RMS (camera px). With ``update=True`` the passed calibration is
+    modified in place; set it False to only compute the transforms.
     """
     if not calibration.get("split_fov"):
         raise ValueError(
-            "reestimate_split_fov_transforms requires a split-FOV calibration."
+            "refine_split_fov_transforms_from_signal requires a split-FOV "
+            "calibration."
         )
     n_channels = int(calibration.get("n_channels", len(regions)))
     if len(regions) != n_channels:
@@ -2175,184 +2235,169 @@ def reestimate_split_fov_transforms(
         raise ValueError(f"reference={reference} out of range.")
     if box is None:
         box = int(calibration.get("box") or calibration["n_data"][0])
-    if max_match_distance is None:
-        max_match_distance = float(box)
+    if max_pair_distance is None:
+        # the coarse seed is flip + ROI placement only, so allow a little more
+        # slack than one box for an imperfectly drawn ROI (still well below the
+        # typical single-molecule spacing, so per-frame matches stay unambiguous)
+        max_pair_distance = 1.5 * float(box)
 
-    region_rects = [_normalized_region(r) for r in regions]
+    # reference-first ordering for both the regions and the stored affines
     order = [reference] + [c for c in range(n_channels) if c != reference]
-    region_rects = [region_rects[c] for c in order]
+    region_rects = [_normalized_region(regions[c]) for c in order]
     sizes = {(r[1][0] - r[0][0], r[1][1] - r[0][1]) for r in region_rects}
     if len(sizes) != 1:
         raise ValueError("All regions must have the same size.")
+    affines_stored = _split_fov_local_affines(calibration, regions)
+    affines = [affines_stored[c] for c in order]
 
-    n_frames = int(movie.shape[0])
-    d = float(calibration.get("z_step_nm", 1.0))
-    step_of_frame, _, step_range = _step_of_frame(
-        n_frames, d, frames_per_step, frame_order, frame_bounds
-    )
-    ref_bounds = _reference_frame_segments(step_of_frame, step_range)
-    mid_frame = _reference_mid_frame(step_of_frame, step_range)
-
-    # registration only: pooled detection across FOVs is fine here (beads are
-    # matched by position between the two regions of the same movie)
-    beads_ref = _detect_bead_positions(
-        movie, minimum_ng, box, ref_bounds, roi=region_rects[0]
-    )
-    (y0_ref, x0_ref) = region_rects[0][0]
-
+    # coarse seed = only the flip the calibration applied placed at the
+    # drawn regions
+    h = region_rects[0][1][0] - region_rects[0][0][0]
+    w = region_rects[0][1][1] - region_rects[0][0][1]
     identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-    transforms = [identity]
+    seed_local_affines = [identity]
+    for c in range(1, n_channels):
+        dec = _decompose_affine(affines[c], pixelsize=1.0)
+        if dec["mirror"] and dec["flip_axis"] == "x":
+            seed_local_affines.append(
+                np.array([[-1.0, 0.0, float(w)], [0.0, 1.0, 0.0]])
+            )
+        elif dec["mirror"] and dec["flip_axis"] == "y":
+            seed_local_affines.append(
+                np.array([[1.0, 0.0, 0.0], [0.0, -1.0, float(h)]])
+            )
+        else:
+            seed_local_affines.append(identity.copy())
+    seed_transforms = localize.compose_region_transforms(
+        region_rects, seed_local_affines
+    )
+
+    # detect only on a bounded, evenly-spaced sample of frames (several tens):
+    # the same subset is used for every region so per-frame pairing stays aligned
+    n_frames = int(movie.shape[0])
+    allowed = _frames_in_bounds(n_frames, frame_bounds)
+    if allowed.size == 0:
+        raise ValueError("No frames in the requested frame range.")
+    pick = np.unique(
+        np.linspace(
+            0, allowed.size - 1, min(int(max_frames), allowed.size)
+        ).astype(int)
+    )
+    sample_frames = allowed[pick]
+    movie_sub = np.stack([np.asarray(movie[int(f)]) for f in sample_frames])
+
+    # per-region, per-frame detections (absolute coords) on the sampled frames
+    def _by_frame(rect):
+        ids, _ = localize.identify(movie_sub, minimum_ng, box, roi=rect)
+        if len(ids) == 0:
+            return {}
+        frame = np.asarray(ids["frame"], dtype=np.int64)
+        xy = np.column_stack(
+            [
+                np.asarray(ids["x"], dtype=np.float64),
+                np.asarray(ids["y"], dtype=np.float64),
+            ]
+        )
+        out = {}
+        for f in np.unique(frame):
+            out[int(f)] = xy[frame == f]
+        return out
+
+    ref_by_frame = _by_frame(region_rects[0])
+    if not ref_by_frame:
+        raise ValueError(
+            "No detections in the reference region; lower the minimum net "
+            "gradient or check the drawn ROIs / frame range."
+        )
+
+    # match radii shrink from generous (absorb the seed's residual drift) to
+    # tight (sub-box) over the ICP iterations
+    tol_hi = float(max_pair_distance)
+    tol_lo = max(2.0, 0.3 * box)
+    tols = np.linspace(tol_hi, tol_lo, max(1, int(n_iter)))
+
+    transforms = [np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])]
     reg_info = []
     for c in range(1, n_channels):
-        r = region_rects[c]
-        coarse_shift = (float(x0_ref - r[0][1]), float(y0_ref - r[0][0]))
-        transform, n_matches, ref_m, c_m = _estimate_channel_transform(
-            movie,
-            movie,
-            beads_ref,
-            minimum_ng,
-            box,
-            ref_bounds,
-            mid_frame,
-            max_match_distance,
-            channel_roi=r,
-            coarse_shift=coarse_shift,
-            return_matches=True,
+        chan_by_frame = _by_frame(region_rects[c])
+        common = sorted(set(ref_by_frame) & set(chan_by_frame))
+        if not common:
+            raise ValueError(
+                f"No frames with detections in both the reference and channel "
+                f"{c} regions; the channels may not share signal (needs "
+                "biplane / 4Pi / ratiometric data)."
+            )
+        transform = np.asarray(seed_transforms[c], dtype=np.float64)
+        matched_ref = matched_c = np.empty((0, 2))
+        for tol in tols:
+            acc_ref, acc_c = [], []
+            for f in common:
+                rxy = ref_by_frame[f]
+                cxy = chan_by_frame[f]
+                pred = localize.apply_affine_transform(rxy, transform)
+                ri, ci = _match_beads(pred, cxy, tol)
+                if len(ri):
+                    acc_ref.append(rxy[ri])
+                    acc_c.append(cxy[ci])
+            if not acc_ref:
+                break
+            matched_ref = np.vstack(acc_ref)
+            matched_c = np.vstack(acc_c)
+            if len(matched_ref) < 3:
+                break
+            transform = localize.estimate_affine_transform(
+                matched_ref, matched_c
+            )
+        # robust trim: drop coincidental pairs far from the converged transform,
+        # then re-fit once on the inliers
+        if len(matched_ref) >= 3:
+            resid = matched_c - localize.apply_affine_transform(
+                matched_ref, transform
+            )
+            dist = np.sqrt(np.sum(resid**2, axis=1))
+            keep = dist <= max(tol_lo, 3.0 * np.median(dist))
+            if keep.sum() >= 3:
+                matched_ref = matched_ref[keep]
+                matched_c = matched_c[keep]
+                transform = localize.estimate_affine_transform(
+                    matched_ref, matched_c
+                )
+        n_pairs = int(len(matched_ref))
+        if n_pairs < min_pairs:
+            raise ValueError(
+                f"Only {n_pairs} signal correspondences for channel {c} "
+                f"(need >= {min_pairs}); use a longer / denser movie, lower the "
+                "minimum net gradient, or re-register on beads instead."
+            )
+        resid = matched_c - localize.apply_affine_transform(
+            matched_ref, transform
         )
+        rms = float(np.sqrt(np.mean(np.sum(resid**2, axis=1))))
         transforms.append(transform)
         reg_info.append(
             {
                 "channel": c,
-                "n_matches": n_matches,
-                "ref_xy": ref_m,
-                "c_xy": c_m,
+                "n_matches": n_pairs,
+                "ref_xy": matched_ref,
+                "c_xy": matched_c,
                 "transform": transform,
+                "rms": rms,
             }
         )
 
-    affines = localize.decompose_region_affines(region_rects, transforms)
+    new_affines = localize.decompose_region_affines(region_rects, transforms)
     if update:
-        calibration["channel_affines"] = [a.tolist() for a in affines]
+        calibration["channel_affines"] = [a.tolist() for a in new_affines]
         calibration["channel_transforms"] = [t.tolist() for t in transforms]
         calibration["regions"] = [
             [[int(r[0][0]), int(r[0][1])], [int(r[1][0]), int(r[1][1])]]
             for r in region_rects
         ]
-        h = region_rects[0][1][0] - region_rects[0][0][0]
-        w = region_rects[0][1][1] - region_rects[0][0][1]
-        calibration["region_size"] = [int(h), int(w)]
+        h0 = region_rects[0][1][0] - region_rects[0][0][0]
+        w0 = region_rects[0][1][1] - region_rects[0][0][1]
+        calibration["region_size"] = [int(h0), int(w0)]
         calibration["reference"] = 0
     return calibration, reg_info
-
-
-def refine_split_fov_registration(
-    movie,
-    calibration: dict,
-    regions: list | None = None,
-    box: int = 7,
-    max_frames: int = 500,
-    max_shift_frac: float = 0.25,
-) -> tuple[dict, list]:
-    """Refine a split-FOV channel registration from the current data itself, by
-    cross-correlation - no beads required.
-
-    For the common case where the split has drifted by a few pixels since the
-    calibration, this re-measures each channel's region-local lateral offset
-    from a projection of the loaded ``movie`` (reference region vs each channel
-    region) and updates the calibration's ``channel_affines`` translation
-    accordingly, keeping the linear part (rotation/scale) and the PSF templates.
-    Reliable when the channels share structure (biplane / 4Pi, or fiducials in
-    the field of view); for spectrally dissimilar channels the correlation is
-    weak - a per-channel shift larger than ``max_shift_frac`` of the region is
-    treated as unreliable and left unchanged.
-
-    ``regions`` are the channel ROIs in the current data (reference first); when
-    omitted the calibration's stored regions are used. Returns
-    ``(calibration, refinements)`` with the calibration updated in place;
-    ``refinements`` lists per channel the measured ``shift`` (x, y), the applied
-    ``delta`` relative to the old offset, and whether it was ``applied``.
-    """
-    from . import imageprocess
-
-    if not calibration.get("split_fov"):
-        raise ValueError(
-            "refine_split_fov_registration requires a split-FOV calibration."
-        )
-    rects_in = regions if regions is not None else calibration.get("regions")
-    if not rects_in:
-        raise ValueError(
-            "No regions to refine (draw ROIs or load a split-FOV "
-            "calibration)."
-        )
-    region_rects = [_normalized_region(r) for r in rects_in]
-    n_channels = int(calibration.get("n_channels", len(region_rects)))
-    if len(region_rects) != n_channels:
-        raise ValueError(
-            f"Got {len(region_rects)} regions but the calibration has "
-            f"{n_channels} channels."
-        )
-    affines = calibration.get("channel_affines")
-    if affines is None:
-        affines = [
-            a.tolist()
-            for a in localize.decompose_region_affines(
-                calibration["regions"], calibration["channel_transforms"]
-            )
-        ]
-
-    # mean projection over a bounded, evenly-sampled set of frames
-    n_frames = int(movie.shape[0])
-    sample = np.unique(
-        np.linspace(0, n_frames - 1, min(n_frames, max_frames)).astype(int)
-    )
-    proj = np.zeros(movie.shape[1:], dtype=np.float64)
-    for f in sample:
-        proj += np.asarray(movie[f], dtype=np.float64)
-    proj /= len(sample)
-
-    (ry0, rx0), (ry1, rx1) = region_rects[0]
-    ref_img = proj[ry0:ry1, rx0:rx1]
-
-    new_affines = [np.asarray(affines[0], dtype=np.float64)]
-    refinements = []
-    for c in range(1, n_channels):
-        (cy0, cx0), (cy1, cx1) = region_rects[c]
-        c_img = proj[cy0:cy1, cx0:cx1]
-        h = min(ref_img.shape[0], c_img.shape[0])
-        w = min(ref_img.shape[1], c_img.shape[1])
-        yc, xc = imageprocess.get_image_shift(
-            ref_img[:h, :w], c_img[:h, :w], box
-        )
-        a = np.asarray(affines[c], dtype=np.float64)
-        linear, old_t = a[:, :2], a[:, 2]
-        measured = np.array([float(xc), float(yc)])  # region-local (x, y)
-        applied = max(abs(xc), abs(yc)) <= max_shift_frac * max(h, w)
-        new_t = measured if applied else old_t
-        new_affines.append(np.hstack([linear, new_t[:, None]]))
-        refinements.append(
-            {
-                "channel": c,
-                "shift": (float(measured[0]), float(measured[1])),
-                "delta": (
-                    float(new_t[0] - old_t[0]),
-                    float(new_t[1] - old_t[1]),
-                ),
-                "applied": bool(applied),
-            }
-        )
-
-    transforms = localize.compose_region_transforms(region_rects, new_affines)
-    calibration["channel_affines"] = [a.tolist() for a in new_affines]
-    calibration["channel_transforms"] = [t.tolist() for t in transforms]
-    calibration["regions"] = [
-        [[int(r[0][0]), int(r[0][1])], [int(r[1][0]), int(r[1][1])]]
-        for r in region_rects
-    ]
-    h0 = region_rects[0][1][0] - region_rects[0][0][0]
-    w0 = region_rects[0][1][1] - region_rects[0][0][1]
-    calibration["region_size"] = [int(h0), int(w0)]
-    calibration["reference"] = 0
-    return calibration, refinements
 
 
 def decompose_phase_volumes(
