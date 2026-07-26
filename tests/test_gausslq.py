@@ -16,7 +16,22 @@ import pytest
 
 from picasso import gausslq
 
-from tests.conftest import BOX
+from tests.conftest import BOX, make_rotated_gaussian_spot
+
+
+def _precision_matrix(sx, sy, angle):
+    """Precision (inverse-covariance) matrix of a rotated Gaussian.
+
+    ``(sx, sy, angle)`` and ``(sy, sx, angle +/- pi/2)`` describe the *same*
+    ellipse — the rotated fit is free to return either. The precision
+    matrix is invariant under that relabeling, so comparing it (rather than
+    the raw angle/widths) tests recovery without tripping on the
+    degeneracy.
+    """
+    c, s = np.cos(angle), np.sin(angle)
+    R = np.array([[c, -s], [s, c]])
+    D = np.diag([1.0 / sx**2, 1.0 / sy**2])
+    return R.T @ D @ R
 
 
 # ---------------------------------------------------------------------------
@@ -401,3 +416,225 @@ class TestGpufit:
         assert theta.shape == (len(spots), 6)
         # GPU returns parameters as [photons, x, y, sx, sy, bg]
         np.testing.assert_allclose(theta[:, 0], gt.photons.values, rtol=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Spherical (isotropic, single-width) least-squares fit
+# ---------------------------------------------------------------------------
+
+
+class TestFitSpotSpherical:
+    """``gausslq.fit_spot(spherical=True)`` fits one shared width."""
+
+    def test_returns_six_floats_with_equal_widths(
+        self, synthetic_spot_factory
+    ):
+        """The spherical fit still returns the standard 6-parameter layout
+        ``[x, y, photons, bg, sx, sy]`` with ``sx == sy`` so downstream
+        code is unchanged."""
+        spot = synthetic_spot_factory(sx=1.1, sy=1.1)
+        result = gausslq.fit_spot(spot, spherical=True)
+        assert result.shape == (6,)
+        assert np.all(np.isfinite(result))
+        assert result[4] == result[5]
+
+    def test_recovers_isotropic_ground_truth(self, synthetic_spot_factory):
+        """A noiseless isotropic spot is recovered to tight tolerance."""
+        spot = synthetic_spot_factory(
+            x0=0.2, y0=-0.15, sx=1.2, sy=1.2, photons=5000.0, bg=10.0
+        )
+        x, y, photons, bg, sx, sy = gausslq.fit_spot(spot, spherical=True)
+        assert x == pytest.approx(0.2, abs=5e-3)
+        assert y == pytest.approx(-0.15, abs=5e-3)
+        assert sx == pytest.approx(1.2, abs=5e-3)
+        assert sy == pytest.approx(1.2, abs=5e-3)
+        assert photons == pytest.approx(5000.0, rel=5e-3)
+        assert bg == pytest.approx(10.0, rel=5e-2)
+
+    def test_single_width_averages_anisotropic_spot(
+        self, synthetic_spot_factory
+    ):
+        """Given an anisotropic spot, the single-width fit lands between
+        the two true widths (it cannot represent sx != sy)."""
+        spot = synthetic_spot_factory(sx=1.4, sy=0.9)
+        _, _, _, _, sx, sy = gausslq.fit_spot(spot, spherical=True)
+        assert sx == sy
+        assert 0.9 < sx < 1.4
+
+
+class TestFitSpotsSpherical:
+    """Batch spherical fitting via ``gausslq.fit_spots``."""
+
+    def test_shape_and_equal_widths(self, synthetic_spots_isotropic):
+        spots, _ = synthetic_spots_isotropic
+        theta = gausslq.fit_spots(spots, spherical=True)
+        assert theta.shape == (len(spots), 6)
+        assert theta.dtype == np.float32
+        assert np.all(np.isfinite(theta))
+        np.testing.assert_array_equal(theta[:, 4], theta[:, 5])
+
+    def test_recovers_ground_truth(self, synthetic_spots_isotropic):
+        spots, gt = synthetic_spots_isotropic
+        theta = gausslq.fit_spots(spots, spherical=True)
+        # theta cols: x, y, photons, bg, sx, sy
+        np.testing.assert_allclose(theta[:, 0], gt.x.values, atol=0.02)
+        np.testing.assert_allclose(theta[:, 1], gt.y.values, atol=0.02)
+        np.testing.assert_allclose(theta[:, 2], gt.photons.values, rtol=0.02)
+        np.testing.assert_allclose(theta[:, 4], gt.sx.values, atol=0.02)
+
+    def test_per_spot_matches_scalar(self, synthetic_spots_isotropic):
+        spots, _ = synthetic_spots_isotropic
+        batch = gausslq.fit_spots(spots, spherical=True)
+        for i in [0, 5, len(spots) - 1]:
+            single = gausslq.fit_spot(spots[i], spherical=True)
+            np.testing.assert_allclose(batch[i], single, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Rotated elliptical least-squares fit
+# ---------------------------------------------------------------------------
+
+
+class TestFitSpotRotated:
+    """``gausslq.fit_spot(rotated=True)`` recovers the orientation."""
+
+    def test_returns_seven_floats(self):
+        spot = make_rotated_gaussian_spot(
+            9, 0.1, -0.1, 1.6, 0.9, 6000.0, 10.0, 0.4
+        )
+        result = gausslq.fit_spot(spot, rotated=True)
+        assert result.shape == (7,)
+        assert np.all(np.isfinite(result))
+
+    def test_recovers_ellipse_precision_matrix(self):
+        """The recovered ellipse (precision matrix) matches ground truth,
+        independent of the sx<->sy / angle+-pi/2 relabeling."""
+        box = 9
+        for angle in [-1.2, -0.6, -0.2, 0.3, 0.7, 1.1]:
+            spot = make_rotated_gaussian_spot(
+                box, 0.15, -0.1, 1.7, 0.9, 6000.0, 10.0, angle
+            )
+            _, _, _, _, sx, sy, ang = gausslq.fit_spot(spot, rotated=True)
+            np.testing.assert_allclose(
+                _precision_matrix(sx, sy, ang),
+                _precision_matrix(1.7, 0.9, angle),
+                atol=5e-3,
+            )
+            # sorted widths recovered regardless of axis labeling
+            np.testing.assert_allclose(sorted([sx, sy]), [0.9, 1.7], atol=1e-2)
+
+    def test_recovers_position_and_photons(self):
+        spot = make_rotated_gaussian_spot(
+            9, 0.25, -0.2, 1.6, 0.95, 7000.0, 12.0, 0.5
+        )
+        x, y, photons, bg, _, _, _ = gausslq.fit_spot(spot, rotated=True)
+        assert x == pytest.approx(0.25, abs=1e-2)
+        assert y == pytest.approx(-0.2, abs=1e-2)
+        assert photons == pytest.approx(7000.0, rel=1e-2)
+        assert bg == pytest.approx(12.0, rel=5e-2)
+
+
+class TestFitSpotsRotated:
+    """Batch rotated fitting via ``gausslq.fit_spots``."""
+
+    def test_shape_is_seven_columns(self, synthetic_spots_rotated):
+        spots, _ = synthetic_spots_rotated
+        theta = gausslq.fit_spots(spots, rotated=True)
+        assert theta.shape == (len(spots), 7)
+        assert np.all(np.isfinite(theta))
+
+    def test_recovers_each_ellipse(self, synthetic_spots_rotated):
+        spots, gt = synthetic_spots_rotated
+        theta = gausslq.fit_spots(spots, rotated=True)
+        for i in range(len(spots)):
+            np.testing.assert_allclose(
+                _precision_matrix(theta[i, 4], theta[i, 5], theta[i, 6]),
+                _precision_matrix(gt.sx[i], gt.sy[i], gt.angle[i]),
+                atol=1e-2,
+            )
+
+
+# ---------------------------------------------------------------------------
+# locs_from_fits — spherical (no ellipticity) and rotated (angle column)
+# ---------------------------------------------------------------------------
+
+
+class TestLocsFromFitsSphericalRotated:
+    """The ``spherical`` flag drops the (always-zero) ellipticity column;
+    a 7-column theta adds the ``angle`` column."""
+
+    def _ids(self, n):
+        return pd.DataFrame(
+            {
+                "frame": np.arange(n, dtype=np.uint32),
+                "x": np.full(n, 16, dtype=np.int64),
+                "y": np.full(n, 16, dtype=np.int64),
+                "net_gradient": np.full(n, 5000.0, dtype=np.float32),
+            }
+        )
+
+    def test_spherical_omits_ellipticity(self, synthetic_spots_isotropic):
+        spots, _ = synthetic_spots_isotropic
+        theta = gausslq.fit_spots(spots, spherical=True)
+        ids = self._ids(len(spots))
+        locs = gausslq.locs_from_fits(
+            ids, theta, BOX, em=False, spherical=True
+        )
+        assert "ellipticity" not in locs.columns
+        # everything else is still present
+        for col in [
+            "frame",
+            "x",
+            "y",
+            "photons",
+            "sx",
+            "sy",
+            "bg",
+            "lpx",
+            "lpy",
+            "net_gradient",
+        ]:
+            assert col in locs.columns
+
+    def test_non_spherical_keeps_ellipticity(self, synthetic_spots_isotropic):
+        """Default (spherical=False) still emits the ellipticity column,
+        so only the spherical path drops it."""
+        spots, _ = synthetic_spots_isotropic
+        theta = gausslq.fit_spots(spots, spherical=True)
+        ids = self._ids(len(spots))
+        locs = gausslq.locs_from_fits(
+            ids, theta, BOX, em=False, spherical=False
+        )
+        assert "ellipticity" in locs.columns
+        # sx == sy -> ellipticity is (numerically) zero
+        np.testing.assert_allclose(locs["ellipticity"], 0.0, atol=1e-6)
+
+    def test_spherical_flag_only_changes_ellipticity(
+        self, synthetic_spots_isotropic
+    ):
+        """Dropping ellipticity must not perturb any other column."""
+        spots, _ = synthetic_spots_isotropic
+        theta = gausslq.fit_spots(spots, spherical=True)
+        ids = self._ids(len(spots))
+        sph = gausslq.locs_from_fits(ids, theta, BOX, em=False, spherical=True)
+        ell = gausslq.locs_from_fits(
+            ids, theta, BOX, em=False, spherical=False
+        )
+        for col in sph.columns:
+            np.testing.assert_array_equal(
+                sph[col].to_numpy(), ell[col].to_numpy()
+            )
+        assert set(ell.columns) - set(sph.columns) == {"ellipticity"}
+
+    def test_rotated_adds_normalized_angle_column(
+        self, synthetic_spots_rotated
+    ):
+        spots, _ = synthetic_spots_rotated
+        theta = gausslq.fit_spots(spots, rotated=True)
+        ids = self._ids(len(spots))
+        locs = gausslq.locs_from_fits(ids, theta, BOX, em=False)
+        assert "angle" in locs.columns
+        # angle stored in degrees, wrapped to [-90, 90)
+        assert ((locs["angle"] >= -90.0) & (locs["angle"] < 90.0)).all()
+        # ellipticity is present for the (anisotropic) rotated model
+        assert "ellipticity" in locs.columns
