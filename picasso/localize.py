@@ -2733,11 +2733,40 @@ def fit_spots_gpufit_spline(
     return best_params
 
 
+def _phase_z_seeds(calibration: dict, n_z_starts: int) -> np.ndarray | None:
+    """z-shift seeds for the model-12 z multi-start, or ``None`` for a single
+    (default) start.
+
+    The interference fringe is baked into the calibration's mod/mod90 splines,
+    so the z (``z_shift``) objective has local minima spaced by one fringe
+    period ``pi/frequency`` (z-slices). A cold z start therefore locks onto
+    whichever fringe is nearest and is frequently off by whole fringes. Seeding
+    ``z_shift`` across the calibration's axial range with spacing below half a
+    fringe lets the fitter reach every fringe minimum (the best-chi winner is
+    then kept). ``z_eval = -z_shift`` spans ``[0, n_z - 1]``, so seeds run over
+    ``[-(n_z - 1), 0]``.
+    """
+    n_z = int(calibration["n_data"][2])
+    if n_z_starts is None:
+        # auto: enough seeds for < half-fringe spacing over the axial range
+        freq = calibration.get("frequency")
+        if freq and abs(freq) > 1e-9:
+            zt_slices = np.pi / abs(freq)  # fringe period in z-slices
+            n_z_starts = int(np.ceil(2.0 * (n_z - 1) / zt_slices)) + 1
+            n_z_starts = int(np.clip(n_z_starts, 3, 16))
+        else:
+            n_z_starts = 1
+    if int(n_z_starts) <= 1:
+        return None
+    return -np.linspace(0.0, n_z - 1, int(n_z_starts))
+
+
 def fit_spots_gpufit_spline_phase(
     spots: lib.FloatArray3D,
     calibration: dict,
     mle: bool = False,
     n_phase_starts: int = 6,
+    n_z_starts: int | None = 1,
     tolerance: float = 1e-4,
     max_number_iterations: int = 100,
     return_stats: bool = False,
@@ -2745,17 +2774,22 @@ def fit_spots_gpufit_spline_phase(
     lib.FloatArray2D
     | tuple[lib.FloatArray2D, lib.FloatArray1D | None, lib.FloatArray1D]
 ):
-    """Fit the 4Pi phase spline model (Gpufit model 12) with a phase
-    multi-start.
+    """Fit the 4Pi phase spline model (Gpufit model 12) with a phase- and
+    z-multi-start.
 
     The 6th parameter (interference phase) is periodic and the least-squares
     objective is sinusoidal in it, so a single cold start (phase = 0) only
-    converges within roughly (-pi/2, pi/2). This retries each spot from
-    ``n_phase_starts`` phase seeds evenly spanning ``[0, 2*pi)`` and keeps, per
-    spot, the seed whose fit best explains the data (lowest chi-square). With
-    ``mle`` the winner is restricted to converged fits (Gpufit's MLE bails on a
-    large fraction with a garbage chi-square); LSE (default) uses the raw
-    residual, which is reliable.
+    converges within roughly (-pi/2, pi/2). Additionally, because the fringe is
+    baked into the calibration's mod/mod90 splines, the z (``z_shift``) objective
+    has fringe-spaced local minima and a cold z start is frequently off by whole
+    fringes. This retries each spot from a grid of ``n_phase_starts`` phase seeds
+    (spanning ``[0, 2*pi)``) x ``n_z_starts`` z seeds (spanning the calibration's
+    axial range; see :func:`_phase_z_seeds`) and keeps, per spot, the seed whose
+    fit best explains the data (lowest chi-square). ``n_z_starts=None`` auto-sizes
+    the z grid to the fringe period (< half-fringe spacing); ``n_z_starts=1``
+    disables the z multi-start. With ``mle`` the winner is restricted to
+    converged fits (Gpufit's MLE bails on a large fraction with a garbage
+    chi-square); LSE (default) uses the raw residual, which is reliable.
 
     ``spots`` is channel-stacked ``(n, box, box, n_channels)``. Returns the best
     per-spot parameters ``[amplitude, x, y, z, offset, phase]`` and, if
@@ -2773,7 +2807,7 @@ def fit_spots_gpufit_spline_phase(
     n_spots, n_params = base_init.shape
 
     # Track, per spot, the best CONVERGED fit and (as a fallback) the best
-    # merely-finite fit across all phase seeds.
+    # merely-finite fit across all seeds.
     best_ok_chi = np.full(n_spots, np.inf)
     best_ok = np.full((n_spots, n_params), np.nan, np.float32)
     best_ok_it = np.zeros(n_spots, np.int32)
@@ -2781,28 +2815,36 @@ def fit_spots_gpufit_spline_phase(
     best_fin = np.full((n_spots, n_params), np.nan, np.float32)
     best_fin_it = np.zeros(n_spots, np.int32)
 
-    starts = np.linspace(0.0, 2.0 * np.pi, int(n_phase_starts), endpoint=False)
-    for phi0 in starts:
-        init_k = base_init.copy()
-        init_k[:, 5] = np.float32(phi0)
-        params, states, chi, nit, _ = _run_gpufit_spline(
-            spots,
-            calibration,
-            mle=mle,
-            initial_parameters=init_k,
-            tolerance=tolerance,
-            max_number_iterations=max_number_iterations,
-        )
-        finite = np.isfinite(params).all(axis=1) & np.isfinite(chi)
-        converged = finite & ((states == 0) if mle else True)
-        fin_better = finite & (chi < best_fin_chi)
-        best_fin_chi[fin_better] = chi[fin_better]
-        best_fin[fin_better] = params[fin_better]
-        best_fin_it[fin_better] = nit[fin_better]
-        ok_better = converged & (chi < best_ok_chi)
-        best_ok_chi[ok_better] = chi[ok_better]
-        best_ok[ok_better] = params[ok_better]
-        best_ok_it[ok_better] = nit[ok_better]
+    phase_starts = np.linspace(
+        0.0, 2.0 * np.pi, int(n_phase_starts), endpoint=False
+    )
+    z_seeds = _phase_z_seeds(calibration, n_z_starts)
+    # None -> keep the default per-spot z init (base_init[:, 3])
+    z_starts = [None] if z_seeds is None else list(z_seeds)
+    for z0 in z_starts:
+        for phi0 in phase_starts:
+            init_k = base_init.copy()
+            if z0 is not None:
+                init_k[:, 3] = np.float32(z0)
+            init_k[:, 5] = np.float32(phi0)
+            params, states, chi, nit, _ = _run_gpufit_spline(
+                spots,
+                calibration,
+                mle=mle,
+                initial_parameters=init_k,
+                tolerance=tolerance,
+                max_number_iterations=max_number_iterations,
+            )
+            finite = np.isfinite(params).all(axis=1) & np.isfinite(chi)
+            converged = finite & ((states == 0) if mle else True)
+            fin_better = finite & (chi < best_fin_chi)
+            best_fin_chi[fin_better] = chi[fin_better]
+            best_fin[fin_better] = params[fin_better]
+            best_fin_it[fin_better] = nit[fin_better]
+            ok_better = converged & (chi < best_ok_chi)
+            best_ok_chi[ok_better] = chi[ok_better]
+            best_ok[ok_better] = params[ok_better]
+            best_ok_it[ok_better] = nit[ok_better]
 
     has_ok = np.isfinite(best_ok_chi)
     best_params = np.where(has_ok[:, None], best_ok, best_fin)
@@ -3984,11 +4026,53 @@ def locs_from_fits_spline(
     columns["bg_unc"] = bg_unc.astype(np.float32)
     if is_phase:
         # interference phase (radians, wrapped to [0, 2*pi)) and its precision
-        columns["phase"] = np.mod(np.asarray(theta[:, 5]), 2.0 * np.pi).astype(
-            np.float32
-        )
+        phase_arr = np.mod(np.asarray(theta[:, 5], dtype=float), 2.0 * np.pi)
+        columns["phase"] = phase_arr.astype(np.float32)
         with np.errstate(invalid="ignore"):
-            columns["phase_unc"] = np.sqrt(crlb[:, 5]).astype(np.float32)
+            phase_unc_arr = np.sqrt(crlb[:, 5])
+        columns["phase_unc"] = phase_unc_arr.astype(np.float32)
+        # Keep the coarse (astigmatic) z available as `z_astig`.
+        # Optional inline 4Pi phase -> z: SMAP-style fusion of the coarse z and
+        # the fine phase (z_from_phi_JR). NOTE: Gpufit's model 12 bakes the
+        # fringe into mod/mod90(z), so the fitted `phase` is a near-constant
+        # offset rather than a z-tracker - this unwrap is only meaningful for a
+        # calibration whose phase genuinely tracks z, so it is opt-in via the
+        # calibration flag `unwrap_inline`. The re-runnable
+        # ``picasso.fourpi.reconstruct_z_from_phase`` does the same with a
+        # per-frame-window drift model.
+        if is_3d:
+            columns["z_astig"] = columns["z"]
+            try:
+                from . import fourpi
+
+                freq = fourpi.frequency_from_calibration(calibration)
+                if freq and calibration.get("unwrap_inline"):
+                    z_coarse = z  # coarse z (nm), computed above
+                    best_k, best_res, best_z0 = freq, np.inf, 0.0
+                    for cand in (freq, -freq):
+                        z0 = fourpi.estimate_phase_reference(
+                            z_coarse, phase_arr, cand
+                        )
+                        res = float(
+                            np.median(
+                                np.abs(
+                                    fourpi.z_from_phase(
+                                        z_coarse, phase_arr, cand, z0
+                                    )
+                                    - z_coarse
+                                )
+                            )
+                        )
+                        if res < best_res:
+                            best_res, best_k, best_z0 = res, cand, z0
+                    columns["z"] = fourpi.z_from_phase(
+                        z_coarse, phase_arr, best_k, best_z0
+                    ).astype(np.float32)
+                    columns["lpz"] = (
+                        phase_unc_arr / (2.0 * abs(best_k))
+                    ).astype(np.float32)
+            except Exception as e:  # never let unwrap break the fit output
+                print(f"4Pi inline phase->z skipped: {e}")
     if log_likelihood is not None:
         columns["log_likelihood"] = log_likelihood.astype(np.float32)
     if iterations is not None:
@@ -4177,6 +4261,197 @@ def multichannel_inbounds_ids(
             stacklevel=2,
         )
     return identifications.iloc[np.flatnonzero(inside)].reset_index(drop=True)
+
+
+def _matched_mask_within_tol(
+    pred_xy: np.ndarray, target_xy: np.ndarray, tol: float
+) -> np.ndarray:
+    """Nearest-neighbor pairing within ``tol``, one-to-one.
+
+    ``pred_xy`` are reference detections predicted into a channel (via the
+    calibration transform), ``target_xy`` are that channel's own detections.
+    Each reference proposes its nearest target; conflicts are resolved in order
+    of increasing distance so every reference and every target is used at most
+    once. Returns a boolean mask over ``pred_xy`` marking the paired rows - the
+    same pairing the viewer's link colours use (``_nearest_unique_match`` in
+    ``picasso.gui.localize``), reduced to "was this reference spot matched".
+    """
+    n_pred = len(pred_xy)
+    matched = np.zeros(n_pred, dtype=bool)
+    if n_pred == 0 or len(target_xy) == 0:
+        return matched
+    dists = np.sqrt(
+        ((pred_xy[:, None, :] - target_xy[None, :, :]) ** 2).sum(axis=2)
+    )  # (n_pred, n_target)
+    nearest = np.argmin(dists, axis=1)
+    best = dists[np.arange(n_pred), nearest]
+    candidates = np.flatnonzero(best <= tol)
+    if len(candidates) == 0:
+        return matched
+    # closest pair wins; a target already claimed cannot be reused
+    used_target: set[int] = set()
+    for k in candidates[np.argsort(best[candidates], kind="stable")]:
+        j = int(nearest[k])
+        if j in used_target:
+            continue
+        used_target.add(j)
+        matched[k] = True
+    return matched
+
+
+def link_identifications_multichannel(
+    identifications_per_channel: list,
+    transforms: list,
+    tol: float,
+    progress_callback: Callable[[int], None] | None = None,
+) -> np.ndarray:
+    """Boolean mask over the reference channel's detections marking those that
+    are also detected in *every* other channel.
+
+    A molecule that the joint multichannel/4Pi model can describe must be
+    present in all channels: the fit ties one shared ``x, y, z`` (and, for the
+    4Pi phase model, one interference phase) to the *relative* intensities
+    across channels. A reference detection with no counterpart in some channel
+    is fitted there against background only, which biases the shared parameters
+    and - for model 12 - makes the recovered phase meaningless. Filtering on
+    this mask keeps only the cross-channel-linked molecules.
+
+    Parameters
+    ----------
+    identifications_per_channel : list of pd.DataFrame
+        One identification table per channel, ``[0]`` being the reference. Each
+        needs ``frame``, ``x``, ``y``. ``None`` or empty entries mean that
+        channel was not identified; it is then skipped (not counted as a
+        missing match), so a partially identified set degrades to linking
+        against the channels that are available.
+    transforms : list
+        One ``(2, 3)`` affine per channel mapping reference coordinates into
+        that channel (as stored in the calibration's ``channel_transforms``).
+    tol : float
+        Pairing radius in camera pixels (the GUI preview uses ``1.5 * box``).
+    progress_callback : callable, optional
+        Called with the cumulative number of reference detections processed.
+
+    Returns
+    -------
+    linked : np.ndarray
+        Boolean mask over ``identifications_per_channel[0]`` rows. All ``False``
+        if no other channel carries identifications.
+    """
+    reference = identifications_per_channel[0]
+    n_ref = 0 if reference is None else len(reference)
+    if n_ref == 0:
+        return np.zeros(0, dtype=bool)
+    ref_frames = np.asarray(reference["frame"], dtype=np.int64)
+    ref_xy = np.column_stack(
+        [
+            np.asarray(reference["x"], dtype=np.float64),
+            np.asarray(reference["y"], dtype=np.float64),
+        ]
+    )
+    # frame-sorted view of the reference rows, so each frame is a slice
+    ref_order = np.argsort(ref_frames, kind="stable")
+    ref_frames_sorted = ref_frames[ref_order]
+    frames, frame_starts = np.unique(ref_frames_sorted, return_index=True)
+    frame_stops = np.append(frame_starts[1:], n_ref)
+
+    # channels that can be linked against (an unidentified channel is skipped)
+    check = [
+        c
+        for c in range(1, len(identifications_per_channel))
+        if identifications_per_channel[c] is not None
+        and len(identifications_per_channel[c])
+    ]
+    n_checked = len(check)
+    if n_checked == 0:
+        return np.zeros(n_ref, dtype=bool)
+
+    match_count = np.zeros(n_ref, dtype=np.int64)
+    for i_c, c in enumerate(check):
+        ids_c = identifications_per_channel[c]
+        pred = apply_affine_transform(
+            ref_xy, np.asarray(transforms[c], dtype=np.float64)
+        )[ref_order]
+        c_frames = np.asarray(ids_c["frame"], dtype=np.int64)
+        c_xy = np.column_stack(
+            [
+                np.asarray(ids_c["x"], dtype=np.float64),
+                np.asarray(ids_c["y"], dtype=np.float64),
+            ]
+        )
+        c_order = np.argsort(c_frames, kind="stable")
+        c_frames_sorted = c_frames[c_order]
+        c_xy_sorted = c_xy[c_order]
+        # this channel's rows for each reference frame, by binary search
+        c_lo = np.searchsorted(c_frames_sorted, frames, side="left")
+        c_hi = np.searchsorted(c_frames_sorted, frames, side="right")
+        done = 0
+        for f in range(len(frames)):
+            start, stop = frame_starts[f], frame_stops[f]
+            lo, hi = c_lo[f], c_hi[f]
+            if hi > lo:
+                matched = _matched_mask_within_tol(
+                    pred[start:stop], c_xy_sorted[lo:hi], tol
+                )
+                match_count[ref_order[start:stop][matched]] += 1
+            done += stop - start
+            # one monotone 0 -> n_ref progression across all checked channels
+            if callable(progress_callback) and (f % 2000 == 0):
+                progress_callback((i_c * n_ref + done) // n_checked)
+    if callable(progress_callback):
+        progress_callback(n_ref)
+    return match_count == n_checked
+
+
+def filter_linked_identifications(
+    identifications_per_channel: list,
+    transforms: list,
+    box: int,
+    tol: float | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+) -> tuple[pd.DataFrame, int, int]:
+    """Keep only the reference detections linked across *all* channels.
+
+    Thin wrapper around :func:`link_identifications_multichannel` returning the
+    filtered reference table plus ``(n_kept, n_total)``. If no other channel has
+    identifications, the reference table is returned unchanged (with
+    ``n_kept == n_total``) so an un-identified set degrades to the previous
+    behaviour instead of fitting nothing.
+    """
+    reference = identifications_per_channel[0]
+    n_total = 0 if reference is None else len(reference)
+    others = [
+        ids
+        for ids in identifications_per_channel[1:]
+        if ids is not None and len(ids)
+    ]
+    if n_total == 0 or not others:
+        return reference, n_total, n_total
+    if tol is None:
+        tol = 1.5 * float(box)
+    linked = link_identifications_multichannel(
+        identifications_per_channel,
+        transforms,
+        tol,
+        progress_callback=progress_callback,
+    )
+    n_kept = int(linked.sum())
+    # Keeping almost nothing means the inter-channel registration (or the
+    # pairing radius) is off rather than that the sample is empty - the same
+    # failure mode ``multichannel_inbounds_ids`` warns about.
+    if n_total and n_kept / n_total <= 0.05:
+        warnings.warn(
+            f"Cross-channel linking kept only {n_kept} of {n_total} "
+            f"reference detections ({100 * n_kept / n_total:.1f}%) - the "
+            "channel registration is likely off, or the other channels were "
+            "identified with a much higher threshold.",
+            stacklevel=2,
+        )
+    return (
+        reference.iloc[np.flatnonzero(linked)].reset_index(drop=True),
+        n_kept,
+        n_total,
+    )
 
 
 def get_spots_multichannel(

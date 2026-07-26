@@ -2416,6 +2416,111 @@ class TestSplineHelpers:
         assert stacked.shape == (1, BOX, BOX, 2)
 
 
+class TestCrossChannelLinking:
+    """Reference detections must be reduced to those found in every channel:
+    the joint multichannel / 4Pi model shares x, y, z (and the interference
+    phase) across channels, so a spot missing from one channel would be fitted
+    there against background only."""
+
+    IDENTITY = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    SHIFT_X = [[1.0, 0.0, 100.0], [0.0, 1.0, 0.0]]
+
+    @staticmethod
+    def _ids(frames, xs, ys):
+        return pd.DataFrame(
+            {
+                "frame": np.asarray(frames, dtype=int),
+                "x": np.asarray(xs, dtype=float),
+                "y": np.asarray(ys, dtype=float),
+                "net_gradient": np.ones(len(xs), dtype=float),
+            }
+        )
+
+    def test_requires_a_match_in_every_channel(self):
+        ref = self._ids([0, 0, 0, 1], [10, 20, 30, 40], [10, 20, 30, 40])
+        # channel 1 lives 100 px to the right; it sees ref spots 0, 2 and 3
+        ch1 = self._ids([0, 0, 1], [110.4, 130.2, 140], [10.2, 30, 40])
+        # channel 2 is aligned with the reference; it sees ref spots 0 and 1
+        ch2 = self._ids([0, 0], [10.1, 20], [9.9, 20])
+        linked = localize.link_identifications_multichannel(
+            [ref, ch1, ch2], [self.IDENTITY, self.SHIFT_X, self.IDENTITY], 3.0
+        )
+        # only ref spot 0 is present in all three channels
+        assert list(linked) == [True, False, False, False]
+
+    def test_pairing_is_one_to_one(self):
+        """Two reference spots near one detection: only the closer one links."""
+        ref = self._ids([0, 0], [10, 11], [10, 10])
+        target = self._ids([0], [10.2], [10])
+        linked = localize.link_identifications_multichannel(
+            [ref, target], [self.IDENTITY, self.IDENTITY], 3.0
+        )
+        assert list(linked) == [True, False]
+
+    def test_tolerance_and_frame_order(self):
+        ref = self._ids([1, 0, 0], [40, 10, 20], [40, 10, 20])
+        ch1 = self._ids([0, 1], [10.1, 40], [10, 40])
+        args = ([ref, ch1], [self.IDENTITY, self.IDENTITY])
+        # unsorted reference frames are handled (matching is per frame)
+        assert list(
+            localize.link_identifications_multichannel(*args, 3.0)
+        ) == [
+            True,
+            True,
+            False,
+        ]
+        # a tight tolerance rejects the 0.1 px mismatch but keeps the exact one
+        assert list(
+            localize.link_identifications_multichannel(*args, 0.05)
+        ) == [True, False, False]
+
+    def test_unidentified_channels_are_skipped(self):
+        ref = self._ids([0, 0], [10, 20], [10, 20])
+        ch1 = self._ids([0], [110], [10])
+        transforms = [self.IDENTITY, self.SHIFT_X, self.IDENTITY]
+        # channel 2 was never identified -> link against channel 1 only
+        linked = localize.link_identifications_multichannel(
+            [ref, ch1, None], transforms, 3.0
+        )
+        assert list(linked) == [True, False]
+        # no other channel identified at all -> nothing is linked
+        linked = localize.link_identifications_multichannel(
+            [ref, None, None], transforms, 3.0
+        )
+        assert not linked.any()
+
+    def test_filter_wrapper_counts_and_passthrough(self):
+        ref = self._ids([0, 0], [10, 20], [10, 20])
+        ch1 = self._ids([0], [110], [10])
+        kept, n_kept, n_total = localize.filter_linked_identifications(
+            [ref, ch1], [self.IDENTITY, self.SHIFT_X], box=2
+        )
+        assert (n_kept, n_total) == (1, 2)
+        assert len(kept) == 1 and kept["x"].iloc[0] == 10
+        # without identifications in any other channel the table is unchanged,
+        # so an un-identified set degrades to the unfiltered behaviour
+        same, n_kept, n_total = localize.filter_linked_identifications(
+            [ref, None], [self.IDENTITY, self.IDENTITY], box=2
+        )
+        assert same is ref and (n_kept, n_total) == (2, 2)
+
+    def test_progress_is_monotone_across_channels(self):
+        ref = self._ids([0, 0, 1], [10, 20, 30], [10, 20, 30])
+        ch1 = self._ids([0, 1], [110, 130], [10, 30])
+        ch2 = self._ids([0, 1], [10, 30], [10, 30])
+        seen = []
+        localize.link_identifications_multichannel(
+            [ref, ch1, ch2],
+            [self.IDENTITY, self.SHIFT_X, self.IDENTITY],
+            3.0,
+            progress_callback=seen.append,
+        )
+        # one 0 -> n_ref progression for the whole linking pass, not one per
+        # channel (the GUI shows this as a single status count)
+        assert seen and seen[-1] == len(ref)
+        assert all(b >= a for a, b in zip(seen, seen[1:]))
+
+
 def _synthetic_spline_3d_calibration(box=BOX, nz=41):
     """Build a 3D spline calibration from a synthetic astigmatic PSF,
     mirroring the reference pyGpufit splinefit_3d example. Requires Gpuspline
@@ -3960,6 +4065,54 @@ class TestMultichannelWorkerRouting:
             {"model": "spline-3d-phase-multichannel"}, monkeypatch
         )
         assert calls == ["phase"]
+
+    def test_fits_only_spots_linked_across_channels(self, monkeypatch):
+        """Given every channel's identifications, the worker hands the fitter
+        only the reference spots detected in all channels."""
+        seen = {}
+        monkeypatch.setattr(
+            localize,
+            "fit_spline_multichannel",
+            lambda movies, cams, ids, *a, **k: (
+                seen.update(ids=ids),
+                pd.DataFrame({"frame": [0], "x": [0.0], "y": [0.0]}),
+            )[1],
+        )
+        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        ref = pd.DataFrame(
+            {
+                "frame": [0, 0],
+                "x": [6.0, 60.0],
+                "y": [6.0, 60.0],
+                "net_gradient": [1.0, 1.0],
+            }
+        )
+        # channel 1 only sees the first reference spot
+        ch1 = pd.DataFrame(
+            {"frame": [0], "x": [6.2], "y": [5.9], "net_gradient": [1.0]}
+        )
+        worker = localize_gui.MultichannelSplineFitWorker(
+            [None, None],
+            [{}, {}],
+            ref,
+            BOX,
+            {
+                "model": "spline-3d-multichannel",
+                "n_channels": 2,
+                "channel_transforms": [identity, identity],
+            },
+            identifications_per_channel=[ref, ch1],
+        )
+        linked = []
+        worker.linkFinished.connect(
+            lambda kept, total: linked.append((kept, total))
+        )
+        worker.run()
+        assert linked == [(1, 2)]
+        assert len(seen["ids"]) == 1
+        assert float(seen["ids"]["x"].iloc[0]) == 6.0
+        # progress totals follow the linked subset, not the original count
+        assert worker.N == 1
 
 
 # ---------------------------------------------------------------------------

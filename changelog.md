@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 23-JUL-2026 CEST
+Last change: 26-JUL-2026 CEST
 
 ## 0.11.0
 
@@ -11,7 +11,7 @@ Last change: 23-JUL-2026 CEST
 - `config.yaml` can now be stored in the `.picasso` directory and the location is easily accessible via Localize
 
 #### Localize
-- New fitting model: **Experimental PSF (cubic spline)** — fits an experimentally measured PSF (a cubic-spline model built from a bead z-stack) on the GPU, via GPUfit's `SPLINE_2D`/`SPLINE_3D`/`SPLINE_3D_MULTICHANNEL` models. The `pygpuspline` binding is vendored under `picasso/ext/pygpuspline`. The bead alignment follows the workflow from Li, et al, Nature Methods, 2018. See the [experimental PSF (cubic-spline) fitting documentation](https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting) for details. *Note this is an experimental feature, do let us know if you find any bugs/unexpected behavior*
+- New fitting model: **Experimental PSF (cubic spline)** — fits an experimentally measured PSF (a cubic-spline model built from a bead z-stack) on the GPU, via GPUfit's `SPLINE_2D`/`SPLINE_3D`/`SPLINE_3D_MULTICHANNEL`/`SPLINE_3D_PHASE_MULTICHANNEL` models. The `pygpuspline` binding is vendored under `picasso/ext/pygpuspline`. The bead alignment follows the workflow from Li, et al, Nature Methods, 2018. See the [experimental PSF (cubic-spline) fitting documentation](https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting) for details. *Note this is an experimental feature, do let us know if you find any bugs/unexpected behavior*
 - New fitting algorithms from GPUfit supported: 2D rotated Gaussian
 - Multichannel spline PSF fitting (GPUfit's `SPLINE_3D_MULTICHANNEL` and `SPLINE_3D_PHASE_MULTICHANNEL`, e.g. biplane / 4Pi); additionally a new model was added for uncoupled photons (biplane)
 - Picasso relies on package `tifffile` for processing `.tif` files and many other grayscale movie formats, see [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html). **Note:** this is an experimental feature, do not hesitate to let us know if you detect bugs/unexpected behavior or would like to see more file formats in Picasso, see our [GitHub page](https://github.com/jungmannlab/picasso/issues) for contact information.
