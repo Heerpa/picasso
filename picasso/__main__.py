@@ -1068,10 +1068,14 @@ def _localize_load_3d_calibration(
 
 _FIT_METHOD_MAP = {
     "lq": "gausslq",
+    "lq-spherical": "gausslq-spherical",
+    "lq-spherical-gpu": "gausslq-spherical-gpu",
     "lq-3d": "gausslq",
     "lq-gpu": "gausslq-gpu",
     "lq-gpu-3d": "gausslq-gpu",
     "mle": "gaussmle",
+    "mle-spherical": "gaussmle-spherical",
+    "mle-spherical-gpu": "gaussmle-spherical-gpu",
     "mle-3d": "gaussmle",
     "spline": "spline-gpu",
     "spline-mle": "spline-mle-gpu",
@@ -2603,7 +2607,11 @@ def main():  # noqa: C901
         "--fit-method",
         choices=[
             "mle",
+            "mle-spherical",
+            "mle-spherical-gpu",
             "lq",
+            "lq-spherical",
+            "lq-spherical-gpu",
             "lq-gpu",
             "lq-3d",
             "lq-gpu-3d",

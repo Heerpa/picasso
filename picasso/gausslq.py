@@ -113,6 +113,26 @@ def _initial_parameters(
 
 
 @numba.jit(nopython=True, nogil=True)
+def _initial_parameters_sigma(
+    spot: lib.FloatArray2D,
+    size: int,
+    size_half: int,
+) -> lib.FloatArray1D:
+    """Initialize the parameters for the spherical (isotropic) Gaussian
+    fit - x, y, photons, background, sigma. A single width is used; it
+    is the average of the per-axis width estimates."""
+    theta = np.zeros(5, dtype=np.float32)
+    theta[3] = np.min(spot)
+    spot_without_bg = spot - theta[3]
+    sum, theta[1], theta[0] = _sum_and_center_of_mass(spot_without_bg, size)
+    theta[2] = np.maximum(1.0, sum)
+    sy, sx = _initial_sigmas(spot - theta[3], theta[1], theta[0], sum, size)
+    theta[4] = (sx + sy) / 2.0
+    theta[0:2] -= size_half
+    return theta
+
+
+@numba.jit(nopython=True, nogil=True)
 def _outer(
     a: lib.FloatArray1D,
     b: lib.FloatArray1D,
@@ -149,6 +169,25 @@ def _compute_model(
 
 
 @numba.jit(nopython=True, nogil=True)
+def _compute_model_sigma(
+    theta: lib.FloatArray1D,
+    grid: lib.FloatArray1D,
+    size: int,
+    model_x: lib.FloatArray1D,
+    model_y: lib.FloatArray1D,
+    model: lib.FloatArray2D,
+) -> lib.FloatArray2D:
+    """Compute the model of a spherical (isotropic) Gaussian spot (2D)
+    based on the parameters in theta, which contains the x and y
+    positions, the number of photons, background, and a single sigma
+    used for both axes."""
+    model_x[:] = _gaussian(theta[0], theta[4], grid)
+    model_y[:] = _gaussian(theta[1], theta[4], grid)
+    _outer(model_y, model_x, size, model, theta[2], theta[3])
+    return model
+
+
+@numba.jit(nopython=True, nogil=True)
 def _compute_residuals(
     theta: lib.FloatArray1D,
     spot: lib.FloatArray2D,
@@ -167,7 +206,27 @@ def _compute_residuals(
     return residuals.flatten()
 
 
-def fit_spot(spot: lib.FloatArray2D) -> lib.FloatArray1D:
+@numba.jit(nopython=True, nogil=True)
+def _compute_residuals_sigma(
+    theta: lib.FloatArray1D,
+    spot: lib.FloatArray2D,
+    grid: lib.FloatArray1D,
+    size: int,
+    model_x: lib.FloatArray1D,
+    model_y: lib.FloatArray1D,
+    model: lib.FloatArray2D,
+    residuals: lib.FloatArray2D,
+) -> lib.FloatArray1D:
+    """Compute the residuals between the observed spot and the spherical
+    (isotropic) Gaussian model computed from the parameters in theta."""
+    _compute_model_sigma(theta, grid, size, model_x, model_y, model)
+    residuals[:, :] = spot - model
+    return residuals.flatten()
+
+
+def fit_spot(
+    spot: lib.FloatArray2D, spherical: bool = False
+) -> lib.FloatArray1D:
     """Fit a single spot using least squares optimization. The spot is a
     2D array representing the pixel values of the spot image. The
     function returns the optimized parameters as a 1D array with the
@@ -184,6 +243,11 @@ def fit_spot(spot: lib.FloatArray2D) -> lib.FloatArray1D:
         A 2D array representing the pixel values of the spot image.
         The shape of the array should be (size, size), where size is the
         length of one side of the square spot image.
+    spherical : bool, optional
+        If True, fit a spherical (isotropic) Gaussian with a single
+        width. The returned parameters still use the elliptical layout
+        with sx == sy so the rest of the pipeline is unchanged. Default
+        is False.
 
     Returns
     -------
@@ -198,9 +262,22 @@ def fit_spot(spot: lib.FloatArray2D) -> lib.FloatArray1D:
     model_y = np.empty(size, dtype=np.float32)
     model = np.empty((size, size), dtype=np.float32)
     residuals = np.empty((size, size), dtype=np.float32)
+    args = (spot, grid, size, model_x, model_y, model, residuals)
+    if spherical:
+        # theta is [x, y, photons, bg, sigma]
+        theta0 = _initial_parameters_sigma(spot, size, size_half)
+        result = optimize.leastsq(
+            _compute_residuals_sigma, theta0, args=args, ftol=1e-2, xtol=1e-2
+        )
+        fitted = result[0]
+        # Expand the single width into sx == sy so downstream code
+        # (locs_from_fits) sees the standard 6-parameter layout.
+        result_ = np.empty(6, dtype=fitted.dtype)
+        result_[0:5] = fitted
+        result_[5] = fitted[4]
+        return result_
     # theta is [x, y, photons, bg, sx, sy]
     theta0 = _initial_parameters(spot, size, size_half)
-    args = (spot, grid, size, model_x, model_y, model, residuals)
     result = optimize.leastsq(
         _compute_residuals, theta0, args=args, ftol=1e-2, xtol=1e-2
     )  # leastsq is much faster than least_squares
@@ -213,6 +290,7 @@ def fit_spots(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    spherical: bool = False,
 ) -> lib.FloatArray2D:
     """Fit multiple spots using least squares optimization. Each spot is
     a 2D array representing the pixel values of the spot image. The
@@ -231,6 +309,10 @@ def fit_spots(
         If a callable provided, it must accept one integer input (number
         of localized spots). If "console", tqdm is used to display
         progress. If None, progress is not tracked.
+    spherical : bool, optional
+        If True, fit a spherical (isotropic) Gaussian with a single
+        width; the resulting sx and sy columns are identical. Default is
+        False.
 
     Returns
     -------
@@ -247,7 +329,7 @@ def fit_spots(
         iter_range = range(len(spots))
     for i in iter_range:
         spot = spots[i]
-        theta[i] = fit_spot(spot)
+        theta[i] = fit_spot(spot, spherical=spherical)
         if callable(progress_callback):
             progress_callback(i)
     return theta
@@ -256,6 +338,7 @@ def fit_spots(
 def fit_spots_parallel(
     spots: lib.FloatArray3D,
     asynch: bool = False,
+    spherical: bool = False,
 ) -> lib.FloatArray2D | list[futures.Future]:
     """Allows for running ``fit_spots`` asynchronously
     (multiprocessing).
@@ -271,6 +354,10 @@ def fit_spots_parallel(
         If True, the function returns a list of futures that can be
         processed asynchronously. If False, the function waits for all
         futures to complete and returns the results as a 2D array.
+    spherical : bool, optional
+        If True, fit a spherical (isotropic) Gaussian with a single
+        width; the resulting sx and sy columns are identical. Default is
+        False.
 
     Returns
     -------
@@ -298,7 +385,11 @@ def fit_spots_parallel(
     fs = []
     executor = futures.ProcessPoolExecutor(n_workers)
     for i, n_spots_task in zip(start_indices, spots_per_task):
-        fs.append(executor.submit(fit_spots, spots[i : i + n_spots_task]))
+        fs.append(
+            executor.submit(
+                fit_spots, spots[i : i + n_spots_task], spherical=spherical
+            )
+        )
     if asynch:
         return fs
     with tqdm(desc="LQ fitting", total=n_tasks, unit="task") as progress_bar:
