@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 16-JUL-2026 CEST
+Last change: 26-JUL-2026 CEST
 
 ## 0.11.0
 
@@ -64,6 +64,7 @@ Last change: 16-JUL-2026 CEST
 - Fixed combined saving of multiple channels with different columns
 - Fixed ind. loc. precision rendering of `lpx = 0` [#685](https://github.com/jungmannlab/picasso/issues/685)
 - Fixed z color rendering in 3D
+- Fixed `Length of values does not match length of index` error when saving pick properties in a channel where some picks contain no localizations
 
 #### SPINNA
 - Adjustable font sizes and names for the NND plot's title, labels and ticks

@@ -1667,7 +1667,13 @@ def pick_kinetics(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
-) -> tuple[lib.FloatArray1D, lib.FloatArray1D, lib.IntArray1D, pd.DataFrame]:
+) -> tuple[
+    lib.FloatArray1D,
+    lib.FloatArray1D,
+    lib.IntArray1D,
+    pd.DataFrame,
+    lib.IntArray1D,
+]:
     """Calculate kinetics per picked region. Assumes picked
     localizations, see ``picked_locs``.
 
@@ -1703,6 +1709,10 @@ def pick_kinetics(
         added 'length', 'dark' and 'n' fields/columns. Pick regions
         where binding kinetics could not be estimated (e.g., because
         of too little data or unsuccessful fitting) are removed.
+    kept_indices : lib.IntArray1D
+        Indices (into ``picked_locs``) of the picks that were retained,
+        i.e., those for which kinetics could be estimated. Aligns
+        row-for-row with ``length``, ``dark`` and ``no_locs``.
     """
     use_tqdm = progress_callback == "console"
     if use_tqdm:
@@ -1716,6 +1726,7 @@ def pick_kinetics(
     dark = []  # estimated mean dark time
     length = []  # estimated mean bright time
     no_locs = []  # number of locs
+    kept_indices = []  # picks for which kinetics could be estimated
     for i in iter_range:
         if callable(progress_callback):
             progress_callback(i)
@@ -1727,13 +1738,15 @@ def pick_kinetics(
         dark.append(d_)
         no_locs.append(len(pick_locs))
         out_locs.append(pick_locs)
+        kept_indices.append(i)
     if callable(progress_callback):
         progress_callback(i + 1)
     length = np.array(length)
     dark = np.array(dark)
     no_locs = np.array(no_locs)
+    kept_indices = np.array(kept_indices, dtype=int)
     out_locs = pd.concat(out_locs, ignore_index=True)
-    return length, dark, no_locs, out_locs
+    return length, dark, no_locs, out_locs, kept_indices
 
 
 def pick_properties(
@@ -1782,7 +1795,7 @@ def pick_properties(
         warnings.simplefilter(
             "ignore", category=(OptimizeWarning, RuntimeWarning)
         )
-        length, dark, no_locs, out_locs = pick_kinetics(
+        length, dark, no_locs, out_locs, kept_indices = pick_kinetics(
             picked_locs=picked_locs,
             info=info,
             max_dark_time=max_dark_time,
@@ -1790,7 +1803,10 @@ def pick_properties(
         )
         pick_props = groupprops(out_locs, callback=groupprops_progress)
         if pick_areas is not None:
-            pick_props["pick_area_um2"] = pick_areas
+            # only the picks that survived kinetics estimation are present
+            # in pick_props, so subset the areas accordingly to avoid a
+            # length mismatch (e.g. picks empty in this channel are dropped)
+            pick_props["pick_area_um2"] = np.asarray(pick_areas)[kept_indices]
 
     pick_props["n_units"] = 1 / (influx_rate * dark)
     pick_props["locs"] = no_locs
