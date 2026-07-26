@@ -978,6 +978,49 @@ class TestFit2D:
         assert new_info["Convergence criterion"] == 0.001
         assert new_info["Max iterations"] == 100
 
+    @pytest.mark.parametrize(
+        "method", ["gausslq-spherical", "gaussmle-spherical"]
+    )
+    def test_spherical_methods_drop_ellipticity(
+        self, picasso_movie, real_identifications, movie_info, method
+    ):
+        """The spherical CPU methods (LQ and MLE) fit sx == sy and omit the
+        always-zero ellipticity column, while keeping every other column."""
+        locs, new_info = localize.fit2D(
+            picasso_movie,
+            movie_info,
+            CAMERA_INFO_WITH_PIXELSIZE,
+            real_identifications,
+            BOX,
+            fitting_method=method,
+            multiprocess=False,
+        )
+        assert new_info["Fit method"] == method
+        assert len(locs) == len(real_identifications)
+        assert "ellipticity" not in locs.columns
+        assert (locs["sx"].to_numpy() == locs["sy"].to_numpy()).all()
+        for col in ["x", "y", "photons", "sx", "sy", "bg", "lpx", "lpy"]:
+            assert col in locs.columns
+
+    def test_rotated_lq_keeps_ellipticity_and_adds_angle(
+        self, picasso_movie, real_identifications, movie_info
+    ):
+        """The rotated CPU LQ method keeps ellipticity (widths differ) and
+        adds an ``angle`` column wrapped to [-90, 90)."""
+        locs, new_info = localize.fit2D(
+            picasso_movie,
+            movie_info,
+            CAMERA_INFO_WITH_PIXELSIZE,
+            real_identifications,
+            BOX,
+            fitting_method="gausslq-rotated",
+            multiprocess=False,
+        )
+        assert new_info["Fit method"] == "gausslq-rotated"
+        assert "ellipticity" in locs.columns
+        assert "angle" in locs.columns
+        assert ((locs["angle"] >= -90.0) & (locs["angle"] < 90.0)).all()
+
     def test_avg_returns_locs(
         self, picasso_movie, real_identifications, movie_info
     ):
@@ -1528,6 +1571,56 @@ class TestGpufit:
         np.testing.assert_allclose(theta[:, 3], 1.6, atol=5e-3)
         np.testing.assert_allclose(theta[:, 4], 0.9, atol=5e-3)
 
+    def test_rotated_and_spherical_mutually_exclusive(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        with pytest.raises(ValueError):
+            localize.fit_spots_gpufit(spots, rotated=True, spherical=True)
+
+    # -- spherical (isotropic, single-width GAUSS_2D model) ---------------
+
+    def test_spherical_lse_recovers_isotropic(self, synthetic_spots_isotropic):
+        """The GAUSS_2D model recovers the shared width and returns the
+        expanded elliptical layout with sx == sy."""
+        spots, gt = synthetic_spots_isotropic
+        theta = localize.fit_spots_gpufit(spots, spherical=True, mle=False)
+        assert theta.shape == (len(spots), 6)
+        np.testing.assert_array_equal(theta[:, 3], theta[:, 4])
+        half = spots.shape[1] // 2
+        np.testing.assert_allclose(theta[:, 0], gt.photons.values, rtol=2e-3)
+        np.testing.assert_allclose(theta[:, 1] - half, gt.x.values, atol=3e-3)
+        np.testing.assert_allclose(theta[:, 2] - half, gt.y.values, atol=3e-3)
+        np.testing.assert_allclose(theta[:, 3], gt.sx.values, atol=3e-3)
+
+    def test_spherical_mle_converged_recover(self, synthetic_spots_isotropic):
+        spots, gt = synthetic_spots_isotropic
+        theta, ll, n_iter = localize.fit_spots_gpufit(
+            spots, spherical=True, mle=True, return_stats=True
+        )
+        assert theta.shape == (len(spots), 6)
+        np.testing.assert_array_equal(theta[:, 3], theta[:, 4])
+        assert ll is not None and ll.shape == (len(spots),)
+
+    def test_spherical_end_to_end_omits_ellipticity(
+        self, synthetic_spots_isotropic
+    ):
+        """The full GPU spherical path (via ``_fit2d_gauss_gpu``) drops the
+        ellipticity column."""
+        spots, _ = synthetic_spots_isotropic
+        n = len(spots)
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(n, dtype=np.uint32),
+                "x": np.full(n, 50, dtype=np.int64),
+                "y": np.full(n, 70, dtype=np.int64),
+                "net_gradient": np.full(n, 5000.0, dtype=np.float32),
+            }
+        )
+        locs = localize._fit2d_gauss_gpu(
+            spots, ids, spots.shape[1], em=False, spherical=True
+        )
+        assert "ellipticity" not in locs.columns
+        assert (locs["sx"].to_numpy() == locs["sy"].to_numpy()).all()
+
     # -- maximum likelihood (Poisson) -------------------------------------
 
     def test_mle_converged_spots_recover(self, synthetic_spots_noisy):
@@ -1680,6 +1773,27 @@ class TestInitialParametersGpufit:
         assert (init[:, 3] != init[:, 4]).all()
         np.testing.assert_allclose(init[:, 6], 0.0)
 
+    def test_spherical_single_width_layout(self):
+        # Gpufit's isotropic GAUSS_2D model takes 5 parameters:
+        # [amplitude, x, y, s, bg] — a single width, unlike the elliptic
+        # 6-parameter layout.
+        box = 7
+        spots = np.zeros((2, box, box), dtype=np.float32)
+        spots[0] = 3.0
+        spots[0, 3, 3] = 103.0
+        spots[1] = 7.0
+        spots[1, 2, 4] = 57.0
+        init = localize._initial_parameters_gpufit(spots, box, spherical=True)
+        assert init.shape == (2, 5)
+        assert init.dtype == np.float32
+        center = box / 2.0 - 0.5
+        width = max(box / 5.0, 1.0)
+        np.testing.assert_allclose(init[:, 0], [100.0, 50.0])  # amplitude
+        np.testing.assert_allclose(init[:, 1], center)  # x
+        np.testing.assert_allclose(init[:, 2], center)  # y
+        np.testing.assert_allclose(init[:, 3], width)  # single width
+        np.testing.assert_allclose(init[:, 4], [3.0, 7.0])  # background
+
 
 class TestLocsFromFitsGpufit:
     """``localize.locs_from_fits_gpufit`` maps gpufit theta
@@ -1733,6 +1847,42 @@ class TestLocsFromFitsGpufit:
         np.testing.assert_allclose(
             locs["ellipticity"], (1.4 - 1.0) / 1.4, rtol=1e-6
         )
+
+    def test_spherical_omits_ellipticity_column(self):
+        # A spherical fit has sx == sy, so ellipticity is always 0 and is
+        # dropped entirely. The rest of the columns are unaffected.
+        theta = np.array([[500.0, 3.0, 3.0, 1.2, 1.2, 5.0]], dtype=np.float32)
+        locs = localize.locs_from_fits_gpufit(
+            self._ids(1), theta, BOX, em=False, spherical=True
+        )
+        assert "ellipticity" not in locs.columns
+        for col in (
+            "frame",
+            "x",
+            "y",
+            "photons",
+            "sx",
+            "sy",
+            "bg",
+            "lpx",
+            "lpy",
+            "net_gradient",
+        ):
+            assert col in locs.columns
+
+    def test_spherical_flag_only_drops_ellipticity(self):
+        theta = np.array([[500.0, 3.2, 3.7, 1.2, 1.2, 5.0]], dtype=np.float32)
+        full = localize.locs_from_fits_gpufit(
+            self._ids(1), theta, BOX, em=False, mle=True, spherical=False
+        )
+        sph = localize.locs_from_fits_gpufit(
+            self._ids(1), theta, BOX, em=False, mle=True, spherical=True
+        )
+        assert set(full.columns) - set(sph.columns) == {"ellipticity"}
+        for col in sph.columns:
+            np.testing.assert_array_equal(
+                sph[col].to_numpy(), full[col].to_numpy()
+            )
 
     def test_lse_precision_is_mortensen_no_unc_columns(self):
         theta = np.array([[500.0, 3.2, 3.7, 1.3, 1.1, 5.0]], dtype=np.float32)

@@ -7,9 +7,10 @@ localize
 
 Localize allows performing super-resolution reconstruction of image stacks. For spot detection, a gradient-based approach is used. For Fitting, the following algorithms are implemented:
 
-- MLE, integrated Gaussian (based on `Smith et al., 2010 <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2862147/>`_.)
-- LQ, Gaussian (least squares).
-- Rotated elliptical Gaussian, least squares or MLE (GPU only, see `GPU fitting`_ below). The fitted in-plane rotation angle is saved in the ``angle`` column, in degrees.
+- MLE, integrated Gaussian (based on `Smith et al., 2010 <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2862147/>`_.). Fits an elliptical Gaussian with independent widths ``sx`` and ``sy``.
+- LQ, Gaussian (least squares). Fits an elliptical Gaussian with independent widths ``sx`` and ``sy``.
+- Spherical (isotropic) Gaussian, least squares or MLE. Fits a single shared width, so ``sx`` and ``sy`` are always equal. The ``ellipticity`` column is not saved for this model. Available on both CPU and GPU.
+- Rotated elliptical Gaussian. The fitted in-plane rotation angle is saved in the ``angle`` column, in degrees. Least squares runs on both CPU and GPU; MLE is GPU only (see `GPU fitting`_ below).
 - Experimental PSF (cubic spline), least squares or MLE (GPU only). Fits an experimentally measured PSF and a 3D calibration recovers ``z`` directly; see `Experimental PSF (cubic-spline) fitting`_ below.
 - Average of ROI (finds summed intensity of spots)
 

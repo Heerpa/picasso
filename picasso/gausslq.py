@@ -113,6 +113,50 @@ def _initial_parameters(
 
 
 @numba.jit(nopython=True, nogil=True)
+def _initial_parameters_sigma(
+    spot: lib.FloatArray2D,
+    size: int,
+    size_half: int,
+) -> lib.FloatArray1D:
+    """Initialize the parameters for the spherical (isotropic) Gaussian
+    fit - x, y, photons, background, sigma. A single width is used; it
+    is the average of the per-axis width estimates."""
+    theta = np.zeros(5, dtype=np.float32)
+    theta[3] = np.min(spot)
+    spot_without_bg = spot - theta[3]
+    sum, theta[1], theta[0] = _sum_and_center_of_mass(spot_without_bg, size)
+    theta[2] = np.maximum(1.0, sum)
+    sy, sx = _initial_sigmas(spot - theta[3], theta[1], theta[0], sum, size)
+    theta[4] = (sx + sy) / 2.0
+    theta[0:2] -= size_half
+    return theta
+
+
+@numba.jit(nopython=True, nogil=True)
+def _initial_parameters_rotated(
+    spot: lib.FloatArray2D,
+    size: int,
+    size_half: int,
+) -> lib.FloatArray1D:
+    """Initialize the parameters for the rotated elliptical Gaussian fit
+    - x, y, photons, background, sigma_x, sigma_y, angle (radians)."""
+    theta = np.zeros(7, dtype=np.float32)
+    theta[3] = np.min(spot)
+    spot_without_bg = spot - theta[3]
+    sum, theta[1], theta[0] = _sum_and_center_of_mass(spot_without_bg, size)
+    theta[2] = np.maximum(1.0, sum)
+    sy, sx = _initial_sigmas(spot - theta[3], theta[1], theta[0], sum, size)
+    # Break the sx/sy symmetry so the angle has a well-defined gradient at
+    # the start (a circular seed makes the model independent of the angle),
+    # mirroring the GPU initialization.
+    theta[4] = sx * 1.1
+    theta[5] = sy * 0.9
+    theta[6] = 0.0
+    theta[0:2] -= size_half
+    return theta
+
+
+@numba.jit(nopython=True, nogil=True)
 def _outer(
     a: lib.FloatArray1D,
     b: lib.FloatArray1D,
@@ -149,6 +193,55 @@ def _compute_model(
 
 
 @numba.jit(nopython=True, nogil=True)
+def _compute_model_sigma(
+    theta: lib.FloatArray1D,
+    grid: lib.FloatArray1D,
+    size: int,
+    model_x: lib.FloatArray1D,
+    model_y: lib.FloatArray1D,
+    model: lib.FloatArray2D,
+) -> lib.FloatArray2D:
+    """Compute the model of a spherical (isotropic) Gaussian spot (2D)
+    based on the parameters in theta, which contains the x and y
+    positions, the number of photons, background, and a single sigma
+    used for both axes."""
+    model_x[:] = _gaussian(theta[0], theta[4], grid)
+    model_y[:] = _gaussian(theta[1], theta[4], grid)
+    _outer(model_y, model_x, size, model, theta[2], theta[3])
+    return model
+
+
+@numba.jit(nopython=True, nogil=True)
+def _compute_model_rotated(
+    theta: lib.FloatArray1D,
+    grid: lib.FloatArray1D,
+    size: int,
+    model: lib.FloatArray2D,
+) -> lib.FloatArray2D:
+    """Compute the model of a rotated elliptical Gaussian spot (2D) based
+    on the parameters in theta - x, y, photons, background, sigma_x,
+    sigma_y and the rotation angle (radians). Unlike the non-rotated
+    models, the rotated Gaussian is not separable, so the full 2D
+    exponential is evaluated per pixel (point-sampled at the pixel
+    centers, matching the GPU's GAUSS_2D_ROTATED model)."""
+    ct = np.cos(theta[6])
+    st = np.sin(theta[6])
+    sx = theta[4]
+    sy = theta[5]
+    norm = theta[2] / (2.0 * np.pi * sx * sy)
+    for i in range(size):
+        dy = grid[i] - theta[1]
+        for j in range(size):
+            dx = grid[j] - theta[0]
+            u = dx * ct - dy * st
+            w = dx * st + dy * ct
+            model[i, j] = (
+                norm * np.exp(-0.5 * (u**2 / sx**2 + w**2 / sy**2)) + theta[3]
+            )
+    return model
+
+
+@numba.jit(nopython=True, nogil=True)
 def _compute_residuals(
     theta: lib.FloatArray1D,
     spot: lib.FloatArray2D,
@@ -167,7 +260,45 @@ def _compute_residuals(
     return residuals.flatten()
 
 
-def fit_spot(spot: lib.FloatArray2D) -> lib.FloatArray1D:
+@numba.jit(nopython=True, nogil=True)
+def _compute_residuals_sigma(
+    theta: lib.FloatArray1D,
+    spot: lib.FloatArray2D,
+    grid: lib.FloatArray1D,
+    size: int,
+    model_x: lib.FloatArray1D,
+    model_y: lib.FloatArray1D,
+    model: lib.FloatArray2D,
+    residuals: lib.FloatArray2D,
+) -> lib.FloatArray1D:
+    """Compute the residuals between the observed spot and the spherical
+    (isotropic) Gaussian model computed from the parameters in theta."""
+    _compute_model_sigma(theta, grid, size, model_x, model_y, model)
+    residuals[:, :] = spot - model
+    return residuals.flatten()
+
+
+@numba.jit(nopython=True, nogil=True)
+def _compute_residuals_rotated(
+    theta: lib.FloatArray1D,
+    spot: lib.FloatArray2D,
+    grid: lib.FloatArray1D,
+    size: int,
+    model: lib.FloatArray2D,
+    residuals: lib.FloatArray2D,
+) -> lib.FloatArray1D:
+    """Compute the residuals between the observed spot and the rotated
+    elliptical Gaussian model computed from the parameters in theta."""
+    _compute_model_rotated(theta, grid, size, model)
+    residuals[:, :] = spot - model
+    return residuals.flatten()
+
+
+def fit_spot(
+    spot: lib.FloatArray2D,
+    spherical: bool = False,
+    rotated: bool = False,
+) -> lib.FloatArray1D:
     """Fit a single spot using least squares optimization. The spot is a
     2D array representing the pixel values of the spot image. The
     function returns the optimized parameters as a 1D array with the
@@ -184,12 +315,22 @@ def fit_spot(spot: lib.FloatArray2D) -> lib.FloatArray1D:
         A 2D array representing the pixel values of the spot image.
         The shape of the array should be (size, size), where size is the
         length of one side of the square spot image.
+    spherical : bool, optional
+        If True, fit a spherical (isotropic) Gaussian with a single
+        width. The returned parameters still use the elliptical layout
+        with sx == sy so the rest of the pipeline is unchanged. Default
+        is False.
+    rotated : bool, optional
+        If True, fit a rotated elliptical Gaussian; the returned array
+        has a seventh element, the rotation angle in radians. Cannot be
+        combined with ``spherical``. Default is False.
 
     Returns
     -------
     result_ : lib.FloatArray1D
-        A 1D array containing the optimized parameters in the following order:
-        [x, y, photons, bg, sx, sy].
+        A 1D array containing the optimized parameters in the following
+        order: [x, y, photons, bg, sx, sy], or, if ``rotated``,
+        [x, y, photons, bg, sx, sy, angle (radians)].
     """
     size = spot.shape[0]
     size_half = int(size / 2)
@@ -198,9 +339,34 @@ def fit_spot(spot: lib.FloatArray2D) -> lib.FloatArray1D:
     model_y = np.empty(size, dtype=np.float32)
     model = np.empty((size, size), dtype=np.float32)
     residuals = np.empty((size, size), dtype=np.float32)
+    if rotated:
+        # theta is [x, y, photons, bg, sx, sy, angle]; the rotated model
+        # is not separable, so it does not use the per-axis buffers.
+        theta0 = _initial_parameters_rotated(spot, size, size_half)
+        result = optimize.leastsq(
+            _compute_residuals_rotated,
+            theta0,
+            args=(spot, grid, size, model, residuals),
+            ftol=1e-2,
+            xtol=1e-2,
+        )
+        return result[0]
+    args = (spot, grid, size, model_x, model_y, model, residuals)
+    if spherical:
+        # theta is [x, y, photons, bg, sigma]
+        theta0 = _initial_parameters_sigma(spot, size, size_half)
+        result = optimize.leastsq(
+            _compute_residuals_sigma, theta0, args=args, ftol=1e-2, xtol=1e-2
+        )
+        fitted = result[0]
+        # Expand the single width into sx == sy so downstream code
+        # (locs_from_fits) sees the standard 6-parameter layout.
+        result_ = np.empty(6, dtype=fitted.dtype)
+        result_[0:5] = fitted
+        result_[5] = fitted[4]
+        return result_
     # theta is [x, y, photons, bg, sx, sy]
     theta0 = _initial_parameters(spot, size, size_half)
-    args = (spot, grid, size, model_x, model_y, model, residuals)
     result = optimize.leastsq(
         _compute_residuals, theta0, args=args, ftol=1e-2, xtol=1e-2
     )  # leastsq is much faster than least_squares
@@ -213,12 +379,15 @@ def fit_spots(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    spherical: bool = False,
+    rotated: bool = False,
 ) -> lib.FloatArray2D:
     """Fit multiple spots using least squares optimization. Each spot is
     a 2D array representing the pixel values of the spot image. The
     function returns a 2D array with the optimized parameters for each
     spot, where each row corresponds to a spot and the columns are the
-    parameters in the following order: [x, y, photons, bg, sx, sy].
+    parameters in the following order: [x, y, photons, bg, sx, sy]
+    (or, if ``rotated``, [x, y, photons, bg, sx, sy, angle (radians)]).
 
     Parameters
     ----------
@@ -231,14 +400,24 @@ def fit_spots(
         If a callable provided, it must accept one integer input (number
         of localized spots). If "console", tqdm is used to display
         progress. If None, progress is not tracked.
+    spherical : bool, optional
+        If True, fit a spherical (isotropic) Gaussian with a single
+        width; the resulting sx and sy columns are identical. Default is
+        False.
+    rotated : bool, optional
+        If True, fit a rotated elliptical Gaussian; the returned array
+        has a seventh column, the rotation angle in radians. Cannot be
+        combined with ``spherical``. Default is False.
 
     Returns
     -------
     theta : lib.FloatArray2D
         A 2D array with the optimized parameters for each spot. The
-        columns correspond to [x, y, photons, bg, sx, sy].
+        columns correspond to [x, y, photons, bg, sx, sy] (or, if
+        ``rotated``, [x, y, photons, bg, sx, sy, angle (radians)]).
     """
-    theta = np.empty((len(spots), 6), dtype=np.float32)
+    n_params = 7 if rotated else 6
+    theta = np.empty((len(spots), n_params), dtype=np.float32)
     theta.fill(np.nan)
     use_tqdm = progress_callback == "console"
     if use_tqdm:
@@ -247,7 +426,7 @@ def fit_spots(
         iter_range = range(len(spots))
     for i in iter_range:
         spot = spots[i]
-        theta[i] = fit_spot(spot)
+        theta[i] = fit_spot(spot, spherical=spherical, rotated=rotated)
         if callable(progress_callback):
             progress_callback(i)
     return theta
@@ -256,6 +435,8 @@ def fit_spots(
 def fit_spots_parallel(
     spots: lib.FloatArray3D,
     asynch: bool = False,
+    spherical: bool = False,
+    rotated: bool = False,
 ) -> lib.FloatArray2D | list[futures.Future]:
     """Allows for running ``fit_spots`` asynchronously
     (multiprocessing).
@@ -271,6 +452,14 @@ def fit_spots_parallel(
         If True, the function returns a list of futures that can be
         processed asynchronously. If False, the function waits for all
         futures to complete and returns the results as a 2D array.
+    spherical : bool, optional
+        If True, fit a spherical (isotropic) Gaussian with a single
+        width; the resulting sx and sy columns are identical. Default is
+        False.
+    rotated : bool, optional
+        If True, fit a rotated elliptical Gaussian; the returned array
+        has a seventh column, the rotation angle in radians. Cannot be
+        combined with ``spherical``. Default is False.
 
     Returns
     -------
@@ -298,7 +487,14 @@ def fit_spots_parallel(
     fs = []
     executor = futures.ProcessPoolExecutor(n_workers)
     for i, n_spots_task in zip(start_indices, spots_per_task):
-        fs.append(executor.submit(fit_spots, spots[i : i + n_spots_task]))
+        fs.append(
+            executor.submit(
+                fit_spots,
+                spots[i : i + n_spots_task],
+                spherical=spherical,
+                rotated=rotated,
+            )
+        )
     if asynch:
         return fs
     with tqdm(desc="LQ fitting", total=n_tasks, unit="task") as progress_bar:
@@ -345,6 +541,7 @@ def locs_from_fits(
     theta: lib.FloatArray2D,
     box: int,
     em: bool,
+    spherical: bool = False,
 ) -> pd.DataFrame:
     """Convert the fit results into a data frame of localizations.
 
@@ -357,11 +554,19 @@ def locs_from_fits(
         A 2D array with the optimized parameters for each spot, where
         each row corresponds to a spot and the columns are the
         parameters in the following order: [x, y, photons, bg, sx, sy].
+        If a seventh column is present it is interpreted as the rotation
+        angle (in radians) of a rotated elliptical Gaussian, and the
+        resulting data frame contains the column ``angle`` (in degrees).
     box : int
         The size of the box used for localization, which is used to
         calculate the offsets for the x and y coordinates.
     em : bool
         Whether EMCCD was used for the localization.
+    spherical : bool, optional
+        If True, the fit was a spherical (isotropic) Gaussian, so
+        ``sx == sy`` and the ellipticity is always 0. The
+        ``ellipticity`` column is then omitted as it carries no
+        information. Default is False.
 
     Returns
     -------
@@ -369,6 +574,7 @@ def locs_from_fits(
         Data frame containing the localized spots.
     """
     # box_offset = int(box / 2)
+    rotated = theta.shape[1] == 7
     x = theta[:, 0] + identifications["x"]  # - box_offset
     y = theta[:, 1] + identifications["y"]  # - box_offset
     lpx = localization_precision(
@@ -377,48 +583,41 @@ def locs_from_fits(
     lpy = localization_precision(
         theta[:, 2], theta[:, 5], theta[:, 4], theta[:, 3], em=em
     )
-    a = np.maximum(theta[:, 4], theta[:, 5])
-    b = np.minimum(theta[:, 4], theta[:, 5])
-    ellipticity = (a - b) / a
+    columns = {
+        "frame": identifications["frame"].astype(np.uint32),
+        "x": x.astype(np.float32),
+        "y": y.astype(np.float32),
+        "photons": theta[:, 2].astype(np.float32),
+        "sx": theta[:, 4].astype(np.float32),
+        "sy": theta[:, 5].astype(np.float32),
+        "bg": theta[:, 3].astype(np.float32),
+        "lpx": lpx.astype(np.float32),
+        "lpy": lpy.astype(np.float32),
+    }
+    if not spherical:
+        # For a spherical (isotropic) Gaussian sx == sy, so the
+        # ellipticity is always 0 and carries no information.
+        a = np.maximum(theta[:, 4], theta[:, 5])
+        b = np.minimum(theta[:, 4], theta[:, 5])
+        ellipticity = (a - b) / a
+        columns["ellipticity"] = ellipticity.astype(np.float32)
+    columns["net_gradient"] = identifications["net_gradient"].astype(
+        np.float32
+    )
+    if rotated:
+        # Match the GPU convention (see localize.locs_from_fits_gpufit):
+        # negate, convert to degrees and normalize to [-90, 90) since the
+        # ellipse repeats every half turn.
+        angle = -np.rad2deg(theta[:, 6])
+        angle = np.mod(angle + 90.0, 180.0) - 90.0
+        columns["angle"] = angle.astype(np.float32)
 
     if "n_id" in identifications.columns:
-        locs = pd.DataFrame(
-            {
-                "frame": identifications["frame"].astype(np.uint32),
-                "x": x.astype(np.float32),
-                "y": y.astype(np.float32),
-                "photons": theta[:, 2].astype(np.float32),
-                "sx": theta[:, 4].astype(np.float32),
-                "sy": theta[:, 5].astype(np.float32),
-                "bg": theta[:, 3].astype(np.float32),
-                "lpx": lpx.astype(np.float32),
-                "lpy": lpy.astype(np.float32),
-                "ellipticity": ellipticity.astype(np.float32),
-                "net_gradient": (
-                    identifications["net_gradient"].astype(np.float32)
-                ),
-                "n_id": identifications["n_id"].astype(np.uint32),
-            }
-        )
+        columns["n_id"] = identifications["n_id"].astype(np.uint32)
+        locs = pd.DataFrame(columns)
         locs.sort_values(by="n_id", kind="quicksort", inplace=True)
     else:
-        locs = pd.DataFrame(
-            {
-                "frame": identifications["frame"].astype(np.uint32),
-                "x": x.astype(np.float32),
-                "y": y.astype(np.float32),
-                "photons": theta[:, 2].astype(np.float32),
-                "sx": theta[:, 4].astype(np.float32),
-                "sy": theta[:, 5].astype(np.float32),
-                "bg": theta[:, 3].astype(np.float32),
-                "lpx": lpx.astype(np.float32),
-                "lpy": lpy.astype(np.float32),
-                "ellipticity": ellipticity.astype(np.float32),
-                "net_gradient": (
-                    identifications["net_gradient"].astype(np.float32)
-                ),
-            }
-        )
+        locs = pd.DataFrame(columns)
         locs.sort_values(by="frame", kind="quicksort", inplace=True)
     return locs
 

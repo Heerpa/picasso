@@ -135,8 +135,14 @@ FIT_MODELS = {
     },
     "2D rotated elliptical Gaussian": {
         "optimizers": {
-            "Least squares": "gausslq-rotated-gpu",
+            "Least squares": "gausslq-rotated",
             "MLE": "gaussmle-rotated-gpu",
+        },
+    },
+    "2D spherical Gaussian": {
+        "optimizers": {
+            "Least squares": "gausslq-spherical",
+            "MLE": "gaussmle-spherical",
         },
     },
     "Experimental PSF (cubic spline)": {
@@ -151,11 +157,12 @@ FIT_MODELS = {
         "code": "avg",
     },
 }
-# The rotated elliptical Gaussian and the cubic-spline PSF are only
-# implemented in GPUfit (codes ending in "-gpu"), so offer them only when a
-# CUDA-capable GPU is found.
+# The cubic-spline PSF is only implemented in GPUfit (codes ending in "-gpu"),
+# so offer it only when a CUDA-capable GPU is found. The rotated
+# elliptical Gaussian has a CPU least-squares implementation but its MLE
+# optimizer is GPU-only.
 if not GPUFIT_INSTALLED:
-    del FIT_MODELS["2D rotated elliptical Gaussian"]
+    del FIT_MODELS["2D rotated elliptical Gaussian"]["optimizers"]["MLE"]
     del FIT_MODELS["Experimental PSF (cubic spline)"]
 
 
@@ -6417,9 +6424,14 @@ class FitWorker(QtCore.QThread):
         box: int,
         method: Literal[
             "gausslq",
+            "gausslq-spherical",
+            "gausslq-rotated",
             "gausslq-rotated-gpu",
+            "gausslq-spherical-gpu",
             "gaussmle",
+            "gaussmle-spherical",
             "gaussmle-rotated-gpu",
+            "gaussmle-spherical-gpu",
             "spline-gpu",
             "spline-mle-gpu",
             "avg",
@@ -6444,7 +6456,13 @@ class FitWorker(QtCore.QThread):
         self.spline_calibration = spline_calibration
         self.N = len(identifications)
         self._last_cut_emit = 0
-        if use_gpufit and method in ("gausslq", "gaussmle"):
+        if use_gpufit and method in (
+            "gausslq",
+            "gaussmle",
+            "gausslq-spherical",
+            "gaussmle-spherical",
+            "gausslq-rotated",
+        ):
             method += "-gpu"
         self.method = method
 
