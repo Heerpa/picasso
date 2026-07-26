@@ -54,7 +54,7 @@ FIT_MODELS = {
     },
     "2D rotated elliptical Gaussian": {
         "optimizers": {
-            "Least squares": "gausslq-rotated-gpu",
+            "Least squares": "gausslq-rotated",
             "MLE": "gaussmle-rotated-gpu",
         },
     },
@@ -76,12 +76,12 @@ FIT_MODELS = {
         "code": "avg",
     },
 }
-# The rotated elliptical Gaussian and the cubic-spline PSF are only
-# implemented in GPUfit (codes ending in "-gpu"), so offer them only when a
-# CUDA-capable GPU is found. The spherical Gaussian has a CPU implementation
-# (and an optional GPU one via the "Use GPUfit" checkbox), so it stays.
+# The cubic-spline PSF is only implemented in GPUfit (codes ending in "-gpu"),
+# so offer it only when a CUDA-capable GPU is found. The rotated
+# elliptical Gaussian has a CPU least-squares implementation but its MLE
+# optimizer is GPU-only.
 if not GPUFIT_INSTALLED:
-    del FIT_MODELS["2D rotated elliptical Gaussian"]
+    del FIT_MODELS["2D rotated elliptical Gaussian"]["optimizers"]["MLE"]
     del FIT_MODELS["Experimental PSF (cubic spline)"]
 
 
@@ -4980,6 +4980,7 @@ class FitWorker(QtCore.QThread):
         method: Literal[
             "gausslq",
             "gausslq-spherical",
+            "gausslq-rotated",
             "gausslq-rotated-gpu",
             "gausslq-spherical-gpu",
             "gaussmle",
@@ -5015,6 +5016,7 @@ class FitWorker(QtCore.QThread):
             "gaussmle",
             "gausslq-spherical",
             "gaussmle-spherical",
+            "gausslq-rotated",
         ):
             method += "-gpu"
         self.method = method

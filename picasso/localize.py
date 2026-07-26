@@ -1467,6 +1467,7 @@ def fit2D(
     fitting_method: Literal[
         "gausslq",
         "gausslq-spherical",
+        "gausslq-rotated",
         "gausslq-gpu",
         "gausslq-rotated-gpu",
         "gausslq-spherical-gpu",
@@ -1508,16 +1509,17 @@ def fit2D(
     box : int
         Size of the box to cut out around each spot. Should be an odd
         integer.
-    fitting_method : {"gausslq", "gausslq-spherical", "gausslq-gpu", \
-            "gausslq-rotated-gpu", "gausslq-spherical-gpu", "gaussmle", \
-            "gaussmle-spherical", "gaussmle-gpu", "gaussmle-rotated-gpu", \
-            "gaussmle-spherical-gpu", "spline-gpu", "spline-mle-gpu" or \
-            "avg"}, optional
+    fitting_method : {"gausslq", "gausslq-spherical", "gausslq-rotated", \
+            "gausslq-gpu", "gausslq-rotated-gpu", "gausslq-spherical-gpu", \
+            "gaussmle", "gaussmle-spherical", "gaussmle-gpu", \
+            "gaussmle-rotated-gpu", "gaussmle-spherical-gpu", "spline-gpu", \
+            "spline-mle-gpu" or "avg"}, optional
         Which 2D fitting algorithm to use. "gausslq" for least-squares
         fitting of a 2D Gaussian. "gausslq-gpu" for its GPU
         implemntation (if available). "gaussmle" for MLE 2D Gaussian
         fitting (CPU). "gaussmle-gpu" for MLE fitting of a 2D Gaussian
         on the GPU (Gpufit's maximum likelihood estimator).
+        "gausslq-rotated" for CPU least-squares fitting, and
         "gausslq-rotated-gpu" and "gaussmle-rotated-gpu" for GPU
         least-squares and MLE fitting, respectively, of a rotated
         elliptical Gaussian, whose fitted rotation angle (in degrees)
@@ -1593,6 +1595,7 @@ def fit2D(
     assert fitting_method in [
         "gausslq",
         "gausslq-spherical",
+        "gausslq-rotated",
         "gausslq-gpu",
         "gausslq-rotated-gpu",
         "gausslq-spherical-gpu",
@@ -1606,10 +1609,10 @@ def fit2D(
         "avg",
     ], (
         "fitting_method must be one of 'gausslq', 'gausslq-spherical',"
-        " 'gausslq-gpu', 'gausslq-rotated-gpu', 'gausslq-spherical-gpu',"
-        " 'gaussmle', 'gaussmle-spherical', 'gaussmle-gpu',"
-        " 'gaussmle-rotated-gpu', 'gaussmle-spherical-gpu', 'spline-gpu',"
-        " 'spline-mle-gpu', or 'avg'"
+        " 'gausslq-rotated', 'gausslq-gpu', 'gausslq-rotated-gpu',"
+        " 'gausslq-spherical-gpu', 'gaussmle', 'gaussmle-spherical',"
+        " 'gaussmle-gpu', 'gaussmle-rotated-gpu', 'gaussmle-spherical-gpu',"
+        " 'spline-gpu', 'spline-mle-gpu', or 'avg'"
     )
     if fitting_method.startswith("spline"):
         assert isinstance(spline_calibration, dict), (
@@ -1643,7 +1646,7 @@ def fit2D(
         progress_callback=cut_progress_callback,
     )
     em = camera_info["Gain"] > 1
-    if fitting_method in ("gausslq", "gausslq-spherical"):
+    if fitting_method in ("gausslq", "gausslq-spherical", "gausslq-rotated"):
         locs = _fit2d_gausslq(
             spots=spots,
             identifications=identifications,
@@ -1653,6 +1656,7 @@ def fit2D(
             progress_callback=progress_callback,
             abort_callback=abort_callback,
             spherical=fitting_method == "gausslq-spherical",
+            rotated=fitting_method == "gausslq-rotated",
         )
     elif fitting_method in (
         "gausslq-gpu",
@@ -1748,15 +1752,18 @@ def _fit2d_gausslq(
     ) = None,
     abort_callback: Callable[[], bool] | None = None,
     spherical: bool = False,
+    rotated: bool = False,
 ) -> pd.DataFrame | None:
     """Fit 2D Gaussians using least-squares fitting (CPU). If
     ``spherical``, an isotropic Gaussian with a single width is fitted
-    and the resulting ``sx`` and ``sy`` columns are identical. See
-    ``fit_2D`` for more details."""
+    and the resulting ``sx`` and ``sy`` columns are identical. If
+    ``rotated``, a rotated elliptical Gaussian is fitted and the
+    resulting localizations contain the fitted rotation angle (in
+    degrees) in the column ``angle``. See ``fit_2D`` for more details."""
     N = len(identifications)
     if multiprocess:
         fs = gausslq.fit_spots_parallel(
-            spots, asynch=True, spherical=spherical
+            spots, asynch=True, spherical=spherical, rotated=rotated
         )
         theta = _process_fitting_futures(
             fs, N, progress_callback, abort_callback
@@ -1765,7 +1772,7 @@ def _fit2d_gausslq(
             return
     else:
         theta = gausslq.fit_spots(
-            spots, progress_callback, spherical=spherical
+            spots, progress_callback, spherical=spherical, rotated=rotated
         )
     locs = gausslq.locs_from_fits(
         identifications,
@@ -3644,6 +3651,7 @@ def localize(
     fitting_method: Literal[
         "gausslq",
         "gausslq-spherical",
+        "gausslq-rotated",
         "gausslq-gpu",
         "gausslq-rotated-gpu",
         "gausslq-spherical-gpu",
@@ -3700,10 +3708,11 @@ def localize(
     frame_bounds : tuple, optional
         Minimum and maximum frame numbers to consider for the
         identification. If None, all frames are used. Default is None.
-    fitting_method : {"gausslq", "gausslq-spherical", "gausslq-gpu", \
-            "gausslq-rotated-gpu", "gausslq-spherical-gpu", "gaussmle", \
-            "gaussmle-spherical", "gaussmle-gpu", "gaussmle-rotated-gpu", \
-            "gaussmle-spherical-gpu" or "avg"}, optional
+    fitting_method : {"gausslq", "gausslq-spherical", "gausslq-rotated", \
+            "gausslq-gpu", "gausslq-rotated-gpu", "gausslq-spherical-gpu", \
+            "gaussmle", "gaussmle-spherical", "gaussmle-gpu", \
+            "gaussmle-rotated-gpu", "gaussmle-spherical-gpu" or "avg"}, \
+            optional
         Which 2D fitting algorithm to use, see ``fit2D``. Default is
         "gausslq".
     eps : float, optional
@@ -3792,6 +3801,7 @@ def localize_3D(
     fitting_method: Literal[
         "gausslq",
         "gausslq-spherical",
+        "gausslq-rotated",
         "gausslq-gpu",
         "gausslq-rotated-gpu",
         "gausslq-spherical-gpu",
@@ -3867,10 +3877,10 @@ def localize_3D(
         is to be specified, the other is to be set to None, for example,
         ``(5, None)`` sets minimum frame to 5 without maximum frame.
         Default is None.
-    fitting_method : {"gausslq", "gausslq-spherical", "gausslq-gpu", \
-            "gausslq-rotated-gpu", "gausslq-spherical-gpu", "gaussmle", \
-            "gaussmle-spherical", "gaussmle-gpu", "gaussmle-rotated-gpu" or \
-            "gaussmle-spherical-gpu"}, optional
+    fitting_method : {"gausslq", "gausslq-spherical", "gausslq-rotated", \
+            "gausslq-gpu", "gausslq-rotated-gpu", "gausslq-spherical-gpu", \
+            "gaussmle", "gaussmle-spherical", "gaussmle-gpu", \
+            "gaussmle-rotated-gpu" or "gaussmle-spherical-gpu"}, optional
         Which 2D fitting algorithm to use, see ``fit2D``. "avg" is not
         supported since z fitting requires the fitted Gaussian sigmas.
         Note that the rotated elliptical Gaussian methods report sx and
@@ -3918,6 +3928,7 @@ def localize_3D(
     assert fitting_method in [
         "gausslq",
         "gausslq-spherical",
+        "gausslq-rotated",
         "gausslq-gpu",
         "gausslq-rotated-gpu",
         "gausslq-spherical-gpu",
@@ -3930,10 +3941,10 @@ def localize_3D(
         "spline-mle-gpu",
     ], (
         "fitting_method must be one of 'gausslq', 'gausslq-spherical',"
-        " 'gausslq-gpu', 'gausslq-rotated-gpu', 'gausslq-spherical-gpu',"
-        " 'gaussmle', 'gaussmle-spherical', 'gaussmle-gpu',"
-        " 'gaussmle-rotated-gpu', 'gaussmle-spherical-gpu', 'spline-gpu',"
-        " or 'spline-mle-gpu'"
+        " 'gausslq-rotated', 'gausslq-gpu', 'gausslq-rotated-gpu',"
+        " 'gausslq-spherical-gpu', 'gaussmle', 'gaussmle-spherical',"
+        " 'gaussmle-gpu', 'gaussmle-rotated-gpu', 'gaussmle-spherical-gpu',"
+        " 'spline-gpu', or 'spline-mle-gpu'"
     )
     if fitting_method.startswith("spline"):
         # The spline PSF fit recovers z itself; it uses a spline calibration
@@ -3992,6 +4003,7 @@ def _localize_3D(
     fitting_method: Literal[
         "gausslq",
         "gausslq-spherical",
+        "gausslq-rotated",
         "gausslq-gpu",
         "gausslq-rotated-gpu",
         "gausslq-spherical-gpu",
