@@ -1711,6 +1711,7 @@ def fit2D(
             multiprocess=multiprocess,
             progress_callback=progress_callback,
             abort_callback=abort_callback,
+            spherical=fitting_method == "gaussmle-spherical",
         )
     elif fitting_method == "avg":
         locs = _fit2d_avg(
@@ -1779,6 +1780,7 @@ def _fit2d_gausslq(
         theta,
         box,
         em,
+        spherical=spherical,
     )
     return locs
 
@@ -2095,6 +2097,7 @@ def locs_from_fits_gpufit(
     mle: bool = False,
     log_likelihood: lib.FloatArray1D | None = None,
     iterations: lib.FloatArray1D | None = None,
+    spherical: bool = False,
 ) -> pd.DataFrame:
     """Convert the fit results from GPU-based fitting (Gaussian) into a
     data frame array of localizations.
@@ -2135,6 +2138,11 @@ def locs_from_fits_gpufit(
     iterations : lib.FloatArray1D, optional
         The number of iterations taken to converge for each spot.
         Default is None.
+    spherical : bool, optional
+        If True, the fit was a spherical (isotropic) Gaussian, so
+        ``sx == sy`` and the ellipticity is always 0. The
+        ``ellipticity`` column is then omitted as it carries no
+        information. Default is False.
 
     Returns
     -------
@@ -2160,9 +2168,6 @@ def locs_from_fits_gpufit(
         lpy = gausslq.localization_precision(
             theta[:, 0], theta[:, 4], theta[:, 3], theta[:, 5], em=em
         )
-    a = np.maximum(theta[:, 3], theta[:, 4])
-    b = np.minimum(theta[:, 3], theta[:, 4])
-    ellipticity = (a - b) / a
     columns = {
         "frame": identifications["frame"].astype(np.uint32),
         "x": x.astype(np.float32),
@@ -2173,9 +2178,17 @@ def locs_from_fits_gpufit(
         "bg": theta[:, 5].astype(np.float32),
         "lpx": lpx.astype(np.float32),
         "lpy": lpy.astype(np.float32),
-        "ellipticity": ellipticity.astype(np.float32),
-        "net_gradient": identifications["net_gradient"].astype(np.float32),
     }
+    if not spherical:
+        # For a spherical (isotropic) Gaussian sx == sy, so the
+        # ellipticity is always 0 and carries no information.
+        a = np.maximum(theta[:, 3], theta[:, 4])
+        b = np.minimum(theta[:, 3], theta[:, 4])
+        ellipticity = (a - b) / a
+        columns["ellipticity"] = ellipticity.astype(np.float32)
+    columns["net_gradient"] = identifications["net_gradient"].astype(
+        np.float32
+    )
     if rotated:  # rotated elliptical Gaussian
         # Normalize to [-90, 90) as the ellipse repeats every half turn.
         angle = -np.rad2deg(theta[:, 6])
@@ -2227,6 +2240,7 @@ def _fit2d_gauss_gpu(
         mle=mle,
         log_likelihood=log_likelihood,
         iterations=iterations,
+        spherical=spherical,
     )
     return locs
 
@@ -3524,9 +3538,12 @@ def _fit2d_gaussmle(
         Callable[[int], None] | Literal["console"] | None
     ) = None,
     abort_callback: Callable[[], bool] | None = None,
+    spherical: bool = False,
 ) -> pd.DataFrame | None:
-    """Fit 2D Gaussians using MLE fitting. See ``fit_2D`` for more
-    details."""
+    """Fit 2D Gaussians using MLE fitting. If ``spherical``, an isotropic
+    Gaussian with a single width is fitted (``sx == sy``) and the
+    ellipticity column is omitted as it is always 0. See ``fit_2D`` for
+    more details."""
     N = len(identifications)
     # MLE API is a bit different (at least for now) so we cannot use
     # _process_fitting_futures here
@@ -3566,6 +3583,7 @@ def _fit2d_gaussmle(
         llhoods,
         iterations,
         box,
+        spherical=spherical,
     )
     return locs
 

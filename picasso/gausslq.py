@@ -541,6 +541,7 @@ def locs_from_fits(
     theta: lib.FloatArray2D,
     box: int,
     em: bool,
+    spherical: bool = False,
 ) -> pd.DataFrame:
     """Convert the fit results into a data frame of localizations.
 
@@ -561,6 +562,11 @@ def locs_from_fits(
         calculate the offsets for the x and y coordinates.
     em : bool
         Whether EMCCD was used for the localization.
+    spherical : bool, optional
+        If True, the fit was a spherical (isotropic) Gaussian, so
+        ``sx == sy`` and the ellipticity is always 0. The
+        ``ellipticity`` column is then omitted as it carries no
+        information. Default is False.
 
     Returns
     -------
@@ -577,10 +583,6 @@ def locs_from_fits(
     lpy = localization_precision(
         theta[:, 2], theta[:, 5], theta[:, 4], theta[:, 3], em=em
     )
-    a = np.maximum(theta[:, 4], theta[:, 5])
-    b = np.minimum(theta[:, 4], theta[:, 5])
-    ellipticity = (a - b) / a
-
     columns = {
         "frame": identifications["frame"].astype(np.uint32),
         "x": x.astype(np.float32),
@@ -591,9 +593,17 @@ def locs_from_fits(
         "bg": theta[:, 3].astype(np.float32),
         "lpx": lpx.astype(np.float32),
         "lpy": lpy.astype(np.float32),
-        "ellipticity": ellipticity.astype(np.float32),
-        "net_gradient": identifications["net_gradient"].astype(np.float32),
     }
+    if not spherical:
+        # For a spherical (isotropic) Gaussian sx == sy, so the
+        # ellipticity is always 0 and carries no information.
+        a = np.maximum(theta[:, 4], theta[:, 5])
+        b = np.minimum(theta[:, 4], theta[:, 5])
+        ellipticity = (a - b) / a
+        columns["ellipticity"] = ellipticity.astype(np.float32)
+    columns["net_gradient"] = identifications["net_gradient"].astype(
+        np.float32
+    )
     if rotated:
         # Match the GPU convention (see localize.locs_from_fits_gpufit):
         # negate, convert to degrees and normalize to [-90, 90) since the

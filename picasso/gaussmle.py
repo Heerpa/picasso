@@ -951,6 +951,7 @@ def locs_from_fits(
     log_likelihoods: lib.FloatArray1D,
     iterations: lib.IntArray1D,
     box: int,
+    spherical: bool = False,
 ) -> pd.DataFrame:
     """Convert the results of Gaussian fits into a data frame array
     suitable for further analysis or visualization.
@@ -975,6 +976,11 @@ def locs_from_fits(
     box : int
         The size of the box used for fitting, which is used to
         calculate the offsets for the x and y coordinates.
+    spherical : bool, optional
+        If True, the fit was a spherical (isotropic) Gaussian, so
+        ``sx == sy`` and the ellipticity is always 0. The
+        ``ellipticity`` column is then omitted as it carries no
+        information. Default is False.
 
     Returns
     -------
@@ -998,18 +1004,23 @@ def locs_from_fits(
         bg_unc = np.sqrt(CRLBs[:, 3])
         sx_unc = np.sqrt(CRLBs[:, 4])
         sy_unc = np.sqrt(CRLBs[:, 5])
-    locs = pd.DataFrame(
+    columns = {
+        "frame": identifications["frame"].to_numpy(dtype=np.uint32),
+        "x": x.astype(np.float32),
+        "y": y.astype(np.float32),
+        "photons": theta[:, 2].astype(np.float32),
+        "sx": theta[:, 4].astype(np.float32),
+        "sy": theta[:, 5].astype(np.float32),
+        "bg": theta[:, 3].astype(np.float32),
+        "lpx": lpx.astype(np.float32),
+        "lpy": lpy.astype(np.float32),
+    }
+    if not spherical:
+        # For a spherical (isotropic) Gaussian sx == sy, so the
+        # ellipticity is always 0 and carries no information.
+        columns["ellipticity"] = ellipticity.astype(np.float32)
+    columns.update(
         {
-            "frame": identifications["frame"].to_numpy(dtype=np.uint32),
-            "x": x.astype(np.float32),
-            "y": y.astype(np.float32),
-            "photons": theta[:, 2].astype(np.float32),
-            "sx": theta[:, 4].astype(np.float32),
-            "sy": theta[:, 5].astype(np.float32),
-            "bg": theta[:, 3].astype(np.float32),
-            "lpx": lpx.astype(np.float32),
-            "lpy": lpy.astype(np.float32),
-            "ellipticity": ellipticity.astype(np.float32),
             "net_gradient": identifications["net_gradient"].astype(np.float32),
             "log_likelihood": log_likelihoods.astype(np.float32),
             "iterations": iterations.astype(np.uint32),
@@ -1019,6 +1030,7 @@ def locs_from_fits(
             "sy_unc": sy_unc.astype(np.float32),
         }
     )
+    locs = pd.DataFrame(columns)
     if "n_id" in identifications.columns:
         locs["n_id"] = identifications.n_id.astype(np.uint32)
         locs.sort_values(by=["n_id"], kind="quicksort", inplace=True)
