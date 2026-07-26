@@ -3531,10 +3531,10 @@ class Window(QtWidgets.QMainWindow):
         calibrate_spline_action.triggered.connect(self.calibrate_spline)
 
         reregister_signal_action = threed_menu.addAction(
-            "Re-align split-FOV channels (current signal)"
+            "Re-align channels (current signal)"
         )
         reregister_signal_action.triggered.connect(
-            self.reregister_split_fov_from_signal
+            self.reregister_channels_from_signal
         )
 
         self.plugin_menu = menu_bar.addMenu("Plugins")  # do not delete
@@ -5645,74 +5645,117 @@ class Window(QtWidgets.QMainWindow):
         self.abort_action.setEnabled(True)
         self.fit_worker.start()
 
-    def reregister_split_fov_from_signal(self) -> None:
-        """Re-estimate the inter-channel affine of a loaded split-FOV spline
-        calibration directly from the current blinking data: the signal
-        is read from several tens of frames inside the drawn ROIs, each
-        channel is flipped as the original calibration did, and a new affine is
-        fitted between the paired signal."""
+    def reregister_channels_from_signal(self) -> None:
+        """Re-estimate the inter-channel registration of the loaded spline
+        calibration directly from the current blinking data.
+
+        Both channel layouts pair shared single-molecule signal frame by frame
+        and re-fit the inter-channel affines, updating the loaded calibration;
+        this dispatches on the calibration:
+
+        * **Split-FOV** (regions of one movie): the signal is read inside the
+          drawn ROIs (or the calibration's regions) and each channel is seeded
+          by only the calibration's flip (see
+          :func:`spline.refine_split_fov_transforms_from_signal`).
+        * **Multichannel** (a separate movie per channel): the loaded channel
+          movies are paired frame by frame, seeded from the calibration's
+          existing transforms (see
+          :func:`spline.refine_multichannel_transforms_from_signal`).
+        """
+        title = "Re-align channels (signal)"
         calibration = self.parameters_dialog.spline_calibration
-        if self.movie is None:
-            QtWidgets.QMessageBox.information(
-                self, "Re-register split-FOV (signal)", "No movie loaded."
-            )
-            return
-        if not (calibration and calibration.get("split_fov")):
+        if not (calibration and calibration.get("channel_transforms")):
             QtWidgets.QMessageBox.warning(
                 self,
-                "Re-align split-FOV (signal)",
-                "Load a split-FOV spline calibration first "
+                title,
+                "Load a multichannel or split-FOV spline calibration first "
                 "(Experimental PSF (spline) > Load calibration).",
             )
             return
-        n_channels = int(calibration.get("n_channels", 0))
-        if self.view.split_fov_mode and len(self.view.rois) == n_channels:
-            regions = [list(map(list, r)) for r in self.view.rois]
-        else:
-            regions = calibration.get("regions")
-        if not regions or len(regions) != n_channels:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Re-register split-FOV (signal)",
-                f"Draw one ROI per channel (reference first): {n_channels} "
-                "regions are needed for this calibration.",
-            )
-            return
+        split_fov = bool(calibration.get("split_fov"))
         parameters = self.parameters
-        self.status_bar.showMessage(
-            "Re-registering split-FOV channels from signal ..."
-        )
+
+        # gather the layout-specific inputs and pick the refiner
+        if split_fov:
+            if self.movie is None:
+                QtWidgets.QMessageBox.information(
+                    self, title, "No movie loaded."
+                )
+                return
+            n_channels = int(calibration.get("n_channels", 0))
+            if self.view.split_fov_mode and len(self.view.rois) == n_channels:
+                regions = [list(map(list, r)) for r in self.view.rois]
+            else:
+                regions = calibration.get("regions")
+            if not regions or len(regions) != n_channels:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    title,
+                    f"Draw one ROI per channel (reference first): {n_channels} "
+                    "regions are needed for this calibration.",
+                )
+                return
+
+            def _refine():
+                return spline.refine_split_fov_transforms_from_signal(
+                    self.movie,
+                    calibration,
+                    regions,
+                    minimum_ng=parameters["Min. Net Gradient"],
+                    box=parameters["Box Size"],
+                    frame_bounds=self.frame_range,
+                )
+
+        else:
+            n_channels = int(calibration.get("n_channels", len(self.channels)))
+            if len(self.channels) < n_channels:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    title,
+                    f"This calibration has {n_channels} channels, but "
+                    f"{len(self.channels)} movies are loaded. Load them with "
+                    "'File > Open channels from several movies' in the same "
+                    "order as the calibration (reference first).",
+                )
+                return
+            # persist the active channel so every channel's movie is current
+            self._snapshot_current_channel()
+            movies = [self.channels[c].movie for c in range(n_channels)]
+
+            def _refine():
+                return spline.refine_multichannel_transforms_from_signal(
+                    movies,
+                    calibration,
+                    minimum_ng=parameters["Min. Net Gradient"],
+                    box=parameters["Box Size"],
+                    frame_bounds=self.frame_range,
+                )
+
+        self.status_bar.showMessage("Re-aligning channels from signal ...")
         QtWidgets.QApplication.setOverrideCursor(
             QtCore.Qt.CursorShape.WaitCursor
         )
         try:
-            _, reg_info = spline.refine_split_fov_transforms_from_signal(
-                self.movie,
-                calibration,
-                regions,
-                minimum_ng=parameters["Min. Net Gradient"],
-                box=parameters["Box Size"],
-                frame_bounds=self.frame_range,
-            )
+            _, reg_info = _refine()
         except Exception as e:
             QtWidgets.QApplication.restoreOverrideCursor()
             self.status_bar.showMessage("")
             QtWidgets.QMessageBox.critical(
-                self,
-                "Re-register split-FOV (signal)",
-                f"Re-registration failed: {e}",
+                self, title, f"Re-alignment failed: {e}"
             )
             return
         QtWidgets.QApplication.restoreOverrideCursor()
         self.status_bar.showMessage("")
-        # reflect the regions
-        regions_now = calibration.get("regions") or []
-        self.view.rois = [
-            [[int(r[0][0]), int(r[0][1])], [int(r[1][0]), int(r[1][1])]]
-            for r in regions_now
-        ]
-        self.parameters_dialog.update_roi_display()
-        self.draw_frame()
+
+        # split-FOV: reflect the (possibly re-ordered) regions in the view
+        if split_fov:
+            self.view.rois = [
+                [[int(r[0][0]), int(r[0][1])], [int(r[1][0]), int(r[1][1])]]
+                for r in (calibration.get("regions") or [])
+            ]
+            self.parameters_dialog.update_roi_display()
+            self.draw_frame()
+
         rows = [
             f"ch{r['channel']}: {r['n_matches']} paired signals, "
             f"RMS {r['rms']:.2f} px"
@@ -5720,8 +5763,8 @@ class Window(QtWidgets.QMainWindow):
         ]
         reply = QtWidgets.QMessageBox.question(
             self,
-            "Re-register split-FOV (signal)",
-            "Channels re-registered from the current signal:\n\n"
+            title,
+            "Channels re-aligned from the current signal:\n\n"
             + "\n".join(rows)
             + "\n\nThe loaded calibration is updated. Save it to a file?",
             QtWidgets.QMessageBox.StandardButton.Save
@@ -5733,7 +5776,7 @@ class Window(QtWidgets.QMainWindow):
             )[0]
             path, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self,
-                "Save re-registered spline calibration",
+                "Save re-aligned spline calibration",
                 (base or "") + "_reregistered.hdf5",
                 filter="*.hdf5",
             )
@@ -5741,7 +5784,7 @@ class Window(QtWidgets.QMainWindow):
                 io.save_spline_calibration(path, calibration)
                 self.parameters_dialog.spline_calibration_path = path
                 self.status_bar.showMessage(
-                    f"Saved re-registered calibration to {path}", 5000
+                    f"Saved re-aligned calibration to {path}", 5000
                 )
 
     def fit_z(self) -> None:
@@ -5823,6 +5866,7 @@ class Window(QtWidgets.QMainWindow):
         )
         self.locs = locs
         self.locs_display = locs
+        self._distribute_multichannel_fit(locs)
         self.draw_frame()
         # sound notification
         if elapsed_time > lib.SOUND_NOTIFICATION_DURATION:
@@ -5867,6 +5911,60 @@ class Window(QtWidgets.QMainWindow):
                 self.fit_z()
             else:
                 self.save_locs_after_fit()
+
+    def _locs_in_channel(
+        self, locs: pd.DataFrame, transform: np.ndarray
+    ) -> pd.DataFrame:
+        """Map reference-channel localizations into another channel's pixel
+        coordinates via the calibration's affine, for cross-channel display."""
+        xy = localize.apply_affine_transform(
+            np.column_stack(
+                [
+                    np.asarray(locs["x"], dtype=np.float64),
+                    np.asarray(locs["y"], dtype=np.float64),
+                ]
+            ),
+            np.asarray(transform, dtype=np.float64),
+        )
+        mapped = locs.copy()
+        mapped["x"] = xy[:, 0].astype(np.float32)
+        mapped["y"] = xy[:, 1].astype(np.float32)
+        return mapped
+
+    def _distribute_multichannel_fit(self, locs: pd.DataFrame) -> bool:
+        """Show a multichannel spline fit on every loaded channel.
+
+        The fit is in the reference channel's (channel 0) coordinates. Each
+        other channel's ``locs_display`` gets the same localizations mapped
+        into its own pixel frame via the calibration's ``channel_transforms``,
+        so switching channels overlays the fit on that channel's movie. The
+        fit itself (saveable ``locs``) stays with the reference channel, which
+        is made active so it displays and saves in reference coordinates.
+
+        Returns False (a no-op) for single-movie data, including split-FOV.
+        """
+        if len(self.channels) <= 1:
+            return False
+        calibration = self.parameters_dialog.spline_calibration
+        transforms = (calibration or {}).get("channel_transforms")
+        for c, channel in enumerate(self.channels):
+            if c == 0 or not transforms or c >= len(transforms):
+                channel.locs_display = locs
+            else:
+                channel.locs_display = self._locs_in_channel(
+                    locs, transforms[c]
+                )
+        self.channels[0].locs = locs
+        if self.current_channel != 0:
+            # the fit belongs to the reference channel: activate it so the
+            # overlay lands on the reference movie and saving uses reference
+            # coordinates. Restore directly (no snapshot) - the just-set
+            # per-channel locs_display would otherwise be clobbered by the
+            # stale flat state.
+            self.current_channel = 0
+            self._populate_channel_combo()
+            self._restore_current_channel()
+        return True
 
     def on_fit_z_progress(self, curr: int, total: int) -> None:
         """Update the status bar with the fitting progress."""

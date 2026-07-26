@@ -95,6 +95,10 @@ LOCALIZATION_COLUMNS = {
     "Picked spots only": ["n_id"],
     "MLE only": ["log_likelihood", "iterations"],
     "Uncertainty": ["photons_unc", "bg_unc", "sx_unc", "sy_unc"],
+    # 4Pi phase model (model 12): the fitted interference phase, its
+    # precision, and the coarse (astigmatic) z kept alongside the
+    # phase-refined z. Without these the phase is dropped at save time.
+    "4Pi phase only": ["phase", "phase_unc", "z_astig"],
 }
 # For database:
 MEAN_COLS = LOCALIZATION_COLUMNS["Base"] + LOCALIZATION_COLUMNS["3D only"]

@@ -2400,6 +2400,204 @@ def refine_split_fov_transforms_from_signal(
     return calibration, reg_info
 
 
+def refine_multichannel_transforms_from_signal(
+    movies: list,
+    calibration: dict,
+    minimum_ng: float,
+    box: int | None = None,
+    reference: int = 0,
+    frame_bounds: tuple[int, int] | list | None = None,
+    max_frames: int = 50,
+    max_pair_distance: float | None = None,
+    n_iter: int = 4,
+    min_pairs: int = 20,
+    update: bool = True,
+) -> tuple[dict, list]:
+    """Re-register a separate-movie multichannel spline calibration from the
+    experimental (blinking) data.
+
+    The multi-movie analogue of :func:`refine_split_fov_transforms_from_signal`.
+    In a multichannel acquisition the same emitter fluoresces in every channel's
+    movie in the *same frame* (the channels are frame-synchronized, as the
+    multichannel linking in :func:`localize.link_identifications_multichannel`
+    already assumes), so the inter-channel affine can be re-fit directly from that
+    shared signal:
+
+    1. Single molecules are detected in each channel's movie on a bounded,
+       evenly-spaced sample of ``max_frames`` frames.
+    2. The calibration's **existing** ``channel_transforms`` seed the pairing -
+       they are already close, so no flip/cross-correlation search is needed;
+       this refines a registration that drifted (e.g. across days), it does not
+       recover a grossly wrong one.
+    3. Reference and channel detections are paired frame by frame at that seed and
+       a fresh affine is fit on the pooled correspondences; a few ICP iterations
+       with a shrinking radius tighten it and a final robust trim drops the
+       coincidental (non-physical) pairs.
+
+    Unlike the split-FOV refinement this needs no ``regions`` - the channels are
+    whole separate movies - so only ``channel_transforms`` is updated (the PSF
+    ``coefficients`` are untouched). ``movies`` are the loaded channel movies in
+    calibration order (reference first).
+
+    Returns ``(calibration, reg_info)`` where ``reg_info`` lists, per non-
+    reference channel, the number of matched pairs, their coordinates, the fitted
+    transform and the residual RMS (camera px). With ``update=True`` the passed
+    calibration is modified in place.
+    """
+    if calibration.get("split_fov"):
+        raise ValueError(
+            "refine_multichannel_transforms_from_signal is for separate-movie "
+            "multichannel calibrations; use "
+            "refine_split_fov_transforms_from_signal for split-FOV."
+        )
+    stored = calibration.get("channel_transforms")
+    if not stored:
+        raise ValueError("Calibration has no channel_transforms to refine.")
+    n_channels = int(calibration.get("n_channels", len(stored)))
+    if len(movies) != n_channels:
+        raise ValueError(
+            f"Got {len(movies)} channel movies but the calibration has "
+            f"{n_channels} channels."
+        )
+    if len(stored) != n_channels:
+        raise ValueError(
+            f"Calibration has {n_channels} channels but {len(stored)} "
+            "channel transforms."
+        )
+    if not (0 <= reference < n_channels):
+        raise ValueError(f"reference={reference} out of range.")
+    if box is None:
+        box = int(calibration.get("box") or calibration["n_data"][0])
+    if max_pair_distance is None:
+        # the seed is the stored (already close) transform, so a match radius of
+        # about one box absorbs the residual drift without inviting coincidental
+        # cross-molecule pairs
+        max_pair_distance = float(box)
+
+    seed_transforms = [np.asarray(t, dtype=np.float64) for t in stored]
+
+    # detect on a bounded, evenly-spaced sample of frames shared by every movie,
+    # so per-frame pairing across the synchronized movies stays aligned
+    n_frames = min(int(m.shape[0]) for m in movies)
+    allowed = _frames_in_bounds(n_frames, frame_bounds)
+    if allowed.size == 0:
+        raise ValueError("No frames in the requested frame range.")
+    pick = np.unique(
+        np.linspace(
+            0, allowed.size - 1, min(int(max_frames), allowed.size)
+        ).astype(int)
+    )
+    sample_frames = allowed[pick]
+
+    def _by_frame(movie):
+        """Per-frame detections (absolute coords) on the sampled frames."""
+        movie_sub = np.stack(
+            [np.asarray(movie[int(f)]) for f in sample_frames]
+        )
+        ids, _ = localize.identify(movie_sub, minimum_ng, box)
+        if len(ids) == 0:
+            return {}
+        frame = np.asarray(ids["frame"], dtype=np.int64)
+        xy = np.column_stack(
+            [
+                np.asarray(ids["x"], dtype=np.float64),
+                np.asarray(ids["y"], dtype=np.float64),
+            ]
+        )
+        return {int(f): xy[frame == f] for f in np.unique(frame)}
+
+    ref_by_frame = _by_frame(movies[reference])
+    if not ref_by_frame:
+        raise ValueError(
+            "No detections in the reference channel; lower the minimum net "
+            "gradient or check the frame range."
+        )
+
+    # match radii shrink from generous (absorb the seed's residual drift) to
+    # tight (sub-box) over the ICP iterations
+    tol_hi = float(max_pair_distance)
+    tol_lo = max(2.0, 0.3 * box)
+    tols = np.linspace(tol_hi, tol_lo, max(1, int(n_iter)))
+
+    identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    transforms = [
+        identity if c == reference else None for c in range(n_channels)
+    ]
+    reg_info = []
+    for c in range(n_channels):
+        if c == reference:
+            continue
+        chan_by_frame = _by_frame(movies[c])
+        common = sorted(set(ref_by_frame) & set(chan_by_frame))
+        if not common:
+            raise ValueError(
+                f"No frames with detections in both the reference and channel "
+                f"{c} movies; the channels may not share signal, or the movies "
+                "are not frame-synchronized."
+            )
+        transform = np.asarray(seed_transforms[c], dtype=np.float64)
+        matched_ref = matched_c = np.empty((0, 2))
+        for tol in tols:
+            acc_ref, acc_c = [], []
+            for f in common:
+                rxy = ref_by_frame[f]
+                cxy = chan_by_frame[f]
+                pred = localize.apply_affine_transform(rxy, transform)
+                ri, ci = _match_beads(pred, cxy, tol)
+                if len(ri):
+                    acc_ref.append(rxy[ri])
+                    acc_c.append(cxy[ci])
+            if not acc_ref:
+                break
+            matched_ref = np.vstack(acc_ref)
+            matched_c = np.vstack(acc_c)
+            if len(matched_ref) < 3:
+                break
+            transform = localize.estimate_affine_transform(
+                matched_ref, matched_c
+            )
+        # robust trim: drop coincidental pairs far from the converged transform,
+        # then re-fit once on the inliers
+        if len(matched_ref) >= 3:
+            resid = matched_c - localize.apply_affine_transform(
+                matched_ref, transform
+            )
+            dist = np.sqrt(np.sum(resid**2, axis=1))
+            keep = dist <= max(tol_lo, 3.0 * np.median(dist))
+            if keep.sum() >= 3:
+                matched_ref = matched_ref[keep]
+                matched_c = matched_c[keep]
+                transform = localize.estimate_affine_transform(
+                    matched_ref, matched_c
+                )
+        n_pairs = int(len(matched_ref))
+        if n_pairs < min_pairs:
+            raise ValueError(
+                f"Only {n_pairs} signal correspondences for channel {c} "
+                f"(need >= {min_pairs}); use a longer / denser movie, lower the "
+                "minimum net gradient, or re-calibrate on beads instead."
+            )
+        resid = matched_c - localize.apply_affine_transform(
+            matched_ref, transform
+        )
+        rms = float(np.sqrt(np.mean(np.sum(resid**2, axis=1))))
+        transforms[c] = transform
+        reg_info.append(
+            {
+                "channel": c,
+                "n_matches": n_pairs,
+                "ref_xy": matched_ref,
+                "c_xy": matched_c,
+                "transform": transform,
+                "rms": rms,
+            }
+        )
+
+    if update:
+        calibration["channel_transforms"] = [t.tolist() for t in transforms]
+    return calibration, reg_info
+
+
 def decompose_phase_volumes(
     volumes: np.ndarray, phases: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -3033,10 +3231,8 @@ def _save_phase_diagnostics(
     envelope = phase_templates.mean(axis=(0, 4))  # incoherent (box, box, n_z)
     sx = np.array([_moment_widths(envelope[:, :, k])[0] for k in z_idx])
     sy = np.array([_moment_widths(envelope[:, :, k])[1] for k in z_idx])
-    px = 1.0  # widths in pixels
-    ax8.plot(z_nm, sx, color="tab:blue", label="σx (envelope)")
-    ax8.plot(z_nm, sy, color="tab:orange", label="σy (envelope)")
-    ax8.plot(z_nm, sx - sy, color="tab:green", label="σx − σy (astig.)")
+    ax8.plot(z_nm, sx, color="tab:blue", label="σx")
+    ax8.plot(z_nm, sy, color="tab:orange", label="σy")
     # mark one fringe period at the top so its size vs the astig. range is clear
     if np.isfinite(zt_nm):
         y0 = np.nanmax([np.nanmax(sx), np.nanmax(sy)]) * 1.02

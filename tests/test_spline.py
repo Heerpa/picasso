@@ -1479,6 +1479,130 @@ class TestRefineSplitFovTransformsFromSignal:
             )
 
 
+class TestRefineMultichannelTransformsFromSignal:
+    """Data-driven re-registration of a separate-movie multichannel calibration:
+    pair blinking signal across the (frame-synchronized) channel movies frame by
+    frame, seeded from the calibration's existing (slightly stale) transforms.
+    """
+
+    @staticmethod
+    def _blinking_movies(true_transform, n_frames=150, seed=0):
+        """Two 64x64 frame-synchronized movies; each frame has a few emitters in
+        the reference movie that also appear in the channel movie at
+        ``true_transform`` (shared signal, as in multichannel acquisition)."""
+        rng = np.random.RandomState(seed)
+        H, W = 64, 64
+
+        def render(frame, x, y, amp, sigma=1.2):
+            xi, yi = int(round(x)), int(round(y))
+            for dy in range(-4, 5):
+                for dx in range(-4, 5):
+                    yy, xx = yi + dy, xi + dx
+                    if 0 <= yy < H and 0 <= xx < W:
+                        frame[yy, xx] += amp * np.exp(
+                            -((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma**2)
+                        )
+
+        ref_movie = np.zeros((n_frames, H, W), dtype=np.float32)
+        c_movie = np.zeros((n_frames, H, W), dtype=np.float32)
+        for f in range(n_frames):
+            for _ in range(rng.randint(5, 8)):
+                x = rng.uniform(16, 48)
+                y = rng.uniform(16, 48)
+                amp = rng.uniform(2500, 4000)
+                render(ref_movie[f], x, y, amp)
+                cx, cy = localize.apply_affine_transform(
+                    np.array([[x, y]]), true_transform
+                )[0]
+                render(c_movie[f], cx, cy, amp)
+        ref_movie = rng.poisson(np.maximum(ref_movie, 0) + 100).astype(
+            np.uint16
+        )
+        c_movie = rng.poisson(np.maximum(c_movie, 0) + 100).astype(np.uint16)
+        return [ref_movie, c_movie]
+
+    def test_recovers_true_transform_from_signal(self):
+        # true fine registration: small rotation + sub-pixel shift
+        theta = 0.02
+        true_transform = np.array(
+            [
+                [np.cos(theta), -np.sin(theta), 2.0],
+                [np.sin(theta), np.cos(theta), -1.5],
+            ]
+        )
+        movies = self._blinking_movies(true_transform)
+        # stale calibration: the stored transform has drifted from the truth
+        calib = {
+            "n_channels": 2,
+            "box": BOX,
+            "n_data": [BOX, BOX, 1],
+            "channel_transforms": [
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+            ],
+        }
+        seed = np.array(calib["channel_transforms"][1])
+        updated, reg_info = spline.refine_multichannel_transforms_from_signal(
+            movies, calib, minimum_ng=800.0, box=BOX
+        )
+        # only ~50 frames are sampled (not all 150), so expect fewer pairs
+        assert reg_info[0]["n_matches"] >= 40
+        assert reg_info[0]["rms"] < 1.0
+        # the refined transform recovers the truth (a residual sub-pixel bias
+        # remains because identify uses a centroid, not a Gaussian fit) ...
+        fitted = np.array(updated["channel_transforms"][1])
+        np.testing.assert_allclose(fitted, true_transform, atol=0.35)
+        # ... and is much closer to the truth than the stale stored seed
+        assert (
+            np.abs(fitted - true_transform).max()
+            < 0.5 * np.abs(seed - true_transform).max()
+        )
+
+    def test_rejects_split_fov_calibration(self):
+        movies = self._blinking_movies(
+            np.array([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]), n_frames=10
+        )
+        calib = {
+            "split_fov": True,
+            "n_channels": 2,
+            "channel_transforms": [
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+            ],
+        }
+        with pytest.raises(ValueError):
+            spline.refine_multichannel_transforms_from_signal(
+                movies, calib, minimum_ng=800.0, box=BOX
+            )
+
+    def test_raises_without_shared_signal(self):
+        # channel movie has no correlated signal -> no pairs -> raises
+        rng = np.random.RandomState(1)
+        ref_movie = np.zeros((60, 64, 64), dtype=np.float32)
+        for f in range(60):
+            for _ in range(4):
+                x, y = rng.uniform(12, 52), rng.uniform(12, 52)
+                xi, yi = int(round(x)), int(round(y))
+                ref_movie[f, yi - 1 : yi + 2, xi - 1 : xi + 2] += 3000
+        ref_movie = rng.poisson(np.maximum(ref_movie, 0) + 100).astype(
+            np.uint16
+        )
+        c_movie = rng.poisson(np.full((60, 64, 64), 100.0)).astype(np.uint16)
+        calib = {
+            "n_channels": 2,
+            "box": BOX,
+            "n_data": [BOX, BOX, 1],
+            "channel_transforms": [
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+            ],
+        }
+        with pytest.raises(ValueError):
+            spline.refine_multichannel_transforms_from_signal(
+                [ref_movie, c_movie], calib, minimum_ng=800.0, box=BOX
+            )
+
+
 class TestSplinePhaseCalibration:
     """4Pi phase calibration: harmonic decomposition + spline build (model 12)."""
 
