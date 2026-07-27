@@ -13,6 +13,9 @@ The binding loads a compiled Gpufit library that must sit next to gpufit.py:
 - Linux:   libGpufit.so - NOT shipped, because the binary depends on your CUDA
            toolkit and GPU. You have to build it yourself (see below).
 
+IMPORTANT: Picasso needs fit models that are not part of upstream Gpufit. Build
+the library from our fork, https://github.com/rafalkowalewski1/Gpufit.
+
 When no library can be loaded (or no CUDA GPU is available), Picasso hides the
 GPU fitting option and falls back to the equivalent CPU implementation. Building
 the library is optional and only possible if you have an NVIDIA (CUDA-capable)
@@ -26,7 +29,7 @@ Prerequisites: an NVIDIA GPU with a matching CUDA toolkit
 (https://developer.nvidia.com/cuda-downloads), CMake >= 3.11, a C/C++ compiler
 (GCC) and git.
 
-    git clone https://github.com/gpufit/Gpufit.git Gpufit
+    git clone https://github.com/rafalkowalewski1/Gpufit.git Gpufit
     mkdir Gpufit-build
     cd Gpufit-build
     cmake -DCMAKE_BUILD_TYPE=RELEASE ../Gpufit
