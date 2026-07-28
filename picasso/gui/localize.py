@@ -2311,7 +2311,7 @@ class ParametersDialog(lib.Dialog):
             self.link_photons_checkbox.setToolTip(LINK_PHOTONS_TIP)
             self.link_photons_checkbox.setTristate(False)
             self.link_photons_checkbox.setChecked(True)
-            self.link_photons_checkbox.hide()  # shown for 2-channel calibs
+            self.link_photons_checkbox.hide()  # shown for 2-6 channel calibs
             spline_grid.addWidget(self.link_photons_checkbox, 1, 0, 1, 3)
 
         # show the calibration box that matches the initial fit model

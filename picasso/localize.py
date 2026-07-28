@@ -2756,7 +2756,7 @@ def fit_spots_gpufit_spline(
         Use Gpufit's maximum likelihood (Poisson) estimator. Default False.
     n_z_starts : int, optional
         Number of axial (z) seeds for a z multi-start (default 1 = a single
-        in-focus start, the historical behaviour). A biplane / two-channel fit
+        in-focus start, the historical behaviour). A biplane / multichannel fit
         is z-degenerate at large |z| from a single start (the per-plane defocus
         cancels), so several z seeds spanning the calibration stack are tried
         and, per spot, the seed whose fit best explains the data (lowest
@@ -2785,7 +2785,7 @@ def fit_spots_gpufit_spline(
             return parameters, log_likelihood, number_iterations
         return parameters
 
-    # z multi-start (biplane/two-channel z-degeneracy). The z_shift parameter
+    # z multi-start (biplane/multichannel z-degeneracy). The z_shift parameter
     # column is 2 for the photon-decoupled model, else 3.
     model = calibration["model"]
     if model == "spline-2d":
