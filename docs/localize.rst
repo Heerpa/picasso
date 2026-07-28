@@ -293,7 +293,7 @@ Picasso can fit an **experimentally measured PSF** to every spot. The measured P
 
 **Requirements.** Fitting runs only on a CUDA-capable NVIDIA GPU through `Gpufit <https://github.com/gpufit/Gpufit>`_ (see `GPU fitting`_ above); if no GPU library is available, the model and its controls do not appear. *Building* a calibration additionally uses Gpuspline, which — despite the name — is a CPU library, so the calibration step needs no GPU but is only distributed on Windows directly. The .so file for Linux needs to be built and distributed by the user.
 
-The method combines three published works: the experimental-PSF localization workflow and bead alignment of `Li et al., Nature Methods 15, 367–369 (2018) <https://doi.org/10.1038/nmeth.4661>`_, the cubic-spline PSF model for single-molecule data introduced by `Babcock & Zhuang, Scientific Reports 7, 552 (2017) <https://doi.org/10.1038/s41598-017-00622-w>`_, and the GPU localization-fitting and calibration-building backend of `Przybylski et al., Scientific Reports 7, 15722 (2017) <https://doi.org/10.1038/s41598-017-15313-9>`_.
+The method combines three published works: the experimental-PSF localization workflow and bead alignment of `Li et al., Nature Methods 15, 367–369 (2018) <https://doi.org/10.1038/nmeth.4661>`_, the cubic-spline PSF model for single-molecule data introduced by `Babcock & Zhuang, Scientific Reports 7, 552 (2017) <https://doi.org/10.1038/s41598-017-00622-w>`_, and the GPU localization-fitting and calibration-building backend of `Przybylski et al., Scientific Reports 7, 15722 (2017) <https://doi.org/10.1038/s41598-017-15313-9>`_. The multichannel variant (see `Multichannel spline PSF (e.g. biplane)`_ below) additionally follows the global-fitting approach of globLoc, `Li et al., Nature Communications 13, 3133 (2022) <https://doi.org/10.1038/s41467-022-30719-4>`_.
 
 Building a spline calibration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -347,6 +347,8 @@ Multichannel spline PSF (e.g. biplane)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Several spatially-registered channels (e.g. biplane setups) can be fit simultaneously, sharing one ``x``, ``y`` and ``z`` per molecule. The calibration needs one bead z-stack per channel, all scanned over the same z range with the same number of frames.
+
+This implements the global-fitting (globLoc) approach of `Li et al., Nature Communications 13, 3133 (2022) <https://doi.org/10.1038/s41467-022-30719-4>`_ — one experimental PSF per channel, the channels registered to a reference channel, and all channels fitted jointly with linked parameters. Please cite that work when using multichannel spline fitting.
 
 To build it in the GUI, first load the channels:
 

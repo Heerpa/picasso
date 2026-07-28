@@ -121,7 +121,9 @@ LINK_PHOTONS_TIP = (
     "CHECK to link photons + background across both channels. "
     "Appropriate when the channels share one emission.\n\n"
     "UNCHECK to decouple: each channel fits a free photon count"
-    " + background, x/y/z shared."
+    " + background, x/y/z shared.\n\n"
+    "Parameter sharing as in globLoc (Li et al., Nat Commun 13, 3133, 2022; "
+    "https://doi.org/10.1038/s41467-022-30719-4)."
 )
 
 # Fitting models offered in the GUI, decoupled from the optimizer. Each
@@ -2274,6 +2276,12 @@ class ParametersDialog(lib.Dialog):
                 "Gpufit: An open-source toolkit for GPU-accelerated curve "
                 "fitting. Sci Rep 7, 15722 (2017). "
                 "https://doi.org/10.1038/s41598-017-15313-9"
+                "\n\n"
+                "Multichannel (global) fitting follows globLoc:\n"
+                "Li, Y., Shi, W., Liu, S. et al. Global fitting for "
+                "high-accuracy multi-channel single-molecule localization. "
+                "Nat Commun 13, 3133 (2022). "
+                "https://doi.org/10.1038/s41467-022-30719-4"
             )
             vbox.addWidget(spline_groupbox)
             spline_grid = QtWidgets.QGridLayout(spline_groupbox)

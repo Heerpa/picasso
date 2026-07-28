@@ -70,6 +70,7 @@ If you use some of the functionalities provided by Picasso, please also cite the
 - GPU fitting (LQ and MLE, also used for experimental-PSF spline fitting). DOI: 10.1038/s41598-017-15313-9 (https://doi.org/10.1038/s41598-017-15313-9). License can be found here (https://github.com/jungmannlab/picasso/tree/master/picasso/ext/pygpufit).
 - 3D fitting via astigmatism. DOI: 10.1126/science.1153529 (https://www.science.org/doi/10.1126/science.1153529).
 - Experimental PSF (cubic-spline) fitting. DOIs: 10.1038/nmeth.4661 (https://doi.org/10.1038/nmeth.4661) (Li et al., experimental-PSF localization and bead alignment) and 10.1038/s41598-017-00622-w (https://doi.org/10.1038/s41598-017-00622-w) (Babcock & Zhuang, cubic-spline PSF model).
+- Multichannel (global) experimental-PSF fitting. DOI: 10.1038/s41467-022-30719-4 (https://doi.org/10.1038/s41467-022-30719-4) (Li et al., globLoc).
 - RCC undrifting: DOI: 10.1364/OE.22.015982 (https://doi.org/10.1364/OE.22.015982)
 - AIM undrifting. DOI: 10.1126/sciadv.adm776 (https://www.science.org/doi/10.1126/sciadv.adm7765)
 - SMLM clusterer. DOIs: 10.1038/s41467-021-22606-1 (https://doi.org/10.1038/s41467-021-22606-1) and 10.1038/s41586-023-05925-9 (https://doi.org/10.1038/s41586-023-05925-9)

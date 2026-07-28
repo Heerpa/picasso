@@ -2262,7 +2262,11 @@ _LINK_XYZ_MODEL = "spline-3d-multichannel-link-xyz"
 
 def _as_link_xyz_calibration(calibration: dict) -> dict:
     """Shallow copy of a ``spline-3d-multichannel`` calibration re-tagged for the
-    photon-decoupled (link-XYZ) fit. Validates the 2-channel requirement."""
+    photon-decoupled (link-XYZ) fit. Validates the 2-channel requirement.
+
+    Linking only the coordinates while leaving photons and background free per
+    channel is globLoc's flexible parameter-sharing scheme (Li et al., Nat.
+    Commun. 13, 3133, 2022)."""
     if calibration.get("model") != "spline-3d-multichannel":
         raise ValueError(
             "Photon-decoupled (link-XYZ) fitting requires a "
@@ -3870,6 +3874,15 @@ def _fit2d_spline_gpu(
 # channel and stacked, and the stack is fitted against the per-channel spline
 # coefficients. There is no affine-transform machinery elsewhere in Picasso,
 # so the small least-squares helpers below are self-contained.
+#
+# This is the global-fitting scheme of globLoc: Li, Y., Shi, W., Liu, S.,
+# Cavka, I., Wu, Y.-L., Matti, U., Wu, D., Koehler, S. & Ries, J. "Global
+# fitting for high-accuracy multi-channel single-molecule localization."
+# Nature Communications 13, 3133 (2022). DOI: 10.1038/s41467-022-30719-4.
+# Linked parameters (shared x, y, z), the optional per-channel photon /
+# background decoupling (``_as_link_xyz_calibration``) and the ratiometric
+# color assignment (``fit_spline_multichannel_ratiometric``) all follow that
+# work; the calibration side lives in ``picasso.spline``.
 # ----------------------------------------------------------------------
 
 
@@ -4284,6 +4297,9 @@ def fit_spline_multichannel(
 ) -> pd.DataFrame:
     """Fit a multichannel cubic-spline PSF across several registered channels.
 
+    Global fit in the sense of globLoc (Li et al., Nat. Commun. 13, 3133,
+    2022): every channel contributes to one fit with linked x, y and z.
+
     Ties ``get_spots_multichannel`` (extraction via the calibration's stored
     ``channel_transforms``) to ``fit_spots_gpufit_spline`` and
     ``locs_from_fits_spline``. The resulting localizations are in the
@@ -4571,6 +4587,9 @@ def fit_spline_split_fov(
 ) -> pd.DataFrame:
     """Fit a split-FOV multichannel spline PSF from a *single* movie whose
     rectangular sub-regions are the channels.
+
+    Global fit as in globLoc (Li et al., Nat. Commun. 13, 3133, 2022), for the
+    single-camera split-FOV geometry.
 
     The calibration (built by :func:`picasso.spline.calibrate_spline_split_fov`)
     stores the *inter-channel* registration as region-local ``channel_affines``

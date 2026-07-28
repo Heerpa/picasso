@@ -24,12 +24,23 @@ multiple fields of view per z position (``frame_order``, ``frames_per_step``,
 Bead alignment and preparation is done according to Li et al. (2018);
 spline fitting follows Gpufit, see References.
 
+The multichannel calibration (``calibrate_spline_multichannel`` /
+``calibrate_spline_split_fov``, used for biplane, split-FOV and ratiometric
+multicolor data) follows the global-fitting approach of globLoc (Li et al.,
+2022): one PSF per channel, the channels registered to a reference by an
+affine transform, and all channels fitted jointly with shared (linked)
+coordinates.
+
 References
 ----------
 - Li, Y., Mund, M., Hoess, P., Deschamps, J., Matti, U., Nijmeijer, B.,
   Sabinina, V. J., Ellenberg, J., Schoen, I. & Ries, J. "Real-time 3D
   single-molecule localization using experimental point spread functions."
   Nature Methods 15, 367-369 (2018).
+- Li, Y., Shi, W., Liu, S., Cavka, I., Wu, Y.-L., Matti, U., Wu, D.,
+  Koehler, S. & Ries, J. "Global fitting for high-accuracy multi-channel
+  single-molecule localization." Nature Communications 13, 3133 (2022).
+  DOI: 10.1038/s41467-022-30719-4. (globLoc)
 - Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
   "Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
   Scientific Reports 7, 15722 (2017).
@@ -1067,6 +1078,11 @@ def calibrate_spline(
 
 # ----------------------------------------------------------------------
 # Multichannel calibration (SPLINE_3D_MULTICHANNEL)
+#
+# Global (multi-channel) fitting as introduced by globLoc: Li, Shi, Liu,
+# et al. "Global fitting for high-accuracy multi-channel single-molecule
+# localization." Nature Communications 13, 3133 (2022).
+# DOI: 10.1038/s41467-022-30719-4.
 # ----------------------------------------------------------------------
 
 
@@ -1380,6 +1396,12 @@ def calibrate_spline_multichannel(
 ) -> dict:
     """Generate a multichannel cubic-spline PSF calibration from registered
     bead z-stacks (one movie per channel).
+
+    This is the calibration side of globLoc-style global fitting (Li et al.,
+    Nat. Commun. 13, 3133, 2022): a separate experimental PSF per channel plus
+    the channel-to-channel registration, so that the channels can later be
+    fitted jointly with shared coordinates by
+    :func:`localize.fit_spline_multichannel`.
 
     Detects beads in the reference channel (``movies[0]``), estimates an affine
     transform from the reference channel to each other channel from bead
@@ -2080,6 +2102,9 @@ def calibrate_spline_split_fov(
     """Build a multichannel spline calibration from a *single* bead z-stack in
     which several rectangular field-of-view regions are the channels (split-FOV
     optics: spectral/ratiometric splitters, biplane relays).
+
+    This is the acquisition geometry globLoc was designed around (Li et al.,
+    Nat. Commun. 13, 3133, 2022).
 
     This is a thin wrapper over :func:`calibrate_spline_multichannel`: it repeats
     the one ``movie``/``info``/``camera_info`` once per region and forwards
@@ -2833,8 +2858,9 @@ def _axial_precision_multichannel(
     else:
         fit_cal = calibration
         z_col = 3
-    # z multi-start (like SMAP/globLoc): a single in-focus start leaves the
-    # biplane fit degenerate at large |z|; several z seeds recover it.
+    # z multi-start (like globLoc, Li et al., Nat. Commun. 13, 3133,
+    # 2022): a single in-focus start leaves the biplane fit degenerate at
+    # large |z|; several z seeds recover it.
     n_z = int(calibration["n_data"][2])
     n_z_starts = int(np.clip(n_z // 20, 5, 15))
     try:
