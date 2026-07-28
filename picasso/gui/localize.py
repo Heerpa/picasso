@@ -3533,15 +3533,20 @@ class Window(QtWidgets.QMainWindow):
         )
         calibrate_z_action.triggered.connect(self.calibrate_z)
 
-        calibrate_spline_action = threed_menu.addAction("Calibrate spline PSF")
-        calibrate_spline_action.triggered.connect(self.calibrate_spline)
+        # The spline actions need the compiled Gpuspline library; offer them
+        # only when it loaded, rather than showing actions that can only fail.
+        if GPUSPLINE_INSTALLED:
+            calibrate_spline_action = threed_menu.addAction(
+                "Calibrate spline PSF"
+            )
+            calibrate_spline_action.triggered.connect(self.calibrate_spline)
 
-        reregister_signal_action = threed_menu.addAction(
-            "Re-align channels (current signal)"
-        )
-        reregister_signal_action.triggered.connect(
-            self.reregister_channels_from_signal
-        )
+            reregister_signal_action = threed_menu.addAction(
+                "Re-align channels (current signal)"
+            )
+            reregister_signal_action.triggered.connect(
+                self.reregister_channels_from_signal
+            )
 
         self.plugin_menu = menu_bar.addMenu("Plugins")  # do not delete
 
@@ -3589,7 +3594,7 @@ class Window(QtWidgets.QMainWindow):
                 "Spline PSF Calibration",
                 "Gpuspline could not be loaded. See "
                 "picasso/ext/pygpuspline/README.txt for how to add the "
-                "compiled library.",
+                "compiled library. Only Windows and Linux are supported.",
             )
             return
 
@@ -5716,31 +5721,12 @@ class Window(QtWidgets.QMainWindow):
             f"RMS {r['rms']:.2f} px"
             for r in reg_info
         ]
-        reply = QtWidgets.QMessageBox.question(
+        QtWidgets.QMessageBox.information(
             self,
             title,
             "Channels re-aligned from the current signal:\n\n"
-            + "\n".join(rows)
-            + "\n\nThe loaded calibration is updated. Save it to a file?",
-            QtWidgets.QMessageBox.StandardButton.Save
-            | QtWidgets.QMessageBox.StandardButton.Close,
+            + "\n".join(rows),
         )
-        if reply == QtWidgets.QMessageBox.StandardButton.Save:
-            base = os.path.splitext(
-                self.parameters_dialog.spline_calibration_path or ""
-            )[0]
-            path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self,
-                "Save re-aligned spline calibration",
-                (base or "") + "_reregistered.hdf5",
-                filter="*.hdf5",
-            )
-            if path:
-                io.save_spline_calibration(path, calibration)
-                self.parameters_dialog.spline_calibration_path = path
-                self.status_bar.showMessage(
-                    f"Saved re-aligned calibration to {path}", 5000
-                )
 
     def fit_z(self) -> None:
         """Fit z coordinates of the fitted localizations based on the
