@@ -1305,19 +1305,8 @@ class CalibrateSplineDialog(lib.Dialog):
         self.model = QtWidgets.QComboBox()
         self.model.addItem("3D (recovers z)", userData="spline-3d")
         self.model.addItem("2D (single plane)", userData="spline-2d")
-        self.model.addItem(
-            "4Pi phase",
-            userData="spline-3d-phase-multichannel",
-        )
         self.model.setToolTip(
-            "3D / 2D: single- or multichannel cubic-spline PSF.\n\n"
-            "4Pi phase: build a per-channel mean / modulation /\n"
-            "modulation-90deg calibration from bead z-stacks acquired at "
-            "several\n"
-            "interferometer phase steps. Load n_channels x n_phase_steps "
-            "movies\n"
-            "grouped channel-major (all phases of channel 0, then channel 1, "
-            "...)."
+            "3D / 2D: single- or multichannel cubic-spline PSF."
         )
         grid.addWidget(self.model, 3, 1)
 
@@ -1358,66 +1347,8 @@ class CalibrateSplineDialog(lib.Dialog):
         self.link_photons.setChecked(True)
         grid.addWidget(self.link_photons, 6, 0, 1, 2)
 
-        # 4Pi phase parameters
-        self.phase_steps_label = QtWidgets.QLabel("Phase steps per channel:")
-        self.phase_steps_label.setToolTip(
-            "Number of interferometer phase steps acquired per spatial "
-            "channel\n"
-            "(>= 3, needed for the per-voxel harmonic decomposition "
-            "into\n"
-            "mean / modulation / modulation-90deg)."
-        )
-        grid.addWidget(self.phase_steps_label, 7, 0)
-        self.phase_steps = QtWidgets.QSpinBox()
-        self.phase_steps.setRange(3, 64)
-        self.phase_steps.setValue(3)
-        grid.addWidget(self.phase_steps, 7, 1)
-
-        self.phases_label = QtWidgets.QLabel("Phase values (deg):")
-        self.phases_label.setToolTip(
-            "Interferometer phase (degrees) at each phase step, comma-"
-            "separated.\n"
-            "Defaults to evenly-spaced steps over [0, 360)."
-        )
-        grid.addWidget(self.phases_label, 8, 0)
-        self.phases = QtWidgets.QLineEdit()
-        grid.addWidget(self.phases, 8, 1)
-
-        # Optional manual fringe-period override (0 = measure from the data).
-        self.zt_label = QtWidgets.QLabel(
-            "Fringe period zT (stage nm, 0=measure):"
-        )
-        self.zt_label.setToolTip(
-            "Interference fringe period of the setup, in RAW STAGE nm\n"
-            "Leave 0 to measure it from the calibration;\n"
-            "set it to override with a known value."
-        )
-        grid.addWidget(self.zt_label, 9, 0)
-        self.zt_nm = QtWidgets.QDoubleSpinBox()
-        self.zt_nm.setRange(0.0, 1e5)
-        self.zt_nm.setDecimals(1)
-        self.zt_nm.setValue(0.0)
-        grid.addWidget(self.zt_nm, 9, 1)
-
-        # Opt-in fit-based validation (needs a GPU fitter): fits the calibration
-        # beads and saves a <base>_phase4pi_validation.png.
-        self.validate = QtWidgets.QCheckBox(
-            "Validate by fitting beads (extra diagnostic, GPU)"
-        )
-        self.validate.setToolTip(
-            "After building the 4Pi calibration, fit the beads\n"
-            "and save a validation plot (coarse z, phase vs z,\n"
-            "phase-unwrapped z with fringe jumps)."
-        )
-        self.validate.setChecked(False)
-        grid.addWidget(self.validate, 10, 0, 1, 2)
-
         self.frames_per_step.valueChanged.connect(self._update_order_enabled)
         self._update_order_enabled(self.frames_per_step.value())
-        self.model.currentIndexChanged.connect(self._update_phase_enabled)
-        self.phase_steps.valueChanged.connect(self._fill_default_phases)
-        self._fill_default_phases(self.phase_steps.value())
-        self._update_phase_enabled()
 
         # OK and Cancel buttons
         self.buttons = QtWidgets.QDialogButtonBox(
@@ -1437,47 +1368,14 @@ class CalibrateSplineDialog(lib.Dialog):
         self.order_label.setEnabled(enabled)
         self.frame_order.setEnabled(enabled)
 
-    def _is_phase_model(self) -> bool:
-        """Whether the 4Pi phase (Gpufit model 12) calibration is selected."""
-        return self.model.currentData() == "spline-3d-phase-multichannel"
-
-    def _update_phase_enabled(self, *args) -> None:
-        """Show the phase-step fields only for the 4Pi phase model."""
-        phase = self._is_phase_model()
-        for w in (
-            self.phase_steps_label,
-            self.phase_steps,
-            self.phases_label,
-            self.phases,
-            self.zt_label,
-            self.zt_nm,
-            self.validate,
-        ):
-            w.setVisible(phase)
-        # a 4Pi phase calibration always recovers z from the fit; z-bias
-        # correction / photon linking do not apply.
-        self.correct_z_bias.setEnabled(not phase)
-        self.link_photons.setEnabled(not phase)
-
-    def _fill_default_phases(self, n_steps: int) -> None:
-        """Fill the phase-values field with evenly-spaced defaults over
-        [0, 360) degrees for the current number of phase steps."""
-        degs = [round(360.0 * i / n_steps, 3) for i in range(int(n_steps))]
-        self.phases.setText(", ".join(f"{d:g}" for d in degs))
-
     @staticmethod
     def getCalibrationSpecs(
         parent: QtWidgets.QWidget | None = None,
-    ) -> tuple[
-        float, int, str, str, float, bool, bool, int, str, float, bool, bool
-    ]:
+    ) -> tuple[float, int, str, str, float, bool, bool, bool]:
         """Show the dialog and return the chosen step size, number of frames
         per step, frame order, spline model, magnification factor, whether to
-        correct the z bias, whether to link photons across channels, the number
-        of interferometer phase steps and their phase values (degrees, as
-        entered), the manual fringe period ``zt_nm`` (0 = measure) and whether to
-        run the fit-based validation for the 4Pi phase model, and whether it was
-        accepted."""
+        correct the z bias, whether to link photons across channels, and whether
+        it was accepted."""
         dialog = CalibrateSplineDialog(parent)
         result = dialog.exec()
         step = dialog.step.value()
@@ -1487,10 +1385,6 @@ class CalibrateSplineDialog(lib.Dialog):
         magnification_factor = dialog.magnification_factor.value()
         correct_z_bias = dialog.correct_z_bias.isChecked()
         link_photons = dialog.link_photons.isChecked()
-        n_phase_steps = dialog.phase_steps.value()
-        phases_text = dialog.phases.text()
-        zt_nm = dialog.zt_nm.value()
-        validate = dialog.validate.isChecked()
         accepted = result == QtWidgets.QDialog.DialogCode.Accepted
         return (
             step,
@@ -1500,10 +1394,6 @@ class CalibrateSplineDialog(lib.Dialog):
             magnification_factor,
             correct_z_bias,
             link_photons,
-            n_phase_steps,
-            phases_text,
-            zt_nm,
-            validate,
             accepted,
         )
 
@@ -1960,7 +1850,7 @@ class ParametersDialog(lib.Dialog):
             "gray. Pairing uses the loaded multichannel / split-FOV spline\n"
             "calibration's inter-channel transform. With no calibration loaded\n"
             "(separate channels), an identity transform is assumed, so already-\n"
-            "registered channels (e.g. co-cropped 4Pi quadrants) still link.\n"
+            "registered channels (e.g. co-cropped quadrants) still link.\n"
             "Identify every channel first."
         )
         self.link_colors_checkbox.setTristate(False)
@@ -1989,7 +1879,7 @@ class ParametersDialog(lib.Dialog):
         self.split_fov_checkbox = QtWidgets.QCheckBox("Regions = channels")
         self.split_fov_checkbox.setToolTip(
             "Split-FOV mode: treat the drawn ROIs as separate channels imaged\n"
-            "side-by-side on one camera (spectral / biplane / 4Pi split\n"
+            "side-by-side on one camera (spectral / biplane split\n"
             "optics). The first region is the reference channel and all\n"
             "regions are kept the same size: drag once to set the size, click\n"
             "to drop more regions, drag a region (or use the arrow keys) to\n"
@@ -2792,8 +2682,8 @@ class ParametersDialog(lib.Dialog):
 
     def _update_link_photons_visibility(self) -> None:
         """Show the 'Link photons across channels' checkbox only for a
-        2-channel (non-phase) multichannel spline calibration - the sole case
-        where photon decoupling (model 15) is available."""
+        2-channel multichannel spline calibration - the sole case where photon
+        decoupling (model 15) is available."""
         # A config auto-load may call update_spline_calib during startup before
         # the fit UI (and this checkbox) is built; ignore until it exists.
         if not hasattr(self, "link_photons_checkbox"):
@@ -3767,64 +3657,10 @@ class Window(QtWidgets.QMainWindow):
             magnification_factor,
             correct_z_bias,
             link_photons,
-            n_phase_steps,
-            phases_text,
-            zt_nm,
-            validate,
             accepted,
         ) = specs
         if not accepted:
             return
-
-        # 4Pi phase (Gpufit model 12): built from several loaded channels
-        # grouped channel-major as (n_channels x n_phase_steps). Validate
-        # the layout and parse the interferometer phase values before
-        # starting the worker.
-        phases = None
-        phase_model = model == "spline-3d-phase-multichannel"
-        if phase_model:
-            if not multichannel:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "4Pi phase calibration",
-                    "The 4Pi phase model is built from several loaded "
-                    "channels. Open all n_channels x n_phase_steps movies via "
-                    "'File > Open channels from several movies', grouped "
-                    "channel-major (all phases of channel 0, then channel 1, "
-                    "...), and turn split-FOV mode off.",
-                )
-                return
-            n_loaded = len(self.channels)
-            if n_loaded % n_phase_steps != 0:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "4Pi phase calibration",
-                    f"{n_loaded} channels are loaded, which is not a multiple "
-                    f"of {n_phase_steps} phase steps. Load "
-                    "n_channels x n_phase_steps movies.",
-                )
-                return
-            try:
-                degs = [
-                    float(v) for v in phases_text.replace(",", " ").split()
-                ]
-            except ValueError:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "4Pi phase calibration",
-                    f"Could not parse the phase values '{phases_text}'. Enter "
-                    f"{n_phase_steps} comma-separated numbers (degrees).",
-                )
-                return
-            if len(degs) != n_phase_steps:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "4Pi phase calibration",
-                    f"Got {len(degs)} phase values but {n_phase_steps} phase "
-                    "steps. They must match.",
-                )
-                return
-            phases = np.radians(degs).tolist()
 
         base = os.path.splitext(self.movie_path)[0] if self.movie_path else ""
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -3862,10 +3698,6 @@ class Window(QtWidgets.QMainWindow):
             magnification_factor=magnification_factor,
             correct_z_bias=correct_z_bias,
             link_photons=link_photons,
-            n_phase_steps=n_phase_steps,
-            phases=phases,
-            zt_nm=(zt_nm if zt_nm and zt_nm > 0 else None),
-            validate=validate,
             roi=self.view.rois,
             regions=regions,
             movies=movies,
@@ -3873,10 +3705,6 @@ class Window(QtWidgets.QMainWindow):
             camera_infos=camera_infos,
             path=path,
         )
-        # remembered for the finished dialog, which reports whether the opt-in
-        # validation plot was even requested
-        self._calibration_validate_requested = bool(validate)
-        self._calibration_is_phase_model = bool(phase_model)
         self.spline_calibration_worker.statusChanged.connect(
             self.status_bar.showMessage
         )
@@ -3886,13 +3714,7 @@ class Window(QtWidgets.QMainWindow):
         self.spline_calibration_worker.failed.connect(
             self.on_spline_calibration_failed
         )
-        if phase_model:
-            n_spatial = len(self.channels) // n_phase_steps
-            msg = (
-                f"Building 4Pi phase spline PSF calibration from "
-                f"{n_spatial} channels x {n_phase_steps} phase steps ..."
-            )
-        elif multichannel:
+        if multichannel:
             msg = (
                 f"Building multichannel spline PSF calibration from "
                 f"{len(self.channels)} channels (reference: "
@@ -5573,10 +5395,7 @@ class Window(QtWidgets.QMainWindow):
             # A 3D spline fit recovers z directly, so the separate
             # astigmatism z-fitting step must not run.
             fit_z = False
-            if spline_calibration.get("model") in (
-                "spline-3d-multichannel",
-                "spline-3d-phase-multichannel",
-            ):
+            if spline_calibration.get("model") == "spline-3d-multichannel":
                 self._start_multichannel_spline_fit(spline_calibration, method)
                 return
         self.fit_worker = FitWorker(
@@ -6725,20 +6544,6 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     link_photons=self.link_photons,
                     progress_callback=self.on_progress,
                 )
-            elif (
-                self.calibration.get("model") == "spline-3d-phase-multichannel"
-            ):
-                # 4Pi phase model: joint fit over the interference channels
-                # with a phase multi-start; localizations carry z and phase.
-                locs = localize.fit_spline_phase_multichannel(
-                    self.movies,
-                    self.camera_infos,
-                    self.identifications,
-                    self.box,
-                    self.calibration,
-                    mle=self.mle,
-                    progress_callback=self.on_progress,
-                )
             elif not self.link_photons and n_channels == 2:
                 # Photon decoupling (globLoc link-XYZ): free per-channel photons
                 # and background, shared x/y/z. Supersedes the ratiometric scan.
@@ -6861,10 +6666,6 @@ class SplineCalibrationWorker(QtCore.QThread):
         magnification_factor: float = 0.79,
         correct_z_bias: bool = False,
         link_photons: bool = True,
-        n_phase_steps: int = 3,
-        phases=None,
-        zt_nm=None,
-        validate: bool = False,
         roi=None,
         regions=None,
         movies=None,
@@ -6885,11 +6686,6 @@ class SplineCalibrationWorker(QtCore.QThread):
         self.magnification_factor = magnification_factor
         self.correct_z_bias = correct_z_bias
         self.link_photons = link_photons
-        # 4Pi phase (Gpufit model 12)
-        self.n_phase_steps = n_phase_steps
-        self.phases = phases
-        self.zt_nm = zt_nm
-        self.validate = validate
         self.roi = roi
         # When set (>= 2 rectangles), the ROIs are treated as channels of one
         # movie (split-FOV) and a multichannel calibration is built instead.
@@ -6904,29 +6700,7 @@ class SplineCalibrationWorker(QtCore.QThread):
 
     def run(self) -> None:
         try:
-            if self.movies and self.model == "spline-3d-phase-multichannel":
-                # 4Pi phase (model 12): the loaded movies are grouped
-                # channel-major as (n_channels x n_phase_steps).
-                calibration = spline.calibrate_spline_phase_multichannel(
-                    self.movies,
-                    infos=self.infos,
-                    camera_infos=self.camera_infos,
-                    box=self.box,
-                    minimum_ng=self.minimum_ng,
-                    d=self.step,
-                    n_phase_steps=self.n_phase_steps,
-                    phases=self.phases,
-                    zt_nm=self.zt_nm,
-                    validate=self.validate,
-                    frames_per_step=self.frames_per_step,
-                    frame_bounds=self.frame_bounds,
-                    frame_order=self.frame_order,
-                    magnification_factor=self.magnification_factor,
-                    reference=0,
-                    path=self.path,
-                    status_callback=self.statusChanged.emit,
-                )
-            elif self.movies:
+            if self.movies:
                 calibration = spline.calibrate_spline_multichannel(
                     self.movies,
                     infos=self.infos,

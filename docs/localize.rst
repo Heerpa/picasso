@@ -343,11 +343,20 @@ Fitting with the spline PSF
 
 In addition to the usual columns, spline fits report per-localization precisions (``lpx``, ``lpy``, and ``lpz`` for 3D, in nm), ``photons`` and ``bg`` with their uncertainties (``photons_unc``, ``bg_unc``), and, for MLE, ``log_likelihood`` and ``iterations``. A 3D calibration adds the recovered ``z`` (and ``lpz``). The accompanying ``_locs.yaml`` records the spline calibration model and file path used.
 
-Multichannel spline PSF (biplane / 4Pi)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Multichannel spline PSF (e.g. biplane)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Several spatially-registered channels (e.g. biplane or 4Pi setups) can be fit simultaneously, sharing one ``x``, ``y`` and ``z`` per molecule. Build a multichannel calibration by passing one bead movie per channel::
+Several spatially-registered channels (e.g. biplane setups) can be fit simultaneously, sharing one ``x``, ``y`` and ``z`` per molecule. The calibration needs one bead z-stack per channel, all scanned over the same z range with the same number of frames.
 
-   picasso spline-calibrate channel0.tif channel1.tif -s 20
+To build it in the GUI, first load the channels:
 
-The first movie is the reference channel; every other channel is registered to it by an affine transform estimated from matching beads, and the per-channel PSFs and transforms are stored in the calibration. In Localize, load the channels with ``File`` > ``Open channels from several movies`` (or ``Open one multichannel movie``), load the multichannel calibration, and fit with the ``Experimental PSF (cubic spline)`` model.
+- **Separate movies** — ``File`` > ``Open channels from several movies`` (or ``Open one multichannel movie`` for a single file holding several channels). The first movie loaded is the **reference channel**.
+- **Split field of view** — if the channels are imaged side by side on one camera, load the single movie, tick **Regions = channels** in the ``Parameters`` dialog and drag the ROIs onto the channels. The first region is the reference channel; all regions are kept the same size (drag once to set the size, click to drop more, drag a region or use the arrow keys to fine-tune it).
+
+Then run ``Calibration`` > ``Calibrate spline PSF`` as for a single channel. The dialog is the same, with one additional option:
+
+- **Link photon counts across channels** — on by default, so all channels share one photon count and background. Turn it off for a 2-channel calibration to fit per-channel photons and background instead (useful when the channels do not split the signal in a fixed ratio).
+
+Picasso builds a PSF for every channel and registers each non-reference channel to the reference by an affine transform estimated from matching beads; the per-channel PSFs and transforms are stored in one calibration ``.hdf5``. Alongside the usual diagnostic plot, a ``<base>_registration.png`` is written showing how well the channels align (residuals and the decomposed shift / rotation / scale / mirror) — check it before fitting.
+
+To fit, load the same channels, load the multichannel calibration under **Experimental PSF (spline)**, and run the fit with the ``Experimental PSF (cubic spline)`` model. Only spots detected in *every* channel are fitted, so identify each channel first. If the channel alignment has drifted since the bead stack was taken, ``Calibration`` > ``Re-align channels (current signal)`` re-estimates the transforms from the blinking data itself and saves an updated calibration.
