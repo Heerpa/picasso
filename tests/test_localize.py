@@ -2670,6 +2670,138 @@ class TestCrossChannelLinking:
         assert all(b >= a for a, b in zip(seen, seen[1:]))
 
 
+class TestCrossRegionLinkingSplitFov:
+    """Split-FOV: one movie is identified as a whole, so a single table holds
+    every region's detections. They must be split by region and linked across
+    regions, leaving one fitted spot per molecule - not one per detection."""
+
+    # two side-by-side 32x32 regions of a 32x64 movie; channel 1 sits half a
+    # pixel to the right and a quarter pixel up of the perfect split
+    REGIONS = [[[0, 0], [32, 32]], [[0, 32], [32, 64]]]
+    AFFINES = [
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        [[1.0, 0.0, 0.5], [0.0, 1.0, -0.25]],
+    ]
+
+    def _calibration(self, reference=0):
+        transforms = localize.compose_region_transforms(
+            [localize._normalize_rect(r) for r in self.REGIONS],
+            [np.asarray(a, dtype=float) for a in self.AFFINES],
+        )
+        return {
+            "model": "spline-3d-multichannel",
+            "split_fov": True,
+            "n_channels": 2,
+            "reference": reference,
+            "regions": self.REGIONS,
+            "channel_affines": self.AFFINES,
+            "channel_transforms": [t.tolist() for t in transforms],
+        }, transforms
+
+    @staticmethod
+    def _ids(xy):
+        xy = np.asarray(xy, dtype=float)
+        return pd.DataFrame(
+            {
+                "frame": np.zeros(len(xy), dtype=int),
+                "x": xy[:, 0],
+                "y": xy[:, 1],
+                "net_gradient": np.ones(len(xy), dtype=float),
+            }
+        )
+
+    def _detections(self, transforms):
+        """Three reference-region spots, two of which have a counterpart in
+        region 1, plus one unpaired detection in region 1."""
+        ref = np.array([[5.0, 5.0], [10.0, 20.0], [25.0, 8.0]])
+        partners = (
+            localize.apply_affine_transform(ref[:2], transforms[1]) + 0.3
+        )
+        return self._ids(np.vstack([ref, partners, [[50.0, 30.0]]])), ref
+
+    def test_keeps_reference_spots_found_in_every_region(self):
+        calib, transforms = self._calibration()
+        ids, ref = self._detections(transforms)
+        linked, n_kept, n_total = (
+            localize.filter_linked_identifications_split_fov(ids, calib, box=7)
+        )
+        # 6 detections over both regions -> 3 in the reference region -> the 2
+        # molecules seen in both. The count the fit progress must show.
+        assert len(ids) == 6
+        assert (n_kept, n_total) == (2, 3)
+        assert np.allclose(linked[["x", "y"]].to_numpy(), ref[:2])
+
+    def test_regions_may_be_re_placed(self):
+        """Drawn ROIs shifted off the calibration positions link the same."""
+        calib, transforms = self._calibration()
+        ids, _ = self._detections(transforms)
+        shifted = ids.copy()
+        shifted["x"] += 3.0
+        shifted["y"] += 2.0
+        regions = [
+            [[y0 + 2, x0 + 3], [y1 + 2, x1 + 3]]
+            for (y0, x0), (y1, x1) in self.REGIONS
+        ]
+        _, n_kept, n_total = localize.filter_linked_identifications_split_fov(
+            shifted, calib, box=7, regions=regions
+        )
+        assert (n_kept, n_total) == (2, 3)
+
+    def test_non_zero_reference_region(self):
+        """A calibration whose reference is not region 0 links against it."""
+        calib, transforms = self._calibration(reference=1)
+        ids, _ = self._detections(transforms)
+        # transforms must map the reference region (1) into every region
+        inverse = np.array([[1.0, 0.0, -32.5], [0.0, 1.0, 0.25]])
+        calib["channel_transforms"] = [
+            inverse.tolist(),
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        ]
+        linked, n_kept, n_total = (
+            localize.filter_linked_identifications_split_fov(ids, calib, box=7)
+        )
+        # region 1 holds the 2 counterparts plus one unpaired detection
+        assert (n_kept, n_total) == (2, 3)
+        assert (linked["x"] > 32).all()
+
+    def test_misregistration_links_nothing(self):
+        calib, transforms = self._calibration()
+        ids, _ = self._detections(transforms)
+        # the stored transform puts channel 1 40 px off its true position
+        calib["channel_transforms"] = [
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [[1.0, 0.0, 32.5], [0.0, 1.0, 39.75]],
+        ]
+        with pytest.warns(UserWarning, match="registration"):
+            _, n_kept, n_total = (
+                localize.filter_linked_identifications_split_fov(
+                    ids, calib, box=7
+                )
+            )
+        assert (n_kept, n_total) == (0, 3)
+
+    def test_other_regions_unidentified_passes_through(self):
+        """Identifying only the reference region (e.g. a restricted ROI) keeps
+        every reference detection, as for separately loaded channels."""
+        calib, _ = self._calibration()
+        ids = self._ids([[5.0, 5.0], [10.0, 20.0]])
+        kept, n_kept, n_total = (
+            localize.filter_linked_identifications_split_fov(ids, calib, box=7)
+        )
+        assert (n_kept, n_total) == (2, 2)
+        assert len(kept) == 2
+
+    def test_confine_to_region(self):
+        ids = self._ids([[5.0, 5.0], [40.0, 5.0], [31.9, 31.9]])
+        inside = localize.confine_to_region(ids, self.REGIONS[0])
+        # the region is half-open: [y_min, y_max) x [x_min, x_max)
+        assert list(inside["x"]) == [5.0, 31.9]
+
+    def test_geometry_requires_a_split_fov_calibration(self):
+        with pytest.raises(ValueError, match="split-FOV"):
+            localize.split_fov_fit_geometry({"model": "spline-3d"})
+
+
 def _synthetic_spline_3d_calibration(box=BOX, nz=41):
     """Build a 3D spline calibration from a synthetic astigmatic PSF,
     mirroring the reference pyGpufit splinefit_3d example. Requires Gpuspline

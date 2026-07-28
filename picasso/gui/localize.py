@@ -5186,6 +5186,76 @@ class Window(QtWidgets.QMainWindow):
         )
         self.status_bar.showMessage(message)
 
+    def _linked_count_phrase(self, n_detections: int) -> str | None:
+        """How many identified spots a joint spline fit would actually fit.
+
+        A multichannel (or split-FOV) spline fit fits one spot per molecule:
+        the reference detections that are found in every channel / region are
+        fitted jointly, everything else is dropped (see
+        ``localize.filter_linked_identifications``).
+        """
+        cal = self.parameters_dialog.spline_calibration or {}
+        box = self.parameters["Box Size"]
+        split_fov = bool(cal.get("split_fov"))
+        self.status_bar.showMessage(
+            "Linking spots across "
+            + ("regions" if split_fov else "channels")
+            + " ..."
+        )
+        self.status_bar.repaint()  # not processEvents: no re-entrant slots
+        try:
+            if split_fov:
+                ids = self.identifications
+                if ids is None or len(ids) == 0:
+                    return None
+                n_channels = int(
+                    cal.get("n_channels") or len(cal.get("regions") or [])
+                )
+                regions = None
+                if (
+                    self.view.split_fov_mode
+                    and len(self.view.rois) == n_channels
+                ):
+                    regions = [list(map(list, r)) for r in self.view.rois]
+                _, n_kept, _ = (
+                    localize.filter_linked_identifications_split_fov(
+                        ids, cal, box, regions=regions
+                    )
+                )
+                where = "regions"
+            else:
+                transforms = cal.get("channel_transforms")
+                n_channels = min(
+                    int(cal.get("n_channels", len(self.channels))),
+                    len(self.channels),
+                )
+                if (
+                    n_channels < 2
+                    or not transforms
+                    or len(transforms) < n_channels
+                ):
+                    return None
+                # the flat state holds the active channel's detections
+                self._snapshot_current_channel()
+                ids_per_channel = [
+                    c.identifications for c in self.channels[:n_channels]
+                ]
+                reference = ids_per_channel[0]
+                if reference is None or len(reference) == 0:
+                    return None
+                if all(i is None or len(i) == 0 for i in ids_per_channel[1:]):
+                    return None
+                _, n_kept, _ = localize.filter_linked_identifications(
+                    ids_per_channel, transforms, box
+                )
+                where = "channels"
+        except (ValueError, KeyError, IndexError):
+            return None
+        return (
+            f"{n_kept:,} spots linked across {n_channels} {where} "
+            f"({n_detections:,} in total)"
+        )
+
     def on_identify_finished(
         self,
         parameters: dict,
@@ -5209,14 +5279,21 @@ class Window(QtWidgets.QMainWindow):
             n_identifications = len(identifications)
             box = parameters["Box Size"]
             mng = parameters["Min. Net Gradient"]
+            self.identifications = identifications
+            self.ready_for_fit = True
+            # for split-FOV data the detections of every region sit in this one
+            # table, but the joint fit only fits molecules linked across all of
+            # them - report that count (see _linked_count_phrase)
+            counted = (
+                self._linked_count_phrase(n_identifications)
+                or f"{n_identifications:,} spots"
+            )
             message = (
-                f"Identified {n_identifications:,} spots in {elapsed_time:.2f}"
+                f"Identified {counted} in {elapsed_time:.2f}"
                 f" seconds. (Box Size: {box}; Min. Net Gradient: {mng}). "
                 "Ready for fit."
             )
             self.status_bar.showMessage(message)
-            self.identifications = identifications
-            self.ready_for_fit = True
             self.draw_frame()
             # sound notification
             if elapsed_time > lib.SOUND_NOTIFICATION_DURATION:
@@ -5279,9 +5356,13 @@ class Window(QtWidgets.QMainWindow):
             self._active_worker = None
             self.abort_action.setEnabled(False)
             self.draw_frame()
+            # the joint multichannel fit only fits molecules found in every
+            # channel, so report those rather than the raw detection total
+            counted = self._linked_count_phrase(state["sum"]) or (
+                f"{state['sum']:,} spots across {state['total']} channels"
+            )
             self.status_bar.showMessage(
-                f"Identified {state['sum']:,} spots across "
-                f"{state['total']} channels. Ready for fit."
+                f"Identified {counted}. Ready for fit."
             )
             # the follow-up requested by the entry point (Localize / a
             # calibration run), now that every channel is identified
@@ -5608,6 +5689,8 @@ class Window(QtWidgets.QMainWindow):
             regions=regions,
             link_photons=self.parameters_dialog._link_photons_enabled(),
         )
+        self.fit_worker.linkMade.connect(self.on_link_progress)
+        self.fit_worker.linkFinished.connect(self.on_link_finished)
         self.fit_worker.progressMade.connect(self.on_fit_progress)
         self.fit_worker.finished.connect(self.on_fit_finished)
         self.fit_worker.aborted.connect(self.on_worker_aborted)
@@ -5791,10 +5874,17 @@ class Window(QtWidgets.QMainWindow):
         message = f"Extracting spot {curr:,} / {total:,} ..."
         self.status_bar.showMessage(message)
 
+    def _link_target_name(self) -> str:
+        """'regions' for a split-FOV fit (the channels are regions of the one
+        loaded movie), 'channels' otherwise."""
+        worker = getattr(self, "fit_worker", None)
+        return "regions" if getattr(worker, "split_fov", False) else "channels"
+
     def on_link_progress(self, curr: int, total: int) -> None:
         """Update the status bar with the cross-channel linking progress."""
         self.status_bar.showMessage(
-            f"Linking spots across channels: {curr:,} / {total:,} ..."
+            f"Linking spots across {self._link_target_name()}: "
+            f"{curr:,} / {total:,} ..."
         )
 
     def on_link_finished(self, n_kept: int, n_total: int) -> None:
@@ -5802,7 +5892,7 @@ class Window(QtWidgets.QMainWindow):
         pct = 100 * n_kept / n_total if n_total else 0.0
         self.status_bar.showMessage(
             f"{n_kept:,} of {n_total:,} spots ({pct:.1f}%) linked across all "
-            "channels; fitting those ..."
+            f"{self._link_target_name()}; fitting those ..."
         )
 
     def on_fit_progress(self, curr: int, total: int) -> None:
@@ -6522,7 +6612,13 @@ class MultichannelSplineFitWorker(QtCore.QThread):
 
     def _link_across_channels(self, n_channels: int) -> bool:
         """Restrict the reference detections to those found in every channel.
-        Returns False if nothing survives (the caller then aborts)."""
+        Returns False if nothing survives (the caller then aborts).
+
+        ``self.N`` - the denominator of the fit progress - is set to the number
+        of spots that are actually fitted, i.e. the linked molecules (one fit
+        per molecule across all channels), not the raw detection count."""
+        if self.split_fov:
+            return self._link_across_regions()
         ids_per_channel = self.identifications_per_channel
         if not ids_per_channel or len(ids_per_channel) < 2:
             return True
@@ -6543,6 +6639,43 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         self.N = len(linked)
         return True
 
+    def _link_across_regions(self) -> bool:
+        """Split-FOV counterpart of :meth:`_link_across_channels`: the single
+        identification table holds every region's detections, so it is split by
+        region and linked across them. Keeps the reference-region detections
+        found in all other regions - one fitted spot per molecule."""
+        all_regions = self.identifications
+        try:
+            fit_regions, reference, _ = localize.split_fov_fit_geometry(
+                self.calibration, self.regions
+            )
+        except (ValueError, KeyError):
+            # geometry unavailable (e.g. no channel_affines to re-place at the
+            # drawn ROIs): fit as before, on the whole identification table
+            return True
+        # only the reference region is fitted (the other regions are cut from
+        # it via the transforms), so it - not the movie-wide detection count -
+        # is the denominator of the linking and fit progress
+        self.identifications = localize.confine_to_region(
+            all_regions, fit_regions[reference]
+        )
+        self.N = len(self.identifications)
+        linked, n_kept, n_total = (
+            localize.filter_linked_identifications_split_fov(
+                all_regions,
+                self.calibration,
+                self.box,
+                regions=self.regions,
+                progress_callback=self.on_link_progress,
+            )
+        )
+        self.linkFinished.emit(n_kept, n_total)
+        if n_kept == 0:
+            return False
+        self.identifications = linked
+        self.N = len(linked)
+        return True
+
     def run(self) -> None:
         t0 = time.time()
         try:
@@ -6550,9 +6683,10 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                 self.calibration.get("n_channels", len(self.movies))
             )
             if not self._link_across_channels(n_channels):
+                where = "regions" if self.split_fov else "channels"
                 print(
-                    "Multichannel spline fit: no detection is linked across "
-                    "all channels - check the channel registration."
+                    f"Multichannel spline fit: no detection is linked across "
+                    f"all {where} - check the channel registration."
                 )
                 self.aborted.emit()
                 return

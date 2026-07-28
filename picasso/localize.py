@@ -4572,6 +4572,139 @@ def _split_fov_channel_affines(calibration: dict) -> list | None:
     return None
 
 
+def split_fov_fit_geometry(
+    calibration: dict, regions: list | None = None
+) -> tuple[list, int, list]:
+    """Where a split-FOV fit's channels sit, and how they map onto each other.
+
+    The channels are placed at ``regions`` (e.g. the ROIs drawn for *this*
+    data) when given, else at the calibration's own regions; the inter-channel
+    affine is the same either way (see :func:`compose_region_transforms`).
+
+    Parameters
+    ----------
+    calibration : dict
+        Split-FOV spline calibration (``spline.calibrate_spline_split_fov``).
+    regions : list, optional
+        One ``[[y_min, x_min], [y_max, x_max]]`` per channel, reference first.
+
+    Returns
+    -------
+    fit_regions : list
+        Normalized channel rectangles actually in use.
+    reference : int
+        Index of the reference channel in ``fit_regions``/``transforms``.
+    transforms : list
+        One ``(2, 3)`` affine per channel mapping reference-channel
+        coordinates into that channel, placed at ``fit_regions``.
+    """
+    if not calibration.get("split_fov"):
+        raise ValueError(
+            "A split-FOV fit requires a split-FOV calibration (built with "
+            "spline.calibrate_spline_split_fov / a 'regions' argument)."
+        )
+    calib_regions = calibration.get("regions")
+    if not calib_regions:
+        raise ValueError("Split-FOV calibration is missing 'regions'.")
+    n_channels = len(calib_regions)
+
+    if regions is not None:
+        if len(regions) != n_channels:
+            raise ValueError(
+                f"Got {len(regions)} regions but the calibration has "
+                f"{n_channels} channels; draw one ROI per channel "
+                "(reference first)."
+            )
+        fit_regions = [_normalize_rect(r) for r in regions]
+        reference = 0  # fit-time ROIs are drawn reference-first
+        affines = _split_fov_channel_affines(calibration)
+        if affines is None:
+            raise ValueError(
+                "Calibration has no channel_affines to re-place at the given "
+                "regions."
+            )
+        transforms = compose_region_transforms(fit_regions, affines)
+    else:
+        fit_regions = [_normalize_rect(r) for r in calib_regions]
+        reference = int(calibration.get("reference", 0))
+        transforms = [
+            np.asarray(t, dtype=np.float64)
+            for t in calibration["channel_transforms"]
+        ]
+    if len(transforms) != n_channels:
+        raise ValueError(
+            f"Calibration has {n_channels} channels but {len(transforms)} "
+            "channel transforms."
+        )
+    return fit_regions, reference, transforms
+
+
+def confine_to_region(
+    identifications: pd.DataFrame, region: list
+) -> pd.DataFrame:
+    """The detections inside one ``[[y_min, x_min], [y_max, x_max]]`` rect."""
+    (y0, x0), (y1, x1) = _normalize_rect(region)
+    x = np.asarray(identifications["x"], dtype=np.float64)
+    y = np.asarray(identifications["y"], dtype=np.float64)
+    inside = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
+    return identifications.iloc[np.flatnonzero(inside)].reset_index(drop=True)
+
+
+def filter_linked_identifications_split_fov(
+    identifications: pd.DataFrame,
+    calibration: dict,
+    box: int,
+    regions: list | None = None,
+    tol: float | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+) -> tuple[pd.DataFrame, int, int]:
+    """Split-FOV counterpart of :func:`filter_linked_identifications`.
+
+    A split-FOV movie is identified as a whole, so one table holds the
+    detections of every channel. They are split by region and paired across
+    regions exactly as separate channel movies are, keeping only the
+    reference-region detections found in *all* other regions - the molecules
+    the joint fit can describe.
+
+    Parameters
+    ----------
+    identifications : pd.DataFrame
+        Movie-wide detections (all regions), as identified in the GUI.
+    calibration : dict
+        Split-FOV spline calibration.
+    box : int
+        Box side length; sets the default pairing radius (``1.5 * box``).
+    regions : list, optional
+        Channel ROIs for this data (reference first); see
+        :func:`split_fov_fit_geometry`.
+
+    Returns
+    -------
+    linked : pd.DataFrame
+        The reference-region detections that link across all regions.
+    n_kept, n_total : int
+        Linked and total *reference-region* detections.
+    """
+    fit_regions, reference, transforms = split_fov_fit_geometry(
+        calibration, regions
+    )
+    # reference first, as ``filter_linked_identifications`` expects; the
+    # transforms already map reference coordinates into each region
+    order = [reference] + [
+        c for c in range(len(fit_regions)) if c != reference
+    ]
+    ids_per_region = [
+        confine_to_region(identifications, fit_regions[c]) for c in order
+    ]
+    return filter_linked_identifications(
+        ids_per_region,
+        [transforms[c] for c in order],
+        box,
+        tol=tol,
+        progress_callback=progress_callback,
+    )
+
+
 def fit_spline_split_fov(
     movie,
     camera_info: dict,
@@ -4621,54 +4754,14 @@ def fit_spline_split_fov(
     Remaining parameters are as in the underlying multichannel fitters. The
     localizations are in the reference region's coordinates.
     """
-    if not calibration.get("split_fov"):
-        raise ValueError(
-            "fit_spline_split_fov requires a split-FOV calibration (built with "
-            "spline.calibrate_spline_split_fov / a 'regions' argument)."
-        )
-    calib_regions = calibration.get("regions")
-    if not calib_regions:
-        raise ValueError("Split-FOV calibration is missing 'regions'.")
-    n_channels = len(calib_regions)
-
-    # channels are placed at the fit-time ROIs when given, else at the
-    # calibration positions; the inter-channel affine is the same either way.
-    if regions is not None:
-        if len(regions) != n_channels:
-            raise ValueError(
-                f"Got {len(regions)} regions but the calibration has "
-                f"{n_channels} channels; draw one ROI per channel "
-                "(reference first)."
-            )
-        fit_regions = [_normalize_rect(r) for r in regions]
-        reference = 0  # fit-time ROIs are drawn reference-first
-        affines = _split_fov_channel_affines(calibration)
-        if affines is None:
-            raise ValueError(
-                "Calibration has no channel_affines to re-place at the given "
-                "regions."
-            )
-        transforms = compose_region_transforms(fit_regions, affines)
-    else:
-        fit_regions = [_normalize_rect(r) for r in calib_regions]
-        reference = int(calibration.get("reference", 0))
-        transforms = [
-            np.asarray(t, dtype=np.float64)
-            for t in calibration["channel_transforms"]
-        ]
-    if len(transforms) != n_channels:
-        raise ValueError(
-            f"Calibration has {n_channels} channels but {len(transforms)} "
-            "channel transforms."
-        )
+    fit_regions, reference, transforms = split_fov_fit_geometry(
+        calibration, regions
+    )
+    n_channels = len(fit_regions)
 
     ids = identifications
     if confine_to_reference:
-        (y0, x0), (y1, x1) = fit_regions[reference]
-        x = np.asarray(ids["x"], dtype=np.float64)
-        y = np.asarray(ids["y"], dtype=np.float64)
-        inside = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
-        ids = ids.iloc[np.flatnonzero(inside)].reset_index(drop=True)
+        ids = confine_to_region(ids, fit_regions[reference])
 
     # downstream fitters read channel_transforms off the calibration; hand them
     # the transforms placed at the regions actually in use
