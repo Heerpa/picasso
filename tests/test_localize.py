@@ -2471,11 +2471,18 @@ class TestSplineHelpers:
                 np.zeros((2, 2)), np.zeros((2, 2))
             )
 
-    def test_pack_user_info_multichannel_layout(self):
+    @pytest.mark.parametrize("n_channels", [2, 3, 4, 5, 6])
+    @pytest.mark.parametrize("link_xyz", [False, True])
+    def test_pack_user_info_multichannel_layout(self, link_xyz, n_channels):
         n_channels = 3
         calib = _fake_spline_calibration(
             model="spline-3d-multichannel", n_channels=n_channels
         )
+        # the photon-decoupled model reuses the multichannel blob verbatim -
+        # only the parameter handling differs
+        if link_xyz:
+            calib = localize._as_link_xyz_calibration(calib)
+        model = calib["model"]
         user_info = localize._pack_spline_user_info(calib)
         assert user_info.dtype == np.float32
         nx, ny, _ = calib["n_data"]
@@ -2485,15 +2492,136 @@ class TestSplineHelpers:
             user_info[:7],
             np.array([n_channels, nx, ny, 1, ix, iy, iz], np.float32),
         )
-        assert user_info.size == 7 + calib["coefficients"].size
+        n_coeff = calib["coefficients"].size
+        # coefficients, then the per-channel lateral affine channel-major (4
+        # reals each). The CUDA models detect that trailing block purely by the
+        # total size, so its length is part of the contract.
+        assert user_info.size == 7 + n_coeff + 4 * n_channels
         # each channel's block is reordered to forward axis order and the
         # blocks are concatenated channel-major (outermost axis)
         np.testing.assert_array_equal(
-            user_info[7:],
+            user_info[7 : 7 + n_coeff],
             localize._reorder_spline_coefficients_for_gpufit(
-                calib["coefficients"], "spline-3d-multichannel"
+                calib["coefficients"], model
             ),
         )
+        np.testing.assert_array_equal(
+            user_info[7 + n_coeff :],
+            np.tile(np.array([1.0, 0.0, 0.0, 1.0], np.float32), n_channels),
+        )
+        # without transforms the blob stops after the coefficients and the
+        # CUDA models fall back to an identity per channel
+        calib = dict(calib)
+        calib.pop("channel_transforms")
+        assert localize._pack_spline_user_info(calib).size == 7 + n_coeff
+
+    def test_link_xyz_model_ids_cover_the_supported_range(self):
+        # the map and the advertised maximum must not drift apart
+        assert sorted(localize._LINK_XYZ_MODEL_ID_NAMES) == list(
+            range(2, localize._LINK_XYZ_MAX_CHANNELS + 1)
+        )
+
+    def test_model_id_mapping_link_xyz(self):
+        if not localize.GPUFIT_INSTALLED:
+            pytest.skip("ModelID enum needs the Gpufit binding")
+        model = localize._LINK_XYZ_MODEL
+        # Gpufit fixes a model's parameter count at compile time, and link-XYZ
+        # needs 3 + 2*n_channels, so the channel count is encoded in the id.
+        # These literals are the wire contract with Gpufit.dll.
+        for n_channels, model_id in {
+            2: 15,
+            3: 16,
+            4: 17,
+            5: 18,
+            6: 19,
+        }.items():
+            assert localize._spline_model_id(model, n_channels) == model_id
+        # a bare call keeps meaning the original 2-channel model
+        assert localize._spline_model_id(model) == 15
+        for bad in (0, 1, localize._LINK_XYZ_MAX_CHANNELS + 1):
+            with pytest.raises(ValueError):
+                localize._spline_model_id(model, bad)
+        # the shared-amplitude model has 5 parameters whatever the channel
+        # count, so it ignores the argument
+        assert localize._spline_model_id("spline-3d-multichannel", 6) == (
+            localize.gf.ModelID.SPLINE_3D_MULTICHANNEL
+        )
+
+    @pytest.mark.parametrize("n_channels", [2, 3, 4, 5, 6])
+    def test_as_link_xyz_calibration_accepts_supported_channels(
+        self, n_channels
+    ):
+        calib = _fake_spline_calibration(
+            model="spline-3d-multichannel", n_channels=n_channels
+        )
+        link = localize._as_link_xyz_calibration(calib)
+        assert link["model"] == localize._LINK_XYZ_MODEL
+        # shallow copy: the original is untouched and the (large) coefficient
+        # table is shared, not duplicated
+        assert calib["model"] == "spline-3d-multichannel"
+        assert link["coefficients"] is calib["coefficients"]
+
+    @pytest.mark.parametrize("n_channels", [1, 7, 12])
+    def test_as_link_xyz_calibration_rejects_unsupported_channels(
+        self, n_channels
+    ):
+        calib = _fake_spline_calibration(
+            model="spline-3d-multichannel", n_channels=n_channels
+        )
+        with pytest.raises(ValueError, match="2 to 6 channels"):
+            localize._as_link_xyz_calibration(calib)
+
+    def test_as_link_xyz_calibration_requires_multichannel(self):
+        with pytest.raises(ValueError):
+            localize._as_link_xyz_calibration(
+                _fake_spline_calibration(model="spline-3d")
+            )
+
+    @pytest.mark.parametrize("n_channels", [2, 3, 4, 5, 6])
+    def test_initial_parameters_link_xyz_per_channel(self, n_channels):
+        calib = localize._as_link_xyz_calibration(
+            _fake_spline_calibration(
+                model="spline-3d-multichannel", n_channels=n_channels
+            )
+        )
+        rng = np.random.default_rng(0)
+        spots = rng.random((4, BOX, BOX, n_channels)).astype(np.float32)
+        # scale the channels apart so a transposed or channel-major/minor
+        # mix-up cannot pass
+        spots = spots * (1.0 + np.arange(n_channels, dtype=np.float32))
+        init = localize._initial_parameters_spline(spots, calib)
+        # [x, y, z, N_0..N_{c-1}, bg_0..bg_{c-1}]
+        assert init.shape == (4, 3 + 2 * n_channels)
+        np.testing.assert_allclose(init[:, :2], 0.0)
+        np.testing.assert_allclose(init[:, 2], -calib["z_center"])
+        ch_max = spots.max(axis=(1, 2))
+        ch_min = spots.min(axis=(1, 2))
+        np.testing.assert_allclose(
+            init[:, 3 : 3 + n_channels], ch_max - ch_min, rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            init[:, 3 + n_channels :], ch_min, rtol=1e-5
+        )
+
+    def test_run_gpufit_spline_rejects_mismatched_parameter_width(self):
+        # Gpufit sizes its output from initial_parameters but strides the
+        # device buffers by the ModelID's parameter count, so a too-narrow
+        # array would corrupt memory instead of raising. The guard runs before
+        # anything reaches the GPU.
+        if not localize.GPUFIT_INSTALLED:
+            pytest.skip("needs the Gpufit binding")
+        n_channels = 3
+        calib = localize._as_link_xyz_calibration(
+            _fake_spline_calibration(
+                model="spline-3d-multichannel", n_channels=n_channels
+            )
+        )
+        spots = np.zeros((2, BOX, BOX, n_channels), dtype=np.float32)
+        too_narrow = np.zeros((2, 3 + 2 * (n_channels - 1)), dtype=np.float32)
+        with pytest.raises(ValueError, match="initial parameters"):
+            localize._run_gpufit_spline(
+                spots, calib, initial_parameters=too_narrow
+            )
 
     def test_initial_parameters_multichannel_stacked(self):
         calib = _fake_spline_calibration(
@@ -3530,6 +3658,102 @@ class TestGaussCRLB:
         assert np.all(bright[1:5] < dim[1:5])
 
 
+def _link_xyz_theta(n_channels, n_locs=3, z_center=10.0, bg=2.0):
+    """``[x, y, z, N_0..N_{c-1}, bg_0..bg_{c-1}]`` with deliberately unequal
+    per-channel photons, so a channel mix-up cannot pass unnoticed."""
+    photons = 100.0 * (1.0 + np.arange(n_channels))
+    theta = np.zeros((n_locs, 3 + 2 * n_channels))
+    theta[:, 2] = -z_center
+    theta[:, 3 : 3 + n_channels] = photons
+    theta[:, 3 + n_channels :] = bg
+    return theta, photons
+
+
+class TestSplineLinkXyzColumns:
+    """Output columns of the photon-decoupled (link-XYZ) multichannel spline
+    fit. Pure numpy/numba - the constructor is a function of the fitted
+    parameters, so no GPU is needed."""
+
+    @staticmethod
+    def _ids(n_locs):
+        return pd.DataFrame(
+            {
+                "frame": np.arange(n_locs, dtype=np.uint32),
+                "x": np.full(n_locs, 20.0),
+                "y": np.full(n_locs, 30.0),
+                "net_gradient": np.full(n_locs, 100.0),
+            }
+        )
+
+    def _locs(self, n_channels, theta=None):
+        calib, _ = _gauss_spline_calibration(
+            model="spline-3d-multichannel", n_channels=n_channels
+        )
+        calib = localize._as_link_xyz_calibration(calib)
+        photons = None
+        if theta is None:
+            theta, photons = _link_xyz_theta(
+                n_channels, z_center=calib["z_center"]
+            )
+        locs = localize.locs_from_fits_spline(
+            self._ids(len(theta)),
+            theta,
+            BOX,
+            em=False,
+            calibration=calib,
+            mle=False,
+        )
+        return locs, photons
+
+    @pytest.mark.parametrize("n_channels", [2, 3, 4, 5, 6])
+    def test_emits_one_column_per_channel(self, n_channels):
+        locs, photons = self._locs(n_channels)
+        for c in range(n_channels):
+            assert f"photons_ch{c}" in locs.columns
+            assert f"bg_ch{c}" in locs.columns
+            assert f"rel_photons_ch{c}" in locs.columns
+        # nothing for channels this calibration does not have
+        assert f"photons_ch{n_channels}" not in locs.columns
+        assert f"rel_photons_ch{n_channels}" not in locs.columns
+        # the continuous readout replaced the old `color` column, and there is
+        # no bare `rel_photons`
+        assert "color" not in locs.columns
+        assert "rel_photons" not in locs.columns
+
+    @pytest.mark.parametrize("n_channels", [2, 3, 4, 5, 6])
+    def test_rel_photons_are_the_channel_shares(self, n_channels):
+        locs, photons = self._locs(n_channels)
+        rel = np.stack(
+            [locs[f"rel_photons_ch{c}"].to_numpy() for c in range(n_channels)],
+            axis=1,
+        )
+        # each channel's share of the total, summing to 1 per localization
+        np.testing.assert_allclose(rel.sum(axis=1), 1.0, rtol=1e-5)
+        np.testing.assert_allclose(
+            rel, np.broadcast_to(photons / photons.sum(), rel.shape), rtol=1e-5
+        )
+        per_ch = np.stack(
+            [locs[f"photons_ch{c}"].to_numpy() for c in range(n_channels)],
+            axis=1,
+        )
+        np.testing.assert_allclose(
+            locs["photons"].to_numpy(), per_ch.sum(axis=1), rtol=1e-5
+        )
+        np.testing.assert_allclose(per_ch, rel * photons.sum(), rtol=1e-5)
+
+    def test_rel_photons_nan_without_photons(self):
+        n_channels = 3
+        theta, _ = _link_xyz_theta(n_channels, n_locs=2)
+        theta[1, 3 : 3 + n_channels] = 0.0  # a spot that fitted no photons
+        locs, _ = self._locs(n_channels, theta=theta)
+        rel = np.stack(
+            [locs[f"rel_photons_ch{c}"].to_numpy() for c in range(n_channels)],
+            axis=1,
+        )
+        assert np.isfinite(rel[0]).all()
+        assert np.isnan(rel[1]).all()
+
+
 class TestSaveableColumns:
     """Guard the save whitelist: every column a fit path can emit must be
     registered in ``localize.LOCALIZATION_COLUMNS``. The GUI's
@@ -3630,6 +3854,46 @@ class TestSaveableColumns:
             stats["iterations"],
             BOX,
         )
+        # Photon-decoupled (link-XYZ) multichannel spline, at the largest
+        # channel count there is a fit model for - it emits the widest set of
+        # per-channel columns.
+        n_channels = localize._LINK_XYZ_MAX_CHANNELS
+        calib_mc, _ = _gauss_spline_calibration(
+            model="spline-3d-multichannel", n_channels=n_channels
+        )
+        calib_link = localize._as_link_xyz_calibration(calib_mc)
+        theta_link, _ = _link_xyz_theta(
+            n_channels, n_locs=2, z_center=calib_link["z_center"]
+        )
+        frames["spline-3d-link-xyz"] = localize.locs_from_fits_spline(
+            ids,
+            theta_link,
+            BOX,
+            em=False,
+            calibration=calib_link,
+            mle=False,
+        )
+
+        # Ratiometric multichannel spline: the shared-amplitude model plus the
+        # per-channel photons and the integer `color` (the assigned channel)
+        # that fit_spline_multichannel_ratiometric bolts on afterwards.
+        theta_mc = np.array(
+            [
+                [4000.0, 0.2, -0.15, -6.0, 20.0],
+                [3800.0, 0.1, -0.10, -5.0, 18.0],
+            ]
+        )
+        locs_ratio = localize.locs_from_fits_spline(
+            ids, theta_mc, BOX, em=False, calibration=calib_mc, mle=False
+        )
+        ratios = np.arange(1.0, n_channels + 1.0)
+        ratios /= ratios.sum()
+        for c in range(n_channels):
+            locs_ratio[f"photons_ch{c}"] = (
+                locs_ratio["photons"] * ratios[c]
+            ).astype(np.float32)
+        locs_ratio["color"] = np.int32(1)
+        frames["spline-3d-ratiometric"] = locs_ratio
         return frames
 
     def test_all_fit_columns_are_whitelisted(self):
@@ -4125,6 +4389,67 @@ class TestMultichannelWorkerRouting:
     def test_routes_to_plain_without_ratios(self, monkeypatch):
         calls, _ = self._run({"model": "spline-3d-multichannel"}, monkeypatch)
         assert calls == ["plain"]
+
+    def _run_unlinked(self, n_channels, monkeypatch, photon_ratios=None):
+        """Route with photons UNLINKED, recording which fitter ran and the
+        ``link_photons`` it was called with ("default" = not passed)."""
+        calls = []
+        df = pd.DataFrame({"frame": [0], "x": [0.0], "y": [0.0]})
+        monkeypatch.setattr(
+            localize,
+            "fit_spline_multichannel_ratiometric",
+            lambda *a, **k: (calls.append("ratio"), df)[1],
+        )
+        monkeypatch.setattr(
+            localize,
+            "fit_spline_multichannel",
+            lambda *a, **k: (
+                calls.append(("plain", k.get("link_photons", "default"))),
+                df,
+            )[1],
+        )
+        calibration = {
+            "model": "spline-3d-multichannel",
+            "n_channels": n_channels,
+        }
+        if photon_ratios is not None:
+            calibration["photon_ratios"] = photon_ratios
+        ids = pd.DataFrame(
+            {"frame": [0], "x": [6], "y": [6], "net_gradient": [1.0]}
+        )
+        worker = localize_gui.MultichannelSplineFitWorker(
+            [None] * n_channels,
+            [{}] * n_channels,
+            ids,
+            BOX,
+            calibration,
+            mle=False,
+            link_photons=False,
+        )
+        worker.run()
+        return calls
+
+    @pytest.mark.parametrize("n_channels", [2, 3, 4, 5, 6])
+    def test_unlinked_photons_route_to_link_xyz(self, n_channels, monkeypatch):
+        assert self._run_unlinked(n_channels, monkeypatch) == [
+            ("plain", False)
+        ]
+
+    def test_unlinked_photons_supersede_ratiometric(self, monkeypatch):
+        # photon decoupling fits the ratio instead of scanning hypotheses, so
+        # it wins over the ratiometric branch when both are possible
+        calls = self._run_unlinked(
+            4, monkeypatch, photon_ratios=[[0.4, 0.3, 0.2, 0.1]]
+        )
+        assert calls == [("plain", False)]
+
+    def test_unlinked_photons_above_cap_fall_back_to_linked(self, monkeypatch):
+        # no link-XYZ fit model is compiled beyond the cap, so the
+        # shared-amplitude model (which takes any channel count) is used
+        n_channels = localize._LINK_XYZ_MAX_CHANNELS + 1
+        assert self._run_unlinked(n_channels, monkeypatch) == [
+            ("plain", "default")
+        ]
 
     def test_fits_only_spots_linked_across_channels(self, monkeypatch):
         """Given every channel's identifications, the worker hands the fitter

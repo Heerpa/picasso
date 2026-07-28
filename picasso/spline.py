@@ -2846,13 +2846,12 @@ def _axial_precision_multichannel(
         return None
     # (n_spots, box, box) per channel -> (n_spots, box, box, n_channels)
     spots = np.ascontiguousarray(np.stack(spots_c, axis=-1))
-    # Refit with the model the user chose for this calibration: photon-decoupled
-    # (link-XYZ, model 15) when photons are unlinked and there are 2 channels,
-    # else the shared-amplitude model 11. The reported axial precision then
-    # matches how the data will actually be fitted.
+    # Refit with the model the user chose for this calibration
     n_channels = len(per_channel)
     link_photons = bool(calibration.get("link_photons", True))
-    if not link_photons and n_channels == 2:
+    if not link_photons and (
+        2 <= n_channels <= localize._LINK_XYZ_MAX_CHANNELS
+    ):
         fit_cal = localize._as_link_xyz_calibration(calibration)
         z_col = 2
     else:

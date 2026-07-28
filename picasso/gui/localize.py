@@ -117,13 +117,13 @@ def _normalize_rect(
 
 
 LINK_PHOTONS_TIP = (
-    "2-channel fitting only.\n\n'"
-    "CHECK to link photons + background across both channels. "
+    "2- to 6-channel fitting.\n\n"
+    "CHECK to link photons + background across all channels. "
     "Appropriate when the channels share one emission.\n\n"
     "UNCHECK to decouple: each channel fits a free photon count"
-    " + background, x/y/z shared.\n\n"
-    "Parameter sharing as in globLoc (Li et al., Nat Commun 13, 3133, 2022; "
-    "https://doi.org/10.1038/s41467-022-30719-4)."
+    " + background, x/y/z shared. Adds photons_ch<c>, bg_ch<c> and"
+    " rel_photons_ch<c> (the channel's share of the total photons)"
+    " to the localizations."
 )
 
 # Fitting models offered in the GUI, decoupled from the optimizer. Each
@@ -1338,10 +1338,8 @@ class CalibrateSplineDialog(lib.Dialog):
         self.correct_z_bias.setChecked(False)
         grid.addWidget(self.correct_z_bias, 5, 0, 1, 2)
 
-        # Multichannel (2-channel) default fit mode. Stored in the calibration
-        # and used to (a) run this calibration's axial-precision diagnostic with
-        # that model and (b) default the fit's "Link photons" toggle. The same
-        # coefficients serve both models, so it can still be flipped at fit time.
+        # Multichannel (2- to 6-channel) default fit mode. Stored in the
+        # calibration
         self.link_photons = QtWidgets.QCheckBox(
             "Link photon counts across channels"
         )
@@ -2690,8 +2688,9 @@ class ParametersDialog(lib.Dialog):
 
     def _update_link_photons_visibility(self) -> None:
         """Show the 'Link photons across channels' checkbox only for a
-        2-channel multichannel spline calibration - the sole case where photon
-        decoupling (model 15) is available."""
+        multichannel spline calibration with 2 to
+        ``localize._LINK_XYZ_MAX_CHANNELS`` channels - the range for which
+        photon-decoupled (link-XYZ) fit models are compiled into Gpufit."""
         # A config auto-load may call update_spline_calib during startup before
         # the fit UI (and this checkbox) is built; ignore until it exists.
         if not hasattr(self, "link_photons_checkbox"):
@@ -2702,7 +2701,9 @@ class ParametersDialog(lib.Dialog):
             cal.get("n_channels", len(cal.get("channel_transforms", []) or []))
         )
         is_multichannel = cal.get("model") == "spline-3d-multichannel"
-        show = is_multichannel and n_channels == 2
+        show = is_multichannel and (
+            2 <= n_channels <= localize._LINK_XYZ_MAX_CHANNELS
+        )
         if show:
             # default the toggle to the mode chosen when the calibration was
             # built (stored as "link_photons"); the user can still flip it.
@@ -3051,32 +3052,41 @@ class LocColumnSelectionDialog(lib.Dialog):
     """Dialog for selecting which columns to save in the localization
     file."""
 
+    # Target height of one on-screen column of checkboxes
+    _MAX_ROWS_PER_COLUMN = 20
+
     def __init__(self, parent: QtWidgets.QMainWindow) -> None:
         super().__init__(parent)
         self.setWindowTitle("Select columns to save")
-        self.setMinimumWidth(250)
         self.setModal(True)
-        vbox = QtWidgets.QVBoxLayout(self)
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
 
-        # add checkboxes
+        # one titled group box per LOCALIZATION_COLUMNS key, packed into as
+        # many side-by-side columns as it takes to stay under the row target
         self.column_checkboxes = {}
-        for column in localize.LOCALIZATION_COLUMNS["Base"]:
-            checkbox = QtWidgets.QCheckBox(column)
-            checkbox.setChecked(True)
-            self.column_checkboxes[column] = checkbox
-            vbox.addWidget(checkbox)
-            if column in lib.REQUIRED_COLUMNS:
-                checkbox.setDisabled(True)
-        for key, column in localize.LOCALIZATION_COLUMNS.items():
-            if key == "Base":
-                continue
-            for col in column:
-                checkbox = QtWidgets.QCheckBox(f"{col} ({key})")
+        screen_column = None
+        rows_used = 0
+        for key, columns in localize.LOCALIZATION_COLUMNS.items():
+            if (
+                screen_column is None
+                or rows_used + len(columns) > self._MAX_ROWS_PER_COLUMN
+            ):
+                screen_column = QtWidgets.QVBoxLayout()
+                screen_column.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+                layout.addLayout(screen_column)
+                rows_used = 0
+            group = QtWidgets.QGroupBox(key)
+            group_layout = QtWidgets.QVBoxLayout(group)
+            for column in columns:
+                checkbox = QtWidgets.QCheckBox(column)
                 checkbox.setChecked(True)
-                self.column_checkboxes[col] = checkbox
-                vbox.addWidget(checkbox)
-                if col in lib.REQUIRED_COLUMNS:
+                if column in lib.REQUIRED_COLUMNS:
                     checkbox.setDisabled(True)
+                self.column_checkboxes[column] = checkbox
+                group_layout.addWidget(checkbox)
+            screen_column.addWidget(group)
+            rows_used += len(columns)
 
         self.load_user_settings()
 
@@ -6593,8 +6603,9 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         self.calibration = calibration
         self.mle = mle
         # Link photons across channels (shared amplitude, model 11). When False
-        # and the calibration has 2 channels, fit the photon-decoupled model 15
-        # (globLoc link-XYZ): per-channel free photons/background
+        # and the calibration has 2 to 6 channels, fit the photon-decoupled
+        # link-XYZ model (one Gpufit id per channel count, 15..19): per-channel
+        # free photons/background
         self.link_photons = link_photons
         # Split-FOV: ``movies``/``camera_infos`` hold a single entry (one loaded
         # movie); the channels are regions of that movie, handled by
@@ -6702,7 +6713,9 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     link_photons=self.link_photons,
                     progress_callback=self.on_progress,
                 )
-            elif not self.link_photons and n_channels == 2:
+            elif not self.link_photons and (
+                2 <= n_channels <= localize._LINK_XYZ_MAX_CHANNELS
+            ):
                 # Photon decoupling (globLoc link-XYZ): free per-channel photons
                 # and background, shared x/y/z. Supersedes the ratiometric scan.
                 locs = localize.fit_spline_multichannel(

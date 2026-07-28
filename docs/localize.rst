@@ -355,10 +355,17 @@ To build it in the GUI, first load the channels:
 - **Separate movies** — ``File`` > ``Open channels from several movies`` (or ``Open one multichannel movie`` for a single file holding several channels). The first movie loaded is the **reference channel**.
 - **Split field of view** — if the channels are imaged side by side on one camera, load the single movie, tick **Regions = channels** in the ``Parameters`` dialog and drag the ROIs onto the channels. The first region is the reference channel; all regions are kept the same size (drag once to set the size, click to drop more, drag a region or use the arrow keys to fine-tune it).
 
-Then run ``Calibration`` > ``Calibrate spline PSF`` as for a single channel. The dialog is the same, with one additional option:
+Then run ``Calibration`` > ``Calibrate spline PSF`` as for a single channel. The dialog is the same, with an additional option:
 
-- **Link photon counts across channels** — on by default, so all channels share one photon count and background. Turn it off for a 2-channel calibration to fit per-channel photons and background instead (useful when the channels do not split the signal in a fixed ratio).
+- **Link photon counts across channels** — on by default, so all channels share one photon count and background. Turn it off (2 to 6 channels) to fit per-channel photons and background instead, with only ``x``, ``y`` and ``z`` shared.
+
+If photon counts are not linked, the resulting localizations contain per-channel columns, one set per channel ``c``:
+
+- ``photons_ch<c>`` and ``bg_ch<c>`` — that channel's photon count and background. ``photons`` and ``bg`` are their sums.
+- ``rel_photons_ch<c>`` — that channel's share of the total photons, so the values sum to 1 per localization.
+- ``color`` — an *integer* channel index, written by the ratiometric fit instead (the calibration carries candidate photon ratios and each localization is assigned the most likely one).
 
 Picasso builds a PSF for every channel and registers each non-reference channel to the reference by an affine transform estimated from matching beads; the per-channel PSFs and transforms are stored in one calibration ``.hdf5``. Alongside the usual diagnostic plot, a ``<base>_registration.png`` is written showing how well the channels align (residuals and the decomposed shift / rotation / scale / mirror) — check it before fitting.
 
 To fit, load the same channels, load the multichannel calibration under **Experimental PSF (spline)**, and run the fit with the ``Experimental PSF (cubic spline)`` model. Only spots detected in *every* channel are fitted, so identify each channel first. If the channel alignment has drifted since the bead stack was taken, ``Calibration`` > ``Re-align channels (current signal)`` re-estimates the transforms from the blinking data itself. Because the correction is derived by pairing the shared single-molecule signal frame by frame, a dialog first asks for the frame window to use and how many frames are evenly sampled from it. The result is reported per channel as the number of paired signals and the residual RMS (in camera pixels). **The re-alignment updates the loaded calibration only; the calibration file is never modified.**
+
