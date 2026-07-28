@@ -1508,6 +1508,107 @@ class CalibrateSplineDialog(lib.Dialog):
         )
 
 
+class RefineRegistrationDialog(lib.Dialog):
+    """Dialog for choosing which frames the signal-based channel re-alignment
+    considers.
+
+    The refinement pairs shared single-molecule signal frame by frame, so the
+    frames it samples matter: early frames of a movie are often too dense (or
+    still bleaching) to pair unambiguously, while late frames may be too
+    sparse. The user picks the frame window (1-indexed, inclusive) and how many
+    frames are evenly sampled from it."""
+
+    def __init__(
+        self,
+        window: QtWidgets.QWidget,
+        n_frames: int,
+        frame_range: list | None,
+    ) -> None:
+        super().__init__(window)
+        self.window = window
+        self.setWindowTitle("Re-align channels (signal)")
+        vbox = QtWidgets.QVBoxLayout(self)
+        info = QtWidgets.QLabel(
+            "Frames used to pair the shared single-molecule signal.\n"
+            "The sampled frames are spread evenly over the range."
+        )
+        vbox.addWidget(info)
+        grid = QtWidgets.QGridLayout()
+        vbox.addLayout(grid)
+
+        # frame window (1-indexed, inclusive), seeded from the identification
+        # frame range when a single segment is set
+        lo, hi = 1, max(1, int(n_frames))
+        if frame_range:
+            first = frame_range[0]
+            if not np.isscalar(first):
+                lo = max(1, int(first[0]) + 1)
+                hi = min(hi, int(frame_range[-1][1]) + 1)
+        grid.addWidget(QtWidgets.QLabel("First frame:"), 0, 0)
+        self.first_frame = QtWidgets.QSpinBox()
+        self.first_frame.setRange(1, max(1, int(n_frames)))
+        self.first_frame.setValue(lo)
+        grid.addWidget(self.first_frame, 0, 1)
+
+        grid.addWidget(QtWidgets.QLabel("Last frame:"), 1, 0)
+        self.last_frame = QtWidgets.QSpinBox()
+        self.last_frame.setRange(1, max(1, int(n_frames)))
+        self.last_frame.setValue(max(lo, hi))
+        grid.addWidget(self.last_frame, 1, 1)
+
+        sampled_label = QtWidgets.QLabel("Frames to sample:")
+        sampled_label.setToolTip(
+            "Number of frames evenly sampled from the range above.\n"
+            "Only these frames are detected on, so this bounds the runtime.\n"
+            "Increase it for sparse data (fewer blinks per frame)."
+        )
+        grid.addWidget(sampled_label, 2, 0)
+        self.max_frames = QtWidgets.QSpinBox()
+        self.max_frames.setRange(2, 10000)
+        self.max_frames.setValue(50)
+        grid.addWidget(self.max_frames, 2, 1)
+
+        # keep the window ordered
+        self.first_frame.valueChanged.connect(
+            lambda v: self.last_frame.setValue(max(v, self.last_frame.value()))
+        )
+        self.last_frame.valueChanged.connect(
+            lambda v: self.first_frame.setValue(
+                min(v, self.first_frame.value())
+            )
+        )
+
+        self.buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            QtCore.Qt.Orientation.Horizontal,
+            self,
+        )
+        vbox.addWidget(self.buttons)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+    @staticmethod
+    def getFrameSpecs(
+        parent: QtWidgets.QWidget,
+        n_frames: int,
+        frame_range: list | None = None,
+    ) -> tuple[list, int, bool]:
+        """Show the dialog and return the chosen ``frame_bounds`` (a single
+        0-indexed inclusive segment), the number of frames to sample and
+        whether the dialog was accepted."""
+        dialog = RefineRegistrationDialog(parent, n_frames, frame_range)
+        result = dialog.exec()
+        bounds = [
+            [dialog.first_frame.value() - 1, dialog.last_frame.value() - 1]
+        ]
+        return (
+            bounds,
+            dialog.max_frames.value(),
+            result == QtWidgets.QDialog.DialogCode.Accepted,
+        )
+
+
 class ROIDialog(lib.Dialog):
     """Sub-dialog for managing several regions of interest (ROIs)
     numerically.
@@ -5668,6 +5769,11 @@ class Window(QtWidgets.QMainWindow):
           movies are paired frame by frame, seeded from the calibration's
           existing transforms (see
           :func:`spline.refine_multichannel_transforms_from_signal`).
+
+        The frame window and the number of frames sampled from it are asked for
+        in :class:`RefineRegistrationDialog` (seeded from the identification
+        frame range), since which part of the movie pairs best is
+        data-dependent.
         """
         title = "Re-align channels (signal)"
         calibration = self.parameters_dialog.spline_calibration
@@ -5703,14 +5809,17 @@ class Window(QtWidgets.QMainWindow):
                 )
                 return
 
-            def _refine():
+            n_movie_frames = len(self.movie)
+
+            def _refine(frame_bounds, max_frames):
                 return spline.refine_split_fov_transforms_from_signal(
                     self.movie,
                     calibration,
                     regions,
                     minimum_ng=parameters["Min. Net Gradient"],
                     box=parameters["Box Size"],
-                    frame_bounds=self.frame_range,
+                    frame_bounds=frame_bounds,
+                    max_frames=max_frames,
                 )
 
         else:
@@ -5728,22 +5837,34 @@ class Window(QtWidgets.QMainWindow):
             # persist the active channel so every channel's movie is current
             self._snapshot_current_channel()
             movies = [self.channels[c].movie for c in range(n_channels)]
+            # the channels are frame-synchronized, so only frames present in
+            # every movie can be paired
+            n_movie_frames = min(len(m) for m in movies)
 
-            def _refine():
+            def _refine(frame_bounds, max_frames):
                 return spline.refine_multichannel_transforms_from_signal(
                     movies,
                     calibration,
                     minimum_ng=parameters["Min. Net Gradient"],
                     box=parameters["Box Size"],
-                    frame_bounds=self.frame_range,
+                    frame_bounds=frame_bounds,
+                    max_frames=max_frames,
                 )
+
+        # let the user pick the frames considered: the first frames of a movie
+        # are often too dense (or still bleaching) for unambiguous pairing
+        frame_bounds, max_frames, ok = RefineRegistrationDialog.getFrameSpecs(
+            self, n_movie_frames, self.frame_range
+        )
+        if not ok:
+            return
 
         self.status_bar.showMessage("Re-aligning channels from signal ...")
         QtWidgets.QApplication.setOverrideCursor(
             QtCore.Qt.CursorShape.WaitCursor
         )
         try:
-            _, reg_info = _refine()
+            _, reg_info = _refine(frame_bounds, max_frames)
         except Exception as e:
             QtWidgets.QApplication.restoreOverrideCursor()
             self.status_bar.showMessage("")
