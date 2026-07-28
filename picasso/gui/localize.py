@@ -3476,6 +3476,21 @@ class Window(QtWidgets.QMainWindow):
         go_to_frame_action.triggered.connect(self.to_frame)
         view_menu.addAction(go_to_frame_action)
         view_menu.addSeparator()
+        # Channel navigation (multichannel only). Disabled - and therefore
+        # not stealing the Up/Down keys from the split-FOV region nudging in
+        # View.keyPressEvent - until several channels are loaded (see
+        # _populate_channel_combo).
+        self.previous_channel_action = view_menu.addAction("Previous channel")
+        self.previous_channel_action.setShortcut("Up")
+        self.previous_channel_action.triggered.connect(self.previous_channel)
+        self.previous_channel_action.setEnabled(False)
+        view_menu.addAction(self.previous_channel_action)
+        self.next_channel_action = view_menu.addAction("Next channel")
+        self.next_channel_action.setShortcut("Down")
+        self.next_channel_action.triggered.connect(self.next_channel)
+        self.next_channel_action.setEnabled(False)
+        view_menu.addAction(self.next_channel_action)
+        view_menu.addSeparator()
         zoom_in_action = view_menu.addAction("Zoom in")
         zoom_in_action.setShortcuts(["Ctrl++", "Ctrl+="])
         zoom_in_action.triggered.connect(self.zoom_in)
@@ -4157,6 +4172,8 @@ class Window(QtWidgets.QMainWindow):
         self.channel_combo.blockSignals(False)
         multichannel = len(self.channels) > 1
         self.channel_combo.setVisible(multichannel)
+        self.previous_channel_action.setEnabled(multichannel)
+        self.next_channel_action.setEnabled(multichannel)
         self.parameters_dialog.link_groupbox.setVisible(multichannel)
         # Split-FOV (regions = channels of one movie) is incompatible with
         # separate-movie multichannel data
@@ -4173,6 +4190,14 @@ class Window(QtWidgets.QMainWindow):
         """Switch the active channel from the selector."""
         self.set_current_channel(index)
 
+    def previous_channel(self) -> None:
+        """Activate the channel above the current one (Up arrow)."""
+        self.set_current_channel(self.current_channel - 1)
+
+    def next_channel(self) -> None:
+        """Activate the channel below the current one (Down arrow)."""
+        self.set_current_channel(self.current_channel + 1)
+
     def set_current_channel(self, index: int) -> None:
         """Make channel ``index`` the active one, swapping the flat state
         and the Parameters/Contrast dialog values."""
@@ -4184,6 +4209,11 @@ class Window(QtWidgets.QMainWindow):
             return
         self._snapshot_current_channel()
         self.current_channel = index
+        # Keep the selector in sync for switches that did not come from it
+        # (keyboard navigation, multichannel identify batches).
+        self.channel_combo.blockSignals(True)
+        self.channel_combo.setCurrentIndex(index)
+        self.channel_combo.blockSignals(False)
         self._restore_current_channel()
         self.parameters_dialog.reset_quality_check()
 
