@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 import time
+import warnings
 
 import h5py
 import numpy as np
@@ -3422,6 +3423,30 @@ class TestSplineCRLBReal:
         crlb = localize._spline_crlb(thetas, calib, box)
         assert np.all(np.isfinite(crlb)) and np.all(crlb > 0)
 
+    @pytest.mark.skipif(
+        not localize.SPLINE_CRLB_CUDA_AVAILABLE,
+        reason="requires a CUDA-capable GPU (numba-cuda)",
+    )
+    def test_gpu_matches_cpu_on_real_coefficients(self):
+        """Parity on a genuinely non-separable, Gpuspline-generated coefficient
+        table - the analytic test spline cannot exercise that layout."""
+        calib, _, amplitude, offset = _synthetic_spline_3d_calibration()
+        box, _, nz = calib["n_data"]
+        rng = np.random.default_rng(0)
+        n = 500
+        thetas = np.zeros((n, 5))
+        thetas[:, 0] = amplitude * rng.uniform(0.5, 2.0, n)
+        thetas[:, 1] = rng.uniform(-0.7, 0.7, n)
+        thetas[:, 2] = rng.uniform(-0.7, 0.7, n)
+        thetas[:, 3] = -(calib["z_center"] + rng.uniform(-6.0, 6.0, n))
+        thetas[:, 4] = offset * rng.uniform(0.5, 2.0, n)
+        for mle in (True, False):
+            np.testing.assert_allclose(
+                _crlb(thetas, calib, box, mle=mle, gpu=True),
+                _crlb(thetas, calib, box, mle=mle, gpu=False),
+                rtol=1e-6,
+            )
+
 
 class TestSplineCRLB:
     """Cramer-Rao lower bounds for spline-fitted localizations. Uses a known
@@ -3556,6 +3581,466 @@ class TestSplineCRLB:
         assert seen and seen[-1] == n and seen == sorted(seen)
         # the tqdm ("console") path must not raise
         localize._spline_crlb(theta, calib, BOX, progress_callback="console")
+
+
+def _crlb(theta, calibration, box, *, gpu, **kwargs):
+    """``localize._spline_crlb`` pinned to one device.
+
+    Production dispatch is automatic (GPU when present, CPU otherwise), so
+    hiding the GPU is the only way to exercise the CPU path deliberately - and
+    the only way to compare the two against each other."""
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(localize, "SPLINE_CRLB_CUDA_AVAILABLE", gpu)
+        return localize._spline_crlb(theta, calibration, box, **kwargs)
+
+
+def _shared_theta(n, rng, n_params=5, nz=21):
+    """Well-spread fitted parameters for the shared-amplitude spline models,
+    ``[amplitude, x, y, (z,) offset]``."""
+    theta = np.zeros((n, n_params))
+    theta[:, 0] = rng.uniform(500.0, 8000.0, n)
+    theta[:, 1] = rng.uniform(-0.7, 0.7, n)
+    theta[:, 2] = rng.uniform(-0.7, 0.7, n)
+    if n_params == 5:
+        # native z = -z_shift, kept clear of the ends of the calibration stack
+        theta[:, 3] = -rng.uniform(4.0, nz - 5.0, n)
+    theta[:, -1] = rng.uniform(1.0, 50.0, n)
+    return theta
+
+
+def _link_xyz_calib_and_theta(n_channels, n_locs, rng, nz=21):
+    """Link-XYZ calibration on the separable Gaussian spline, plus a batch of
+    fitted parameters ``[x, y, z, N_0.., bg_0..]`` with unequal per-channel
+    photons so a channel mix-up cannot pass unnoticed."""
+    calib, _ = _gauss_spline_calibration(
+        model="spline-3d-multichannel", n_channels=n_channels, nz=nz
+    )
+    calib = localize._as_link_xyz_calibration(calib)
+    theta = np.zeros((n_locs, 3 + 2 * n_channels))
+    theta[:, 0] = rng.uniform(-0.7, 0.7, n_locs)
+    theta[:, 1] = rng.uniform(-0.7, 0.7, n_locs)
+    theta[:, 2] = -rng.uniform(4.0, nz - 5.0, n_locs)
+    theta[:, 3 : 3 + n_channels] = rng.uniform(
+        200.0, 3000.0, (n_locs, n_channels)
+    )
+    theta[:, 3 + n_channels :] = rng.uniform(2.0, 40.0, (n_locs, n_channels))
+    return calib, theta
+
+
+class TestSplineLinkXyzCRLB:
+    """Variances of the photon-decoupled (link-XYZ) spline model, the
+    ``(3 + 2*n_channels)``-parameter block-sparse kernel. CPU only; the GPU
+    parity tests live in ``TestSplineCRLBGPU``."""
+
+    @pytest.mark.parametrize("n_channels", [2, 3, 4, 5, 6])
+    @pytest.mark.parametrize("mle", [True, False])
+    def test_shape_and_positivity(self, n_channels, mle):
+        rng = np.random.default_rng(0)
+        calib, theta = _link_xyz_calib_and_theta(n_channels, 5, rng)
+        var = _crlb(theta, calib, BOX, mle=mle, gpu=False)
+        assert var.shape == (5, 3 + 2 * n_channels)
+        assert np.all(np.isfinite(var)) and np.all(var > 0)
+
+    def test_channel_order_is_carried_through(self):
+        """Reordering the channels permutes the per-channel variances and
+        leaves the shared x/y/z ones alone. Guards the block-sparse indexing
+        (``3 + ch`` for photons, ``3 + n_channels + ch`` for background), which
+        is where a channel mix-up would hide."""
+        n_channels = 4
+        calib, _ = _gauss_spline_calibration(
+            model="spline-3d-multichannel", n_channels=n_channels
+        )
+        # Make the channels distinguishable: without this a permutation is a
+        # no-op and the test proves nothing.
+        coeff = np.asarray(calib["coefficients"], dtype=np.float32).copy()
+        for c in range(n_channels):
+            coeff[..., c] *= 0.5 + 0.4 * c
+        calib["coefficients"] = coeff
+        calib = localize._as_link_xyz_calibration(calib)
+
+        rng = np.random.default_rng(1)
+        _, theta = _link_xyz_calib_and_theta(n_channels, 6, rng)
+        var = _crlb(theta, calib, BOX, gpu=False)
+
+        perm = np.array([2, 0, 3, 1])
+        permuted = dict(calib)
+        permuted["coefficients"] = coeff[..., perm]
+        theta_p = theta.copy()
+        theta_p[:, 3 : 3 + n_channels] = theta[:, 3 + perm]
+        theta_p[:, 3 + n_channels :] = theta[:, 3 + n_channels + perm]
+        var_p = _crlb(theta_p, permuted, BOX, gpu=False)
+
+        np.testing.assert_allclose(var_p[:, :3], var[:, :3], rtol=1e-9)
+        np.testing.assert_allclose(
+            var_p[:, 3 : 3 + n_channels],
+            var[:, 3 + perm],
+            rtol=1e-9,
+        )
+        np.testing.assert_allclose(
+            var_p[:, 3 + n_channels :],
+            var[:, 3 + n_channels + perm],
+            rtol=1e-9,
+        )
+
+    @pytest.mark.parametrize("n_channels", [2, 4])
+    def test_lsq_variance_geq_crlb(self, n_channels):
+        # Least squares is not efficient for Poisson data.
+        rng = np.random.default_rng(2)
+        calib, theta = _link_xyz_calib_and_theta(n_channels, 4, rng)
+        crlb = _crlb(theta, calib, BOX, mle=True, gpu=False)
+        lsq = _crlb(theta, calib, BOX, mle=False, gpu=False)
+        assert np.all(lsq >= crlb * (1 - 1e-6))
+
+    def test_nan_theta_row_isolated(self):
+        rng = np.random.default_rng(3)
+        calib, theta = _link_xyz_calib_and_theta(2, 2, rng)
+        theta[1, 3] = np.nan
+        var = _crlb(theta, calib, BOX, gpu=False)
+        assert np.all(np.isfinite(var[0]))
+        assert np.all(np.isnan(var[1]))
+
+    def test_progress_callback_and_console(self):
+        rng = np.random.default_rng(4)
+        calib, theta = _link_xyz_calib_and_theta(2, 120, rng)
+        seen = []
+        _crlb(theta, calib, BOX, progress_callback=seen.append, gpu=False)
+        assert seen and seen[-1] == len(theta) and seen == sorted(seen)
+        _crlb(theta, calib, BOX, progress_callback="console", gpu=False)
+
+
+class TestSplineCRLBEMCCD:
+    """EMCCD excess noise in the spline uncertainties. Stochastic electron
+    multiplication doubles every pixel's variance on top of the Poisson term,
+    so every reported variance has to double with it - for both estimators,
+    since that is a property of the detector and not of the fit. Matches
+    ``gausslq.localization_precision`` and ``_gauss_crlb``."""
+
+    @pytest.mark.parametrize("mle", [True, False])
+    @pytest.mark.parametrize(
+        "model", ["spline-2d", "spline-3d", "spline-3d-multichannel"]
+    )
+    def test_em_doubles_the_variance(self, model, mle):
+        calib, _ = _gauss_spline_calibration(model=model, n_channels=2)
+        rng = np.random.default_rng(0)
+        theta = _shared_theta(
+            32, rng, n_params=4 if model == "spline-2d" else 5
+        )
+        plain = localize._spline_crlb(theta, calib, BOX, mle=mle)
+        em = localize._spline_crlb(theta, calib, BOX, mle=mle, em=True)
+        np.testing.assert_allclose(em, 2.0 * plain, rtol=1e-12)
+
+    @pytest.mark.parametrize("mle", [True, False])
+    @pytest.mark.parametrize("n_channels", [2, 4])
+    def test_em_doubles_the_variance_link_xyz(self, n_channels, mle):
+        rng = np.random.default_rng(1)
+        calib, theta = _link_xyz_calib_and_theta(n_channels, 16, rng)
+        plain = localize._spline_crlb(theta, calib, BOX, mle=mle)
+        em = localize._spline_crlb(theta, calib, BOX, mle=mle, em=True)
+        np.testing.assert_allclose(em, 2.0 * plain, rtol=1e-12)
+
+    @pytest.mark.parametrize("mle", [True, False])
+    def test_em_reaches_the_reported_precisions(self, mle):
+        """The end-to-end check: ``em`` must survive the trip through
+        ``locs_from_fits_spline`` into lpx/lpy/lpz/photons_unc/bg_unc. It used
+        to be accepted there and silently dropped, leaving EMCCD precisions a
+        factor sqrt(2) too optimistic."""
+        calib, _ = _gauss_spline_calibration(model="spline-3d")
+        rng = np.random.default_rng(2)
+        theta = _shared_theta(24, rng)
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(len(theta), dtype=np.uint32),
+                "x": np.full(len(theta), 20.0),
+                "y": np.full(len(theta), 30.0),
+                "net_gradient": np.full(len(theta), 100.0),
+            }
+        )
+        cols = ["lpx", "lpy", "lpz", "photons_unc", "bg_unc"]
+        plain = localize.locs_from_fits_spline(
+            ids, theta, BOX, False, calib, mle=mle
+        )
+        em = localize.locs_from_fits_spline(
+            ids, theta, BOX, True, calib, mle=mle
+        )
+        for col in cols:
+            np.testing.assert_allclose(
+                em[col].to_numpy(),
+                np.sqrt(2.0) * plain[col].to_numpy(),
+                rtol=1e-5,
+            )
+
+
+requires_crlb_gpu = pytest.mark.skipif(
+    not localize.SPLINE_CRLB_CUDA_AVAILABLE,
+    reason="requires a CUDA-capable GPU (numba-cuda)",
+)
+
+
+class TestSplineCRLBGPU:
+    """The numba.cuda spline CRLB path.
+
+    The GPU reproduces the CPU kernels plus ``numpy.linalg.pinv`` rather than
+    approximating them, so these are parity tests, run through :func:`_crlb` to
+    pin each side to one device. The separable Gaussian test PSF makes that a
+    demanding comparison: ``dPhi/dz`` is proportional to ``Phi``, so the z and
+    amplitude columns are collinear and the information matrix is exactly rank
+    deficient - both paths have to truncate the same mode for the answers to
+    agree at all.
+    """
+
+    # Headroom for the pseudo-inverse of that rank-deficient matrix; on a real
+    # (well-conditioned) calibration the two agree to ~1e-8 relative.
+    RTOL = 1e-5
+
+    def test_no_cuda_uses_the_cpu_silently(self, monkeypatch):
+        """Without a CUDA device the CPU kernels are used, with no warning and
+        no way (or need) for the caller to ask for anything else."""
+        monkeypatch.setattr(localize, "SPLINE_CRLB_CUDA_AVAILABLE", False)
+        calib, _ = _gauss_spline_calibration(model="spline-2d")
+        theta = np.array([[3000.0, 0.1, -0.1, 15.0]])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            got = localize._spline_crlb(theta, calib, BOX)
+        np.testing.assert_array_equal(got, _crlb(theta, calib, BOX, gpu=False))
+
+    @pytest.mark.parametrize("model", ["spline-2d", "spline-3d"])
+    def test_unsolvable_rows_are_recomputed_on_the_cpu(
+        self, monkeypatch, model
+    ):
+        """Rows the device reports as unsolvable must come back with the CPU's
+        pinv numbers, not whatever the kernel left behind. Driven through a stub
+        device driver so it runs without a GPU - this fallback is the only
+        structural difference between the two paths, so it needs a test."""
+        monkeypatch.setattr(localize, "SPLINE_CRLB_CUDA_AVAILABLE", True)
+        calib, _ = _gauss_spline_calibration(model=model)
+        rng = np.random.default_rng(5)
+        n_params = 4 if model == "spline-2d" else 5
+        theta = _shared_theta(9, rng, n_params=n_params)
+        expected = _crlb(theta, calib, BOX, gpu=False)
+
+        def stub(
+            coeff,
+            box,
+            amp,
+            xs,
+            ys,
+            ze,
+            off,
+            finite,
+            mu_floor,
+            mle,
+            progress_callback=None,
+        ):
+            out = localize._spline_crlb_cpu(
+                np.asarray(coeff, dtype=np.float64),
+                box,
+                amp,
+                xs,
+                ys,
+                ze,
+                off,
+                finite,
+                mle,
+            )
+            failed = np.zeros(len(amp), dtype=bool)
+            failed[::2] = True
+            out[failed] = 12345.0  # device garbage the host must discard
+            return out, failed
+
+        monkeypatch.setattr(localize, "_spline_crlb_cuda", stub)
+        np.testing.assert_allclose(
+            _crlb(theta, calib, BOX, gpu=True), expected
+        )
+
+    def test_device_error_falls_back_and_warns_once(self, monkeypatch):
+        """A device that is present but fails still returns the right numbers,
+        but must not do it silently - a permanently broken GPU path would
+        otherwise never be noticed. (Having no device at all is not an error
+        and stays quiet; see test_no_cuda_uses_the_cpu_silently.)"""
+        monkeypatch.setattr(localize, "SPLINE_CRLB_CUDA_AVAILABLE", True)
+        monkeypatch.setattr(localize, "_crlb_gpu_fallback_warned", False)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("device on fire")
+
+        monkeypatch.setattr(localize, "_spline_crlb_cuda", boom)
+        calib, _ = _gauss_spline_calibration(model="spline-2d")
+        theta = np.array([[3000.0, 0.1, -0.1, 15.0]])
+        expected = _crlb(theta, calib, BOX, gpu=False)
+
+        with pytest.warns(RuntimeWarning, match="falling back to the CPU"):
+            got = localize._spline_crlb(theta, calib, BOX)
+        np.testing.assert_allclose(got, expected)
+
+        # warned once per process, not once per call
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            np.testing.assert_allclose(
+                localize._spline_crlb(theta, calib, BOX), expected
+            )
+
+    @requires_crlb_gpu
+    @pytest.mark.parametrize("mle", [True, False])
+    @pytest.mark.parametrize(
+        "model, n_channels",
+        [
+            ("spline-2d", 1),
+            ("spline-3d", 1),
+            ("spline-3d-multichannel", 2),
+            ("spline-3d-multichannel", 6),
+        ],
+    )
+    def test_matches_cpu(self, model, n_channels, mle):
+        calib, _ = _gauss_spline_calibration(
+            model=model, n_channels=n_channels
+        )
+        rng = np.random.default_rng(0)
+        theta = _shared_theta(
+            300, rng, n_params=4 if model == "spline-2d" else 5
+        )
+        np.testing.assert_allclose(
+            _crlb(theta, calib, BOX, mle=mle, gpu=True),
+            _crlb(theta, calib, BOX, mle=mle, gpu=False),
+            rtol=self.RTOL,
+        )
+
+    @requires_crlb_gpu
+    @pytest.mark.parametrize("mle", [True, False])
+    @pytest.mark.parametrize("n_channels", [2, 3, 4, 5, 6])
+    def test_link_xyz_matches_cpu(self, n_channels, mle):
+        rng = np.random.default_rng(1)
+        calib, theta = _link_xyz_calib_and_theta(n_channels, 200, rng)
+        gpu = _crlb(theta, calib, BOX, mle=mle, gpu=True)
+        cpu = _crlb(theta, calib, BOX, mle=mle, gpu=False)
+        assert gpu.shape == (200, 3 + 2 * n_channels)
+        np.testing.assert_allclose(gpu, cpu, rtol=self.RTOL)
+
+    @requires_crlb_gpu
+    def test_matches_closed_form_3d(self):
+        """Against the analytic reference, not just against the CPU - a port
+        that is systematically wrong could still match a co-wrong CPU path."""
+        calib, splines = _gauss_spline_calibration(
+            model="spline-3d", sx=1.0, sy=1.4
+        )
+        amp, off, z_shift = 4000.0, 20.0, -6.0
+        theta = np.array([[amp, 0.2, -0.15, z_shift, off]])
+        np.testing.assert_allclose(
+            _crlb(theta, calib, BOX, gpu=True)[0],
+            _ref_crlb(splines, BOX, amp, 0.2, -0.15, -z_shift, off),
+            rtol=1e-2,
+        )
+        np.testing.assert_allclose(
+            _crlb(theta, calib, BOX, mle=False, gpu=True)[0],
+            _ref_crlb_lsq(splines, BOX, amp, 0.2, -0.15, -z_shift, off),
+            rtol=1e-2,
+        )
+
+    @requires_crlb_gpu
+    def test_matches_closed_form_2d(self):
+        calib, splines = _gauss_spline_calibration(
+            model="spline-2d", sx=1.0, sy=1.3
+        )
+        amp, off = 3000.0, 15.0
+        theta = np.array([[amp, 0.1, -0.1, off]])
+        np.testing.assert_allclose(
+            _crlb(theta, calib, BOX, gpu=True)[0],
+            _ref_crlb(splines, BOX, amp, 0.1, -0.1, None, off),
+            rtol=1e-2,
+        )
+
+    @requires_crlb_gpu
+    @pytest.mark.parametrize("model", ["spline-2d", "spline-3d"])
+    def test_nan_theta_row_isolated(self, model):
+        calib, _ = _gauss_spline_calibration(model=model)
+        rng = np.random.default_rng(6)
+        n_params = 4 if model == "spline-2d" else 5
+        theta = _shared_theta(3, rng, n_params=n_params)
+        theta[1, 0] = np.nan
+        crlb = _crlb(theta, calib, BOX, gpu=True)
+        assert np.all(np.isfinite(crlb[0])) and np.all(np.isfinite(crlb[2]))
+        assert np.all(np.isnan(crlb[1]))
+
+    @requires_crlb_gpu
+    @pytest.mark.parametrize("model", ["spline-2d", "spline-3d"])
+    def test_empty_theta(self, model):
+        calib, _ = _gauss_spline_calibration(model=model)
+        n_params = 4 if model == "spline-2d" else 5
+        crlb = _crlb(np.zeros((0, n_params)), calib, BOX, gpu=True)
+        assert crlb.shape == (0, n_params)
+
+    @requires_crlb_gpu
+    def test_cropped_box_matches_cpu(self):
+        """The GPU must see the same centered crop the fit used."""
+        calib, _ = _gauss_spline_calibration(model="spline-3d", box=9)
+        calib = localize.crop_spline_calibration(calib, 7)
+        rng = np.random.default_rng(7)
+        theta = _shared_theta(64, rng)
+        np.testing.assert_allclose(
+            _crlb(theta, calib, 7, gpu=True),
+            _crlb(theta, calib, 7, gpu=False),
+            rtol=self.RTOL,
+        )
+
+    @requires_crlb_gpu
+    def test_low_signal_stays_finite(self):
+        # offset = 0 drives some model pixels to ~0; the MU_FLOOR guard keeps
+        # the Fisher weight (1 / mu) finite on the device too.
+        calib, _ = _gauss_spline_calibration(model="spline-2d")
+        theta = np.array([[500.0, 0.0, 0.0, 0.0]])
+        crlb = _crlb(theta, calib, BOX, gpu=True)[0]
+        assert np.all(np.isfinite(crlb))
+        np.testing.assert_allclose(
+            crlb,
+            _crlb(theta, calib, BOX, gpu=False)[0],
+            rtol=self.RTOL,
+        )
+
+    @requires_crlb_gpu
+    def test_progress_callback_and_console(self):
+        calib, _ = _gauss_spline_calibration(model="spline-3d")
+        rng = np.random.default_rng(8)
+        theta = _shared_theta(250, rng)
+        seen = []
+        _crlb(theta, calib, BOX, progress_callback=seen.append, gpu=True)
+        assert seen and seen[-1] == len(theta) and seen == sorted(seen)
+        _crlb(theta, calib, BOX, progress_callback="console", gpu=True)
+
+    @pytest.mark.slow
+    def test_simulator_matches_cpu(self):
+        """Under Numba's CUDA simulator (no physical GPU needed) the kernels and
+        the device pseudo-inverse reproduce the CPU path. Runs in a subprocess
+        because the simulator must be enabled before numba is imported. Kept
+        tiny - the simulator interprets every thread in Python."""
+        import subprocess
+
+        script = (
+            "import os\n"
+            "os.environ['NUMBA_ENABLE_CUDASIM'] = '1'\n"
+            "import numpy as np\n"
+            "import matplotlib\n"
+            "matplotlib.use('Agg')\n"
+            "import sys; sys.path.insert(0, '.')\n"
+            "from picasso import localize\n"
+            "from tests.test_localize import ("
+            "_gauss_spline_calibration, _shared_theta, _crlb, BOX)\n"
+            "assert localize.SPLINE_CRLB_CUDA_AVAILABLE, 'simulator off'\n"
+            "rng = np.random.default_rng(0)\n"
+            "for model in ('spline-2d', 'spline-3d'):\n"
+            "    calib, _ = _gauss_spline_calibration(model=model)\n"
+            "    p = 4 if model == 'spline-2d' else 5\n"
+            "    theta = _shared_theta(3, rng, n_params=p)\n"
+            "    for mle in (True, False):\n"
+            "        g = _crlb("
+            "theta, calib, BOX, mle=mle, gpu=True)\n"
+            "        c = _crlb("
+            "theta, calib, BOX, mle=mle, gpu=False)\n"
+            "        np.testing.assert_allclose(g, c, rtol=1e-5)\n"
+            "print('SIMOK')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True
+        )
+        assert "SIMOK" in result.stdout, result.stdout + result.stderr
 
 
 def _gauss_model(theta, box, rotated):
