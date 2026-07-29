@@ -12,6 +12,7 @@ sequence.
 
 from __future__ import annotations
 
+import math
 import os
 import multiprocessing
 import threading
@@ -25,6 +26,7 @@ from datetime import datetime
 
 import numba
 import numpy as np
+from numba import cuda
 import dask.array as da
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -43,6 +45,13 @@ from . import (
     zfit,
     __version__,
 )
+
+# Check for CUDA availability for spline CRLB calculations. Otherwise,
+# CPU is used
+try:
+    SPLINE_CRLB_CUDA_AVAILABLE = bool(cuda.is_available())
+except Exception:
+    SPLINE_CRLB_CUDA_AVAILABLE = False
 
 try:
     from .ext.pygpufit import gpufit as gf
@@ -75,6 +84,10 @@ _SPLINE_CRLB_CHUNK_BYTES = 64 << 20
 _GAUSS_CRLB_MU_FLOOR = (
     1e-3  # photons; floors 1 / mu in the Poisson Fisher weight
 )
+# EMCCD stochastic multiplication doubles every pixel's variance (excess noise
+# factor F^2 = 2), so every variance derived from a Poisson pixel model has to
+# be scaled by it. Same factor as in gausslq.localization_precision.
+_EM_EXCESS_NOISE_FACTOR = 2.0
 
 # Largest channel count the photon-decoupled (link-XYZ) spline fit supports.
 _LINK_XYZ_MAX_CHANNELS = 6
@@ -1791,6 +1804,9 @@ def fit2D(
         localize_info["Spline calibration path"] = spline_calibration.get(
             "Path", "N/A"
         )
+        localize_info["Spline CRLB device"] = (
+            "GPU" if SPLINE_CRLB_CUDA_AVAILABLE else "CPU"
+        )
     new_info = localize_info | camera_info
     return locs, new_info
 
@@ -2137,7 +2153,7 @@ def _gauss_crlb(
     if em:
         # EMCCD excess noise doubles every pixel's variance, hence the CRLB
         # (matches the factor-2 in gausslq.localization_precision).
-        crlb *= 2.0
+        crlb *= _EM_EXCESS_NOISE_FACTOR
     crlb = np.where(crlb > 0.0, crlb, np.nan)
     return crlb
 
@@ -3642,43 +3658,961 @@ def _spline_infomats_link_xyz_3d(
                     meat[m, b_, a_] = meat[m, a_, b_]
 
 
-def _spline_link_xyz_crlb(
-    theta: lib.FloatArray2D,
-    calibration: dict,
+# ---------------------------------------------------------------------------
+# CUDA (numba.cuda) spline CRLB
+# ---------------------------------------------------------------------------
+
+_SPLINE_CRLB_PINV_RCOND = 1e-15
+_SPLINE_CRLB_JACOBI_SWEEPS = 30
+_SPLINE_CRLB_JACOBI_TOL = 1e-30
+
+# Largest link-XYZ parameter count. Device-local arrays need a compile-time
+# constant shape, so one kernel is compiled at this size for every channel count
+# and indexes the leading ``n_params`` rows and columns.
+_LINK_XYZ_MAX_P = 3 + 2 * _LINK_XYZ_MAX_CHANNELS
+
+_SPLINE_CRLB_CUDA_THREADS = 128
+# Device working set (inputs + outputs) per kernel launch. Chunking bounds
+# device memory and paces the progress callback; unlike the host path there is
+# no (n, P, P) matrix stack to budget for, so the chunks are large.
+_SPLINE_CRLB_CUDA_CHUNK_BYTES = 256 << 20
+# Ceiling on one launch, so a display-attached GPU cannot trip a watchdog
+# timeout on a single enormous grid.
+_SPLINE_CRLB_CUDA_MAX_ROWS = 4_000_000
+
+
+# ---------------------------------------------------------------------------
+# Device helpers
+# ---------------------------------------------------------------------------
+
+
+@cuda.jit(device=True)
+def _sym_pinv_device(a, n, v, lam) -> int:
+    """Moore-Penrose pseudo-inverse of the symmetric ``a[:n, :n]``, in place.
+
+    Cyclic Jacobi eigendecomposition ``a = V Λ Vᵀ``, then
+    ``a⁺ = Σ_{|λ| > rcond·max|λ|} v vᵀ / λ``. ``v`` and ``lam`` are per-thread
+    scratch of at least ``(n, n)`` and ``(n,)``. Returns 0 on success, 1 if the
+    sweeps did not converge (the caller then hands that localization back to the
+    host).
+
+    A plain inverse would be cheaper, but the information matrix is genuinely
+    rank deficient whenever the model's parameters are locally collinear - a PSF
+    whose z-dependence is a pure rescaling makes the z and amplitude columns
+    proportional, and then only the truncating pseudo-inverse gives a finite
+    answer. The CPU path uses ``numpy.linalg.pinv``.
+    """
+    for p in range(n):
+        for q in range(n):
+            v[p, q] = 1.0 if p == q else 0.0
+    converged = False
+    for _ in range(_SPLINE_CRLB_JACOBI_SWEEPS):
+        off = 0.0
+        fro = 0.0
+        for p in range(n):
+            fro += a[p, p] * a[p, p]
+            for q in range(p + 1, n):
+                off += a[p, q] * a[p, q]
+        fro += 2.0 * off
+        if off <= _SPLINE_CRLB_JACOBI_TOL * fro:
+            converged = True
+            break
+        for p in range(n - 1):
+            for q in range(p + 1, n):
+                apq = a[p, q]
+                if apq == 0.0:
+                    continue
+                # Rotation that annihilates a[p, q]; the smaller root of
+                # t² + 2θt - 1 = 0 keeps the rotation angle below 45°.
+                theta = (a[q, q] - a[p, p]) / (2.0 * apq)
+                sgn = 1.0 if theta >= 0.0 else -1.0
+                t = sgn / (abs(theta) + math.sqrt(theta * theta + 1.0))
+                c = 1.0 / math.sqrt(t * t + 1.0)
+                s = t * c
+                for k in range(n):  # a <- a J
+                    akp = a[k, p]
+                    akq = a[k, q]
+                    a[k, p] = c * akp - s * akq
+                    a[k, q] = s * akp + c * akq
+                for k in range(n):  # a <- Jᵀ a
+                    apk = a[p, k]
+                    aqk = a[q, k]
+                    a[p, k] = c * apk - s * aqk
+                    a[q, k] = s * apk + c * aqk
+                for k in range(n):  # v <- v J
+                    vkp = v[k, p]
+                    vkq = v[k, q]
+                    v[k, p] = c * vkp - s * vkq
+                    v[k, q] = s * vkp + c * vkq
+    if not converged:
+        return 1
+    biggest = 0.0
+    for p in range(n):
+        lam[p] = a[p, p]
+        if abs(lam[p]) > biggest:
+            biggest = abs(lam[p])
+    cutoff = _SPLINE_CRLB_PINV_RCOND * biggest
+    for p in range(n):
+        for q in range(p, n):
+            acc = 0.0
+            for k in range(n):
+                if abs(lam[k]) > cutoff:
+                    acc += v[p, k] * v[q, k] / lam[k]
+            a[p, q] = acc
+            a[q, p] = acc
+    return 0
+
+
+@cuda.jit(device=True)
+def _crlb_diag_device(ainv, meat, n, mle, out, m) -> None:
+    """Write the covariance diagonal of localization ``m`` into ``out``.
+
+    With ``mle`` the covariance is the inverse Fisher matrix itself, so the
+    diagonal is read straight off ``ainv``. Otherwise it is the unweighted
+    least-squares sandwich ``diag(J⁻¹ M J⁻¹)``, evaluated using the symmetry of
+    ``J⁻¹`` so only its ``p``-th row is needed per parameter.
+    """
+    for p in range(n):
+        if mle:
+            out[m, p] = ainv[p, p]
+        else:
+            s = 0.0
+            for k in range(n):
+                t = 0.0
+                for ll in range(n):
+                    t += meat[k, ll] * ainv[p, ll]
+                s += ainv[p, k] * t
+            out[m, p] = s
+
+
+# ---------------------------------------------------------------------------
+# Kernels
+# ---------------------------------------------------------------------------
+
+
+@cuda.jit(cache=True)
+def _spline_crlb_3d_kernel(
+    coeff,
+    box,
+    amp,
+    x_shift,
+    y_shift,
+    z_eval,
+    offset,
+    finite,
+    mu_floor,
+    mle,
+    crlb,
+    status,
+) -> None:
+    """One thread per localization: covariance diagonal of the 3D cubic-spline
+    model, parameter order [x, y, z, amplitude, offset]. CUDA transcription of
+    :func:`_spline_infomats_3d` with the solve fused in. ``coeff`` is
+    ``(n_channels, niz, niy, nix, 4, 4, 4)``; ``crlb`` is ``(n_locs, 5)`` and
+    ``status`` ``(n_locs,)`` (0 ok, 1 not positive definite).
+    """
+    m = cuda.grid(1)
+    if m >= amp.shape[0]:
+        return
+    status[m] = 0
+    if finite[m] == 0:
+        # Skipped rows are NaN-masked on the host; write a definite value so no
+        # uninitialized device memory is ever copied back.
+        for p in range(5):
+            crlb[m, p] = 0.0
+        return
+    n_channels = coeff.shape[0]
+    niz = coeff.shape[1]
+    niy = coeff.shape[2]
+    nix = coeff.shape[3]
+    a = amp[m]
+    o = offset[m]
+    # bread accumulators (f*): Fisher when mle else Gauss-Newton normal J.
+    f00 = f01 = f02 = f03 = f04 = 0.0
+    f11 = f12 = f13 = f14 = 0.0
+    f22 = f23 = f24 = 0.0
+    f33 = f34 = 0.0
+    f44 = 0.0
+    # meat accumulators (s*): least-squares sandwich M = Σ μ g gᵀ (0 if mle).
+    s00 = s01 = s02 = s03 = s04 = 0.0
+    s11 = s12 = s13 = s14 = 0.0
+    s22 = s23 = s24 = 0.0
+    s33 = s34 = 0.0
+    s44 = 0.0
+    # z basis (one slice per localization)
+    zc = z_eval[m]
+    zi = int(math.floor(zc))
+    zi = 0 if zi < 0 else (niz - 1 if zi > niz - 1 else zi)
+    fz = zc - zi
+    pz0, pz1, pz2, pz3 = 1.0, fz, fz * fz, fz * fz * fz
+    dz1, dz2, dz3 = 1.0, 2.0 * fz, 3.0 * fz * fz
+    for ch in range(n_channels):
+        for i in range(box):
+            xco = i - x_shift[m]
+            xi = int(math.floor(xco))
+            xi = 0 if xi < 0 else (nix - 1 if xi > nix - 1 else xi)
+            fx = xco - xi
+            px0, px1, px2, px3 = 1.0, fx, fx * fx, fx * fx * fx
+            dx1, dx2, dx3 = 1.0, 2.0 * fx, 3.0 * fx * fx
+            for j in range(box):
+                yco = j - y_shift[m]
+                yi = int(math.floor(yco))
+                yi = 0 if yi < 0 else (niy - 1 if yi > niy - 1 else yi)
+                fy = yco - yi
+                py0, py1, py2, py3 = 1.0, fy, fy * fy, fy * fy * fy
+                dy1, dy2, dy3 = 1.0, 2.0 * fy, 3.0 * fy * fy
+                phi = gx = gy = gz = 0.0
+                for zp in range(4):
+                    pzv = (
+                        pz0
+                        if zp == 0
+                        else (pz1 if zp == 1 else (pz2 if zp == 2 else pz3))
+                    )
+                    dzv = (
+                        0.0
+                        if zp == 0
+                        else (dz1 if zp == 1 else (dz2 if zp == 2 else dz3))
+                    )
+                    for yp in range(4):
+                        pyv = (
+                            py0
+                            if yp == 0
+                            else (
+                                py1 if yp == 1 else (py2 if yp == 2 else py3)
+                            )
+                        )
+                        dyv = (
+                            0.0
+                            if yp == 0
+                            else (
+                                dy1 if yp == 1 else (dy2 if yp == 2 else dy3)
+                            )
+                        )
+                        for xp in range(4):
+                            cf = coeff[ch, zi, yi, xi, zp, yp, xp]
+                            pxv = (
+                                px0
+                                if xp == 0
+                                else (
+                                    px1
+                                    if xp == 1
+                                    else (px2 if xp == 2 else px3)
+                                )
+                            )
+                            dxv = (
+                                0.0
+                                if xp == 0
+                                else (
+                                    dx1
+                                    if xp == 1
+                                    else (dx2 if xp == 2 else dx3)
+                                )
+                            )
+                            phi += cf * pzv * pyv * pxv
+                            gx += cf * pzv * pyv * dxv
+                            gy += cf * pzv * dyv * pxv
+                            gz += cf * dzv * pyv * pxv
+                mu = o + a * phi
+                if mu < mu_floor:
+                    mu = mu_floor
+                # bread weight wa (1/μ Fisher, else 1) and meat weight wb
+                # (μ for the least-squares sandwich, else unused).
+                if mle:
+                    wa = 1.0 / mu
+                    wb = 0.0
+                else:
+                    wa = 1.0
+                    wb = mu
+                # d(mu)/d(param); the CRLB diagonal is sign-invariant per
+                # parameter, so native-coordinate vs shift sign is irrelevant.
+                d0, d1, d2, d3 = a * gx, a * gy, a * gz, phi
+                f00 += d0 * d0 * wa
+                f01 += d0 * d1 * wa
+                f02 += d0 * d2 * wa
+                f03 += d0 * d3 * wa
+                f04 += d0 * wa
+                f11 += d1 * d1 * wa
+                f12 += d1 * d2 * wa
+                f13 += d1 * d3 * wa
+                f14 += d1 * wa
+                f22 += d2 * d2 * wa
+                f23 += d2 * d3 * wa
+                f24 += d2 * wa
+                f33 += d3 * d3 * wa
+                f34 += d3 * wa
+                f44 += wa
+                s00 += d0 * d0 * wb
+                s01 += d0 * d1 * wb
+                s02 += d0 * d2 * wb
+                s03 += d0 * d3 * wb
+                s04 += d0 * wb
+                s11 += d1 * d1 * wb
+                s12 += d1 * d2 * wb
+                s13 += d1 * d3 * wb
+                s14 += d1 * wb
+                s22 += d2 * d2 * wb
+                s23 += d2 * d3 * wb
+                s24 += d2 * wb
+                s33 += d3 * d3 * wb
+                s34 += d3 * wb
+                s44 += wb
+    bread = cuda.local.array((5, 5), numba.float64)
+    meat = cuda.local.array((5, 5), numba.float64)
+    vecs = cuda.local.array((5, 5), numba.float64)
+    lam = cuda.local.array(5, numba.float64)
+    bread[0, 0] = f00
+    bread[0, 1] = bread[1, 0] = f01
+    bread[0, 2] = bread[2, 0] = f02
+    bread[0, 3] = bread[3, 0] = f03
+    bread[0, 4] = bread[4, 0] = f04
+    bread[1, 1] = f11
+    bread[1, 2] = bread[2, 1] = f12
+    bread[1, 3] = bread[3, 1] = f13
+    bread[1, 4] = bread[4, 1] = f14
+    bread[2, 2] = f22
+    bread[2, 3] = bread[3, 2] = f23
+    bread[2, 4] = bread[4, 2] = f24
+    bread[3, 3] = f33
+    bread[3, 4] = bread[4, 3] = f34
+    bread[4, 4] = f44
+    meat[0, 0] = s00
+    meat[0, 1] = meat[1, 0] = s01
+    meat[0, 2] = meat[2, 0] = s02
+    meat[0, 3] = meat[3, 0] = s03
+    meat[0, 4] = meat[4, 0] = s04
+    meat[1, 1] = s11
+    meat[1, 2] = meat[2, 1] = s12
+    meat[1, 3] = meat[3, 1] = s13
+    meat[1, 4] = meat[4, 1] = s14
+    meat[2, 2] = s22
+    meat[2, 3] = meat[3, 2] = s23
+    meat[2, 4] = meat[4, 2] = s24
+    meat[3, 3] = s33
+    meat[3, 4] = meat[4, 3] = s34
+    meat[4, 4] = s44
+    if _sym_pinv_device(bread, 5, vecs, lam) != 0:
+        status[m] = 1
+        for p in range(5):
+            crlb[m, p] = 0.0
+        return
+    _crlb_diag_device(bread, meat, 5, mle, crlb, m)
+
+
+@cuda.jit(cache=True)
+def _spline_crlb_2d_kernel(
+    coeff,
+    box,
+    amp,
+    x_shift,
+    y_shift,
+    offset,
+    finite,
+    mu_floor,
+    mle,
+    crlb,
+    status,
+) -> None:
+    """2D analogue of :func:`_spline_crlb_3d_kernel`, transcribing
+    :func:`_spline_infomats_2d`. ``coeff`` is
+    ``(n_channels, niy, nix, 4, 4)``; parameter order [x, y, amplitude, offset].
+    """
+    m = cuda.grid(1)
+    if m >= amp.shape[0]:
+        return
+    status[m] = 0
+    if finite[m] == 0:
+        for p in range(4):
+            crlb[m, p] = 0.0
+        return
+    n_channels = coeff.shape[0]
+    niy = coeff.shape[1]
+    nix = coeff.shape[2]
+    a = amp[m]
+    o = offset[m]
+    # bread accumulators (f*): Fisher when mle else Gauss-Newton normal J.
+    f00 = f01 = f02 = f03 = 0.0
+    f11 = f12 = f13 = 0.0
+    f22 = f23 = 0.0
+    f33 = 0.0
+    # meat accumulators (s*): least-squares sandwich M = Σ μ g gᵀ (0 if mle).
+    s00 = s01 = s02 = s03 = 0.0
+    s11 = s12 = s13 = 0.0
+    s22 = s23 = 0.0
+    s33 = 0.0
+    for ch in range(n_channels):
+        for i in range(box):
+            xco = i - x_shift[m]
+            xi = int(math.floor(xco))
+            xi = 0 if xi < 0 else (nix - 1 if xi > nix - 1 else xi)
+            fx = xco - xi
+            px0, px1, px2, px3 = 1.0, fx, fx * fx, fx * fx * fx
+            dx1, dx2, dx3 = 1.0, 2.0 * fx, 3.0 * fx * fx
+            for j in range(box):
+                yco = j - y_shift[m]
+                yi = int(math.floor(yco))
+                yi = 0 if yi < 0 else (niy - 1 if yi > niy - 1 else yi)
+                fy = yco - yi
+                py0, py1, py2, py3 = 1.0, fy, fy * fy, fy * fy * fy
+                dy1, dy2, dy3 = 1.0, 2.0 * fy, 3.0 * fy * fy
+                phi = gx = gy = 0.0
+                for yp in range(4):
+                    pyv = (
+                        py0
+                        if yp == 0
+                        else (py1 if yp == 1 else (py2 if yp == 2 else py3))
+                    )
+                    dyv = (
+                        0.0
+                        if yp == 0
+                        else (dy1 if yp == 1 else (dy2 if yp == 2 else dy3))
+                    )
+                    for xp in range(4):
+                        cf = coeff[ch, yi, xi, yp, xp]
+                        pxv = (
+                            px0
+                            if xp == 0
+                            else (
+                                px1 if xp == 1 else (px2 if xp == 2 else px3)
+                            )
+                        )
+                        dxv = (
+                            0.0
+                            if xp == 0
+                            else (
+                                dx1 if xp == 1 else (dx2 if xp == 2 else dx3)
+                            )
+                        )
+                        phi += cf * pyv * pxv
+                        gx += cf * pyv * dxv
+                        gy += cf * dyv * pxv
+                mu = o + a * phi
+                if mu < mu_floor:
+                    mu = mu_floor
+                if mle:
+                    wa = 1.0 / mu
+                    wb = 0.0
+                else:
+                    wa = 1.0
+                    wb = mu
+                d0, d1, d2 = a * gx, a * gy, phi
+                f00 += d0 * d0 * wa
+                f01 += d0 * d1 * wa
+                f02 += d0 * d2 * wa
+                f03 += d0 * wa
+                f11 += d1 * d1 * wa
+                f12 += d1 * d2 * wa
+                f13 += d1 * wa
+                f22 += d2 * d2 * wa
+                f23 += d2 * wa
+                f33 += wa
+                s00 += d0 * d0 * wb
+                s01 += d0 * d1 * wb
+                s02 += d0 * d2 * wb
+                s03 += d0 * wb
+                s11 += d1 * d1 * wb
+                s12 += d1 * d2 * wb
+                s13 += d1 * wb
+                s22 += d2 * d2 * wb
+                s23 += d2 * wb
+                s33 += wb
+    bread = cuda.local.array((4, 4), numba.float64)
+    meat = cuda.local.array((4, 4), numba.float64)
+    vecs = cuda.local.array((4, 4), numba.float64)
+    lam = cuda.local.array(4, numba.float64)
+    bread[0, 0] = f00
+    bread[0, 1] = bread[1, 0] = f01
+    bread[0, 2] = bread[2, 0] = f02
+    bread[0, 3] = bread[3, 0] = f03
+    bread[1, 1] = f11
+    bread[1, 2] = bread[2, 1] = f12
+    bread[1, 3] = bread[3, 1] = f13
+    bread[2, 2] = f22
+    bread[2, 3] = bread[3, 2] = f23
+    bread[3, 3] = f33
+    meat[0, 0] = s00
+    meat[0, 1] = meat[1, 0] = s01
+    meat[0, 2] = meat[2, 0] = s02
+    meat[0, 3] = meat[3, 0] = s03
+    meat[1, 1] = s11
+    meat[1, 2] = meat[2, 1] = s12
+    meat[1, 3] = meat[3, 1] = s13
+    meat[2, 2] = s22
+    meat[2, 3] = meat[3, 2] = s23
+    meat[3, 3] = s33
+    if _sym_pinv_device(bread, 4, vecs, lam) != 0:
+        status[m] = 1
+        for p in range(4):
+            crlb[m, p] = 0.0
+        return
+    _crlb_diag_device(bread, meat, 4, mle, crlb, m)
+
+
+@cuda.jit(cache=True)
+def _spline_crlb_link_xyz_kernel(
+    coeff,
+    box,
+    x_shift,
+    y_shift,
+    z_eval,
+    photons,
+    bg,
+    finite,
+    mu_floor,
+    mle,
+    crlb,
+    status,
+) -> None:
+    """One thread per localization: covariance diagonal of the photon-decoupled
+    (link-XYZ) 3D cubic-spline model, parameter order
+    ``[x, y, z, N_0..N_{c-1}, bg_0..bg_{c-1}]``. CUDA transcription of
+    :func:`_spline_infomats_link_xyz_3d` with the solve fused in.
+
+    The CPU kernel accumulates through a dense ``n_params``-long gradient
+    vector; here the block sparsity is spelled out instead. Each pixel touches
+    only 15 distinct matrix entries - the six shared x/y/z ones plus nine that
+    belong to its own channel - so all of them live in registers, and the nine
+    channel-local ones are written out once per channel. The summation order is
+    the CPU's, so the two agree to rounding.
+    """
+    m = cuda.grid(1)
+    if m >= x_shift.shape[0]:
+        return
+    n_channels = coeff.shape[0]
+    n_params = 3 + 2 * n_channels
+    status[m] = 0
+    if finite[m] == 0:
+        for p in range(n_params):
+            crlb[m, p] = 0.0
+        return
+    niz = coeff.shape[1]
+    niy = coeff.shape[2]
+    nix = coeff.shape[3]
+
+    bread = cuda.local.array((_LINK_XYZ_MAX_P, _LINK_XYZ_MAX_P), numba.float64)
+    meat = cuda.local.array((_LINK_XYZ_MAX_P, _LINK_XYZ_MAX_P), numba.float64)
+    vecs = cuda.local.array((_LINK_XYZ_MAX_P, _LINK_XYZ_MAX_P), numba.float64)
+    lam = cuda.local.array(_LINK_XYZ_MAX_P, numba.float64)
+    # The cross-channel photon/background blocks are structurally zero (a pixel
+    # belongs to exactly one channel), so clear both matrices once and then fill
+    # only the blocks that are actually touched.
+    for p in range(n_params):
+        for q in range(n_params):
+            bread[p, q] = 0.0
+            meat[p, q] = 0.0
+
+    # Shared x/y/z block, accumulated across every channel.
+    xx = xy = xz = yy = yz = zz = 0.0
+    sxx = sxy = sxz = syy = syz = szz = 0.0
+    zc = z_eval[m]
+    zi = int(math.floor(zc))
+    zi = 0 if zi < 0 else (niz - 1 if zi > niz - 1 else zi)
+    fz = zc - zi
+    pz0, pz1, pz2, pz3 = 1.0, fz, fz * fz, fz * fz * fz
+    dz1, dz2, dz3 = 1.0, 2.0 * fz, 3.0 * fz * fz
+    for ch in range(n_channels):
+        nc = photons[m, ch]
+        bgc = bg[m, ch]
+        # This channel's own photon (n) and background (b) entries.
+        bxn = byn = bzn = bxb = byb = bzb = bnn = bnb = bbb = 0.0
+        sxn = syn = szn = sxb = syb = szb = snn = snb = sbb = 0.0
+        for i in range(box):
+            xco = i - x_shift[m]
+            xi = int(math.floor(xco))
+            xi = 0 if xi < 0 else (nix - 1 if xi > nix - 1 else xi)
+            fx = xco - xi
+            px0, px1, px2, px3 = 1.0, fx, fx * fx, fx * fx * fx
+            dx1, dx2, dx3 = 1.0, 2.0 * fx, 3.0 * fx * fx
+            for j in range(box):
+                yco = j - y_shift[m]
+                yi = int(math.floor(yco))
+                yi = 0 if yi < 0 else (niy - 1 if yi > niy - 1 else yi)
+                fy = yco - yi
+                py0, py1, py2, py3 = 1.0, fy, fy * fy, fy * fy * fy
+                dy1, dy2, dy3 = 1.0, 2.0 * fy, 3.0 * fy * fy
+                phi = gx = gy = gz = 0.0
+                for zp in range(4):
+                    pzv = (
+                        pz0
+                        if zp == 0
+                        else (pz1 if zp == 1 else (pz2 if zp == 2 else pz3))
+                    )
+                    dzv = (
+                        0.0
+                        if zp == 0
+                        else (dz1 if zp == 1 else (dz2 if zp == 2 else dz3))
+                    )
+                    for yp in range(4):
+                        pyv = (
+                            py0
+                            if yp == 0
+                            else (
+                                py1 if yp == 1 else (py2 if yp == 2 else py3)
+                            )
+                        )
+                        dyv = (
+                            0.0
+                            if yp == 0
+                            else (
+                                dy1 if yp == 1 else (dy2 if yp == 2 else dy3)
+                            )
+                        )
+                        for xp in range(4):
+                            cf = coeff[ch, zi, yi, xi, zp, yp, xp]
+                            pxv = (
+                                px0
+                                if xp == 0
+                                else (
+                                    px1
+                                    if xp == 1
+                                    else (px2 if xp == 2 else px3)
+                                )
+                            )
+                            dxv = (
+                                0.0
+                                if xp == 0
+                                else (
+                                    dx1
+                                    if xp == 1
+                                    else (dx2 if xp == 2 else dx3)
+                                )
+                            )
+                            phi += cf * pzv * pyv * pxv
+                            gx += cf * pzv * pyv * dxv
+                            gy += cf * pzv * dyv * pxv
+                            gz += cf * dzv * pyv * pxv
+                mu = bgc + nc * phi
+                if mu < mu_floor:
+                    mu = mu_floor
+                if mle:
+                    wa = 1.0 / mu
+                    wb = 0.0
+                else:
+                    wa = 1.0
+                    wb = mu
+                # Gradient columns: x/y/z scale with this channel's photons, the
+                # photon column is phi and the background column is 1.
+                d0, d1, d2 = nc * gx, nc * gy, nc * gz
+                xx += d0 * d0 * wa
+                xy += d0 * d1 * wa
+                xz += d0 * d2 * wa
+                yy += d1 * d1 * wa
+                yz += d1 * d2 * wa
+                zz += d2 * d2 * wa
+                bxn += d0 * phi * wa
+                byn += d1 * phi * wa
+                bzn += d2 * phi * wa
+                bxb += d0 * wa
+                byb += d1 * wa
+                bzb += d2 * wa
+                bnn += phi * phi * wa
+                bnb += phi * wa
+                bbb += wa
+                sxx += d0 * d0 * wb
+                sxy += d0 * d1 * wb
+                sxz += d0 * d2 * wb
+                syy += d1 * d1 * wb
+                syz += d1 * d2 * wb
+                szz += d2 * d2 * wb
+                sxn += d0 * phi * wb
+                syn += d1 * phi * wb
+                szn += d2 * phi * wb
+                sxb += d0 * wb
+                syb += d1 * wb
+                szb += d2 * wb
+                snn += phi * phi * wb
+                snb += phi * wb
+                sbb += wb
+        cn = 3 + ch
+        cb = 3 + n_channels + ch
+        bread[0, cn] = bread[cn, 0] = bxn
+        bread[1, cn] = bread[cn, 1] = byn
+        bread[2, cn] = bread[cn, 2] = bzn
+        bread[0, cb] = bread[cb, 0] = bxb
+        bread[1, cb] = bread[cb, 1] = byb
+        bread[2, cb] = bread[cb, 2] = bzb
+        bread[cn, cn] = bnn
+        bread[cn, cb] = bread[cb, cn] = bnb
+        bread[cb, cb] = bbb
+        meat[0, cn] = meat[cn, 0] = sxn
+        meat[1, cn] = meat[cn, 1] = syn
+        meat[2, cn] = meat[cn, 2] = szn
+        meat[0, cb] = meat[cb, 0] = sxb
+        meat[1, cb] = meat[cb, 1] = syb
+        meat[2, cb] = meat[cb, 2] = szb
+        meat[cn, cn] = snn
+        meat[cn, cb] = meat[cb, cn] = snb
+        meat[cb, cb] = sbb
+    bread[0, 0] = xx
+    bread[0, 1] = bread[1, 0] = xy
+    bread[0, 2] = bread[2, 0] = xz
+    bread[1, 1] = yy
+    bread[1, 2] = bread[2, 1] = yz
+    bread[2, 2] = zz
+    meat[0, 0] = sxx
+    meat[0, 1] = meat[1, 0] = sxy
+    meat[0, 2] = meat[2, 0] = sxz
+    meat[1, 1] = syy
+    meat[1, 2] = meat[2, 1] = syz
+    meat[2, 2] = szz
+    if _sym_pinv_device(bread, n_params, vecs, lam) != 0:
+        status[m] = 1
+        for p in range(n_params):
+            crlb[m, p] = 0.0
+        return
+    _crlb_diag_device(bread, meat, n_params, mle, crlb, m)
+
+
+# ---------------------------------------------------------------------------
+# CUDA CRLB host drivers (launch the kernels above)
+# ---------------------------------------------------------------------------
+
+
+def _require_crlb_cuda() -> None:
+    if not SPLINE_CRLB_CUDA_AVAILABLE:
+        raise RuntimeError(
+            "GPU spline CRLB requested but no CUDA-capable GPU is available."
+        )
+
+
+def _crlb_chunk_rows(bytes_per_row: int) -> int:
+    """Localizations per kernel launch for a given per-row device footprint."""
+    rows = max(1024, _SPLINE_CRLB_CUDA_CHUNK_BYTES // max(bytes_per_row, 1))
+    return int(min(rows, _SPLINE_CRLB_CUDA_MAX_ROWS))
+
+
+def _spline_crlb_cuda(
+    coeff: np.ndarray,
     box: int,
-    residuals: np.ndarray | None = None,
-    mle: bool = True,
+    amplitude: lib.FloatArray1D,
+    x_shift: lib.FloatArray1D,
+    y_shift: lib.FloatArray1D,
+    z_eval: lib.FloatArray1D | None,
+    offset: lib.FloatArray1D,
+    finite: np.ndarray,
+    mu_floor: float,
+    mle: bool,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> tuple[lib.FloatArray2D, np.ndarray]:
+    """Covariance diagonal of the shared-amplitude spline models on the GPU.
+
+    Array-in / array-out counterpart of :func:`_spline_crlb_cpu`; the
+    caller owns the calibration parsing and the NaN masking. ``z_eval`` None
+    selects the 2D model.
+
+    Returns
+    -------
+    crlb : lib.FloatArray2D
+        ``(n_locs, 4 or 5)`` raw variances.
+    failed : np.ndarray
+        Boolean mask of localizations whose information matrix the device could
+        not diagonalize. Their ``crlb`` rows are meaningless and the caller is
+        expected to recompute them on the CPU.
+    """
+    _require_crlb_cuda()
+    is_3d = z_eval is not None
+    n_params = 5 if is_3d else 4
+    n_locs = len(amplitude)
+    crlb = np.empty((n_locs, n_params), dtype=np.float64)
+    failed = np.zeros(n_locs, dtype=bool)
+    if n_locs == 0:
+        return crlb, failed
+
+    amplitude = np.ascontiguousarray(amplitude, dtype=np.float64)
+    x_shift = np.ascontiguousarray(x_shift, dtype=np.float64)
+    y_shift = np.ascontiguousarray(y_shift, dtype=np.float64)
+    offset = np.ascontiguousarray(offset, dtype=np.float64)
+    if is_3d:
+        z_eval = np.ascontiguousarray(z_eval, dtype=np.float64)
+    finite_u8 = np.ascontiguousarray(finite).astype(np.uint8)
+
+    d_coeff = cuda.to_device(np.ascontiguousarray(coeff))
+    # inputs (amp, x, y, [z], offset) + outputs (crlb row, status byte)
+    n_inputs = 5 if is_3d else 4
+    chunk = min(n_locs, _crlb_chunk_rows(8 * (n_inputs + n_params) + 1))
+
+    use_tqdm = progress_callback == "console"
+    do_callback = callable(progress_callback)
+    pbar = (
+        tqdm(total=n_locs, desc="Computing spline CRLB", unit="locs")
+        if use_tqdm
+        else None
+    )
+    for start in range(0, n_locs, chunk):
+        stop = min(start + chunk, n_locs)
+        n = stop - start
+        d_amp = cuda.to_device(amplitude[start:stop])
+        d_x = cuda.to_device(x_shift[start:stop])
+        d_y = cuda.to_device(y_shift[start:stop])
+        d_off = cuda.to_device(offset[start:stop])
+        d_finite = cuda.to_device(finite_u8[start:stop])
+        d_crlb = cuda.device_array((n, n_params), dtype=np.float64)
+        d_status = cuda.device_array(n, dtype=np.uint8)
+        blocks = (
+            n + _SPLINE_CRLB_CUDA_THREADS - 1
+        ) // _SPLINE_CRLB_CUDA_THREADS
+        if is_3d:
+            d_z = cuda.to_device(z_eval[start:stop])
+            _spline_crlb_3d_kernel[blocks, _SPLINE_CRLB_CUDA_THREADS](
+                d_coeff,
+                box,
+                d_amp,
+                d_x,
+                d_y,
+                d_z,
+                d_off,
+                d_finite,
+                mu_floor,
+                mle,
+                d_crlb,
+                d_status,
+            )
+        else:
+            _spline_crlb_2d_kernel[blocks, _SPLINE_CRLB_CUDA_THREADS](
+                d_coeff,
+                box,
+                d_amp,
+                d_x,
+                d_y,
+                d_off,
+                d_finite,
+                mu_floor,
+                mle,
+                d_crlb,
+                d_status,
+            )
+        crlb[start:stop] = d_crlb.copy_to_host()
+        failed[start:stop] = d_status.copy_to_host() != 0
+        if use_tqdm:
+            pbar.update(n)
+        elif do_callback:
+            progress_callback(stop)
+    if use_tqdm:
+        pbar.close()
+    return crlb, failed
+
+
+def _spline_link_xyz_crlb_cuda(
+    coeff: np.ndarray,
+    box: int,
+    x_shift: lib.FloatArray1D,
+    y_shift: lib.FloatArray1D,
+    z_eval: lib.FloatArray1D,
+    photons: lib.FloatArray2D,
+    bg: lib.FloatArray2D,
+    finite: np.ndarray,
+    mu_floor: float,
+    mle: bool,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> tuple[lib.FloatArray2D, np.ndarray]:
+    """Covariance diagonal of the photon-decoupled (link-XYZ) spline model on
+    the GPU. Array-in / array-out counterpart of
+    :func:`_spline_link_xyz_crlb_cpu`; see :func:`_spline_crlb_cuda` for the
+    return convention."""
+    _require_crlb_cuda()
+    n_channels = coeff.shape[0]
+    n_params = 3 + 2 * n_channels
+    if n_params > _LINK_XYZ_MAX_P:
+        raise ValueError(
+            f"link-XYZ CRLB on the GPU supports up to "
+            f"{(_LINK_XYZ_MAX_P - 3) // 2} channels, got {n_channels}."
+        )
+    n_locs = len(x_shift)
+    crlb = np.empty((n_locs, n_params), dtype=np.float64)
+    failed = np.zeros(n_locs, dtype=bool)
+    if n_locs == 0:
+        return crlb, failed
+
+    x_shift = np.ascontiguousarray(x_shift, dtype=np.float64)
+    y_shift = np.ascontiguousarray(y_shift, dtype=np.float64)
+    z_eval = np.ascontiguousarray(z_eval, dtype=np.float64)
+    photons = np.ascontiguousarray(photons, dtype=np.float64)
+    bg = np.ascontiguousarray(bg, dtype=np.float64)
+    finite_u8 = np.ascontiguousarray(finite).astype(np.uint8)
+
+    d_coeff = cuda.to_device(np.ascontiguousarray(coeff))
+    # inputs (x, y, z, photons, bg) + outputs (crlb row, status byte)
+    chunk = min(
+        n_locs, _crlb_chunk_rows(8 * (3 + 2 * n_channels + n_params) + 1)
+    )
+
+    use_tqdm = progress_callback == "console"
+    do_callback = callable(progress_callback)
+    pbar = (
+        tqdm(total=n_locs, desc="Computing spline CRLB", unit="locs")
+        if use_tqdm
+        else None
+    )
+    for start in range(0, n_locs, chunk):
+        stop = min(start + chunk, n_locs)
+        n = stop - start
+        d_x = cuda.to_device(x_shift[start:stop])
+        d_y = cuda.to_device(y_shift[start:stop])
+        d_z = cuda.to_device(z_eval[start:stop])
+        d_photons = cuda.to_device(photons[start:stop])
+        d_bg = cuda.to_device(bg[start:stop])
+        d_finite = cuda.to_device(finite_u8[start:stop])
+        d_crlb = cuda.device_array((n, n_params), dtype=np.float64)
+        d_status = cuda.device_array(n, dtype=np.uint8)
+        blocks = (
+            n + _SPLINE_CRLB_CUDA_THREADS - 1
+        ) // _SPLINE_CRLB_CUDA_THREADS
+        _spline_crlb_link_xyz_kernel[blocks, _SPLINE_CRLB_CUDA_THREADS](
+            d_coeff,
+            box,
+            d_x,
+            d_y,
+            d_z,
+            d_photons,
+            d_bg,
+            d_finite,
+            mu_floor,
+            mle,
+            d_crlb,
+            d_status,
+        )
+        crlb[start:stop] = d_crlb.copy_to_host()
+        failed[start:stop] = d_status.copy_to_host() != 0
+        if use_tqdm:
+            pbar.update(n)
+        elif do_callback:
+            progress_callback(stop)
+    if use_tqdm:
+        pbar.close()
+    return crlb, failed
+
+
+def _spline_link_xyz_crlb_cpu(
+    coeff: np.ndarray,
+    aff: np.ndarray,
+    res: np.ndarray,
+    box: int,
+    x_shift: lib.FloatArray1D,
+    y_shift: lib.FloatArray1D,
+    z_eval: lib.FloatArray1D,
+    photons: lib.FloatArray2D,
+    bg: lib.FloatArray2D,
+    finite: np.ndarray,
+    mle: bool,
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
 ) -> lib.FloatArray2D:
-    """CRLB / least-squares variances for the photon-decoupled (link-XYZ) fit.
-
-    Same estimator theory as :func:`_spline_crlb`, but for the
-    ``(3 + 2*n_channels)``-parameter model
-    ``[x, y, z, N_0..N_{c-1}, bg_0..bg_{c-1}]`` (see
-    :func:`_spline_infomats_link_xyz_3d`). Returns
-    ``(n_locs, 3 + 2*n_channels)`` variances in that parameter order."""
-    theta = np.asarray(theta, dtype=np.float64)
-    n_locs = len(theta)
-    n_channels = _spline_n_channels(calibration)
+    """CPU (numba) parameter variances for the photon-decoupled (link-XYZ)
+    model. The numerical core of :func:`_spline_link_xyz_crlb`, split out so it
+    can also be run on a subset of rows (the GPU path falls back here for
+    localizations the device could not diagonalize). ``aff`` and ``res`` are the
+    per-channel affine and ROI residuals the fit used (see
+    :func:`_spline_channel_affines` / :func:`_spline_crlb_residuals`); ``res``
+    must already be sliced to the same rows as ``x_shift``. Returns the raw
+    ``(n_locs, 3 + 2*n_channels)`` covariance diagonal; masking non-finite and
+    non-positive entries is the caller's job."""
+    n_channels = coeff.shape[0]
     n_params = 3 + 2 * n_channels
-
-    coeff = _spline_coeff_reshaped(calibration)
-    x_shift = np.ascontiguousarray(theta[:, 0])
-    y_shift = np.ascontiguousarray(theta[:, 1])
-    # Native z sampling coordinate = -z_shift (see _spline_crlb).
-    z_eval = np.ascontiguousarray(-theta[:, 2])
-    photons = np.ascontiguousarray(theta[:, 3 : 3 + n_channels])
-    bg = np.ascontiguousarray(theta[:, 3 + n_channels : 3 + 2 * n_channels])
-    finite = np.isfinite(theta).all(axis=1)
-
-    bread = np.tile(np.eye(n_params), (max(n_locs, 1), 1, 1))
-    meat = np.zeros((max(n_locs, 1), n_params, n_params))
-    # same per-channel geometry as the fit (affine + ROI residual), so
-    # the reported precision belongs to the model actually fitted
-    aff = _spline_channel_affines(calibration, n_channels)
-    res = _spline_crlb_residuals(residuals, n_locs, n_channels)
+    n_locs = len(x_shift)
 
     use_tqdm = progress_callback == "console"
     do_callback = callable(progress_callback)
@@ -3695,7 +4629,7 @@ def _spline_link_xyz_crlb(
         stop = min(start + chunk, n_locs)
         sl = slice(start, stop)
         # Rows the kernel skips (non-finite theta) keep the identity, so the
-        # batched pinv stays well-defined; they become NaN below.
+        # batched pinv stays well-defined; the caller NaNs them.
         bread = np.tile(np.eye(n_params), (stop - start, 1, 1))
         meat = np.zeros((stop - start, n_params, n_params))
         _spline_infomats_link_xyz_3d(
@@ -3720,6 +4654,104 @@ def _spline_link_xyz_crlb(
             crlb[sl] = np.diagonal(cov, axis1=1, axis2=2)
         if do_callback:
             progress_callback(stop)
+    return crlb
+
+
+def _spline_link_xyz_crlb(
+    theta: lib.FloatArray2D,
+    calibration: dict,
+    box: int,
+    residuals: np.ndarray | None = None,
+    mle: bool = True,
+    em: bool = False,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> lib.FloatArray2D:
+    """CRLB / least-squares variances for the photon-decoupled (link-XYZ) fit.
+
+    Same estimator theory as :func:`_spline_crlb`, but for the
+    ``(3 + 2*n_channels)``-parameter model
+    ``[x, y, z, N_0..N_{c-1}, bg_0..bg_{c-1}]`` (see
+    :func:`_spline_infomats_link_xyz_3d`). ``residuals`` are the per-channel
+    sub-pixel ROI offsets the fit used, as in :func:`_spline_crlb`, and ``em``
+    applies the same EMCCD excess-noise doubling. Returns
+    ``(n_locs, 3 + 2*n_channels)`` variances in that parameter order."""
+    theta = np.asarray(theta, dtype=np.float64)
+    n_locs = len(theta)
+    n_channels = _spline_n_channels(calibration)
+
+    x_shift = np.ascontiguousarray(theta[:, 0])
+    y_shift = np.ascontiguousarray(theta[:, 1])
+    # Native z sampling coordinate = -z_shift (see _spline_crlb).
+    z_eval = np.ascontiguousarray(-theta[:, 2])
+    photons = np.ascontiguousarray(theta[:, 3 : 3 + n_channels])
+    bg = np.ascontiguousarray(theta[:, 3 + n_channels : 3 + 2 * n_channels])
+    finite = np.isfinite(theta).all(axis=1)
+    # same per-channel geometry as the fit (affine + ROI residual), so
+    # the reported precision belongs to the model actually fitted
+    aff = _spline_channel_affines(calibration, n_channels)
+    res = _spline_crlb_residuals(residuals, n_locs, n_channels)
+
+    crlb = None
+    if SPLINE_CRLB_CUDA_AVAILABLE:
+        try:
+            crlb, failed = _spline_link_xyz_crlb_cuda(
+                _spline_coeff_reshaped(
+                    calibration, dtype=_spline_crlb_coeff_dtype(calibration)
+                ),
+                aff,
+                res,
+                box,
+                x_shift,
+                y_shift,
+                z_eval,
+                photons,
+                bg,
+                finite,
+                _SPLINE_CRLB_MU_FLOOR,
+                mle,
+                progress_callback=progress_callback,
+            )
+        except Exception as exc:
+            # Degrade to the CPU (e.g. device out of memory while Gpufit still
+            # holds allocations) rather than failing the whole fit.
+            _warn_crlb_gpu_fallback(exc)
+            crlb = None
+        else:
+            if failed.any():
+                # The device could not diagonalize these information matrices;
+                # redo just those rows through the CPU kernel and pinv.
+                crlb[failed] = _spline_link_xyz_crlb_cpu(
+                    _spline_coeff_reshaped(calibration),
+                    aff,
+                    res[failed],
+                    box,
+                    x_shift[failed],
+                    y_shift[failed],
+                    z_eval[failed],
+                    photons[failed],
+                    bg[failed],
+                    finite[failed],
+                    mle,
+                )
+    if crlb is None:
+        crlb = _spline_link_xyz_crlb_cpu(
+            _spline_coeff_reshaped(calibration),
+            aff,
+            res,
+            box,
+            x_shift,
+            y_shift,
+            z_eval,
+            photons,
+            bg,
+            finite,
+            mle,
+            progress_callback=progress_callback,
+        )
+    if em:
+        crlb *= _EM_EXCESS_NOISE_FACTOR
     crlb[~finite] = np.nan
     crlb = np.where(crlb > 0.0, crlb, np.nan)
     return crlb
@@ -3764,13 +4796,19 @@ def _spline_crlb_residuals(
     return res
 
 
-def _spline_coeff_reshaped(calibration: dict) -> np.ndarray:
+def _spline_coeff_reshaped(
+    calibration: dict, dtype: type = np.float64
+) -> np.ndarray:
     """Raw calibration coefficients as ``(n_channels, niz, niy, nix, 4, 4, 4)``
     (3D) or ``(n_channels, niy, nix, 4, 4)`` (2D), float64 for the numba kernels.
     The flat C-order buffer is the Gpuspline-binding layout (see
-    :func:`_spline_model_and_grad`)."""
+    :func:`_spline_model_and_grad`).
+
+    ``dtype`` narrows the output; the CUDA kernels ask for float32 when the
+    calibration itself is float32 (see :func:`_spline_crlb_coeff_dtype`), which
+    halves the device-side table without losing any information."""
     model = calibration["model"]
-    coeff = np.ascontiguousarray(calibration["coefficients"], dtype=np.float64)
+    coeff = np.ascontiguousarray(calibration["coefficients"], dtype=dtype)
     if model in ("spline-3d-multichannel", _LINK_XYZ_MODEL):
         _, nix, niy, niz, n_channels = coeff.shape
         return np.stack(
@@ -3781,116 +4819,91 @@ def _spline_coeff_reshaped(calibration: dict) -> np.ndarray:
                 for c in range(n_channels)
             ]
         )
+    # Single-channel models get their leading channel axis from reshape rather
+    # than ``[None]``: the latter gives that axis stride 0, which numba (CPU and
+    # CUDA alike) types as a non-contiguous array and then indexes through
+    # computed strides - several times slower for no reason.
     if model == "spline-2d":
         _, nix, niy = coeff.shape
-        return coeff.reshape(niy, nix, 4, 4)[None]
+        return coeff.reshape(1, niy, nix, 4, 4)
     _, nix, niy, niz = coeff.shape
-    return coeff.reshape(niz, niy, nix, 4, 4, 4)[None]
+    return coeff.reshape(1, niz, niy, nix, 4, 4, 4)
 
 
-def _spline_crlb(
-    theta: lib.FloatArray2D,
-    calibration: dict,
+def _spline_crlb_coeff_dtype(calibration: dict) -> type:
+    """Precision to upload the spline coefficients to the GPU in.
+
+    Calibrations are stored float32 (``io.load_spline_calibration``), so
+    widening them for the device would cost bandwidth without adding
+    information - the kernels widen each coefficient to float64 in-register
+    anyway, which is what the CPU kernels do in bulk. Anything not already
+    float32 is passed through as float64."""
+    if np.asarray(calibration["coefficients"]).dtype == np.float32:
+        return np.float32
+    return np.float64
+
+
+_crlb_gpu_fallback_warned = False
+
+
+def _warn_crlb_gpu_fallback(exc: Exception) -> None:
+    """Report the first time a GPU CRLB attempt falls back to the CPU.
+
+    Having no CUDA device at all is not an error and is never reported - the
+    CPU kernels are simply used. This is for the other case: a device is
+    present but the attempt failed (out of memory, driver error), where the
+    results are still correct but a silent fallback would hide a broken device
+    path indefinitely. Warned once per process so a per-chunk failure cannot
+    spam the log."""
+    global _crlb_gpu_fallback_warned
+    if _crlb_gpu_fallback_warned:
+        return
+    _crlb_gpu_fallback_warned = True
+    warnings.warn(
+        f"Spline CRLB on the GPU failed ({exc!r}); falling back to the CPU. "
+        "Results are unaffected, only slower.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _spline_crlb_cpu(
+    coeff: np.ndarray,
+    aff: np.ndarray,
+    res: np.ndarray,
     box: int,
-    mle: bool = True,
+    amplitude: lib.FloatArray1D,
+    x_shift: lib.FloatArray1D,
+    y_shift: lib.FloatArray1D,
+    z_eval: lib.FloatArray1D | None,
+    offset: lib.FloatArray1D,
+    finite: np.ndarray,
+    mle: bool,
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
-    residuals: np.ndarray | None = None,
 ) -> lib.FloatArray2D:
-    """Parameter-variance estimates for spline-fitted localizations.
+    """CPU (numba) parameter variances for the shared-amplitude spline models.
 
-    Evaluates the estimator covariance at the fitted parameters, using the
-    cubic-spline PSF model ``mu = offset + amplitude * Phi`` and its analytic
-    spatial derivatives.
-
-    With ``mle`` True the result is the Cramer-Rao lower bound: the diagonal of
-    the inverse Poisson Fisher-information matrix ``I = Σ g gᵀ / μ`` (``g =
-    ∂μ/∂θ``), which an efficient maximum-likelihood estimator attains. Mirrors
-    ``gaussmle._mlefit_sigmaxy_crlb``.
-
-    With ``mle`` False the result is the covariance of the *unweighted*
-    least-squares estimator (Gpufit's ``spline-gpu`` LSE mode), the Huber
-    sandwich ``J⁻¹ M J⁻¹`` with normal matrix ``J = Σ g gᵀ`` and, for Poisson
-    pixel noise (``σ² = μ``), meat ``M = Σ μ g gᵀ``. This is ≥ the Cramer-Rao
-    bound elementwise (least squares is not efficient for Poisson data), so it
-    is the honest precision for LSQ fits rather than the optimistic MLE floor.
-
-    Parameters
-    ----------
-    theta : lib.FloatArray2D
-        Fitted parameters, columns ``[amplitude, x_shift, y_shift, offset]``
-        (2D) or ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D and 3D
-        multichannel). Photon units (spots are gain-converted before fitting),
-        so ``mu`` is an expected photon count and the Poisson noise model
-        applies directly.
-    calibration : dict
-        The spline PSF calibration (see ``io.load_spline_calibration``).
-    box : int
-        Fit box side length (camera pixels).
-    mle : bool, optional
-        If True (default), return the Poisson Cramer-Rao bound (for
-        maximum-likelihood fits). If False, return the least-squares sandwich
-        covariance (for ``spline-gpu`` least-squares fits).
-    progress_callback : callable, "console" or None, optional
-        Progress over localization chunks. ``"console"`` shows a tqdm bar; a
-        callable is invoked with the cumulative number of localizations done.
-    residuals : np.ndarray, optional
-        Per-localization, per-channel sub-pixel ROI offsets ``(n_locs,
-        n_channels, 2)``, as passed to the fit (see
-        :func:`channel_roi_residuals`). Multichannel only; ``None`` (the
-        default) means zero, which is the single-channel case. Pass whatever
-        the fit used: the covariance is evaluated at ``theta`` under the same
-        geometry, and the per-channel affine that goes with it is read from
-        ``calibration["channel_transforms"]``.
-
-    Returns
-    -------
-    crlb : lib.FloatArray2D
-        ``(n_locs, n_params)`` array of parameter variances (float64) in native
-        parameter order ``[x_shift, y_shift, (z_shift,) amplitude, offset]``
-        (pixels, (z-slices,) photons, photons). Non-converged fits and
-        numerically singular problems are NaN.
-    """
-    model = calibration["model"]
-    if model == _LINK_XYZ_MODEL:
-        # Photon-decoupled model: distinct 7-parameter block structure
-        # [x, y, z, N_0..N_{c-1}, bg_0..bg_{c-1}], handled by its own kernel.
-        return _spline_link_xyz_crlb(
-            theta,
-            calibration,
-            box,
-            mle=mle,
-            progress_callback=progress_callback,
-            residuals=residuals,
-        )
-    is_3d = model != "spline-2d"
+    The numerical core of :func:`_spline_crlb`, split out so it can also be run
+    on a subset of rows (the GPU path falls back here for localizations the
+    device could not diagonalize). ``z_eval`` None selects the 2D model. ``aff``
+    and ``res`` are the per-channel affine and ROI residuals the fit used (see
+    :func:`_spline_channel_affines` / :func:`_spline_crlb_residuals`); ``res``
+    must already be sliced to the same rows as ``amplitude``, and neither is
+    used by the single-channel 2D model. Returns the raw ``(n_locs, P)``
+    covariance diagonal; masking non-finite and non-positive entries is the
+    caller's job."""
+    is_3d = z_eval is not None
     n_params = 5 if is_3d else 4
-
-    theta = np.asarray(theta, dtype=np.float64)
-    n_locs = len(theta)
-
-    coeff = _spline_coeff_reshaped(calibration)
-    amplitude = np.ascontiguousarray(theta[:, 0])
-    x_shift = np.ascontiguousarray(theta[:, 1])
-    y_shift = np.ascontiguousarray(theta[:, 2])
-    offset = np.ascontiguousarray(theta[:, -1])
-    # Native z sampling coordinate = -z_shift (single-frame Gpufit
-    # "position = pixel_index - parameter", pixel_index_z = 0). The kernel
-    # clamps the z-interval, so no pre-clamping is needed here.
-    z_eval = np.ascontiguousarray(-theta[:, 3]) if is_3d else None
-    finite = np.isfinite(theta).all(axis=1)
+    n_locs = len(amplitude)
 
     # Per-localization information matrices (float64). ``bread`` is the Fisher
     # matrix (mle) or the least-squares normal matrix J; non-converged rows stay
-    # the identity so the batched pinv is well-defined (they become NaN below).
+    # the identity so the batched pinv is well-defined (the caller NaNs them).
     # ``meat`` M is only filled for the least-squares sandwich (stays 0 for mle).
     bread = np.tile(np.eye(n_params), (max(n_locs, 1), 1, 1))
     meat = np.zeros((max(n_locs, 1), n_params, n_params))
-    # same per-channel geometry as the fit (affine + ROI residual), so
-    # the reported precision belongs to the model actually fitted
-    aff = _spline_channel_affines(calibration, coeff.shape[0])
-    res = _spline_crlb_residuals(residuals, n_locs, coeff.shape[0])
 
     use_tqdm = progress_callback == "console"
     do_callback = callable(progress_callback)
@@ -3948,7 +4961,174 @@ def _spline_crlb(
             # cov = J⁻¹ M J⁻¹ (unweighted-least-squares sandwich).
             cov = bread_inv @ meat @ bread_inv
         crlb = np.diagonal(cov, axis1=1, axis2=2).copy()
-    crlb = crlb[:n_locs]
+    return crlb[:n_locs]
+
+
+def _spline_crlb(
+    theta: lib.FloatArray2D,
+    calibration: dict,
+    box: int,
+    mle: bool = True,
+    em: bool = False,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+    residuals: np.ndarray | None = None,
+) -> lib.FloatArray2D:
+    """Parameter-variance estimates for spline-fitted localizations.
+
+    Runs on a CUDA GPU when one is available and falls back to the CPU kernels
+    otherwise; both compute the same quantity, so the choice is invisible.
+
+    Evaluates the estimator covariance at the fitted parameters, using the
+    cubic-spline PSF model ``mu = offset + amplitude * Phi`` and its analytic
+    spatial derivatives.
+
+    With ``mle`` True the result is the Cramer-Rao lower bound: the diagonal of
+    the inverse Poisson Fisher-information matrix ``I = Σ g gᵀ / μ`` (``g =
+    ∂μ/∂θ``), which an efficient maximum-likelihood estimator attains. Mirrors
+    ``gaussmle._mlefit_sigmaxy_crlb``.
+
+    With ``mle`` False the result is the covariance of the *unweighted*
+    least-squares estimator (Gpufit's ``spline-gpu`` LSE mode), the Huber
+    sandwich ``J⁻¹ M J⁻¹`` with normal matrix ``J = Σ g gᵀ`` and, for Poisson
+    pixel noise (``σ² = μ``), meat ``M = Σ μ g gᵀ``. This is ≥ the Cramer-Rao
+    bound elementwise (least squares is not efficient for Poisson data), so it
+    is the honest precision for LSQ fits rather than the optimistic MLE floor.
+
+    Parameters
+    ----------
+    theta : lib.FloatArray2D
+        Fitted parameters, columns ``[amplitude, x_shift, y_shift, offset]``
+        (2D) or ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D and 3D
+        multichannel). Photon units (spots are gain-converted before fitting),
+        so ``mu`` is an expected photon count and the Poisson noise model
+        applies directly.
+    calibration : dict
+        The spline PSF calibration (see ``io.load_spline_calibration``).
+    box : int
+        Fit box side length (camera pixels).
+    mle : bool, optional
+        If True (default), return the Poisson Cramer-Rao bound (for
+        maximum-likelihood fits). If False, return the least-squares sandwich
+        covariance (for ``spline-gpu`` least-squares fits).
+    em : bool, optional
+        Whether the camera is an EMCCD. Its stochastic multiplication doubles
+        every pixel's variance on top of the Poisson term, so all variances are
+        scaled by 2. Applies to both estimators: the doubling is a property of
+        the detector, not of the fit. Default False.
+    progress_callback : callable, "console" or None, optional
+        Progress over localization chunks. ``"console"`` shows a tqdm bar; a
+        callable is invoked with the cumulative number of localizations done.
+    residuals : np.ndarray, optional
+        Per-localization, per-channel sub-pixel ROI offsets ``(n_locs,
+        n_channels, 2)``, as passed to the fit (see
+        :func:`channel_roi_residuals`). Multichannel only; ``None`` (the
+        default) means zero, which is the single-channel case. Pass whatever
+        the fit used: the covariance is evaluated at ``theta`` under the same
+        geometry, and the per-channel affine that goes with it is read from
+        ``calibration["channel_transforms"]``.
+
+    Returns
+    -------
+    crlb : lib.FloatArray2D
+        ``(n_locs, n_params)`` array of parameter variances (float64) in native
+        parameter order ``[x_shift, y_shift, (z_shift,) amplitude, offset]``
+        (pixels, (z-slices,) photons, photons). Non-converged fits and
+        numerically singular problems are NaN.
+    """
+    model = calibration["model"]
+    if model == _LINK_XYZ_MODEL:
+        # Photon-decoupled model: distinct 7-parameter block structure
+        # [x, y, z, N_0..N_{c-1}, bg_0..bg_{c-1}], handled by its own kernel.
+        return _spline_link_xyz_crlb(
+            theta,
+            calibration,
+            box,
+            residuals=residuals,
+            mle=mle,
+            em=em,
+            progress_callback=progress_callback,
+        )
+    is_3d = model != "spline-2d"
+
+    theta = np.asarray(theta, dtype=np.float64)
+    n_locs = len(theta)
+
+    amplitude = np.ascontiguousarray(theta[:, 0])
+    x_shift = np.ascontiguousarray(theta[:, 1])
+    y_shift = np.ascontiguousarray(theta[:, 2])
+    offset = np.ascontiguousarray(theta[:, -1])
+    # Native z sampling coordinate = -z_shift (single-frame Gpufit
+    # "position = pixel_index - parameter", pixel_index_z = 0). The kernel
+    # clamps the z-interval, so no pre-clamping is needed here.
+    z_eval = np.ascontiguousarray(-theta[:, 3]) if is_3d else None
+    finite = np.isfinite(theta).all(axis=1)
+    # same per-channel geometry as the fit (affine + ROI residual), so
+    # the reported precision belongs to the model actually fitted
+    n_channels = _spline_n_channels(calibration)
+    aff = _spline_channel_affines(calibration, n_channels)
+    res = _spline_crlb_residuals(residuals, n_locs, n_channels)
+
+    crlb = None
+    if SPLINE_CRLB_CUDA_AVAILABLE:
+        try:
+            crlb, failed = _spline_crlb_cuda(
+                _spline_coeff_reshaped(
+                    calibration, dtype=_spline_crlb_coeff_dtype(calibration)
+                ),
+                aff,
+                res,
+                box,
+                amplitude,
+                x_shift,
+                y_shift,
+                z_eval,
+                offset,
+                finite,
+                _SPLINE_CRLB_MU_FLOOR,
+                mle,
+                progress_callback=progress_callback,
+            )
+        except Exception as exc:
+            # Degrade to the CPU (e.g. device out of memory while Gpufit still
+            # holds allocations) rather than failing the whole fit.
+            _warn_crlb_gpu_fallback(exc)
+            crlb = None
+        else:
+            if failed.any():
+                # The device could not diagonalize these information matrices;
+                # redo just those rows through the CPU kernel and pinv.
+                crlb[failed] = _spline_crlb_cpu(
+                    _spline_coeff_reshaped(calibration),
+                    aff,
+                    res[failed],
+                    box,
+                    amplitude[failed],
+                    x_shift[failed],
+                    y_shift[failed],
+                    None if z_eval is None else z_eval[failed],
+                    offset[failed],
+                    finite[failed],
+                    mle,
+                )
+    if crlb is None:
+        crlb = _spline_crlb_cpu(
+            _spline_coeff_reshaped(calibration),
+            aff,
+            res,
+            box,
+            amplitude,
+            x_shift,
+            y_shift,
+            z_eval,
+            offset,
+            finite,
+            mle,
+            progress_callback=progress_callback,
+        )
+    if em:
+        crlb *= _EM_EXCESS_NOISE_FACTOR
     crlb[~finite] = np.nan
     crlb = np.where(crlb > 0.0, crlb, np.nan)
     return crlb
@@ -3960,6 +5140,7 @@ def _locs_from_fits_spline_link_xyz(
     box: int,
     calibration: dict,
     mle: bool = False,
+    em: bool = False,
     log_likelihood: lib.FloatArray1D | None = None,
     iterations: lib.FloatArray1D | None = None,
     progress_callback: (
@@ -4005,6 +5186,7 @@ def _locs_from_fits_spline_link_xyz(
         calibration,
         box,
         mle=mle,
+        em=em,
         progress_callback=progress_callback,
         residuals=residuals,
     )  # variances [x, y, z, N_0.., bg_0..]
@@ -4084,9 +5266,9 @@ def locs_from_fits_spline(
     uncertainties come from :func:`_spline_crlb`: the Poisson Cramer-Rao bound
     for maximum-likelihood fits (``mle`` True) or the least-squares sandwich
     covariance for ``spline-gpu`` least-squares fits (``mle`` False). ``mle``
-    must match the estimator that produced ``theta``. ``progress_callback`` is
-    forwarded to :func:`_spline_crlb` (that per-localization loop is the slow
-    part)."""
+    must match the estimator that produced ``theta``. ``em`` doubles those
+    variances for EMCCD excess noise, as in the Gaussian fits.
+    ``progress_callback`` is forwarded to :func:`_spline_crlb`."""
     calibration = crop_spline_calibration(calibration, box)
     model = calibration["model"]
     if model == _LINK_XYZ_MODEL:
@@ -4099,6 +5281,7 @@ def locs_from_fits_spline(
             box,
             calibration,
             mle=mle,
+            em=em,
             log_likelihood=log_likelihood,
             iterations=iterations,
             progress_callback=progress_callback,
@@ -4133,6 +5316,7 @@ def locs_from_fits_spline(
         calibration,
         box,
         mle=mle,
+        em=em,
         progress_callback=progress_callback,
         residuals=residuals,
     )
