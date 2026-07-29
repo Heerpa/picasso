@@ -2633,10 +2633,13 @@ def _link_loc_groups(  # noqa: C901
         columns["net_gradient"] = _link_group_mean(
             locs["net_gradient"].to_numpy(), link_group, n_locs, n_groups, n_
         )
-    if "likelihood" in locs.columns:
-        columns["likelihood"] = _link_group_mean(
-            locs["likelihood"].to_numpy(), link_group, n_locs, n_groups, n_
-        )
+    for col in ("log_likelihood", "likelihood"):
+        # "likelihood" is the old name of the column, kept for files saved
+        # with earlier versions of Picasso.
+        if col in locs.columns:
+            columns[col] = _link_group_mean(
+                locs[col].to_numpy(), link_group, n_locs, n_groups, n_
+            )
     if "iterations" in locs.columns:
         columns["iterations"] = _link_group_mean(
             locs["iterations"].to_numpy(), link_group, n_locs, n_groups, n_

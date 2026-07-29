@@ -1441,7 +1441,7 @@ def locs_from_fits(
     locs : pd.DataFrame
         Data frame containing the localized spots. The fields include
         `frame`, `x`, `y`, `photons`, `sx`, `sy`, `bg`, `lpx`, `lpy`,
-        `net_gradient`, `likelihood`, and `iterations`.
+        `net_gradient`, `log_likelihood`, and `iterations`.
     """
     # box_offset = int(box / 2)
     y = theta[:, 0] + identifications["y"]  # - box_offset
@@ -1462,7 +1462,7 @@ def locs_from_fits(
             "net_gradient": (
                 identifications["net_gradient"].astype(np.float32)
             ),
-            "likelihood": likelihoods.astype(np.float32),
+            "log_likelihood": likelihoods.astype(np.float32),
             "iterations": iterations.astype(np.int32),
         }
     )

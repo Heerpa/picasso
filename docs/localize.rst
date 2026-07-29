@@ -363,7 +363,6 @@ If photon counts are not linked, the resulting localizations contain per-channel
 
 - ``photons_ch<c>`` and ``bg_ch<c>`` — that channel's photon count and background. ``photons`` and ``bg`` are their sums.
 - ``rel_photons_ch<c>`` — that channel's share of the total photons, so the values sum to 1 per localization.
-- ``color`` — an *integer* channel index, written by the ratiometric fit instead (the calibration carries candidate photon ratios and each localization is assigned the most likely one).
 
 Picasso builds a PSF for every channel and registers each non-reference channel to the reference by an affine transform estimated from matching beads; the per-channel PSFs and transforms are stored in one calibration ``.hdf5``. Alongside the usual diagnostic plot, a ``<base>_registration.png`` is written showing how well the channels align (residuals and the decomposed shift / rotation / scale / mirror) — check it before fitting.
 
