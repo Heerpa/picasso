@@ -2835,16 +2835,28 @@ def _run_gpufit_spline(
             user_info=user_info,
         )
 
-    if residuals is None:
+    res = None
+    if residuals is not None:
+        res = np.ascontiguousarray(residuals, dtype=np.float32)
+        if len(res) != len(fit_data):
+            raise ValueError(
+                f"Got {len(res)} ROI residuals for {len(fit_data)} spots."
+            )
+
+    if len(fit_data) == 0:
+        return (
+            np.zeros((0, initial_parameters.shape[1]), dtype=np.float32),
+            np.zeros(0, dtype=np.int32),  # states
+            np.zeros(0, dtype=np.float32),  # chi_squares
+            np.zeros(0, dtype=np.int32),  # number_iterations
+            0.0,  # execution_time
+        )
+
+    if res is None:
         return _fit(
             fit_data, initial_parameters, _pack_spline_user_info(calibration)
         )
 
-    res = np.ascontiguousarray(residuals, dtype=np.float32)
-    if len(res) != len(fit_data):
-        raise ValueError(
-            f"Got {len(res)} ROI residuals for {len(fit_data)} spots."
-        )
     # One batch per Gpufit call, so the model's chunk_index is always 0 (see
     # this function's docstring). Slices along axis 0 of a C-contiguous array
     # stay contiguous, so no copy is made here.

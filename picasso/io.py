@@ -1131,7 +1131,10 @@ def save_drift(path: str, drift: pd.DataFrame) -> None:
         A DataFrame with 'x' and 'y' columns and drift values for each
         frame.
     """
-    np.savetxt(path, drift, newline="\r\n")
+    # Binary handle so the explicit "\r\n" is not itself newline-translated
+    # (a text handle writes "\r\r\n" on Windows).
+    with open(path, "wb") as f:
+        np.savetxt(f, drift, newline="\r\n")
 
 
 def load_drift(path: str) -> pd.DataFrame | None:
@@ -3694,13 +3697,16 @@ def export_txt_imagej(
         other export functions.
     """
     loctxt = locs[["frame", "x", "y"]]
-    np.savetxt(
-        path,
-        loctxt.to_records(index=False),
-        fmt=["%.1i", "%.5f", "%.5f"],
-        newline="\r\n",
-        delimiter="   ",
-    )
+    # Binary handle, as in the other .txt exporters: a text-mode handle would
+    # translate the newline of the explicit "\r\n" as well, writing "\r\r\n".
+    with open(path, "wb") as f:
+        np.savetxt(
+            f,
+            loctxt.to_records(index=False),
+            fmt=["%.1i", "%.5f", "%.5f"],
+            newline="\r\n",
+            delimiter="   ",
+        )
 
 
 def export_txt_nis(path: str, locs: pd.DataFrame, info: list[dict]) -> None:
