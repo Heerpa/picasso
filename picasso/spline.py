@@ -3073,7 +3073,8 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
     try:
         # MLE (Poisson) matches the shot-noise statistics of the single-frame
         # spots and stays closer to the CRLB than least squares, especially for
-        # the dim, defocused spots in the tails.
+        # the dim, defocused spots in the tails. The axial multi-start is left
+        # at its default so this measures what the fitting path delivers.
         theta = localize.fit_spots_gpufit_spline(spots, calibration, mle=True)
     except Exception:
         return None
@@ -3180,9 +3181,8 @@ def _axial_precision_multichannel(
         z_col = 3
     # z multi-start (like globLoc, Li et al., Nat. Commun. 13, 3133,
     # 2022): a single in-focus start leaves the biplane fit degenerate at
-    # large |z|; several z seeds recover it.
-    n_z = int(calibration["n_data"][2])
-    n_z_starts = int(np.clip(n_z // 20, 5, 15))
+    # large |z|; several z seeds recover it. Same seed count as the fitting
+    # path, so the precision reported here is the precision that path delivers.
     if spot_residuals is not None and (
         np.asarray(spot_residuals).shape != (n_spots, n_channels, 2)
     ):
@@ -3192,7 +3192,6 @@ def _axial_precision_multichannel(
             spots,
             fit_cal,
             mle=True,
-            n_z_starts=n_z_starts,
             residuals=spot_residuals,
         )
     except Exception:

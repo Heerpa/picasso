@@ -2767,6 +2767,156 @@ class TestSplineHelpers:
             localize._spline_channel_affines(stripped, 3), aff
         )
 
+    def test_default_n_z_starts_from_calibration_depth(self):
+        # one seed per ~20 calibration planes, bounded; 2D has no z to be
+        # degenerate in and must stay on a single start
+        calib = _fake_spline_calibration(model="spline-3d")
+        assert localize._default_n_z_starts(calib) == 5
+        assert (
+            localize._default_n_z_starts(
+                _fake_spline_calibration(model="spline-2d")
+            )
+            == 1
+        )
+        deep = dict(calib)
+        deep["n_data"] = [7, 7, 600]  # far past the upper bound
+        assert localize._default_n_z_starts(deep) == localize._Z_STARTS_MAX
+        shallow = dict(calib)
+        shallow["n_data"] = [7, 7, 4]
+        assert localize._default_n_z_starts(shallow) == localize._Z_STARTS_MIN
+        # a calibration that does not describe a z axis cannot be multi-started
+        assert localize._default_n_z_starts({"n_data": [7, 7]}) == 1
+
+    @pytest.mark.parametrize("model", ["spline-3d", "spline-3d-multichannel"])
+    def test_fit_spots_multistarts_by_default(self, monkeypatch, model):
+        # the whole fit runs once per seed, so "did it multi-start" is exactly
+        # "how many times was the fitter called"
+        calib = _fake_spline_calibration(model=model)
+        expected = localize._default_n_z_starts(calib)
+        assert expected > 1
+        n_channels = localize._spline_n_channels(calib)
+        n_params = 5
+        box = calib["box"]
+        spots = np.zeros((3, box, box), np.float32)
+        if model == "spline-3d-multichannel":
+            spots = np.zeros((3, box, box, n_channels), np.float32)
+
+        calls = []
+
+        def fake_run(spots_, calibration, **kw):
+            calls.append(kw)
+            n = len(spots_)
+            return (
+                np.zeros((n, n_params), np.float32),
+                np.zeros(n, np.int32),
+                np.full(n, 1.0),
+                np.ones(n, np.int32),
+                0.0,
+            )
+
+        monkeypatch.setattr(localize, "_run_gpufit_spline", fake_run)
+        localize.fit_spots_gpufit_spline(spots, calib, mle=True)
+        assert len(calls) == expected
+        # seeded runs must use the tight convergence, else neighbouring axial
+        # minima are indistinguishable and the multi-start is pointless
+        assert all(c["tolerance"] == 1e-4 for c in calls)
+        assert all(c["max_number_iterations"] == 100 for c in calls)
+        # and the seeds must actually differ, spanning the stack
+        z_col = 3
+        seeds = [float(c["initial_parameters"][0, z_col]) for c in calls]
+        assert len(set(seeds)) == expected
+        assert min(seeds) == pytest.approx(-(calib["n_data"][2] - 1))
+        assert max(seeds) == pytest.approx(0.0)
+
+    def test_ratiometric_multistarts_every_hypothesis(self, monkeypatch):
+        # colour is decided by comparing hypotheses' residuals, so they all
+        # need the same axial search - otherwise a hypothesis can win merely by
+        # having stumbled into a better z minimum
+        calib = _fake_spline_calibration(
+            model="spline-3d-multichannel", n_channels=2
+        )
+        n_starts = localize._default_n_z_starts(calib)
+        n_hyp = 3
+        calls = []
+
+        def fake_multistart(spots_, calibration, **kw):
+            calls.append(kw["n_z_starts"])
+            n = len(spots_)
+            return (
+                np.zeros((n, 5), np.float32),
+                np.full(n, 1.0),
+                np.ones(n, bool),
+                np.ones(n, np.int32),
+            )
+
+        monkeypatch.setattr(
+            localize, "_fit_spline_z_multistart", fake_multistart
+        )
+        # exercise only the hypothesis loop; locs building needs a real fit
+        monkeypatch.setattr(
+            localize,
+            "locs_from_fits_spline",
+            lambda ids, theta, box, em, cal, **kw: pd.DataFrame(
+                {"frame": np.asarray(ids["frame"])}
+            ),
+        )
+        box = calib["box"]
+        n_spots = 4
+        spots = np.zeros((n_spots, box, box, 2), np.float32)
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(n_spots),
+                "x": np.full(n_spots, 20),
+                "y": np.full(n_spots, 20),
+                "net_gradient": np.ones(n_spots),
+            }
+        )
+        monkeypatch.setattr(
+            localize,
+            "get_spots_multichannel",
+            lambda *a, **kw: (
+                (spots, np.zeros((n_spots, 2, 2), np.float32))
+                if kw.get("return_residuals")
+                else spots
+            ),
+        )
+        monkeypatch.setattr(
+            localize, "multichannel_inbounds_ids", lambda i, *a, **kw: i
+        )
+        localize.fit_spline_multichannel_ratiometric(
+            [None, None],
+            [CAMERA_INFO, CAMERA_INFO],
+            ids,
+            box,
+            calib,
+            photon_ratios=np.array([[1.0, 1.0], [2.0, 1.0], [1.0, 2.0]]),
+        )
+        assert calls == [n_starts] * n_hyp
+
+    def test_fit_spots_single_start_is_still_reachable(self, monkeypatch):
+        calib = _fake_spline_calibration(model="spline-3d")
+        box = calib["box"]
+        calls = []
+
+        def fake_run(spots_, calibration, **kw):
+            calls.append(kw)
+            n = len(spots_)
+            return (
+                np.zeros((n, 5), np.float32),
+                np.zeros(n, np.int32),
+                np.full(n, 1.0),
+                np.ones(n, np.int32),
+                0.0,
+            )
+
+        monkeypatch.setattr(localize, "_run_gpufit_spline", fake_run)
+        localize.fit_spots_gpufit_spline(
+            np.zeros((3, box, box), np.float32), calib, n_z_starts=1
+        )
+        assert len(calls) == 1
+        # the single-start path keeps the loose defaults
+        assert "tolerance" not in calls[0]
+
     def test_link_xyz_model_ids_cover_the_supported_range(self):
         # the map and the advertised maximum must not drift apart
         assert sorted(localize._LINK_XYZ_MODEL_ID_NAMES) == list(

@@ -95,6 +95,31 @@ def _gpufit_batch_size(n_points: int) -> int:
     return int(max(1, min(by_points, _GPUFIT_MAX_FITS_PER_CALL)))
 
 
+# Axial multi-start. A single in-focus seed leaves a spline fit z-degenerate at
+# large |z|. Several seeds spanning the calibration stack are run per spot and the
+# one that best explains the data is kept. One seed per ~20 calibration planes,
+# bounded; the rule the calibration diagnostic has always used.
+_Z_STARTS_PER_PLANES = 20
+_Z_STARTS_MIN = 5
+_Z_STARTS_MAX = 15
+
+
+def _default_n_z_starts(calibration: dict) -> int:
+    """Number of axial seeds for a spline fit, from the calibration's z depth.
+
+    1 (i.e. no multi-start) for a 2D model, which has no z to be degenerate in,
+    and for a calibration whose ``n_data`` does not describe a z axis."""
+    if calibration.get("model") == "spline-2d":
+        return 1
+    n_data = calibration.get("n_data")
+    if n_data is None or len(n_data) < 3:
+        return 1
+    n_z = int(n_data[2])
+    return int(
+        np.clip(n_z // _Z_STARTS_PER_PLANES, _Z_STARTS_MIN, _Z_STARTS_MAX)
+    )
+
+
 # The columns under base are always available and the keys such as "3D
 # only" will be displayed in the save columns dialog in the GUI for
 # clarity
@@ -2831,7 +2856,7 @@ def fit_spots_gpufit_spline(
     spots: lib.FloatArray3D,
     calibration: dict,
     mle: bool = False,
-    n_z_starts: int = 1,
+    n_z_starts: int | None = None,
     return_stats: bool = False,
     residuals: np.ndarray | None = None,
 ) -> (
@@ -2855,12 +2880,15 @@ def fit_spots_gpufit_spline(
     mle : bool, optional
         Use Gpufit's maximum likelihood (Poisson) estimator. Default False.
     n_z_starts : int, optional
-        Number of axial (z) seeds for a z multi-start (default 1 = a single
-        in-focus start, the historical behaviour). A biplane / multichannel fit
-        is z-degenerate at large |z| from a single start (the per-plane defocus
-        cancels), so several z seeds spanning the calibration stack are tried
-        and, per spot, the seed whose fit best explains the data (lowest
-        chi-square) is kept. Applies to 3D models only.
+        Number of axial (z) seeds to try per spot. ``None`` (the default) picks
+        one from the calibration's z depth via :func:`_default_n_z_starts`; a
+        3D fit is z-degenerate at large |z| from a single seed, most sharply
+        for biplane / multichannel where the per-plane defocus cancels. Several
+        seeds spanning the calibration stack are tried and, per spot, the one
+        whose fit best explains the data (lowest chi-square) is kept. Pass 1 to
+        force the old single in-focus start - much faster, since the whole fit
+        runs once per seed, but liable to settle in the wrong axial minimum.
+        2D models always use a single start.
     return_stats : bool, optional
         Also return ``(log_likelihood, number_iterations)``. Default False.
     residuals : np.ndarray, optional
@@ -2879,6 +2907,8 @@ def fit_spots_gpufit_spline(
     log_likelihood, number_iterations
         Only if ``return_stats`` (log_likelihood is None for least squares).
     """
+    if n_z_starts is None:
+        n_z_starts = _default_n_z_starts(calibration)
     if int(n_z_starts) <= 1:
         parameters, states, chi_squares, number_iterations, exec_time = (
             _run_gpufit_spline(
@@ -2893,11 +2923,44 @@ def fit_spots_gpufit_spline(
             return parameters, log_likelihood, number_iterations
         return parameters
 
-    # z multi-start (biplane/multichannel z-degeneracy). The z_shift parameter
-    # column is 2 for the photon-decoupled model, else 3.
+    best_params, best_chi, _ok, best_it = _fit_spline_z_multistart(
+        spots,
+        calibration,
+        mle=mle,
+        n_z_starts=n_z_starts,
+        residuals=residuals,
+    )
+    if return_stats:
+        log_likelihood = -0.5 * best_chi if mle else None
+        return best_params, log_likelihood, best_it
+    return best_params
+
+
+def _fit_spline_z_multistart(
+    spots: lib.FloatArray3D,
+    calibration: dict,
+    mle: bool = False,
+    n_z_starts: int = 1,
+    residuals: np.ndarray | None = None,
+) -> tuple:
+    """Refit every spot from several axial seeds and keep the best per spot.
+
+    Runs the whole fit once per seed, the seeds spanning the calibration
+    z-stack, and keeps for each spot the seed whose fit best explains the data
+    (lowest chi-square), preferring converged fits over merely finite ones.
+    Seeded runs use a much tighter convergence than the single-start path
+    (``1e-4`` / 100 iterations vs ``1e-2`` / 20), since the point is to tell
+    genuinely different axial minima apart.
+
+    Returns ``(parameters, chi_squares, converged, n_iterations)``.
+    :func:`fit_spots_gpufit_spline` wraps this;
+    :func:`fit_spline_multichannel_ratiometric` calls it directly because it
+    ranks photon-ratio hypotheses on the chi-square.
+    """
     model = calibration["model"]
     if model == "spline-2d":
-        raise ValueError("n_z_starts > 1 requires a 3D spline model.")
+        raise ValueError("A z multi-start requires a 3D spline model.")
+    # z_shift parameter column: 2 for the photon-decoupled model, else 3
     z_col = 2 if model == _LINK_XYZ_MODEL else 3
     spots_for_init = np.maximum(spots, 0) if mle else spots
     base_init = _initial_parameters_spline(spots_for_init, calibration)
@@ -2910,12 +2973,18 @@ def fit_spots_gpufit_spline(
     best_fin = np.full((n_spots, n_params), np.nan, np.float32)
     best_fin_it = np.zeros(n_spots, np.int32)
 
-    # seeds span the calibration z-stack (z_shift = -z_plane, so [-(n_z-1), 0]).
-    n_z = int(calibration["n_data"][2])
-    seeds = np.linspace(-(n_z - 1), 0.0, int(n_z_starts))
+    # seeds span the calibration z-stack (z_shift = -z_plane, so
+    # [-(n_z-1), 0]); a single seed keeps the default in-focus init instead.
+    n_seeds = max(1, int(n_z_starts))
+    if n_seeds == 1:
+        seeds = [None]
+    else:
+        n_z = int(calibration["n_data"][2])
+        seeds = np.linspace(-(n_z - 1), 0.0, n_seeds)
     for z0 in seeds:
         init_k = base_init.copy()
-        init_k[:, z_col] = np.float32(z0)
+        if z0 is not None:
+            init_k[:, z_col] = np.float32(z0)
         params, states, chi, nit, _ = _run_gpufit_spline(
             spots,
             calibration,
@@ -2940,10 +3009,7 @@ def fit_spots_gpufit_spline(
     best_params = np.where(has_ok[:, None], best_ok, best_fin)
     best_chi = np.where(has_ok, best_ok_chi, best_fin_chi)
     best_it = np.where(has_ok, best_ok_it, best_fin_it)
-    if return_stats:
-        log_likelihood = -0.5 * best_chi if mle else None
-        return best_params, log_likelihood, best_it
-    return best_params
+    return best_params, best_chi, has_ok, best_it
 
 
 def _spline_model_and_grad(
@@ -4124,13 +4190,22 @@ def _fit2d_spline_gpu(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    n_z_starts: int | None = None,
 ) -> pd.DataFrame:
     """Fit an experimentally measured cubic-spline PSF on the GPU. For a 3D
     calibration the localizations contain the fitted ``z`` directly. See
     ``fit2D`` for more details. ``progress_callback`` tracks the per-spot CRLB
-    computation in ``locs_from_fits_spline``."""
+    computation in ``locs_from_fits_spline``.
+
+    ``n_z_starts`` is the axial multi-start (see
+    :func:`fit_spots_gpufit_spline`); ``None`` picks it from the calibration.
+    Pass 1 for the single in-focus start."""
     theta, log_likelihood, iterations = fit_spots_gpufit_spline(
-        spots, calibration, mle=mle, return_stats=True
+        spots,
+        calibration,
+        mle=mle,
+        return_stats=True,
+        n_z_starts=n_z_starts,
     )
     locs = locs_from_fits_spline(
         identifications,
@@ -4644,6 +4719,7 @@ def fit_spline_multichannel(
     link_photons: bool = True,
     progress_callback: Callable[[int], None] | None = None,
     apply_roi_residuals: bool = True,
+    n_z_starts: int | None = None,
 ) -> pd.DataFrame:
     """Fit a multichannel cubic-spline PSF across several registered channels.
 
@@ -4717,6 +4793,7 @@ def fit_spline_multichannel(
         mle=mle,
         return_stats=True,
         residuals=residuals if apply_roi_residuals else None,
+        n_z_starts=n_z_starts,
     )
     em = camera_infos[0].get("Gain", 1) > 1
     return locs_from_fits_spline(
@@ -4792,6 +4869,7 @@ def fit_spline_multichannel_ratiometric(
     mle: bool = False,
     progress_callback: Callable[[int], None] | None = None,
     apply_roi_residuals: bool = True,
+    n_z_starts: int | None = None,
 ) -> pd.DataFrame:
     """Ratiometric multichannel spline fit with photon-ratio color assignment.
 
@@ -4866,6 +4944,11 @@ def fit_spline_multichannel_ratiometric(
     ratios_norm = photon_ratios / photon_ratios.sum(axis=1, keepdims=True)
 
     # Fit every hypothesis; keep per-spot parameters, fit state and score.
+    # Every hypothesis gets the same axial multi-start, so the scores that
+    # rank them are comparable - a hypothesis must not win by having landed in
+    # a better axial minimum by luck.
+    if n_z_starts is None:
+        n_z_starts = _default_n_z_starts(calibration)
     thetas = []
     scores = np.full((n_hyp, n_spots), np.inf)
     valid = np.zeros((n_hyp, n_spots), dtype=bool)
@@ -4874,14 +4957,18 @@ def fit_spline_multichannel_ratiometric(
         calib_k["coefficients"] = scale_channel_blocks(
             calibration["coefficients"], ratios_norm[k]
         )
-        params, states, chi_squares, _n_it, _t = _run_gpufit_spline(
-            spots, calib_k, mle=mle, residuals=roi_residuals
+        params, chi_squares, converged, _n_it = _fit_spline_z_multistart(
+            spots,
+            calib_k,
+            mle=mle,
+            n_z_starts=n_z_starts,
+            residuals=roi_residuals,
         )
         thetas.append(params)
         finite = np.isfinite(params).all(axis=1) & np.isfinite(chi_squares)
-        # LSE is robust here; for MLE keep only converged fits (state 0) since
-        # its chi-square is unreliable on the frequent negative-curvature exits.
-        valid[k] = finite & ((states == 0) if mle else True)
+        # LSE is robust here; for MLE keep only converged fits since its
+        # chi-square is unreliable on the frequent negative-curvature exits.
+        valid[k] = finite & (converged if mle else True)
         scores[k] = np.where(finite, chi_squares, np.inf)
 
     # Per spot: the best VALID hypothesis (lowest residual / chi2), falling back
@@ -5096,6 +5183,7 @@ def fit_spline_split_fov(
     confine_to_reference: bool = True,
     progress_callback: Callable[[int], None] | None = None,
     apply_roi_residuals: bool = True,
+    n_z_starts: int | None = None,
 ) -> pd.DataFrame:
     """Fit a split-FOV multichannel spline PSF from a *single* movie whose
     rectangular sub-regions are the channels.
@@ -5163,6 +5251,7 @@ def fit_spline_split_fov(
             link_photons=False,
             progress_callback=progress_callback,
             apply_roi_residuals=apply_roi_residuals,
+            n_z_starts=n_z_starts,
         )
     if (
         photon_ratios is not None
@@ -5178,6 +5267,7 @@ def fit_spline_split_fov(
             mle=mle,
             progress_callback=progress_callback,
             apply_roi_residuals=apply_roi_residuals,
+            n_z_starts=n_z_starts,
         )
     return fit_spline_multichannel(
         movies,
@@ -5189,6 +5279,7 @@ def fit_spline_split_fov(
         link_photons=link_photons,
         progress_callback=progress_callback,
         apply_roi_residuals=apply_roi_residuals,
+        n_z_starts=n_z_starts,
     )
 
 
