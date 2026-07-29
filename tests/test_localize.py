@@ -2515,6 +2515,258 @@ class TestSplineHelpers:
         calib.pop("channel_transforms")
         assert localize._pack_spline_user_info(calib).size == 7 + n_coeff
 
+    def test_channel_roi_residuals_pure_translation_is_constant(self):
+        # Detections sit on integer pixels, so a pure translation shifts every
+        # box by the same fractional amount - the case the calibration absorbs.
+        ids = pd.DataFrame(
+            {"x": np.arange(40, 340, 7), "y": np.arange(60, 360, 7)}
+        )
+        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        shifted = np.array([[1.0, 0.0, 12.3], [0.0, 1.0, -4.8]])
+        res = localize.channel_roi_residuals(ids, [identity, shifted])
+        assert res.shape == (len(ids), 2, 2)
+        # channel 0 is the reference: its box is the detection itself
+        np.testing.assert_array_equal(res[:, 0, :], 0.0)
+        # frac(12.3) = .3 -> residual .3; frac(-4.8) -> .2
+        np.testing.assert_allclose(res[:, 1, 0], 0.3, atol=1e-5)
+        np.testing.assert_allclose(res[:, 1, 1], 0.2, atol=1e-5)
+        assert np.ptp(res[:, 1, :], axis=0).max() < 1e-5
+
+    def test_channel_roi_residuals_rotation_varies_across_field(self):
+        # With any linear part the residual is no longer constant: it sweeps
+        # the full +-0.5 px as soon as E@x moves by a pixel across the field.
+        ids = pd.DataFrame(
+            {"x": np.arange(0, 512, 3), "y": np.arange(0, 512, 3)}
+        )
+        theta = np.deg2rad(0.5)
+        rotated = np.array(
+            [
+                [np.cos(theta), -np.sin(theta), 0.0],
+                [np.sin(theta), np.cos(theta), 0.0],
+            ]
+        )
+        res = localize.channel_roi_residuals(ids, [np.eye(2, 3), rotated])
+        assert np.all(np.abs(res) <= 0.5 + 1e-6)
+        # spans most of the available range rather than sitting at one value
+        assert np.ptp(res[:, 1, 0]) > 0.8
+        # and it is not noise: it tracks the mapped position deterministically
+        mapped = localize.apply_affine_transform(
+            ids[["x", "y"]].to_numpy(float), rotated
+        )
+        np.testing.assert_allclose(
+            res[:, 1, :], mapped - np.rint(mapped), atol=1e-6
+        )
+
+    def test_get_spots_multichannel_residuals_match_helper(
+        self, movie, real_identifications
+    ):
+        # the extractor's by-product and the standalone helper must agree,
+        # otherwise the model is told about a shift the ROIs do not have
+        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        skewed = np.array([[1.002, 0.004, 1.4], [-0.004, 1.001, -0.6]])
+        transforms = [identity, skewed]
+        ids = localize.multichannel_inbounds_ids(
+            real_identifications, BOX, [movie, movie], transforms
+        )
+        spots, res = localize.get_spots_multichannel(
+            [movie, movie],
+            ids,
+            BOX,
+            [CAMERA_INFO, CAMERA_INFO],
+            transforms,
+            return_residuals=True,
+        )
+        assert spots.shape == (len(ids), BOX, BOX, 2)
+        np.testing.assert_allclose(
+            res, localize.channel_roi_residuals(ids, transforms), atol=1e-6
+        )
+        # default stays a bare array, so existing callers are unaffected
+        assert isinstance(
+            localize.get_spots_multichannel(
+                [movie, movie],
+                ids,
+                BOX,
+                [CAMERA_INFO, CAMERA_INFO],
+                transforms,
+            ),
+            np.ndarray,
+        )
+
+    def test_pack_user_info_multichannel_residual_block(self):
+        n_channels = 2
+        n_fits = 5
+        calib = _fake_spline_calibration(
+            model="spline-3d-multichannel", n_channels=n_channels
+        )
+        n_coeff = calib["coefficients"].size
+        rng = np.random.default_rng(0)
+        residuals = rng.uniform(-0.5, 0.5, (n_fits, n_channels, 2)).astype(
+            np.float32
+        )
+        user_info = localize._pack_spline_user_info(calib, residuals)
+        assert user_info.dtype == np.float32
+        # the CUDA model locates the block by total size, so the length and the
+        # [fit][channel][x, y] order are both part of the wire contract
+        base = 7 + n_coeff + 4 * n_channels
+        assert user_info.size == base + n_fits * n_channels * 2
+        np.testing.assert_array_equal(
+            user_info[base:], residuals.ravel(order="C")
+        )
+        # omitting them leaves the previous blob byte for byte
+        np.testing.assert_array_equal(
+            localize._pack_spline_user_info(calib),
+            user_info[:base],
+        )
+
+    def test_pack_user_info_rejects_unusable_residuals(self):
+        calib = _fake_spline_calibration(
+            model="spline-3d-multichannel", n_channels=2
+        )
+        good = np.zeros((3, 2, 2), np.float32)
+        # wrong channel count / rank
+        with pytest.raises(ValueError, match="n_channels, 2"):
+            localize._pack_spline_user_info(calib, np.zeros((3, 3, 2)))
+        with pytest.raises(ValueError, match="n_channels, 2"):
+            localize._pack_spline_user_info(calib, np.zeros((3, 2)))
+        # the model finds the block at a fixed offset past the affine, so
+        # without the affine the two would be confused for each other
+        no_affine = dict(calib)
+        no_affine.pop("channel_transforms")
+        with pytest.raises(ValueError, match="affine"):
+            localize._pack_spline_user_info(no_affine, good)
+        # single-channel models have nowhere to put them
+        with pytest.raises(ValueError, match="multichannel"):
+            localize._pack_spline_user_info(
+                _fake_spline_calibration(model="spline-3d"), good
+            )
+
+    def test_gpufit_batch_size_stays_within_bounds(self):
+        # batching is what keeps Gpufit's chunk_index at 0, which the model's
+        # residual indexing relies on; both bounds must hold for any input
+        for n_points in (1, 169, 338, 2646, 10**7, 10**9):
+            batch = localize._gpufit_batch_size(n_points)
+            assert 1 <= batch <= localize._GPUFIT_MAX_FITS_PER_CALL
+            assert (
+                batch == 1
+                or batch * n_points <= localize._GPUFIT_MAX_POINTS_PER_CALL
+            )
+
+    def test_spline_crlb_residual_equals_a_lateral_shift(self):
+        # A ROI residual just moves where the spline is evaluated, so it must
+        # be indistinguishable from moving the lateral parameter by the same
+        # amount. This pins the sign and the placement of the residual term.
+        calib = _fake_spline_calibration(
+            model="spline-3d-multichannel", n_channels=2
+        )
+        calib = dict(calib)
+        calib["n_channels"] = 1
+        calib["coefficients"] = calib["coefficients"][..., 1:2]
+        calib["channel_transforms"] = [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]
+        box = calib["box"]
+        rng = np.random.default_rng(1)
+        theta = np.zeros((4, 5))  # [amplitude, x, y, z, offset]
+        theta[:, 0], theta[:, 3], theta[:, 4] = 500.0, -8.0, 5.0
+        theta[:, 1] = rng.uniform(-0.3, 0.3, 4)
+        theta[:, 2] = rng.uniform(-0.3, 0.3, 4)
+        dx, dy = 0.31, -0.24
+        res = np.zeros((4, 1, 2))
+        res[:, 0, 0], res[:, 0, 1] = dx, dy
+        with_residual = localize._spline_crlb(
+            theta, calib, box, mle=True, residuals=res
+        )
+        moved = theta.copy()
+        moved[:, 1] += dx
+        moved[:, 2] += dy
+        np.testing.assert_allclose(
+            with_residual,
+            localize._spline_crlb(moved, calib, box, mle=True),
+            rtol=1e-10,
+        )
+
+    def test_spline_crlb_affine_scales_lateral_variance(self):
+        # The shared shift reaches a channel through its affine, so d(mu)/dp
+        # carries A^T. For an isotropic A = s*I the x/y variances must come out
+        # exactly s^-2 times the identity case evaluated at the same position,
+        # and z must be untouched - which is what the chain rule buys.
+        calib = _fake_spline_calibration(
+            model="spline-3d-multichannel", n_channels=2
+        )
+        calib = dict(calib)
+        calib["n_channels"] = 1
+        calib["coefficients"] = calib["coefficients"][..., 1:2]
+        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        calib["channel_transforms"] = [identity]
+        box = calib["box"]
+        rng = np.random.default_rng(2)
+        theta = np.zeros((4, 5))
+        theta[:, 0], theta[:, 3], theta[:, 4] = 500.0, -8.0, 5.0
+        theta[:, 1] = rng.uniform(-0.3, 0.3, 4)
+        theta[:, 2] = rng.uniform(-0.3, 0.3, 4)
+
+        s = 1.05
+        scaled = dict(calib)
+        scaled["channel_transforms"] = [[[s, 0.0, 0.0], [0.0, s, 0.0]]]
+        crlb_scaled = localize._spline_crlb(theta, scaled, box, mle=True)
+        # identity affine reaches the same evaluation point at s * p
+        moved = theta.copy()
+        moved[:, 1] *= s
+        moved[:, 2] *= s
+        crlb_identity = localize._spline_crlb(moved, calib, box, mle=True)
+        np.testing.assert_allclose(
+            crlb_scaled[:, 0], crlb_identity[:, 0] / s**2, rtol=1e-8
+        )
+        np.testing.assert_allclose(
+            crlb_scaled[:, 1], crlb_identity[:, 1] / s**2, rtol=1e-8
+        )
+        np.testing.assert_allclose(
+            crlb_scaled[:, 2], crlb_identity[:, 2], rtol=1e-8
+        )
+
+    @pytest.mark.parametrize("link_xyz", [False, True])
+    def test_spline_crlb_default_geometry_is_unchanged(self, link_xyz):
+        # identity affine + zero residual must reproduce the pre-correction
+        # result exactly, so single-channel output cannot drift
+        calib = _fake_spline_calibration(
+            model="spline-3d-multichannel", n_channels=2
+        )
+        if link_xyz:
+            calib = localize._as_link_xyz_calibration(calib)
+            theta = np.zeros((3, 7))  # [x, y, z, N0, N1, bg0, bg1]
+            theta[:, 2] = -8.0
+            theta[:, 3:5] = 400.0
+            theta[:, 5:] = 5.0
+        else:
+            theta = np.zeros((3, 5))  # [amplitude, x, y, z, offset]
+            theta[:, 0], theta[:, 3], theta[:, 4] = 500.0, -8.0, 5.0
+        box = calib["box"]
+        n_channels = localize._spline_n_channels(calib)
+        explicit = localize._spline_crlb(
+            theta,
+            calib,
+            box,
+            mle=True,
+            residuals=np.zeros((len(theta), n_channels, 2)),
+        )
+        implied = localize._spline_crlb(theta, calib, box, mle=True)
+        assert np.isfinite(implied).all()
+        np.testing.assert_array_equal(explicit, implied)
+
+    def test_spline_channel_affines_defaults_to_identity(self):
+        calib = _fake_spline_calibration(
+            model="spline-3d-multichannel", n_channels=3
+        )
+        aff = localize._spline_channel_affines(calib, 3)
+        np.testing.assert_array_equal(
+            aff, np.tile([1.0, 0.0, 0.0, 1.0], (3, 1))
+        )
+        # a calibration without usable transforms falls back to the identity,
+        # matching what the CUDA models do with no affine block
+        stripped = dict(calib)
+        stripped.pop("channel_transforms")
+        np.testing.assert_array_equal(
+            localize._spline_channel_affines(stripped, 3), aff
+        )
+
     def test_link_xyz_model_ids_cover_the_supported_range(self):
         # the map and the advertised maximum must not drift apart
         assert sorted(localize._LINK_XYZ_MODEL_ID_NAMES) == list(

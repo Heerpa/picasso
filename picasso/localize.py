@@ -79,6 +79,22 @@ _GAUSS_CRLB_MU_FLOOR = (
 # Largest channel count the photon-decoupled (link-XYZ) spline fit supports.
 _LINK_XYZ_MAX_CHANNELS = 6
 
+# Batching for spline fits that pass per-fit ROI residuals to Gpufit. The model
+# indexes the residual block by ``chunk_index * n_fits + fit_index``, which is
+# only correct while a call stays in one chunk, so keep each call comfortably
+# below Gpufit's own (free-VRAM-derived) chunk size. Whichever bound bites
+# first wins: the point budget covers large boxes / many channels, the fit
+# count covers small ones.
+_GPUFIT_MAX_POINTS_PER_CALL = 20_000_000
+_GPUFIT_MAX_FITS_PER_CALL = 50_000
+
+
+def _gpufit_batch_size(n_points: int) -> int:
+    """Spots per Gpufit call so that Gpufit does not split it into chunks."""
+    by_points = _GPUFIT_MAX_POINTS_PER_CALL // max(int(n_points), 1)
+    return int(max(1, min(by_points, _GPUFIT_MAX_FITS_PER_CALL)))
+
+
 # The columns under base are always available and the keys such as "3D
 # only" will be displayed in the save columns dialog in the GUI for
 # clarity
@@ -2421,7 +2437,9 @@ def _reorder_spline_coefficients_for_gpufit(
     raise ValueError(f"Unknown spline model '{model}'.")
 
 
-def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
+def _pack_spline_user_info(
+    calibration: dict, residuals: np.ndarray | None = None
+) -> lib.FloatArray1D:
     """Pack a spline calibration into Gpufit's ``user_info`` blob:
 
     - 2D: ``[n_data_x, n_data_y, n_int_x, n_int_y, coefficients...]``
@@ -2429,6 +2447,19 @@ def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
       coefficients...]``
     - 3D multichannel: ``[n_channels, n_data_x, n_data_y, n_data_z(=1),
       n_int_x, n_int_y, n_int_z, coefficients...]``
+
+    The multichannel models take two further blocks after the coefficients,
+    each optional and each skipped by the model when the blob is too short:
+
+    1. the per-channel lateral affine (4 values per channel), and
+    2. ``residuals``, the per-fit sub-pixel ROI offsets, ``[fit][channel][x,
+       y]``. Because the model resolves its position as ``chunk_index *
+       n_fits + fit_index``, this block must cover **every fit of the call, in
+       call order** - see :func:`_run_gpufit_spline`, which batches its calls
+       so that ``chunk_index`` stays 0.
+
+    Block 2 can only be appended when block 1 is present, since the model
+    locates it at a fixed offset past the affine.
 
     The coefficient block is the calibration's ``coefficients`` array reordered
     by :func:`_reorder_spline_coefficients_for_gpufit` from Gpuspline's
@@ -2488,12 +2519,36 @@ def _pack_spline_user_info(calibration: dict) -> lib.FloatArray1D:
         # updated CUDA models (spline_3d_multichannel.cuh / ..._link_xyz.cuh).
         transforms = calibration.get("channel_transforms")
         n_channels = _spline_n_channels(calibration)
-        if transforms is not None and len(transforms) == n_channels:
+        has_affine = transforms is not None and len(transforms) == n_channels
+        if has_affine:
             affine = []
             for t in transforms:
                 lin = np.asarray(t, dtype=np.float32)[:, :2]
                 affine.extend([lin[0, 0], lin[0, 1], lin[1, 0], lin[1, 1]])
             blocks.append(np.asarray(affine, dtype=np.float32))
+        if residuals is not None:
+            # Per-fit, per-channel sub-pixel ROI residual, laid out as
+            # [fit][channel][x, y].
+            # The model locates it at affine_begin + n_channels * 4, so it can
+            # only be appended when the affine block is actually there -
+            # otherwise the model would read these values as the affine.
+            if not has_affine:
+                raise ValueError(
+                    "ROI residuals need the per-channel affine block, but the "
+                    "calibration has no usable 'channel_transforms'."
+                )
+            res = np.ascontiguousarray(residuals, dtype=np.float32)
+            if res.ndim != 3 or res.shape[1:] != (n_channels, 2):
+                raise ValueError(
+                    "residuals must have shape (n_fits, n_channels, 2), got "
+                    f"{res.shape} for {n_channels} channels."
+                )
+            blocks.append(res.ravel(order="C"))
+    elif residuals is not None:
+        raise ValueError(
+            "ROI residuals only apply to the multichannel spline models, not "
+            f"to '{model}'."
+        )
     user_info = np.hstack(blocks).astype(np.float32)
     return user_info
 
@@ -2630,6 +2685,7 @@ def _run_gpufit_spline(
     initial_parameters: lib.FloatArray2D | None = None,
     tolerance: float = 1e-2,
     max_number_iterations: int = 20,
+    residuals: np.ndarray | None = None,
 ) -> tuple:
     """Low-level spline fit: crop the calibration to the spot box, pack the
     coefficient ``user_info`` and run Gpufit's spline model.
@@ -2643,6 +2699,16 @@ def _run_gpufit_spline(
     ``initial_parameters`` overrides the default per-spot initialization (used
     by the axial multi-start, which retries each spot from several z seeds). It
     must be ``(n_spots, n_parameters)`` matching the model.
+
+    ``residuals`` are the per-spot, per-channel sub-pixel ROI offsets from
+    :func:`get_spots_multichannel` (multichannel models only). When given, the
+    call is split into batches small enough that Gpufit keeps each one in a
+    single chunk. The model resolves a fit's residual as ``chunk_index *
+    n_fits + fit_index``, but ``n_fits`` is the *chunk* size, so for a short
+    final chunk that arithmetic silently points at the wrong fit. Keeping every
+    call to one chunk holds ``chunk_index`` at 0 and sidesteps it. Gpufit
+    derives its chunk size from free GPU memory and does not expose it, hence a
+    fixed, deliberately conservative batch here.
     """
     if not GPUFIT_INSTALLED:
         raise ImportError(
@@ -2687,7 +2753,6 @@ def _run_gpufit_spline(
         initial_parameters = np.ascontiguousarray(
             initial_parameters, dtype=np.float32
         )
-    user_info = _pack_spline_user_info(calibration)
     model_id = _spline_model_id(model, n_channels)
     if model == _LINK_XYZ_MODEL:
         n_parameters = 3 + 2 * n_channels
@@ -2697,9 +2762,10 @@ def _run_gpufit_spline(
                 f"{n_channels} channels needs {n_parameters} initial "
                 f"parameters per spot, got {initial_parameters.shape[1]}."
             )
-        if int(user_info[0]) != n_channels:
+        if int(_spline_n_channels(calibration)) != n_channels:
             raise ValueError(
-                f"user_info declares {int(user_info[0])} channels but the fit "
+                f"The calibration declares "
+                f"{int(_spline_n_channels(calibration))} channels but the fit "
                 f"model is set up for {n_channels}."
             )
     estimator_id = gf.EstimatorID.MLE if mle else gf.EstimatorID.LSE
@@ -2716,15 +2782,48 @@ def _run_gpufit_spline(
     else:
         fit_data = spots.reshape((len(spots), n_points))
 
-    return gf.fit(
-        fit_data,
-        None,
-        model_id,
-        initial_parameters,
-        tolerance=tolerance,
-        max_number_iterations=max_number_iterations,
-        estimator_id=estimator_id,
-        user_info=user_info,
+    def _fit(data, init, user_info):
+        return gf.fit(
+            data,
+            None,
+            model_id,
+            init,
+            tolerance=tolerance,
+            max_number_iterations=max_number_iterations,
+            estimator_id=estimator_id,
+            user_info=user_info,
+        )
+
+    if residuals is None:
+        return _fit(
+            fit_data, initial_parameters, _pack_spline_user_info(calibration)
+        )
+
+    res = np.ascontiguousarray(residuals, dtype=np.float32)
+    if len(res) != len(fit_data):
+        raise ValueError(
+            f"Got {len(res)} ROI residuals for {len(fit_data)} spots."
+        )
+    # One batch per Gpufit call, so the model's chunk_index is always 0 (see
+    # this function's docstring). Slices along axis 0 of a C-contiguous array
+    # stay contiguous, so no copy is made here.
+    batch = _gpufit_batch_size(n_points)
+    outputs = [
+        _fit(
+            fit_data[start : start + batch],
+            initial_parameters[start : start + batch],
+            _pack_spline_user_info(calibration, res[start : start + batch]),
+        )
+        for start in range(0, len(fit_data), batch)
+    ]
+    if len(outputs) == 1:
+        return outputs[0]
+    return (
+        np.concatenate([o[0] for o in outputs]),  # parameters
+        np.concatenate([o[1] for o in outputs]),  # states
+        np.concatenate([o[2] for o in outputs]),  # chi_squares
+        np.concatenate([o[3] for o in outputs]),  # number_iterations
+        float(sum(o[4] for o in outputs)),  # execution_time
     )
 
 
@@ -2734,6 +2833,7 @@ def fit_spots_gpufit_spline(
     mle: bool = False,
     n_z_starts: int = 1,
     return_stats: bool = False,
+    residuals: np.ndarray | None = None,
 ) -> (
     lib.FloatArray2D
     | tuple[lib.FloatArray2D, lib.FloatArray1D | None, lib.FloatArray1D]
@@ -2763,6 +2863,12 @@ def fit_spots_gpufit_spline(
         chi-square) is kept. Applies to 3D models only.
     return_stats : bool, optional
         Also return ``(log_likelihood, number_iterations)``. Default False.
+    residuals : np.ndarray, optional
+        Per-spot, per-channel sub-pixel ROI offsets ``(n_spots, n_channels,
+        2)`` from ``get_spots_multichannel(..., return_residuals=True)``.
+        Multichannel models only; without them the non-reference channels'
+        data sits up to half a pixel from where the model evaluates the
+        spline. See :func:`channel_roi_residuals`.
 
     Returns
     -------
@@ -2775,7 +2881,9 @@ def fit_spots_gpufit_spline(
     """
     if int(n_z_starts) <= 1:
         parameters, states, chi_squares, number_iterations, exec_time = (
-            _run_gpufit_spline(spots, calibration, mle=mle)
+            _run_gpufit_spline(
+                spots, calibration, mle=mle, residuals=residuals
+            )
         )
         if return_stats:
             # As in fit_spots_gpufit: Gpufit's MLE chi-square is twice the
@@ -2815,6 +2923,7 @@ def fit_spots_gpufit_spline(
             initial_parameters=init_k,
             tolerance=1e-4,
             max_number_iterations=100,
+            residuals=residuals,
         )
         finite = np.isfinite(params).all(axis=1) & np.isfinite(chi)
         converged = finite & ((states == 0) if mle else True)
@@ -2928,6 +3037,8 @@ def _spline_model_and_grad(
 @numba.njit(parallel=True, cache=True, fastmath=True)
 def _spline_infomats_3d(
     coeff,
+    aff,
+    res,
     box,
     amp,
     x_shift,
@@ -2945,6 +3056,13 @@ def _spline_infomats_3d(
     :func:`_spline_model_and_grad`. ``coeff`` is
     ``(n_channels, niz, niy, nix, 4, 4, 4)``. Non-converged rows are skipped
     (left as preset by the caller). Parameter order [x, y, z, amplitude, offset].
+
+    ``aff`` is ``(n_channels, 4)`` ``[a00, a01, a10, a11]`` and ``res`` is
+    ``(n_locs, n_channels, 2)`` sub-pixel ROI offsets, so that each channel is
+    evaluated exactly where ``spline_3d_multichannel.cuh`` evaluates it - the
+    shared shift mapped through that channel's affine, minus its ROI residual -
+    and the x/y derivatives pick up the matching ``Aᵀ`` chain rule. Both reduce
+    to the single-channel case at identity and zero.
 
     With ``mle`` True, ``bread`` (n, 5, 5) receives the Poisson Fisher matrix
     ``I = Σ g gᵀ / μ`` (its inverse is the MLE Cramer-Rao bound) and ``meat``
@@ -2985,15 +3103,24 @@ def _spline_infomats_3d(
         pz0, pz1, pz2, pz3 = 1.0, fz, fz * fz, fz * fz * fz
         dz1, dz2, dz3 = 1.0, 2.0 * fz, 3.0 * fz * fz
         for ch in range(n_channels):
+            # This channel sees the shared lateral shift through its own affine
+            # and sits on its own sub-pixel ROI offset - exactly as in
+            # spline_3d_multichannel.cuh. Hoisted: constant over the box.
+            a00 = aff[ch, 0]
+            a01 = aff[ch, 1]
+            a10 = aff[ch, 2]
+            a11 = aff[ch, 3]
+            sx = a00 * x_shift[m] + a01 * y_shift[m] + res[m, ch, 0]
+            sy = a10 * x_shift[m] + a11 * y_shift[m] + res[m, ch, 1]
             for i in range(box):
-                xco = i - x_shift[m]
+                xco = i - sx
                 xi = int(np.floor(xco))
                 xi = 0 if xi < 0 else (nix - 1 if xi > nix - 1 else xi)
                 fx = xco - xi
                 px0, px1, px2, px3 = 1.0, fx, fx * fx, fx * fx * fx
                 dx1, dx2, dx3 = 1.0, 2.0 * fx, 3.0 * fx * fx
                 for j in range(box):
-                    yco = j - y_shift[m]
+                    yco = j - sy
                     yi = int(np.floor(yco))
                     yi = 0 if yi < 0 else (niy - 1 if yi > niy - 1 else yi)
                     fy = yco - yi
@@ -3071,7 +3198,10 @@ def _spline_infomats_3d(
                         wb = mu
                     # d(mu)/d(param); the CRLB diagonal is sign-invariant per
                     # parameter, so native-coordinate vs shift sign is irrelevant.
-                    d0, d1, d2, d3 = a * gx, a * gy, a * gz, phi
+                    d0 = a * (a00 * gx + a10 * gy)
+                    d1 = a * (a01 * gx + a11 * gy)
+                    d2 = a * gz
+                    d3 = phi
                     f00 += d0 * d0 * wa
                     f01 += d0 * d1 * wa
                     f02 += d0 * d2 * wa
@@ -3279,6 +3409,8 @@ def _spline_infomats_2d(
 @numba.njit(parallel=True, cache=True, fastmath=True)
 def _spline_infomats_link_xyz_3d(
     coeff,
+    aff,
+    res,
     box,
     x_shift,
     y_shift,
@@ -3332,15 +3464,22 @@ def _spline_infomats_link_xyz_3d(
         for ch in range(n_channels):
             nc = photons[m, ch]
             bgc = bg[m, ch]
+            # per-channel affine + ROI residual, as in _spline_infomats_3d
+            a00 = aff[ch, 0]
+            a01 = aff[ch, 1]
+            a10 = aff[ch, 2]
+            a11 = aff[ch, 3]
+            sx = a00 * x_shift[m] + a01 * y_shift[m] + res[m, ch, 0]
+            sy = a10 * x_shift[m] + a11 * y_shift[m] + res[m, ch, 1]
             for i in range(box):
-                xco = i - x_shift[m]
+                xco = i - sx
                 xi = int(np.floor(xco))
                 xi = 0 if xi < 0 else (nix - 1 if xi > nix - 1 else xi)
                 fx = xco - xi
                 px0, px1, px2, px3 = 1.0, fx, fx * fx, fx * fx * fx
                 dx1, dx2, dx3 = 1.0, 2.0 * fx, 3.0 * fx * fx
                 for j in range(box):
-                    yco = j - y_shift[m]
+                    yco = j - sy
                     yi = int(np.floor(yco))
                     yi = 0 if yi < 0 else (niy - 1 if yi > niy - 1 else yi)
                     fy = yco - yi
@@ -3416,8 +3555,8 @@ def _spline_infomats_link_xyz_3d(
                         wb = mu
                     for t in range(n_params):
                         g[t] = 0.0
-                    g[0] = nc * gx
-                    g[1] = nc * gy
+                    g[0] = nc * (a00 * gx + a10 * gy)
+                    g[1] = nc * (a01 * gx + a11 * gy)
                     g[2] = nc * gz
                     g[3 + ch] = phi
                     g[3 + n_channels + ch] = 1.0
@@ -3441,6 +3580,7 @@ def _spline_link_xyz_crlb(
     theta: lib.FloatArray2D,
     calibration: dict,
     box: int,
+    residuals: np.ndarray | None = None,
     mle: bool = True,
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
@@ -3469,6 +3609,10 @@ def _spline_link_xyz_crlb(
 
     bread = np.tile(np.eye(n_params), (max(n_locs, 1), 1, 1))
     meat = np.zeros((max(n_locs, 1), n_params, n_params))
+    # same per-channel geometry as the fit (affine + ROI residual), so
+    # the reported precision belongs to the model actually fitted
+    aff = _spline_channel_affines(calibration, n_channels)
+    res = _spline_crlb_residuals(residuals, n_locs, n_channels)
 
     use_tqdm = progress_callback == "console"
     do_callback = callable(progress_callback)
@@ -3490,6 +3634,8 @@ def _spline_link_xyz_crlb(
         meat = np.zeros((stop - start, n_params, n_params))
         _spline_infomats_link_xyz_3d(
             coeff,
+            aff,
+            res[sl],
             box,
             x_shift[sl],
             y_shift[sl],
@@ -3511,6 +3657,45 @@ def _spline_link_xyz_crlb(
     crlb[~finite] = np.nan
     crlb = np.where(crlb > 0.0, crlb, np.nan)
     return crlb
+
+
+def _spline_channel_affines(calibration: dict, n_channels: int) -> np.ndarray:
+    """Per-channel lateral 2x2 affine as ``(n_channels, 4)``
+    ``[a00, a01, a10, a11]``.
+
+    The multichannel fit evaluates one shared lateral shift through each
+    channel's own transform, so the precision has to be computed the same way -
+    otherwise the reported ``lpx``/``lpy`` come from a different model than the
+    one that was fitted. Falls back to the identity per channel when the
+    calibration carries no usable ``channel_transforms``, matching what the
+    CUDA models do when the affine block is missing from ``user_info``."""
+    aff = np.tile(np.array([1.0, 0.0, 0.0, 1.0]), (n_channels, 1))
+    transforms = calibration.get("channel_transforms")
+    if transforms is not None and len(transforms) == n_channels:
+        for c, t in enumerate(transforms):
+            lin = np.asarray(t, dtype=np.float64)[:, :2]
+            aff[c] = (lin[0, 0], lin[0, 1], lin[1, 0], lin[1, 1])
+    return aff
+
+
+def _spline_crlb_residuals(
+    residuals: np.ndarray | None, n_locs: int, n_channels: int
+) -> np.ndarray:
+    """``(n_locs, n_channels, 2)`` float64 ROI residuals for the CRLB kernels,
+    or zeros when the fit was run without them - so the precision is evaluated
+    under the same geometry that produced ``theta``."""
+    rows = max(int(n_locs), 1)
+    if residuals is None:
+        return np.zeros((rows, n_channels, 2), dtype=np.float64)
+    res = np.ascontiguousarray(residuals, dtype=np.float64)
+    if res.shape != (n_locs, n_channels, 2):
+        raise ValueError(
+            "residuals must have shape (n_locs, n_channels, 2) = "
+            f"{(n_locs, n_channels, 2)}, got {res.shape}."
+        )
+    if n_locs == 0:
+        return np.zeros((rows, n_channels, 2), dtype=np.float64)
+    return res
 
 
 def _spline_coeff_reshaped(calibration: dict) -> np.ndarray:
@@ -3545,6 +3730,7 @@ def _spline_crlb(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    residuals: np.ndarray | None = None,
 ) -> lib.FloatArray2D:
     """Parameter-variance estimates for spline-fitted localizations.
 
@@ -3583,6 +3769,14 @@ def _spline_crlb(
     progress_callback : callable, "console" or None, optional
         Progress over localization chunks. ``"console"`` shows a tqdm bar; a
         callable is invoked with the cumulative number of localizations done.
+    residuals : np.ndarray, optional
+        Per-localization, per-channel sub-pixel ROI offsets ``(n_locs,
+        n_channels, 2)``, as passed to the fit (see
+        :func:`channel_roi_residuals`). Multichannel only; ``None`` (the
+        default) means zero, which is the single-channel case. Pass whatever
+        the fit used: the covariance is evaluated at ``theta`` under the same
+        geometry, and the per-channel affine that goes with it is read from
+        ``calibration["channel_transforms"]``.
 
     Returns
     -------
@@ -3602,6 +3796,7 @@ def _spline_crlb(
             box,
             mle=mle,
             progress_callback=progress_callback,
+            residuals=residuals,
         )
     is_3d = model != "spline-2d"
     n_params = 5 if is_3d else 4
@@ -3626,6 +3821,10 @@ def _spline_crlb(
     # ``meat`` M is only filled for the least-squares sandwich (stays 0 for mle).
     bread = np.tile(np.eye(n_params), (max(n_locs, 1), 1, 1))
     meat = np.zeros((max(n_locs, 1), n_params, n_params))
+    # same per-channel geometry as the fit (affine + ROI residual), so
+    # the reported precision belongs to the model actually fitted
+    aff = _spline_channel_affines(calibration, coeff.shape[0])
+    res = _spline_crlb_residuals(residuals, n_locs, coeff.shape[0])
 
     use_tqdm = progress_callback == "console"
     do_callback = callable(progress_callback)
@@ -3643,6 +3842,8 @@ def _spline_crlb(
         if is_3d:
             _spline_infomats_3d(
                 coeff,
+                aff,
+                res[sl],
                 box,
                 amplitude[sl],
                 x_shift[sl],
@@ -3698,6 +3899,7 @@ def _locs_from_fits_spline_link_xyz(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    residuals: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Localizations from a photon-decoupled (link-XYZ) multichannel spline fit.
 
@@ -3733,7 +3935,12 @@ def _locs_from_fits_spline_link_xyz(
     y = y_shift / oversampling + center + ids_y - box_offset
 
     crlb = _spline_link_xyz_crlb(
-        theta, calibration, box, mle=mle, progress_callback=progress_callback
+        theta,
+        calibration,
+        box,
+        mle=mle,
+        progress_callback=progress_callback,
+        residuals=residuals,
     )  # variances [x, y, z, N_0.., bg_0..]
     var_amp = crlb[:, 3 : 3 + n_channels]
     var_bg = crlb[:, 3 + n_channels : 3 + 2 * n_channels]
@@ -3801,6 +4008,7 @@ def locs_from_fits_spline(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    residuals: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Convert spline fit results into a localizations data frame.
 
@@ -3828,6 +4036,7 @@ def locs_from_fits_spline(
             log_likelihood=log_likelihood,
             iterations=iterations,
             progress_callback=progress_callback,
+            residuals=residuals,
         )
     is_3d = model != "spline-2d"
     box_offset = int(box / 2)
@@ -3859,6 +4068,7 @@ def locs_from_fits_spline(
         box,
         mle=mle,
         progress_callback=progress_callback,
+        residuals=residuals,
     )
     amp_var, off_var = crlb[:, -2], crlb[:, -1]
     with np.errstate(invalid="ignore"):
@@ -4291,7 +4501,8 @@ def get_spots_multichannel(
     camera_infos: list[dict],
     transforms: list,
     progress_callback: Callable[[int], None] | None = None,
-) -> np.ndarray:
+    return_residuals: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Extract channel-stacked spots for multichannel spline fitting.
 
     For each identification (given in the reference channel's coordinates),
@@ -4316,11 +4527,19 @@ def get_spots_multichannel(
         coordinates to that channel; ``transforms[0]`` is the identity.
     progress_callback : callable, optional
         Forwarded to ``get_spots`` for the reference channel.
+    return_residuals : bool, optional
+        Also return the sub-pixel ROI-placement residuals, i.e. the fractional
+        part discarded when each channel's box is snapped to an integer pixel.
+        The fit models need these to evaluate the spline where the data
+        actually is; see :func:`channel_roi_residuals`. Default False.
 
     Returns
     -------
     spots : np.ndarray
         Array of shape ``(n_spots, box, box, n_channels)`` in photon units.
+    residuals : np.ndarray
+        Only if ``return_residuals``. ``(n_spots, n_channels, 2)`` in ``[x,
+        y]`` order; channel 0 is exactly zero.
     """
     n_channels = len(movies)
     if not (len(camera_infos) == len(transforms) == n_channels):
@@ -4335,17 +4554,22 @@ def get_spots_multichannel(
         ]
     )
     channel_spots = []
+    residuals = np.zeros((len(ref_xy), n_channels, 2), dtype=np.float32)
     for c in range(n_channels):
         if c == 0:
             ids_c = identifications
         else:
             mapped = apply_affine_transform(ref_xy, transforms[c])
             ids_c = identifications.copy()
-            # get_spots/_cut_spots cut an integer-pixel box; the fixed
-            # fractional per-channel offset is absorbed consistently because
-            # the calibration is built with the same extractor.
-            ids_c["x"] = np.rint(mapped[:, 0]).astype(np.int64)
-            ids_c["y"] = np.rint(mapped[:, 1]).astype(np.int64)
+            # get_spots/_cut_spots cut an INTEGER-pixel box, so the box origin
+            # cannot express the fractional part of the mapped position. Keep
+            # it: the fit model subtracts it from the evaluation position (see
+            # channel_roi_residuals). Channel 0 is the reference and its box
+            # sits on the (integer) detection itself, so its residual is 0.
+            rounded = np.rint(mapped)
+            residuals[:, c, :] = (mapped - rounded).astype(np.float32)
+            ids_c["x"] = rounded[:, 0].astype(np.int64)
+            ids_c["y"] = rounded[:, 1].astype(np.int64)
         spots_c = get_spots(
             movies[c],
             ids_c,
@@ -4354,7 +4578,60 @@ def get_spots_multichannel(
             progress_callback=progress_callback if c == 0 else None,
         )
         channel_spots.append(spots_c)
-    return np.stack(channel_spots, axis=-1)
+    spots = np.stack(channel_spots, axis=-1)
+    if return_residuals:
+        return spots, residuals
+    return spots
+
+
+def channel_roi_residuals(
+    identifications: pd.DataFrame, transforms: list
+) -> np.ndarray:
+    """Sub-pixel ROI-placement residual per localization and channel.
+
+    :func:`get_spots_multichannel` cuts each channel's box at an integer pixel
+    (``rint`` of the mapped position), so the fractional part of the mapping is
+    not representable by the box origin. That leftover, ``mapped -
+    rint(mapped)``, is what this returns; the multichannel spline models
+    subtract it from the position at which they evaluate the spline (see the
+    residual block in ``spline_3d_multichannel.cuh``).
+
+    Detections sit on integer pixels, so for a channel transform
+    ``A = I + E`` the residual is ``(E@x + b) - rint(E@x + b)``.
+
+    :func:`get_spots_multichannel` computes the same quantity as a by-product
+    of cutting the ROIs; prefer its ``return_residuals=True`` form when you are
+    extracting spots anyway. This function is for callers that already have
+    spots and only need the residuals.
+
+    Parameters
+    ----------
+    identifications : pd.DataFrame
+        Detections in the reference channel, with integer ``x``/``y`` columns -
+        the same frame the ROIs are cut in.
+    transforms : list
+        One ``(2, 3)`` affine per channel mapping reference-channel coordinates
+        to that channel, ``transforms[0]`` the identity (as stored in the
+        calibration's ``channel_transforms``).
+
+    Returns
+    -------
+    residuals : np.ndarray
+        ``(n_spots, n_channels, 2)`` float32 in ``[x, y]`` order, matching the
+        model's ``[fit][channel][x, y]`` residual block. Channel 0 is the
+        reference (its box is cut on the detection itself) and is exactly zero.
+    """
+    ref_xy = np.column_stack(
+        [
+            np.asarray(identifications["x"], dtype=np.float64),
+            np.asarray(identifications["y"], dtype=np.float64),
+        ]
+    )
+    residuals = np.zeros((len(ref_xy), len(transforms), 2), dtype=np.float32)
+    for c in range(1, len(transforms)):
+        mapped = apply_affine_transform(ref_xy, transforms[c])
+        residuals[:, c, :] = (mapped - np.rint(mapped)).astype(np.float32)
+    return residuals
 
 
 def fit_spline_multichannel(
@@ -4366,6 +4643,7 @@ def fit_spline_multichannel(
     mle: bool = False,
     link_photons: bool = True,
     progress_callback: Callable[[int], None] | None = None,
+    apply_roi_residuals: bool = True,
 ) -> pd.DataFrame:
     """Fit a multichannel cubic-spline PSF across several registered channels.
 
@@ -4399,6 +4677,14 @@ def fit_spline_multichannel(
         gets its own photon count and background, reported as
         ``photons_ch{c}`` / ``bg_ch{c}`` / ``rel_photons_ch{c}``.
         Available for 2 to 6 channels. See :func:`_as_link_xyz_calibration`.
+    apply_roi_residuals : bool, optional
+        Hand the sub-pixel ROI-placement residuals to the fit model (default
+        True), so each channel's spline is evaluated where its data actually
+        sits rather than at the nearest whole pixel. See
+        :func:`channel_roi_residuals` for why this matters and by how much. Set
+        False to reproduce results from before this correction, or to A/B the
+        two on the same data. Needs a ``Gpufit.dll`` built from the current
+        models; an older build ignores the residuals silently.
     """
     if calibration.get("model") != "spline-3d-multichannel":
         raise ValueError(
@@ -4416,16 +4702,21 @@ def fit_spline_multichannel(
     identifications = multichannel_inbounds_ids(
         identifications, box, movies, transforms
     )
-    spots = get_spots_multichannel(
+    spots, residuals = get_spots_multichannel(
         movies,
         identifications,
         box,
         camera_infos,
         transforms,
         progress_callback=progress_callback,
+        return_residuals=True,
     )
     theta, log_likelihood, iterations = fit_spots_gpufit_spline(
-        spots, calibration, mle=mle, return_stats=True
+        spots,
+        calibration,
+        mle=mle,
+        return_stats=True,
+        residuals=residuals if apply_roi_residuals else None,
     )
     em = camera_infos[0].get("Gain", 1) > 1
     return locs_from_fits_spline(
@@ -4438,6 +4729,7 @@ def fit_spline_multichannel(
         log_likelihood=log_likelihood,
         iterations=iterations,
         progress_callback=progress_callback,
+        residuals=residuals if apply_roi_residuals else None,
     )
 
 
@@ -4499,6 +4791,7 @@ def fit_spline_multichannel_ratiometric(
     photon_ratios: lib.FloatArray2D | None = None,
     mle: bool = False,
     progress_callback: Callable[[int], None] | None = None,
+    apply_roi_residuals: bool = True,
 ) -> pd.DataFrame:
     """Ratiometric multichannel spline fit with photon-ratio color assignment.
 
@@ -4522,6 +4815,9 @@ def fit_spline_multichannel_ratiometric(
     Returns localizations in the reference channel's coordinates with an added
     integer ``color`` column (the winning ratio index) and per-channel photon
     columns ``photons_ch{c}`` (``photons`` is their sum).
+
+    ``apply_roi_residuals`` (default True) is as in
+    :func:`fit_spline_multichannel`.
     """
     if calibration.get("model") != "spline-3d-multichannel":
         raise ValueError(
@@ -4552,14 +4848,17 @@ def fit_spline_multichannel_ratiometric(
     identifications = multichannel_inbounds_ids(
         identifications, box, movies, transforms
     )
-    spots = get_spots_multichannel(
+    spots, roi_residuals = get_spots_multichannel(
         movies,
         identifications,
         box,
         camera_infos,
         transforms,
         progress_callback=progress_callback,
+        return_residuals=True,
     )
+    if not apply_roi_residuals:
+        roi_residuals = None
     n_spots = len(spots)
     n_hyp = len(photon_ratios)
     # Normalize each hypothesis so the shared amplitude keeps a total-photon
@@ -4576,7 +4875,7 @@ def fit_spline_multichannel_ratiometric(
             calibration["coefficients"], ratios_norm[k]
         )
         params, states, chi_squares, _n_it, _t = _run_gpufit_spline(
-            spots, calib_k, mle=mle
+            spots, calib_k, mle=mle, residuals=roi_residuals
         )
         thetas.append(params)
         finite = np.isfinite(params).all(axis=1) & np.isfinite(chi_squares)
@@ -4609,7 +4908,13 @@ def fit_spline_multichannel_ratiometric(
         ids_k = identifications.iloc[rows]
         theta_k = np.asarray(thetas[k])[rows]
         locs_k = locs_from_fits_spline(
-            ids_k, theta_k, box, em, calib_k, mle=mle
+            ids_k,
+            theta_k,
+            box,
+            em,
+            calib_k,
+            mle=mle,
+            residuals=(None if roi_residuals is None else roi_residuals[rows]),
         )
         amp = pd.Series(np.asarray(theta_k[:, 0]), index=ids_k.index)
         ps = _photon_scales(calib_k, n_channels)
@@ -4790,6 +5095,7 @@ def fit_spline_split_fov(
     link_photons: bool = True,
     confine_to_reference: bool = True,
     progress_callback: Callable[[int], None] | None = None,
+    apply_roi_residuals: bool = True,
 ) -> pd.DataFrame:
     """Fit a split-FOV multichannel spline PSF from a *single* movie whose
     rectangular sub-regions are the channels.
@@ -4820,7 +5126,7 @@ def fit_spline_split_fov(
         the stored region-local affines - so the same calibration can be applied
         to data whose split sits at a different position. When omitted, the
         calibration's own ``regions`` (the calibration-time positions) are used.
-    photon_ratios : optional
+    photon_ratios : lib.FloatArray2D, optional
         Candidate per-channel ratios for the ratiometric path (else taken from
         the calibration).
 
@@ -4856,6 +5162,7 @@ def fit_spline_split_fov(
             mle=mle,
             link_photons=False,
             progress_callback=progress_callback,
+            apply_roi_residuals=apply_roi_residuals,
         )
     if (
         photon_ratios is not None
@@ -4870,6 +5177,7 @@ def fit_spline_split_fov(
             photon_ratios=photon_ratios,
             mle=mle,
             progress_callback=progress_callback,
+            apply_roi_residuals=apply_roi_residuals,
         )
     return fit_spline_multichannel(
         movies,
@@ -4880,6 +5188,7 @@ def fit_spline_split_fov(
         mle=mle,
         link_photons=link_photons,
         progress_callback=progress_callback,
+        apply_roi_residuals=apply_roi_residuals,
     )
 
 

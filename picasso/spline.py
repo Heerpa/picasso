@@ -284,11 +284,11 @@ def _bead_volumes(
     over all frames assigned to that step.
 
     If ``return_spots`` is True, also returns the individual per-frame spots
-    flattened to ``(n_spots, box, box)`` and, for each spot, the position of
-    its z-step within ``step_range`` (``(n_spots,)``), so the axial precision
-    can be measured by fitting every single-frame spot separately (the
-    realistic, single-frame shot-noise regime).
-    """
+    flattened to ``(n_spots, box, box)``, for each spot the position of its
+    z-step within ``step_range`` (``(n_spots,)``), and for each spot the row of
+    ``beads`` it came from (``(n_spots,)``), so the axial precision can be
+    measured by fitting every single-frame spot separately (the realistic,
+    single-frame shot-noise regime)."""
     n_beads = len(beads)
     n_steps = len(step_range)
     step_to_pos = {int(s): i for i, s in enumerate(step_range)}
@@ -337,7 +337,12 @@ def _bead_volumes(
         volumes = np.zeros((n_beads, box, box, n_steps), dtype=np.float32)
         volumes[bidx, :, :, pidx] = got
         if return_spots:
-            return volumes, got.astype(np.float32), pidx.astype(int)
+            return (
+                volumes,
+                got.astype(np.float32),
+                pidx.astype(int),
+                bidx.astype(int),
+            )
         return volumes
 
     # single field / repeats: average all frames of a step (pixelwise)
@@ -373,7 +378,8 @@ def _bead_volumes(
         )
         spots_flat = spots.reshape(n_valid * n_beads, box, box)
         spot_step_pos = np.repeat(pos_of_valid, n_beads)
-        return volumes, spots_flat, spot_step_pos
+        spot_bead_idx = np.tile(np.arange(n_beads, dtype=int), n_valid)
+        return volumes, spots_flat, spot_step_pos, spot_bead_idx
     return volumes
 
 
@@ -490,6 +496,63 @@ def _keep_inliers(
     return keep
 
 
+# Sub-pixel lateral offsets below this are left alone rather than paying for an
+# interpolation that cannot move the volume anyway.
+_RECENTER_MIN_SHIFT = 1e-3
+# Largest offset worth correcting, in pixels. The physical worst case is 1.0: a
+# bead is detected on the integer grid, so its average sits within half a pixel
+# of the box centre, plus (for a mapped channel) its sub-pixel ROI residual,
+# another half. The cap sits just above that so a genuine worst-case offset is
+# not refused on fit noise, while a plainly wrong estimate still is - and past
+# roughly here the correction cannot be delivered anyway: on a 7 px box a 1.0
+# px shift lands within 0.01 px of the centre and a 1.3 px one within 0.04, but
+# a 1.7 px one leaves 0.44 px behind, because the PSF runs off the edge and
+# ``mode="nearest"`` smears it. Refusing to shift leaves the template as it
+# was, which is the safe direction.
+_RECENTER_MAX_SHIFT = 1.25
+
+
+def _focus_center_offset(
+    volume: np.ndarray, z_center: int
+) -> tuple[float, float]:
+    """Lateral ``(row, col)`` offset of the in-focus PSF centre from the box
+    centre, in pixels.
+
+    Uses the same least-squares Gaussian fitter as :func:`_focus_step` (whose
+    sigma already defines "in focus" here), falling back to the
+    background-subtracted intensity centroid when the fit does not converge -
+    a PSF a single Gaussian cannot describe, such as a double helix, still has
+    a well-defined centroid. Returns ``(0.0, 0.0)`` if neither estimate is
+    usable, so the caller simply leaves the volume alone."""
+    focus = np.ascontiguousarray(volume[:, :, int(z_center)], dtype=np.float32)
+    try:
+        theta = gausslq.fit_spot(focus)
+        # gausslq returns [x, y, ...] as offsets from the box centre, x the
+        # column and y the row (see gausslq._sum_and_center_of_mass).
+        d_col, d_row = float(theta[0]), float(theta[1])
+    except Exception:
+        # a degenerate slice can divide by zero inside the least-squares
+        # model; that is a reason to fall back, not to fail the calibration
+        d_col = d_row = np.nan
+    if not (np.isfinite(d_row) and np.isfinite(d_col)):
+        weights = np.clip(focus - focus.min(), 0.0, None).astype(np.float64)
+        total = float(weights.sum())
+        if total <= 0.0:
+            return 0.0, 0.0
+        rows, cols = np.mgrid[0 : focus.shape[0], 0 : focus.shape[1]]
+        d_row = (
+            float((weights * rows).sum() / total) - (focus.shape[0] - 1) / 2.0
+        )
+        d_col = (
+            float((weights * cols).sum() / total) - (focus.shape[1] - 1) / 2.0
+        )
+    if not (np.isfinite(d_row) and np.isfinite(d_col)):
+        return 0.0, 0.0
+    if max(abs(d_row), abs(d_col)) > _RECENTER_MAX_SHIFT:
+        return 0.0, 0.0
+    return d_row, d_col
+
+
 def _register_and_average(
     volumes: np.ndarray,
     z_center: int,
@@ -582,6 +645,27 @@ def _register_and_average(
         raise ValueError(
             "No usable beads after registration; the calibration failed."
         )
+    # The rounds above align every bead to ONE anchor - the brightest in-focus
+    # bead of round 0 - so the average inherits that bead's own sub-pixel
+    # offset instead of sitting at the box centre. Put it back on the centre,
+    # which is where the fit model's zero lateral shift evaluates the spline.
+    # Left in, the offset is a constant lateral bias: harmless for a single
+    # channel, where it just translates the whole reconstruction, but not
+    # across channels - each picks its own anchor, so a linked multichannel fit
+    # sees a fixed inter-channel misregistration it cannot represent.
+    d_row, d_col = _focus_center_offset(ref, z_center)
+    if max(abs(d_row), abs(d_col)) > _RECENTER_MIN_SHIFT:
+        shift = (-d_row, -d_col, 0.0)
+        ref = _ndi_shift(ref, shift=shift, order=3, mode="nearest")
+        if return_registered:
+            # the individual beads feed the goodness of fit, which fits only
+            # amplitude and background - so they have to move with the template
+            aligned = _ndi_shift(
+                aligned,
+                shift=(0.0, -d_row, -d_col, 0.0),
+                order=3,
+                mode="nearest",
+            )
     mean_volume = ref.astype(np.float32)
     if return_registered:
         return mean_volume, aligned[keep].astype(np.float32)
@@ -788,10 +872,11 @@ def build_psf_template(
     goodness-of-fit).
 
     If ``return_spots`` is True, the dict also carries ``spots`` (every
-    individual per-frame bead spot, ``(n_spots, box, box)``, photon units) and
+    individual per-frame bead spot, ``(n_spots, box, box)``, photon units),
     ``spot_step_idx`` (the index into the template z-axis of each spot's stage
-    step), which ``_axial_precision`` fits one by one to measure the axial
-    precision in the realistic single-frame regime.
+    step) and ``spot_bead_idx`` (the row of ``beads`` each spot came from),
+    which ``_axial_precision`` fits one by one to measure the axial precision
+    in the realistic single-frame regime.
 
     If ``beads`` (a data frame with integer ``x``/``y`` columns) is given, it
     is used instead of detecting beads on this movie - this lets the
@@ -820,7 +905,7 @@ def build_psf_template(
             fov_of_frame=fov_of_frame,
         )
     if return_spots:
-        volumes, spots, spot_step_pos = _bead_volumes(
+        volumes, spots, spot_step_pos, spot_bead_idx = _bead_volumes(
             movie,
             camera_info,
             beads,
@@ -878,6 +963,10 @@ def build_psf_template(
         # spot's known stage position (see _axial_precision).
         result["spots"] = spots
         result["spot_step_idx"] = spot_step_pos
+        # which bead each spot came from, so a caller that knows where the
+        # beads sit can attach per-spot geometry (e.g. the multichannel ROI
+        # residuals) without re-deriving the flattening order
+        result["spot_bead_idx"] = spot_bead_idx
     return result
 
 
@@ -1044,6 +1133,9 @@ def calibrate_spline(
         # lateral template sampling equals the camera pixel grid, so shifts
         # are already in camera pixels
         "oversampling": 1.0,
+        # the template is centred on the box (see _register_and_average), so a
+        # zero fitted lateral shift means "emitter at the box centre"
+        "lateral_centered": True,
         "z_center": float(z_origin),
         "z_init": float(z_init),
         "z_step_nm": float(d),
@@ -1476,7 +1568,7 @@ def calibrate_spline_multichannel(
                 "All split-FOV regions must have the same size (height, "
                 f"width); got {sorted(sizes)}."
             )
-        (y0_ref, x0_ref) = region_rects[0][0]
+        y0_ref, x0_ref = region_rects[0][0]
         # shift added to a channel's beads to overlay them on the reference
         # region: (x0_ref - x0_c, y0_ref - y0_c)
         coarse_shifts = [
@@ -1610,6 +1702,10 @@ def calibrate_spline_multichannel(
         "n_channels": n_channels,
         "channel_transforms": [t.tolist() for t in transforms],
         "oversampling": 1.0,
+        # every channel's template is centred on its own box, so the channels
+        # share one lateral origin and the linked fit is free of the constant
+        # inter-channel offset an anchor-bead-centred template would carry
+        "lateral_centered": True,
         "z_center": float(z_origin),
         "z_init": float(z_init),
         "z_step_nm": float(d),
@@ -1672,7 +1768,14 @@ def calibrate_spline_multichannel(
         # present) plus one channel-registration plot. Never fatal.
         try:
             _save_multichannel_diagnostics(
-                per_channel, calibration, coefficients, reg_info, path
+                per_channel,
+                calibration,
+                coefficients,
+                reg_info,
+                path,
+                spot_residuals=_spot_roi_residuals(
+                    per_channel, ref_xy, transforms
+                ),
             )
         except Exception:
             pass
@@ -1835,12 +1938,42 @@ def _save_multichannel_summary_plot(
     fig.savefig(base + "_summary.png", format="png", dpi=200)
 
 
+def _spot_roi_residuals(
+    per_channel: list[dict], ref_xy: np.ndarray, transforms: list
+) -> np.ndarray | None:
+    """Per-spot, per-channel sub-pixel ROI residuals for the calibration's own
+    bead spots, ``(n_spots, n_channels, 2)``, or None when they cannot be
+    attributed.
+
+    The bead spots are cut at ``rint`` of each bead's mapped position, exactly
+    as at fit time, so they carry the same residual and the axial-precision
+    refit has to be told about it - otherwise it measures a model mismatch that
+    the real pipeline does not have. ``spot_bead_idx`` maps each spot back to
+    its bead; it must agree across channels, since the caller stacks row *i* of
+    every channel as one physical bead and frame."""
+    idx = [p.get("spot_bead_idx") for p in per_channel]
+    if any(i is None for i in idx):
+        return None
+    first = np.asarray(idx[0])
+    if any(not np.array_equal(first, np.asarray(i)) for i in idx[1:]):
+        # channels disagree on which bead each row is - the stacking the
+        # caller does would be wrong too, so let it fall back
+        return None
+    per_bead = localize.channel_roi_residuals(
+        pd.DataFrame({"x": ref_xy[:, 0], "y": ref_xy[:, 1]}), transforms
+    )
+    if first.size and int(first.max()) >= len(per_bead):
+        return None
+    return np.ascontiguousarray(per_bead[first])
+
+
 def _save_multichannel_diagnostics(
     per_channel: list[dict],
     calibration: dict,
     coefficients: np.ndarray,
     reg_info: list[dict],
     path: str,
+    spot_residuals: np.ndarray | None = None,
 ) -> None:
     """Write the multichannel calibration diagnostics next to ``path``.
 
@@ -1868,7 +2001,7 @@ def _save_multichannel_diagnostics(
     # the summary figure, not repeated (misleadingly) on every channel's plot.
     try:
         joint_precision = _axial_precision_multichannel(
-            per_channel, calibration
+            per_channel, calibration, spot_residuals=spot_residuals
         )
     except Exception:
         joint_precision = None
@@ -3010,10 +3143,16 @@ def _axial_precision_from_theta(
 
 
 def _axial_precision_multichannel(
-    per_channel: list[dict], calibration: dict
+    per_channel: list[dict],
+    calibration: dict,
+    spot_residuals: np.ndarray | None = None,
 ) -> dict | None:
     """Joint (all-channel) axial precision of a multichannel spline
-    calibration."""
+    calibration.
+
+    ``spot_residuals`` (``(n_spots, n_channels, 2)``, see
+    :func:`_spot_roi_residuals`) are the sub-pixel ROI offsets of the bead
+    spots being refitted."""
     if not localize.GPUFIT_INSTALLED:
         return None
     # only the plain multichannel spline fitter is used here
@@ -3044,9 +3183,17 @@ def _axial_precision_multichannel(
     # large |z|; several z seeds recover it.
     n_z = int(calibration["n_data"][2])
     n_z_starts = int(np.clip(n_z // 20, 5, 15))
+    if spot_residuals is not None and (
+        np.asarray(spot_residuals).shape != (n_spots, n_channels, 2)
+    ):
+        spot_residuals = None
     try:
         theta = localize.fit_spots_gpufit_spline(
-            spots, fit_cal, mle=True, n_z_starts=n_z_starts
+            spots,
+            fit_cal,
+            mle=True,
+            n_z_starts=n_z_starts,
+            residuals=spot_residuals,
         )
     except Exception:
         return None

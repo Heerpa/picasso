@@ -224,6 +224,89 @@ class TestTemplateHelpers:
         assert peak_row == c
         assert peak_col == c
 
+    def test_register_and_average_centers_a_common_offset(self):
+        # Every bead offset the SAME way: cross-correlation alignment is a
+        # no-op here (they already agree), so only an explicit centering step
+        # can put the average back on the box center. Left off-center, the
+        # offset is baked into the template - a constant lateral bias that is
+        # harmless for one channel but becomes an inter-channel
+        # misregistration in a linked multichannel fit, where every channel
+        # picks its own anchor bead.
+        box, nz = BOX, 3
+        yy, xx = np.mgrid[0:box, 0:box]
+        c = box // 2
+        s = 1.1
+        dx, dy = 1.0, -1.0
+        volumes = np.zeros((3, box, box, nz), dtype=np.float32)
+        for b in range(3):
+            for k in range(nz):
+                volumes[b, :, :, k] = np.exp(
+                    -((xx - (c + dx)) ** 2 + (yy - (c + dy)) ** 2) / (2 * s**2)
+                )
+        mean_vol = spline._register_and_average(volumes, z_center=1)
+        focus = mean_vol[:, :, 1]
+        peak_row, peak_col = np.unravel_index(np.argmax(focus), focus.shape)
+        assert (peak_row, peak_col) == (c, c)
+
+    def test_focus_center_offset_matches_a_known_shift(self):
+        box, nz = BOX, 3
+        yy, xx = np.mgrid[0:box, 0:box]
+        c = box // 2
+        dx, dy = 0.4, -0.7
+        volume = np.zeros((box, box, nz), dtype=np.float32)
+        for k in range(nz):
+            volume[:, :, k] = np.exp(
+                -((xx - (c + dx)) ** 2 + (yy - (c + dy)) ** 2) / (2 * 1.2**2)
+            )
+        d_row, d_col = spline._focus_center_offset(volume, z_center=1)
+        assert d_row == pytest.approx(dy, abs=0.05)
+        assert d_col == pytest.approx(dx, abs=0.05)
+
+    def test_focus_center_offset_is_accurate_within_its_bound(self):
+        # inside the cap the measurement plus one cubic shift must land on the
+        # centre; this is what makes a single centring pass enough
+        from scipy.ndimage import shift as ndi_shift
+
+        box, nz = BOX, 5
+        yy, xx = np.mgrid[0:box, 0:box]
+        c = box // 2
+        for d in (0.3, 0.8, 1.0):
+            volume = np.zeros((box, box, nz), dtype=np.float32)
+            for k in range(nz):
+                volume[:, :, k] = np.exp(
+                    -((xx - (c + d)) ** 2 + (yy - (c - d)) ** 2) / (2 * 1.1**2)
+                )
+            d_row, d_col = spline._focus_center_offset(volume, 2)
+            assert d_col == pytest.approx(d, abs=0.02)
+            assert d_row == pytest.approx(-d, abs=0.02)
+            centered = ndi_shift(
+                volume, shift=(-d_row, -d_col, 0.0), order=3, mode="nearest"
+            )
+            left = spline._focus_center_offset(centered, 2)
+            assert max(abs(left[0]), abs(left[1])) < 0.02
+
+    def test_focus_center_offset_refuses_beyond_the_cap(self):
+        # a shift this large cannot be delivered on a small box (the PSF runs
+        # off the edge), so the volume is left alone rather than half-moved
+        box, nz = BOX, 5
+        yy, xx = np.mgrid[0:box, 0:box]
+        c = box // 2
+        d = spline._RECENTER_MAX_SHIFT + 0.5
+        volume = np.zeros((box, box, nz), dtype=np.float32)
+        for k in range(nz):
+            volume[:, :, k] = np.exp(
+                -((xx - (c + d)) ** 2 + (yy - c) ** 2) / (2 * 1.1**2)
+            )
+        assert spline._focus_center_offset(volume, 2) == (0.0, 0.0)
+
+    def test_focus_center_offset_rejects_implausible_shifts(self):
+        # a bead average is centred to well under a pixel; a large estimate
+        # means the estimate is wrong, and shifting on it would do harm
+        box, nz = BOX, 3
+        volume = np.zeros((box, box, nz), dtype=np.float32)
+        volume[0, 0, :] = 1.0  # all the signal jammed into one corner
+        assert spline._focus_center_offset(volume, z_center=1) == (0.0, 0.0)
+
 
 class TestBuildPsfTemplate:
     """End-to-end PSF template building on a synthetic bead movie (no GPU)."""
@@ -249,6 +332,134 @@ class TestBuildPsfTemplate:
         )
         assert template.min() == pytest.approx(0.0, abs=0.1)
         assert built["effective_sigma"] > 0
+
+
+def _labelled_bead_movie(n_frames, fov_of=None, h=48, w=48):
+    """Beads with distinguishable brightness, so a spot can be traced back to
+    the bead it came from by its peak value alone."""
+    bead_xy = [(12, 14), (30, 28), (16, 33)]
+    amps = [1000.0, 2000.0, 3000.0]
+    yy, xx = np.mgrid[0:h, 0:w]
+    img = np.full((h, w), 100.0, dtype=np.float32)
+    for (bx, by), a in zip(bead_xy, amps):
+        img += a * np.exp(-((xx - bx) ** 2 + (yy - by) ** 2) / (2 * 1.1**2))
+    movie = np.stack([img] * n_frames).astype(np.uint16)
+    return movie, bead_xy, amps
+
+
+def _peaks(spots):
+    return spots.reshape(len(spots), -1).max(axis=1)
+
+
+class TestSpotBeadIndex:
+    """``_bead_volumes`` must report which bead each flattened spot came from -
+    the two extraction paths flatten in different orders, so no positional rule
+    recovers it for both."""
+
+    def test_single_field_spot_bead_idx(self):
+        import pandas as pd
+
+        n = 6
+        movie, bead_xy, amps = _labelled_bead_movie(n)
+        step_of_frame, _, step_range = spline._step_of_frame(
+            n, 20.0, 1, "fov", None
+        )
+        beads = pd.DataFrame(
+            {"x": [b[0] for b in bead_xy], "y": [b[1] for b in bead_xy]}
+        )
+        _, spots, _, bead_idx = spline._bead_volumes(
+            movie,
+            CAMERA_INFO,
+            beads,
+            BOX,
+            step_of_frame,
+            step_range,
+            return_spots=True,
+        )
+        assert len(bead_idx) == len(spots)
+        expected = np.array([amps[b] for b in bead_idx])
+        np.testing.assert_allclose(_peaks(spots), expected, atol=250)
+
+    def test_multifov_spot_bead_idx(self):
+        import pandas as pd
+
+        # the multi-FOV grid is built bead-major and then re-sorted by frame
+        # (lazy movies need frame-sorted identifications), so the flattened
+        # order is neither bead-major nor frame-major-with-all-beads
+        n_fov, n_steps = 2, 5
+        n_frames = n_fov * n_steps
+        movie, bead_xy, amps = _labelled_bead_movie(n_frames)
+        step_of_frame, _, step_range = spline._step_of_frame(
+            n_frames, 20.0, n_fov, "z", None
+        )
+        fov_of_frame = spline._fov_of_frame(n_frames, n_fov, "z")
+        beads = pd.DataFrame(
+            {
+                "x": [b[0] for b in bead_xy],
+                "y": [b[1] for b in bead_xy],
+                "fov": [0, 1, 0],
+            }
+        )
+        _, spots, _, bead_idx = spline._bead_volumes(
+            movie,
+            CAMERA_INFO,
+            beads,
+            BOX,
+            step_of_frame,
+            step_range,
+            return_spots=True,
+            fov_of_frame=fov_of_frame,
+        )
+        peaks = _peaks(spots)
+        np.testing.assert_allclose(
+            peaks, np.array([amps[b] for b in bead_idx]), atol=250
+        )
+        # and the obvious positional shortcut really is wrong here, which is
+        # why the index is returned rather than recomputed by callers
+        positional = np.array([amps[i % len(amps)] for i in range(len(spots))])
+        assert not np.allclose(peaks, positional, atol=250)
+
+
+class TestSpotRoiResiduals:
+    def test_expands_per_bead_residuals_onto_spots(self):
+        import pandas as pd
+
+        ref_xy = np.array([[10.0, 20.0], [31.0, 12.0], [7.0, 44.0]])
+        transforms = [
+            np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            np.array([[1.002, 0.004, 1.4], [-0.004, 1.001, -0.6]]),
+        ]
+        spot_bead_idx = np.array([2, 0, 1, 2, 0, 1])
+        per_channel = [{"spot_bead_idx": spot_bead_idx} for _ in range(2)]
+        res = spline._spot_roi_residuals(per_channel, ref_xy, transforms)
+        assert res.shape == (len(spot_bead_idx), 2, 2)
+        per_bead = localize.channel_roi_residuals(
+            pd.DataFrame({"x": ref_xy[:, 0], "y": ref_xy[:, 1]}), transforms
+        )
+        np.testing.assert_allclose(res, per_bead[spot_bead_idx])
+        # the reference channel's box sits on the detection itself
+        np.testing.assert_array_equal(res[:, 0, :], 0.0)
+
+    def test_returns_none_when_channels_disagree(self):
+        ref_xy = np.array([[10.0, 20.0], [31.0, 12.0]])
+        transforms = [np.eye(2, 3), np.eye(2, 3)]
+        # the caller stacks row i of every channel as one bead+frame, so a
+        # disagreement means that stacking is wrong too - bail rather than
+        # attach residuals to the wrong spots
+        per_channel = [
+            {"spot_bead_idx": np.array([0, 1])},
+            {"spot_bead_idx": np.array([1, 0])},
+        ]
+        assert (
+            spline._spot_roi_residuals(per_channel, ref_xy, transforms) is None
+        )
+        # and missing indices are simply "no information"
+        assert (
+            spline._spot_roi_residuals(
+                [{"spot_bead_idx": np.array([0, 1])}, {}], ref_xy, transforms
+            )
+            is None
+        )
 
 
 class TestMultiFov:
