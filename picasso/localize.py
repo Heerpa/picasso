@@ -3793,6 +3793,8 @@ def _crlb_diag_device(ainv, meat, n, mle, out, m) -> None:
 @cuda.jit(cache=True)
 def _spline_crlb_3d_kernel(
     coeff,
+    aff,
+    res,
     box,
     amp,
     x_shift,
@@ -3810,6 +3812,13 @@ def _spline_crlb_3d_kernel(
     :func:`_spline_infomats_3d` with the solve fused in. ``coeff`` is
     ``(n_channels, niz, niy, nix, 4, 4, 4)``; ``crlb`` is ``(n_locs, 5)`` and
     ``status`` ``(n_locs,)`` (0 ok, 1 not positive definite).
+
+    ``aff`` is ``(n_channels, 4)`` ``[a00, a01, a10, a11]`` and ``res`` is
+    ``(n_locs, n_channels, 2)`` sub-pixel ROI offsets, exactly as in
+    :func:`_spline_infomats_3d` - each channel is evaluated at the shared shift
+    mapped through its own affine, minus its ROI residual, and the x/y
+    derivatives pick up the matching ``Aᵀ`` chain rule. Both reduce to the
+    single-channel case at identity and zero.
     """
     m = cuda.grid(1)
     if m >= amp.shape[0]:
@@ -3847,15 +3856,24 @@ def _spline_crlb_3d_kernel(
     pz0, pz1, pz2, pz3 = 1.0, fz, fz * fz, fz * fz * fz
     dz1, dz2, dz3 = 1.0, 2.0 * fz, 3.0 * fz * fz
     for ch in range(n_channels):
+        # This channel sees the shared lateral shift through its own affine
+        # and sits on its own sub-pixel ROI offset - exactly as in
+        # spline_3d_multichannel.cuh. Hoisted: constant over the box.
+        a00 = aff[ch, 0]
+        a01 = aff[ch, 1]
+        a10 = aff[ch, 2]
+        a11 = aff[ch, 3]
+        sx = a00 * x_shift[m] + a01 * y_shift[m] + res[m, ch, 0]
+        sy = a10 * x_shift[m] + a11 * y_shift[m] + res[m, ch, 1]
         for i in range(box):
-            xco = i - x_shift[m]
+            xco = i - sx
             xi = int(math.floor(xco))
             xi = 0 if xi < 0 else (nix - 1 if xi > nix - 1 else xi)
             fx = xco - xi
             px0, px1, px2, px3 = 1.0, fx, fx * fx, fx * fx * fx
             dx1, dx2, dx3 = 1.0, 2.0 * fx, 3.0 * fx * fx
             for j in range(box):
-                yco = j - y_shift[m]
+                yco = j - sy
                 yi = int(math.floor(yco))
                 yi = 0 if yi < 0 else (niy - 1 if yi > niy - 1 else yi)
                 fy = yco - yi
@@ -3925,7 +3943,10 @@ def _spline_crlb_3d_kernel(
                     wb = mu
                 # d(mu)/d(param); the CRLB diagonal is sign-invariant per
                 # parameter, so native-coordinate vs shift sign is irrelevant.
-                d0, d1, d2, d3 = a * gx, a * gy, a * gz, phi
+                d0 = a * (a00 * gx + a10 * gy)
+                d1 = a * (a01 * gx + a11 * gy)
+                d2 = a * gz
+                d3 = phi
                 f00 += d0 * d0 * wa
                 f01 += d0 * d1 * wa
                 f02 += d0 * d2 * wa
@@ -4150,6 +4171,8 @@ def _spline_crlb_2d_kernel(
 @cuda.jit(cache=True)
 def _spline_crlb_link_xyz_kernel(
     coeff,
+    aff,
+    res,
     box,
     x_shift,
     y_shift,
@@ -4165,7 +4188,9 @@ def _spline_crlb_link_xyz_kernel(
     """One thread per localization: covariance diagonal of the photon-decoupled
     (link-XYZ) 3D cubic-spline model, parameter order
     ``[x, y, z, N_0..N_{c-1}, bg_0..bg_{c-1}]``. CUDA transcription of
-    :func:`_spline_infomats_link_xyz_3d` with the solve fused in.
+    :func:`_spline_infomats_link_xyz_3d` with the solve fused in. ``aff`` and
+    ``res`` carry the same per-channel affine and ROI residual as in
+    :func:`_spline_crlb_3d_kernel`.
 
     The CPU kernel accumulates through a dense ``n_params``-long gradient
     vector; here the block sparsity is spelled out instead. Each pixel touches
@@ -4215,15 +4240,22 @@ def _spline_crlb_link_xyz_kernel(
         # This channel's own photon (n) and background (b) entries.
         bxn = byn = bzn = bxb = byb = bzb = bnn = bnb = bbb = 0.0
         sxn = syn = szn = sxb = syb = szb = snn = snb = sbb = 0.0
+        # per-channel affine + ROI residual, as in _spline_crlb_3d_kernel
+        a00 = aff[ch, 0]
+        a01 = aff[ch, 1]
+        a10 = aff[ch, 2]
+        a11 = aff[ch, 3]
+        sx = a00 * x_shift[m] + a01 * y_shift[m] + res[m, ch, 0]
+        sy = a10 * x_shift[m] + a11 * y_shift[m] + res[m, ch, 1]
         for i in range(box):
-            xco = i - x_shift[m]
+            xco = i - sx
             xi = int(math.floor(xco))
             xi = 0 if xi < 0 else (nix - 1 if xi > nix - 1 else xi)
             fx = xco - xi
             px0, px1, px2, px3 = 1.0, fx, fx * fx, fx * fx * fx
             dx1, dx2, dx3 = 1.0, 2.0 * fx, 3.0 * fx * fx
             for j in range(box):
-                yco = j - y_shift[m]
+                yco = j - sy
                 yi = int(math.floor(yco))
                 yi = 0 if yi < 0 else (niy - 1 if yi > niy - 1 else yi)
                 fy = yco - yi
@@ -4290,8 +4322,11 @@ def _spline_crlb_link_xyz_kernel(
                     wa = 1.0
                     wb = mu
                 # Gradient columns: x/y/z scale with this channel's photons, the
-                # photon column is phi and the background column is 1.
-                d0, d1, d2 = nc * gx, nc * gy, nc * gz
+                # photon column is phi and the background column is 1. x/y also
+                # pick up the channel affine's Aᵀ chain rule.
+                d0 = nc * (a00 * gx + a10 * gy)
+                d1 = nc * (a01 * gx + a11 * gy)
+                d2 = nc * gz
                 xx += d0 * d0 * wa
                 xy += d0 * d1 * wa
                 xz += d0 * d2 * wa
@@ -4382,6 +4417,8 @@ def _crlb_chunk_rows(bytes_per_row: int) -> int:
 
 def _spline_crlb_cuda(
     coeff: np.ndarray,
+    aff: np.ndarray,
+    res: np.ndarray,
     box: int,
     amplitude: lib.FloatArray1D,
     x_shift: lib.FloatArray1D,
@@ -4399,7 +4436,8 @@ def _spline_crlb_cuda(
 
     Array-in / array-out counterpart of :func:`_spline_crlb_cpu`; the
     caller owns the calibration parsing and the NaN masking. ``z_eval`` None
-    selects the 2D model.
+    selects the 2D model, which has no channel geometry and so ignores ``aff``
+    and ``res``.
 
     Returns
     -------
@@ -4426,11 +4464,20 @@ def _spline_crlb_cuda(
     if is_3d:
         z_eval = np.ascontiguousarray(z_eval, dtype=np.float64)
     finite_u8 = np.ascontiguousarray(finite).astype(np.uint8)
+    aff = np.ascontiguousarray(aff, dtype=np.float64)
+    res = np.ascontiguousarray(res, dtype=np.float64)
+    n_channels = coeff.shape[0]
 
     d_coeff = cuda.to_device(np.ascontiguousarray(coeff))
-    # inputs (amp, x, y, [z], offset) + outputs (crlb row, status byte)
+    # constant over the whole run, so uploaded once
+    d_aff = cuda.to_device(aff)
+    # inputs (amp, x, y, [z], offset, per-channel residual) + outputs (crlb
+    # row, status byte)
     n_inputs = 5 if is_3d else 4
-    chunk = min(n_locs, _crlb_chunk_rows(8 * (n_inputs + n_params) + 1))
+    chunk = min(
+        n_locs,
+        _crlb_chunk_rows(8 * (n_inputs + 2 * n_channels + n_params) + 1),
+    )
 
     use_tqdm = progress_callback == "console"
     do_callback = callable(progress_callback)
@@ -4454,8 +4501,11 @@ def _spline_crlb_cuda(
         ) // _SPLINE_CRLB_CUDA_THREADS
         if is_3d:
             d_z = cuda.to_device(z_eval[start:stop])
+            d_res = cuda.to_device(res[start:stop])
             _spline_crlb_3d_kernel[blocks, _SPLINE_CRLB_CUDA_THREADS](
                 d_coeff,
+                d_aff,
+                d_res,
                 box,
                 d_amp,
                 d_x,
@@ -4495,6 +4545,8 @@ def _spline_crlb_cuda(
 
 def _spline_link_xyz_crlb_cuda(
     coeff: np.ndarray,
+    aff: np.ndarray,
+    res: np.ndarray,
     box: int,
     x_shift: lib.FloatArray1D,
     y_shift: lib.FloatArray1D,
@@ -4511,7 +4563,7 @@ def _spline_link_xyz_crlb_cuda(
     """Covariance diagonal of the photon-decoupled (link-XYZ) spline model on
     the GPU. Array-in / array-out counterpart of
     :func:`_spline_link_xyz_crlb_cpu`; see :func:`_spline_crlb_cuda` for the
-    return convention."""
+    return convention and for ``aff`` / ``res``."""
     _require_crlb_cuda()
     n_channels = coeff.shape[0]
     n_params = 3 + 2 * n_channels
@@ -4532,11 +4584,16 @@ def _spline_link_xyz_crlb_cuda(
     photons = np.ascontiguousarray(photons, dtype=np.float64)
     bg = np.ascontiguousarray(bg, dtype=np.float64)
     finite_u8 = np.ascontiguousarray(finite).astype(np.uint8)
+    aff = np.ascontiguousarray(aff, dtype=np.float64)
+    res = np.ascontiguousarray(res, dtype=np.float64)
 
     d_coeff = cuda.to_device(np.ascontiguousarray(coeff))
-    # inputs (x, y, z, photons, bg) + outputs (crlb row, status byte)
+    # constant over the whole run, so uploaded once
+    d_aff = cuda.to_device(aff)
+    # inputs (x, y, z, photons, bg, per-channel residual) + outputs (crlb row,
+    # status byte)
     chunk = min(
-        n_locs, _crlb_chunk_rows(8 * (3 + 2 * n_channels + n_params) + 1)
+        n_locs, _crlb_chunk_rows(8 * (3 + 4 * n_channels + n_params) + 1)
     )
 
     use_tqdm = progress_callback == "console"
@@ -4555,6 +4612,7 @@ def _spline_link_xyz_crlb_cuda(
         d_photons = cuda.to_device(photons[start:stop])
         d_bg = cuda.to_device(bg[start:stop])
         d_finite = cuda.to_device(finite_u8[start:stop])
+        d_res = cuda.to_device(res[start:stop])
         d_crlb = cuda.device_array((n, n_params), dtype=np.float64)
         d_status = cuda.device_array(n, dtype=np.uint8)
         blocks = (
@@ -4562,6 +4620,8 @@ def _spline_link_xyz_crlb_cuda(
         ) // _SPLINE_CRLB_CUDA_THREADS
         _spline_crlb_link_xyz_kernel[blocks, _SPLINE_CRLB_CUDA_THREADS](
             d_coeff,
+            d_aff,
+            d_res,
             box,
             d_x,
             d_y,

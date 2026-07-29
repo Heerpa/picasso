@@ -29,6 +29,20 @@ from tests.conftest import BOX, CALIB_3D, CAMERA_INFO, MIN_NG, PIXELSIZE
 
 CAMERA_INFO_WITH_PIXELSIZE = {**CAMERA_INFO, "Pixelsize": PIXELSIZE}
 
+# Devices a spline-CRLB test can be pinned to (see ``_crlb``). The GPU variant
+# needs a real CUDA device; ``NUMBA_ENABLE_CUDASIM=1`` also satisfies it, which
+# is how the kernels can be exercised on a machine without one.
+SPLINE_CRLB_DEVICES = [
+    False,
+    pytest.param(
+        True,
+        marks=pytest.mark.skipif(
+            not localize.SPLINE_CRLB_CUDA_AVAILABLE,
+            reason="no CUDA device for the spline CRLB kernels",
+        ),
+    ),
+]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2652,10 +2666,12 @@ class TestSplineHelpers:
                 or batch * n_points <= localize._GPUFIT_MAX_POINTS_PER_CALL
             )
 
-    def test_spline_crlb_residual_equals_a_lateral_shift(self):
+    @pytest.mark.parametrize("gpu", SPLINE_CRLB_DEVICES)
+    def test_spline_crlb_residual_equals_a_lateral_shift(self, gpu):
         # A ROI residual just moves where the spline is evaluated, so it must
         # be indistinguishable from moving the lateral parameter by the same
-        # amount. This pins the sign and the placement of the residual term.
+        # amount. This pins the sign and the placement of the residual term -
+        # on whichever device computes it.
         calib = _fake_spline_calibration(
             model="spline-3d-multichannel", n_channels=2
         )
@@ -2672,19 +2688,20 @@ class TestSplineHelpers:
         dx, dy = 0.31, -0.24
         res = np.zeros((4, 1, 2))
         res[:, 0, 0], res[:, 0, 1] = dx, dy
-        with_residual = localize._spline_crlb(
-            theta, calib, box, mle=True, residuals=res
+        with_residual = _crlb(
+            theta, calib, box, gpu=gpu, mle=True, residuals=res
         )
         moved = theta.copy()
         moved[:, 1] += dx
         moved[:, 2] += dy
         np.testing.assert_allclose(
             with_residual,
-            localize._spline_crlb(moved, calib, box, mle=True),
+            _crlb(moved, calib, box, gpu=gpu, mle=True),
             rtol=1e-10,
         )
 
-    def test_spline_crlb_affine_scales_lateral_variance(self):
+    @pytest.mark.parametrize("gpu", SPLINE_CRLB_DEVICES)
+    def test_spline_crlb_affine_scales_lateral_variance(self, gpu):
         # The shared shift reaches a channel through its affine, so d(mu)/dp
         # carries A^T. For an isotropic A = s*I the x/y variances must come out
         # exactly s^-2 times the identity case evaluated at the same position,
@@ -2707,12 +2724,12 @@ class TestSplineHelpers:
         s = 1.05
         scaled = dict(calib)
         scaled["channel_transforms"] = [[[s, 0.0, 0.0], [0.0, s, 0.0]]]
-        crlb_scaled = localize._spline_crlb(theta, scaled, box, mle=True)
+        crlb_scaled = _crlb(theta, scaled, box, gpu=gpu, mle=True)
         # identity affine reaches the same evaluation point at s * p
         moved = theta.copy()
         moved[:, 1] *= s
         moved[:, 2] *= s
-        crlb_identity = localize._spline_crlb(moved, calib, box, mle=True)
+        crlb_identity = _crlb(moved, calib, box, gpu=gpu, mle=True)
         np.testing.assert_allclose(
             crlb_scaled[:, 0], crlb_identity[:, 0] / s**2, rtol=1e-8
         )
@@ -2723,8 +2740,9 @@ class TestSplineHelpers:
             crlb_scaled[:, 2], crlb_identity[:, 2], rtol=1e-8
         )
 
+    @pytest.mark.parametrize("gpu", SPLINE_CRLB_DEVICES)
     @pytest.mark.parametrize("link_xyz", [False, True])
-    def test_spline_crlb_default_geometry_is_unchanged(self, link_xyz):
+    def test_spline_crlb_default_geometry_is_unchanged(self, link_xyz, gpu):
         # identity affine + zero residual must reproduce the pre-correction
         # result exactly, so single-channel output cannot drift
         calib = _fake_spline_calibration(
@@ -2741,14 +2759,15 @@ class TestSplineHelpers:
             theta[:, 0], theta[:, 3], theta[:, 4] = 500.0, -8.0, 5.0
         box = calib["box"]
         n_channels = localize._spline_n_channels(calib)
-        explicit = localize._spline_crlb(
+        explicit = _crlb(
             theta,
             calib,
             box,
+            gpu=gpu,
             mle=True,
             residuals=np.zeros((len(theta), n_channels, 2)),
         )
-        implied = localize._spline_crlb(theta, calib, box, mle=True)
+        implied = _crlb(theta, calib, box, gpu=gpu, mle=True)
         assert np.isfinite(implied).all()
         np.testing.assert_array_equal(explicit, implied)
 
@@ -4010,6 +4029,33 @@ def _shared_theta(n, rng, n_params=5, nz=21):
     return theta
 
 
+def _with_channel_geometry(calib, n_locs, rng):
+    """Give ``calib`` a non-identity per-channel affine and return matching
+    sub-pixel ROI residuals.
+
+    Without these, every channel is evaluated at the same place and the
+    geometry terms in the CRLB kernels are dead code - so a GPU/CPU comparison
+    on a plain calibration cannot tell whether either side applies them. The
+    reference channel keeps the identity and a zero residual, as the real
+    pipeline does (see :func:`localize.channel_roi_residuals`)."""
+    n_channels = localize._spline_n_channels(calib)
+    calib = dict(calib)
+    calib["channel_transforms"] = [
+        (
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+            if c == 0
+            else [
+                [1.0 + 0.03 * c, 0.02 * c, 0.0],
+                [-0.015 * c, 1.0 - 0.01 * c, 0.0],
+            ]
+        )
+        for c in range(n_channels)
+    ]
+    residuals = rng.uniform(-0.5, 0.5, (n_locs, n_channels, 2))
+    residuals[:, 0, :] = 0.0
+    return calib, residuals
+
+
 def _link_xyz_calib_and_theta(n_channels, n_locs, rng, nz=21):
     """Link-XYZ calibration on the separable Gaussian spline, plus a batch of
     fitted parameters ``[x, y, z, N_0.., bg_0..]`` with unequal per-channel
@@ -4322,6 +4368,57 @@ class TestSplineCRLBGPU:
         np.testing.assert_allclose(gpu, cpu, rtol=self.RTOL)
 
     @requires_crlb_gpu
+    @pytest.mark.parametrize("mle", [True, False])
+    @pytest.mark.parametrize("n_channels", [2, 3, 6])
+    def test_channel_geometry_matches_cpu(self, n_channels, mle):
+        """With a non-identity per-channel affine and non-zero ROI residuals -
+        the case the plain parity tests cannot see, since at identity and zero
+        the geometry terms drop out of both kernels alike."""
+        rng = np.random.default_rng(11)
+        calib, _ = _gauss_spline_calibration(
+            model="spline-3d-multichannel", n_channels=n_channels
+        )
+        theta = _shared_theta(200, rng)
+        calib, res = _with_channel_geometry(calib, len(theta), rng)
+        gpu = _crlb(theta, calib, BOX, mle=mle, residuals=res, gpu=True)
+        cpu = _crlb(theta, calib, BOX, mle=mle, residuals=res, gpu=False)
+        np.testing.assert_allclose(gpu, cpu, rtol=self.RTOL)
+        # and the geometry actually moved the answer, so this is a real test
+        plain = _crlb(theta, calib, BOX, mle=mle, gpu=True)
+        assert not np.allclose(gpu[:, :2], plain[:, :2], rtol=self.RTOL)
+
+    @requires_crlb_gpu
+    @pytest.mark.parametrize("mle", [True, False])
+    @pytest.mark.parametrize("n_channels", [2, 3, 6])
+    def test_link_xyz_channel_geometry_matches_cpu(self, n_channels, mle):
+        rng = np.random.default_rng(12)
+        calib, theta = _link_xyz_calib_and_theta(n_channels, 200, rng)
+        calib, res = _with_channel_geometry(calib, len(theta), rng)
+        gpu = _crlb(theta, calib, BOX, mle=mle, residuals=res, gpu=True)
+        cpu = _crlb(theta, calib, BOX, mle=mle, residuals=res, gpu=False)
+        np.testing.assert_allclose(gpu, cpu, rtol=self.RTOL)
+        plain = _crlb(theta, calib, BOX, mle=mle, gpu=True)
+        assert not np.allclose(gpu[:, :2], plain[:, :2], rtol=self.RTOL)
+
+    @requires_crlb_gpu
+    @pytest.mark.parametrize("model", ["spline-2d", "spline-3d"])
+    def test_em_doubling_matches_cpu(self, model):
+        """The EMCCD factor is applied by the caller, after the device hands
+        back its variances - so it must land identically on both paths."""
+        calib, _ = _gauss_spline_calibration(model=model)
+        rng = np.random.default_rng(13)
+        theta = _shared_theta(
+            64, rng, n_params=4 if model == "spline-2d" else 5
+        )
+        gpu = _crlb(theta, calib, BOX, em=True, gpu=True)
+        np.testing.assert_allclose(
+            gpu, _crlb(theta, calib, BOX, em=True, gpu=False), rtol=self.RTOL
+        )
+        np.testing.assert_allclose(
+            gpu, 2.0 * _crlb(theta, calib, BOX, gpu=True), rtol=1e-12
+        )
+
+    @requires_crlb_gpu
     def test_matches_closed_form_3d(self):
         """Against the analytic reference, not just against the CPU - a port
         that is systematically wrong could still match a co-wrong CPU path."""
@@ -4426,9 +4523,13 @@ class TestSplineCRLBGPU:
             "import matplotlib\n"
             "matplotlib.use('Agg')\n"
             "import sys; sys.path.insert(0, '.')\n"
+            # a device failure would fall back to the CPU and turn every
+            # comparison below into CPU-vs-CPU, i.e. vacuously true
+            "import warnings; warnings.simplefilter('error', RuntimeWarning)\n"
             "from picasso import localize\n"
             "from tests.test_localize import ("
-            "_gauss_spline_calibration, _shared_theta, _crlb, BOX)\n"
+            "_gauss_spline_calibration, _shared_theta, _crlb, BOX,"
+            " _link_xyz_calib_and_theta, _with_channel_geometry)\n"
             "assert localize.SPLINE_CRLB_CUDA_AVAILABLE, 'simulator off'\n"
             "rng = np.random.default_rng(0)\n"
             "for model in ('spline-2d', 'spline-3d'):\n"
@@ -4441,6 +4542,21 @@ class TestSplineCRLBGPU:
             "        c = _crlb("
             "theta, calib, BOX, mle=mle, gpu=False)\n"
             "        np.testing.assert_allclose(g, c, rtol=1e-5)\n"
+            # the multichannel kernels, with the affine + ROI residual live
+            "calib, _ = _gauss_spline_calibration("
+            "model='spline-3d-multichannel', n_channels=2)\n"
+            "theta = _shared_theta(2, rng)\n"
+            "calib, res = _with_channel_geometry(calib, len(theta), rng)\n"
+            "np.testing.assert_allclose(\n"
+            "    _crlb(theta, calib, BOX, residuals=res, gpu=True),\n"
+            "    _crlb(theta, calib, BOX, residuals=res, gpu=False),\n"
+            "    rtol=1e-5)\n"
+            "calib, theta = _link_xyz_calib_and_theta(2, 2, rng)\n"
+            "calib, res = _with_channel_geometry(calib, len(theta), rng)\n"
+            "np.testing.assert_allclose(\n"
+            "    _crlb(theta, calib, BOX, residuals=res, gpu=True),\n"
+            "    _crlb(theta, calib, BOX, residuals=res, gpu=False),\n"
+            "    rtol=1e-5)\n"
             "print('SIMOK')\n"
         )
         result = subprocess.run(
