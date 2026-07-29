@@ -2200,6 +2200,188 @@ def _frames_in_bounds(
     return np.nonzero(mask)[0]
 
 
+# the four mirror orientations tried when nothing is known about the optical
+# path (identity, flip-x, flip-y, flip-xy); (sx, sy) are the mirror signs
+_FLIP_SIGNS = ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0))
+
+
+def _flip_seed_transforms(
+    channel: int,
+    region_rects: list | None,
+    frame_shape: tuple[int, int] | None,
+    ref_xy: np.ndarray,
+    chan_xy: np.ndarray,
+) -> list[np.ndarray]:
+    """Coarse reference->channel seed transforms, one per mirror orientation.
+
+    Split-FOV (``region_rects`` given): the mirror is taken about the channel's
+    region and the region origins supply the placement. Separate movies
+    (``frame_shape`` given): the mirror is taken about the frame and the
+    translation comes from aligning the pooled detection centroids.
+    """
+    seeds = []
+    identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    if region_rects is not None:
+        (cy0, cx0), (cy1, cx1) = region_rects[channel]
+        h, w = float(cy1 - cy0), float(cx1 - cx0)
+        for sx, sy in _FLIP_SIGNS:
+            local = np.array(
+                [
+                    [sx, 0.0, w if sx < 0 else 0.0],
+                    [0.0, sy, h if sy < 0 else 0.0],
+                ]
+            )
+            seeds.append(
+                localize.compose_region_transforms(
+                    [region_rects[0], region_rects[channel]],
+                    [identity, local],
+                )[1]
+            )
+        return seeds
+    if len(ref_xy) == 0 or len(chan_xy) == 0:
+        return [identity]
+    h, w = (
+        (float(frame_shape[0] - 1), float(frame_shape[1] - 1))
+        if frame_shape is not None
+        else (0.0, 0.0)
+    )
+    for sx, sy in _FLIP_SIGNS:
+        seed = np.array(
+            [
+                [sx, 0.0, w if sx < 0 else 0.0],
+                [0.0, sy, h if sy < 0 else 0.0],
+            ]
+        )
+        pred = localize.apply_affine_transform(ref_xy, seed)
+        seed[:, 2] += chan_xy.mean(axis=0) - pred.mean(axis=0)
+        seeds.append(seed)
+    return seeds
+
+
+def estimate_transforms_from_identifications(
+    identifications: list,
+    box: int,
+    regions: list | None = None,
+    frame_shape: tuple[int, int] | None = None,
+    max_frames: int = 50,
+    n_iter: int = 4,
+    min_pairs: int = 10,
+) -> list | None:
+    """Reference->channel affine transforms estimated from *identifications
+    alone*, with no calibration and no prior knowledge of the optical path.
+
+    This is the registration-free counterpart of
+    :func:`refine_split_fov_transforms_from_signal` /
+    :func:`refine_multichannel_transforms_from_signal`: it needs no seed
+    transform and no access to the movies, only the per-channel detections that
+    the Localize preview has already computed. Each mirror orientation
+    (identity / flip-x / flip-y / flip-xy, see :data:`_FLIP_SIGNS`) is used as a
+    coarse seed and refined by ICP - per-frame nearest-neighbour pairing with a
+    shrinking radius, re-fitting the affine on the pooled correspondences - and
+    the orientation that still holds the most pairs at the tightest radius wins.
+    Mirrored channels (the common case for image splitters) are therefore picked
+    up automatically, which an identity assumption cannot do.
+
+    ``identifications`` is one detection table per channel in **absolute**
+    coordinates, reference first; for split-FOV pass the detections of each
+    region plus the ``regions`` themselves. Returns one ``(2, 3)`` transform per
+    channel (the reference's is the identity) with ``None`` for channels that
+    could not be registered, or ``None`` if none of them could.
+    """
+    n_channels = len(identifications)
+    if n_channels < 2:
+        return None
+
+    # Only an evenly-spaced sample of frames is used (as the signal
+    # re-registration does): the transform is global, so a few tens of frames
+    # already give hundreds of correspondences, and nothing scales with the
+    # length of a long movie. The frames are chosen once, on the reference, and
+    # every channel is cut down to them before it is grouped per frame.
+    ref_ids = identifications[0]
+    if ref_ids is None or len(ref_ids) == 0:
+        return None
+    ref_frames = np.unique(np.asarray(ref_ids["frame"], dtype=np.int64))
+    if ref_frames.size > max_frames:
+        pick = np.unique(
+            np.linspace(0, ref_frames.size - 1, int(max_frames)).astype(int)
+        )
+        ref_frames = ref_frames[pick]
+    sample = set(int(f) for f in ref_frames)
+
+    def by_frame(ids) -> dict:
+        if ids is None or len(ids) == 0:
+            return {}
+        frame = np.asarray(ids["frame"], dtype=np.int64)
+        keep = np.isin(frame, ref_frames)
+        frame = frame[keep]
+        xy = np.column_stack(
+            [
+                np.asarray(ids["x"], dtype=np.float64)[keep],
+                np.asarray(ids["y"], dtype=np.float64)[keep],
+            ]
+        )
+        return {int(f): xy[frame == f] for f in np.unique(frame)}
+
+    per_channel = [by_frame(ids) for ids in identifications]
+    ref_by_frame = per_channel[0]
+    if not ref_by_frame:
+        return None
+    region_rects = None
+    if regions is not None:
+        if len(regions) != n_channels:
+            return None
+        region_rects = [_normalized_region(r) for r in regions]
+
+    # radii shrink from generous (absorb the coarse seed's error) to sub-box
+    tols = np.linspace(
+        1.5 * float(box), max(2.0, 0.3 * float(box)), max(1, int(n_iter))
+    )
+    transforms: list = [np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])]
+    for c in range(1, n_channels):
+        chan_by_frame = per_channel[c]
+        common = sorted(sample & set(chan_by_frame))
+        if not common:
+            transforms.append(None)
+            continue
+        ref_pool = np.vstack([ref_by_frame[f] for f in common])
+        chan_pool = np.vstack([chan_by_frame[f] for f in common])
+        best_pairs, best_transform = 0, None
+        for seed in _flip_seed_transforms(
+            c, region_rects, frame_shape, ref_pool, chan_pool
+        ):
+            transform = np.asarray(seed, dtype=np.float64)
+            n_pairs = 0
+            for tol in tols:
+                acc_ref, acc_c = [], []
+                for f in common:
+                    rxy, cxy = ref_by_frame[f], chan_by_frame[f]
+                    pred = localize.apply_affine_transform(rxy, transform)
+                    ri, ci = _match_beads(pred, cxy, tol)
+                    if len(ri):
+                        acc_ref.append(rxy[ri])
+                        acc_c.append(cxy[ci])
+                if not acc_ref:
+                    n_pairs = 0
+                    break
+                matched_ref = np.vstack(acc_ref)
+                matched_c = np.vstack(acc_c)
+                n_pairs = len(matched_ref)
+                if n_pairs < 3:
+                    break
+                transform = localize.estimate_affine_transform(
+                    matched_ref, matched_c
+                )
+            # a wrong orientation converges onto coincidental pairs, which are
+            # few at the tightest radius and usually imply an absurd scale
+            scale = abs(float(np.linalg.det(transform[:, :2])))
+            if n_pairs > best_pairs and 0.5 <= scale <= 2.0:
+                best_pairs, best_transform = n_pairs, transform
+        transforms.append(best_transform if best_pairs >= min_pairs else None)
+    if all(t is None for t in transforms[1:]):
+        return None
+    return transforms
+
+
 def refine_split_fov_transforms_from_signal(
     movie,
     calibration: dict,

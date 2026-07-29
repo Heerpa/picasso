@@ -1848,9 +1848,9 @@ class ParametersDialog(lib.Dialog):
             "Color-code the identification boxes by their cross-channel link.\n\n"
             "Spots paired across channels share a color; unmatched spots are\n"
             "gray. Pairing uses the loaded multichannel / split-FOV spline\n"
-            "calibration's inter-channel transform. With no calibration loaded\n"
-            "(separate channels), an identity transform is assumed, so already-\n"
-            "registered channels (e.g. co-cropped quadrants) still link.\n"
+            "calibration's inter-channel transform. With no calibration\n"
+            "loaded, the transform is estimated from the identifications "
+            "themselves.\n"
             "Identify every channel first."
         )
         self.link_colors_checkbox.setTristate(False)
@@ -4803,20 +4803,18 @@ class Window(QtWidgets.QMainWindow):
             return False
         cal = pdialog.spline_calibration or {}
         n_channels = int(cal.get("n_channels", 0))
-        if n_channels < 2:
-            # No multichannel calibration loaded yet: fall back to identity
-            # inter-channel transforms across the separately loaded channels
-            if len(self.channels) >= 2 and not self.view.split_fov_mode:
-                n_channels = len(self.channels)
-                cal = {
-                    "n_channels": n_channels,
-                    "channel_transforms": [
-                        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
-                        for _ in range(n_channels)
-                    ],
-                }
-            else:
-                return False
+        if n_channels >= 2:
+            # a loaded calibration always provides the registration - the
+            # colours then show exactly what the fit will pair, so a bad
+            # registration is visible and can be re-registered deliberately
+            # (Postprocess > re-register from signal)
+            cal = self._link_calibration_for_mode(cal, n_channels)
+        else:
+            # nothing loaded: register the channels from the identifications
+            cal = self._estimated_link_calibration(box)
+        if cal is None:
+            return False
+        n_channels = int(cal["n_channels"])
         tol = 1.5 * float(box)
         try:
             if cal.get("split_fov"):
@@ -4836,6 +4834,191 @@ class Window(QtWidgets.QMainWindow):
         for x, y, color in boxes:
             self.scene.addRect(x - box_half, y - box_half, box, box, color)
         return True
+
+    def _link_calibration_for_mode(
+        self, cal: dict, n_channels: int
+    ) -> dict | None:
+        """The loaded calibration's registration, adapted to how the data are
+        currently laid out (split-FOV regions vs. separate channels).
+
+        The calibration is *always* the source of the inter-channel transform
+        when one is loaded - the link colours then show exactly the pairing the
+        fit will use, so a stale registration shows up as grey boxes and can be
+        re-registered on purpose rather than being silently papered over. Only
+        the placement is adapted when the layout differs from the calibration's:
+
+        * split-FOV mode with a separate-movie calibration: both its channels
+          start at the frame origin, so its transforms already *are* the
+          region-local registration; they are placed at the drawn ROIs.
+        * separate channels with a split-FOV calibration: the region-local
+          affines *are* the inter-channel registration, so they apply directly
+          to the whole frame of each movie.
+
+        Returns None if the layout cannot be mapped onto the calibration's
+        channels at all (e.g. a different number of ROIs).
+        """
+        split_fov_cal = bool(cal.get("split_fov"))
+        if self.view.split_fov_mode == split_fov_cal:
+            return cal
+        if self.view.split_fov_mode:
+            transforms = cal.get("channel_transforms")
+            if not transforms or len(self.view.rois) != n_channels:
+                return None
+            return {
+                "n_channels": n_channels,
+                "split_fov": True,
+                "regions": [list(map(list, r)) for r in self.view.rois],
+                "channel_affines": [
+                    np.asarray(t, dtype=float).tolist()
+                    for t in transforms[:n_channels]
+                ],
+            }
+        if len(self.channels) < 2:
+            return cal  # single movie: keep the calibration's own regions
+        affines = cal.get("channel_affines")
+        if affines is None:
+            regions = cal.get("regions")
+            transforms = cal.get("channel_transforms")
+            if not regions or not transforms:
+                return None
+            affines = [
+                a.tolist()
+                for a in localize.decompose_region_affines(
+                    [_normalize_rect(r) for r in regions], transforms
+                )
+            ]
+        return {
+            "n_channels": n_channels,
+            "channel_transforms": [
+                np.asarray(a, dtype=float).tolist()
+                for a in affines[:n_channels]
+            ],
+        }
+
+    def _estimated_link_calibration(self, box: int) -> dict | None:
+        """A calibration-shaped dict whose inter-channel transforms are
+        estimated from the identifications themselves, for link colouring
+        without a loaded spline calibration.
+
+        The transforms come from
+        :func:`spline.estimate_transforms_from_identifications`, which searches
+        the mirror orientations - so a flipped channel (image splitter, mirrored
+        quadrant) links just as it does with a calibration. Channels that cannot
+        be registered fall back to the identity, i.e. the plain overlay.
+        Estimating is not free, so the result is cached until the detections,
+        the box size or the ROIs change. Returns None if there is nothing to
+        link.
+        """
+        split_fov = self.view.split_fov_mode
+        if split_fov:
+            regions = [list(map(list, r)) for r in self.view.rois]
+            if len(regions) < 2 or self.identifications is None:
+                return None
+            n_channels = len(regions)
+        else:
+            if len(self.channels) < 2:
+                return None
+            n_channels = len(self.channels)
+            regions = None
+        # the active channel's live detections are not mirrored back into
+        # ``self.channels`` until the channel is switched
+        ids_per_channel = (
+            None
+            if split_fov
+            else [
+                (
+                    self.identifications
+                    if c == self.current_channel
+                    else self.channels[c].identifications
+                )
+                for c in range(n_channels)
+            ]
+        )
+        key = (
+            split_fov,
+            int(box),
+            n_channels,
+            (
+                tuple(np.asarray(regions).ravel().tolist())
+                if regions is not None
+                else None
+            ),
+            tuple(
+                0 if ids is None else len(ids)
+                for ids in (ids_per_channel or [self.identifications])
+            ),
+        )
+        cached = getattr(self, "_link_cal_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        if split_fov:
+            region_rects = [_normalize_rect(r) for r in regions]
+            ids_per_channel = [
+                self._identifications_in_region(rect) for rect in region_rects
+            ]
+        try:
+            transforms = spline.estimate_transforms_from_identifications(
+                ids_per_channel,
+                box,
+                regions=regions,
+                frame_shape=(
+                    None
+                    if split_fov or self.movie is None
+                    else (int(self.movie.shape[1]), int(self.movie.shape[2]))
+                ),
+            )
+        except Exception:
+            transforms = None
+        if split_fov:
+            # region-local affines: the ROI placement is stripped out, so the
+            # boxes follow the ROIs if the user nudges them
+            if transforms is None:
+                affines = [identity for _ in range(n_channels)]
+            else:
+                affines = [
+                    (
+                        identity
+                        if t is None
+                        else localize.decompose_region_affines(
+                            [region_rects[0], region_rects[c]],
+                            [np.asarray(transforms[0]), np.asarray(t)],
+                        )[1].tolist()
+                    )
+                    for c, t in enumerate(transforms)
+                ]
+            cal = {
+                "n_channels": n_channels,
+                "split_fov": True,
+                "regions": regions,
+                "channel_affines": affines,
+            }
+        else:
+            cal = {
+                "n_channels": n_channels,
+                "channel_transforms": [
+                    (
+                        identity
+                        if transforms is None or transforms[c] is None
+                        else np.asarray(transforms[c]).tolist()
+                    )
+                    for c in range(n_channels)
+                ],
+            }
+        self._link_cal_cache = (key, cal)
+        return cal
+
+    def _identifications_in_region(self, rect: tuple) -> pd.DataFrame | None:
+        """The identifications inside a ``((y_min, x_min), (y_max, x_max))``
+        region (split-FOV: one region per channel)."""
+        ids = self.identifications
+        if ids is None or len(ids) == 0:
+            return None
+        (y0, x0), (y1, x1) = rect
+        x = np.asarray(ids["x"], dtype=float)
+        y = np.asarray(ids["y"], dtype=float)
+        return ids[(x >= x0) & (x < x1) & (y >= y0) & (y < y1)]
 
     def _linked_boxes_split_fov(
         self, cal: dict, n_channels: int, frame_number: int, tol: float
