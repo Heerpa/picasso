@@ -690,15 +690,19 @@ class TestPickKinetics:
             pick_shape="Circle",
             pick_size=PICK_SIZE / 2,
         )
-        length, dark, no_locs, out_locs = postprocess.pick_kinetics(
+        length, dark, no_locs, out_locs, kept = postprocess.pick_kinetics(
             pl, info, max_dark_time=3
         )
-        # All four returned arrays are 1D and aligned in length: one
-        # entry per successfully-evaluated pick (picks where kinetics
-        # could not be estimated are silently dropped).
-        assert length.ndim == dark.ndim == no_locs.ndim == 1
-        assert length.shape == dark.shape == no_locs.shape
+        # All returned arrays are 1D and aligned in length: one entry
+        # per successfully-evaluated pick (picks where kinetics could
+        # not be estimated are silently dropped).
+        assert length.ndim == dark.ndim == no_locs.ndim == kept.ndim == 1
+        assert length.shape == dark.shape == no_locs.shape == kept.shape
         assert length.shape[0] <= len(origami_picks)
+        # ``kept`` indexes back into the picks that were passed in.
+        assert len(set(kept.tolist())) == len(kept)
+        assert kept.min() >= 0
+        assert kept.max() < len(pl)
         # Bright/dark times are physical durations in frames — strictly
         # positive whenever they exist.
         assert (length > 0).all()

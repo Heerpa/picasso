@@ -1428,7 +1428,9 @@ class TestMovieLoadWorker:
 
     def test_cancel_stops_before_next_file(self, monkeypatch):
         """cancel() set during a load stops the loop before the next
-        file, so the batch ends with only the files read so far."""
+        file, and the whole batch is discarded: the file that was being
+        read cannot be interrupted mid-way, so it is dropped rather than
+        delivered as a half-loaded channel."""
         seen = []
 
         def fake_load_movie(path, prompt_info=None, progress=None):
@@ -1445,7 +1447,9 @@ class TestMovieLoadWorker:
 
         # Only the first file was loaded; the second was never attempted.
         assert seen == ["first.tif"]
-        assert out.finished[2] == ["first.tif"]
+        # finished still fires (so the GUI can tear the dialog down), but
+        # with an empty batch.
+        assert out.finished == ([], [], [])
 
 
 # ---------------------------------------------------------------------------
