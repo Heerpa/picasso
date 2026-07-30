@@ -168,6 +168,33 @@ if not GPUFIT_INSTALLED:
     del FIT_MODELS["Experimental PSF (cubic spline)"]
 
 
+MODEL_TOOLTIP = (
+    "Model fit to each identified spot:\n\n"
+    "2D elliptical Gaussian: Gaussian with independent widths in x and y."
+    " Standard choice for 2D data and required for 3D via astigmatism.\n\n"
+    "2D rotated elliptical Gaussian: as above, plus a fitted rotation angle"
+    " of the ellipse. Useful for tilted/anisotropic PSFs.\n\n"
+    "2D spherical Gaussian: Gaussian with one common width for x and y.\n\n"
+    "Experimental PSF (cubic spline): fits a cubic spline interpolation of"
+    " a measured 3D PSF (requires a spline calibration file). Most accurate"
+    " model and yields z directly, also for aberrated PSFs. GPU only.\n\n"
+    "Average of ROI: reports the spot's center of mass and integrated "
+    "intensity in the fit box."
+)
+
+OPTIMIZER_TOOLTIP = (
+    "Optimizer used to fit the model to data:\n\n"
+    "Least squares: minimizes the squared residuals between model and"
+    " data. Fast and robust, but assumes Gaussian noise, so it is slightly"
+    " biased for the Poisson (shot) noise of low-photon spots.\n\n"
+    "MLE: maximum likelihood estimation with a Poisson noise model."
+    " Statistically optimal (precision close to the Cramer-Rao lower"
+    " bound) and the better choice for dim spots.\n\n"
+    "Available optimizers may depend on the selected model; some are only"
+    " implemented on the GPU (Gpufit)."
+)
+
+
 def _fit_code(model: str, optimizer: str) -> str:
     """Resolve a (model, optimizer) selection to an internal ``fit2D`` code."""
     entry = FIT_MODELS[model]
@@ -2125,17 +2152,19 @@ class ParametersDialog(lib.Dialog):
         fit_grid = QtWidgets.QGridLayout(fit_groupbox)
 
         model_label = QtWidgets.QLabel("Model:")
-        model_label.setToolTip("Model fit to each identified spot.")
+        model_label.setToolTip(MODEL_TOOLTIP)
         fit_grid.addWidget(model_label, 1, 0)
         self.fit_model = QtWidgets.QComboBox()
         self.fit_model.addItems(list(FIT_MODELS.keys()))
         self.fit_model.setCurrentIndex(0)
+        self.fit_model.setToolTip(MODEL_TOOLTIP)
         fit_grid.addWidget(self.fit_model, 1, 1)
 
         self.optimizer_label = QtWidgets.QLabel("Optimizer:")
-        self.optimizer_label.setToolTip("Optimizer used to fit the model.")
+        self.optimizer_label.setToolTip(OPTIMIZER_TOOLTIP)
         fit_grid.addWidget(self.optimizer_label, 2, 0)
         self.fit_optimizer = QtWidgets.QComboBox()
+        self.fit_optimizer.setToolTip(OPTIMIZER_TOOLTIP)
         fit_grid.addWidget(self.fit_optimizer, 2, 1)
 
         self.fit_stack = QtWidgets.QStackedWidget()
