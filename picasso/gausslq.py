@@ -294,10 +294,28 @@ def _compute_residuals_rotated(
     return residuals.flatten()
 
 
+def _chi_square_of(result: tuple) -> float:
+    """Chi-square of a ``leastsq(..., full_output=1)`` result.
+
+    ``result[2]["fvec"]`` is the residual vector at the returned parameters,
+    so this is the sum of squared residuals at the fit optimum - the
+    least-squares goodness of fit, in photons squared (spots are
+    gain-converted before fitting)."""
+    return float(np.sum(np.asarray(result[2]["fvec"], dtype=np.float64) ** 2))
+
+
+def _with_chi_square(result: tuple, return_chi_square: bool):
+    """The fitted parameters, with the chi-square appended if asked for."""
+    if not return_chi_square:
+        return result[0]
+    return np.append(result[0], _chi_square_of(result))
+
+
 def fit_spot(
     spot: lib.FloatArray2D,
     spherical: bool = False,
     rotated: bool = False,
+    return_chi_square: bool = False,
 ) -> lib.FloatArray1D:
     """Fit a single spot using least squares optimization. The spot is a
     2D array representing the pixel values of the spot image. The
@@ -324,13 +342,25 @@ def fit_spot(
         If True, fit a rotated elliptical Gaussian; the returned array
         has a seventh element, the rotation angle in radians. Cannot be
         combined with ``spherical``. Default is False.
+    return_chi_square : bool, optional
+        If True, the returned array carries one extra trailing element:
+        the chi-square (residual sum of squares) at the fit optimum, the
+        least-squares goodness-of-fit measure. It is appended to the
+        parameters rather than returned separately so that the
+        multiprocessing plumbing (``fit_spots_parallel`` /
+        ``fits_from_futures``) keeps stacking plain 2D arrays.
+        ``locs_from_fits`` takes it as its own ``chi_square`` argument, so
+        callers split it off (see ``localize._fit2d_gausslq``). Default is
+        False.
 
     Returns
     -------
     result_ : lib.FloatArray1D
         A 1D array containing the optimized parameters in the following
         order: [x, y, photons, bg, sx, sy], or, if ``rotated``,
-        [x, y, photons, bg, sx, sy, angle (radians)].
+        [x, y, photons, bg, sx, sy, angle (radians)]. If
+        ``return_chi_square``, the chi-square is appended as the last
+        element.
     """
     size = spot.shape[0]
     size_half = int(size / 2)
@@ -339,6 +369,10 @@ def fit_spot(
     model_y = np.empty(size, dtype=np.float32)
     model = np.empty((size, size), dtype=np.float32)
     residuals = np.empty((size, size), dtype=np.float32)
+    # full_output exposes leastsq's infodict, whose "fvec" is the residual
+    # vector at the returned parameters - the chi-square is then free, with
+    # no extra model evaluation.
+    full_output = 1 if return_chi_square else 0
     if rotated:
         # theta is [x, y, photons, bg, sx, sy, angle]; the rotated model
         # is not separable, so it does not use the per-axis buffers.
@@ -349,14 +383,20 @@ def fit_spot(
             args=(spot, grid, size, model, residuals),
             ftol=1e-2,
             xtol=1e-2,
+            full_output=full_output,
         )
-        return result[0]
+        return _with_chi_square(result, return_chi_square)
     args = (spot, grid, size, model_x, model_y, model, residuals)
     if spherical:
         # theta is [x, y, photons, bg, sigma]
         theta0 = _initial_parameters_sigma(spot, size, size_half)
         result = optimize.leastsq(
-            _compute_residuals_sigma, theta0, args=args, ftol=1e-2, xtol=1e-2
+            _compute_residuals_sigma,
+            theta0,
+            args=args,
+            ftol=1e-2,
+            xtol=1e-2,
+            full_output=full_output,
         )
         fitted = result[0]
         # Expand the single width into sx == sy so downstream code
@@ -364,14 +404,20 @@ def fit_spot(
         result_ = np.empty(6, dtype=fitted.dtype)
         result_[0:5] = fitted
         result_[5] = fitted[4]
+        if return_chi_square:
+            return np.append(result_, _chi_square_of(result))
         return result_
     # theta is [x, y, photons, bg, sx, sy]
     theta0 = _initial_parameters(spot, size, size_half)
     result = optimize.leastsq(
-        _compute_residuals, theta0, args=args, ftol=1e-2, xtol=1e-2
+        _compute_residuals,
+        theta0,
+        args=args,
+        ftol=1e-2,
+        xtol=1e-2,
+        full_output=full_output,
     )  # leastsq is much faster than least_squares
-    result_ = result[0]
-    return result_
+    return _with_chi_square(result, return_chi_square)
 
 
 def fit_spots(
@@ -381,6 +427,7 @@ def fit_spots(
     ) = None,
     spherical: bool = False,
     rotated: bool = False,
+    return_chi_square: bool = False,
 ) -> lib.FloatArray2D:
     """Fit multiple spots using least squares optimization. Each spot is
     a 2D array representing the pixel values of the spot image. The
@@ -408,15 +455,22 @@ def fit_spots(
         If True, fit a rotated elliptical Gaussian; the returned array
         has a seventh column, the rotation angle in radians. Cannot be
         combined with ``spherical``. Default is False.
+    return_chi_square : bool, optional
+        If True, append the per-spot chi-square (residual sum of squares
+        at the fit optimum) as one extra trailing column. See
+        ``fit_spot``. Default is False.
 
     Returns
     -------
     theta : lib.FloatArray2D
         A 2D array with the optimized parameters for each spot. The
         columns correspond to [x, y, photons, bg, sx, sy] (or, if
-        ``rotated``, [x, y, photons, bg, sx, sy, angle (radians)]).
+        ``rotated``, [x, y, photons, bg, sx, sy, angle (radians)]), plus
+        a trailing chi-square column if ``return_chi_square``.
     """
     n_params = 7 if rotated else 6
+    if return_chi_square:
+        n_params += 1
     theta = np.empty((len(spots), n_params), dtype=np.float32)
     theta.fill(np.nan)
     use_tqdm = progress_callback == "console"
@@ -426,7 +480,12 @@ def fit_spots(
         iter_range = range(len(spots))
     for i in iter_range:
         spot = spots[i]
-        theta[i] = fit_spot(spot, spherical=spherical, rotated=rotated)
+        theta[i] = fit_spot(
+            spot,
+            spherical=spherical,
+            rotated=rotated,
+            return_chi_square=return_chi_square,
+        )
         if callable(progress_callback):
             progress_callback(i)
     return theta
@@ -437,6 +496,7 @@ def fit_spots_parallel(
     asynch: bool = False,
     spherical: bool = False,
     rotated: bool = False,
+    return_chi_square: bool = False,
 ) -> lib.FloatArray2D | list[futures.Future]:
     """Allows for running ``fit_spots`` asynchronously
     (multiprocessing).
@@ -460,6 +520,10 @@ def fit_spots_parallel(
         If True, fit a rotated elliptical Gaussian; the returned array
         has a seventh column, the rotation angle in radians. Cannot be
         combined with ``spherical``. Default is False.
+    return_chi_square : bool, optional
+        If True, append the per-spot chi-square (residual sum of squares
+        at the fit optimum) as one extra trailing column. See
+        ``fit_spot``. Default is False.
 
     Returns
     -------
@@ -467,8 +531,9 @@ def fit_spots_parallel(
         If `asynch` is False, returns a 2D array with the optimized
         parameters for each spot, where each row corresponds to a spot
         and the columns are the parameters in the following order:
-        [x, y, photons, bg, sx, sy]. If `asynch` is True, returns a list
-        of futures that can be processed asynchronously.
+        [x, y, photons, bg, sx, sy], plus a trailing chi-square column if
+        ``return_chi_square``. If `asynch` is True, returns a list of
+        futures that can be processed asynchronously.
     """
     n_workers = min(
         60, max(1, int(0.75 * multiprocessing.cpu_count()))
@@ -493,6 +558,7 @@ def fit_spots_parallel(
                 spots[i : i + n_spots_task],
                 spherical=spherical,
                 rotated=rotated,
+                return_chi_square=return_chi_square,
             )
         )
     if asynch:
@@ -542,6 +608,7 @@ def locs_from_fits(
     box: int,
     em: bool,
     spherical: bool = False,
+    chi_square: lib.FloatArray1D | None = None,
 ) -> pd.DataFrame:
     """Convert the fit results into a data frame of localizations.
 
@@ -567,6 +634,13 @@ def locs_from_fits(
         ``sx == sy`` and the ellipticity is always 0. The
         ``ellipticity`` column is then omitted as it carries no
         information. Default is False.
+    chi_square : lib.FloatArray1D, optional
+        The per-spot chi-square (residual sum of squares at the fit
+        optimum, see ``fit_spot``). If provided, the ``chi_square``
+        column is added. It is the least-squares goodness of fit, in
+        photons squared, so it scales with the spot brightness and the
+        box size and is only comparable between fits of the same box
+        size.
 
     Returns
     -------
@@ -611,6 +685,8 @@ def locs_from_fits(
         angle = -np.rad2deg(theta[:, 6])
         angle = np.mod(angle + 90.0, 180.0) - 90.0
         columns["angle"] = angle.astype(np.float32)
+    if chi_square is not None:
+        columns["chi_square"] = np.asarray(chi_square).astype(np.float32)
 
     if "n_id" in identifications.columns:
         columns["n_id"] = identifications["n_id"].astype(np.uint32)

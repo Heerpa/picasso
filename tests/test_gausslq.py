@@ -638,3 +638,100 @@ class TestLocsFromFitsSphericalRotated:
         assert ((locs["angle"] >= -90.0) & (locs["angle"] < 90.0)).all()
         # ellipticity is present for the (anisotropic) rotated model
         assert "ellipticity" in locs.columns
+
+
+# ---------------------------------------------------------------------------
+# chi-square — the least-squares goodness-of-fit metric
+# ---------------------------------------------------------------------------
+
+
+class TestChiSquare:
+    """``return_chi_square`` appends the residual sum of squares at the fit
+    optimum. It is the least-squares counterpart of the MLE fits'
+    ``log_likelihood``: least squares assumes no noise model, so it has no
+    likelihood, but it does have the objective value it minimized."""
+
+    @staticmethod
+    def _ids(n):
+        return pd.DataFrame(
+            {
+                "frame": np.arange(n, dtype=np.uint32),
+                "x": np.full(n, 40, dtype=np.int64),
+                "y": np.full(n, 60, dtype=np.int64),
+                "net_gradient": np.full(n, 5000.0, dtype=np.float32),
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "kwargs, n_params",
+        [({}, 6), ({"spherical": True}, 6), ({"rotated": True}, 7)],
+    )
+    def test_fit_spot_appends_one_column(
+        self, synthetic_spot_factory, kwargs, n_params
+    ):
+        """One extra trailing element, and the parameters themselves are
+        untouched by asking for it."""
+        spot = synthetic_spot_factory()
+        plain = gausslq.fit_spot(spot, **kwargs)
+        with_chi = gausslq.fit_spot(spot, return_chi_square=True, **kwargs)
+        assert plain.shape == (n_params,)
+        assert with_chi.shape == (n_params + 1,)
+        np.testing.assert_allclose(with_chi[:n_params], plain, rtol=1e-6)
+        assert with_chi[-1] >= 0
+
+    def test_matches_residual_sum_of_squares(self, synthetic_spot_factory):
+        """The reported value is the sum of squared residuals of the fitted
+        model against the spot — recomputed here from the model directly."""
+        spot = synthetic_spot_factory()
+        theta = gausslq.fit_spot(spot, return_chi_square=True)
+        x, y, photons, bg, sx, sy = theta[:6].astype(np.float64)
+        half = BOX // 2
+        grid = np.arange(-half, half + 1, dtype=np.float64)
+
+        # The fit model is a point-sampled Gaussian PDF, separable in x and y
+        # (mirrors gausslq._compute_model / _gaussian).
+        def pdf(mu, sigma):
+            norm = 1.0 / (np.sqrt(2.0 * np.pi) * sigma)
+            return norm * np.exp(-0.5 * ((grid - mu) / sigma) ** 2)
+
+        model = photons * np.outer(pdf(y, sy), pdf(x, sx)) + bg
+        expected = np.sum((np.asarray(spot, dtype=np.float64) - model) ** 2)
+        np.testing.assert_allclose(theta[-1], expected, rtol=1e-3)
+
+    def test_fit_spots_batch_column(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        theta = gausslq.fit_spots(spots, return_chi_square=True)
+        assert theta.shape == (len(spots), 7)
+        assert np.all(theta[:, -1] >= 0)
+        assert np.all(np.isfinite(theta[:, -1]))
+        plain = gausslq.fit_spots(spots)
+        np.testing.assert_allclose(theta[:, :6], plain, rtol=1e-5, atol=1e-5)
+
+    def test_scales_with_noise(self, synthetic_spots, synthetic_spots_noisy):
+        """A noisier spot stack leaves larger residuals, so the chi-square
+        must be able to tell the two apart (that is the point of saving it)."""
+        clean, _ = synthetic_spots
+        noisy, _ = synthetic_spots_noisy
+        chi_clean = gausslq.fit_spots(clean, return_chi_square=True)[:, -1]
+        chi_noisy = gausslq.fit_spots(noisy, return_chi_square=True)[:, -1]
+        assert np.median(chi_noisy) > np.median(chi_clean)
+
+    def test_locs_from_fits_adds_column(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        theta = gausslq.fit_spots(spots, return_chi_square=True)
+        theta, chi_square = theta[:, :-1], theta[:, -1]
+        ids = self._ids(len(spots))
+        locs = gausslq.locs_from_fits(
+            ids, theta, BOX, em=False, chi_square=chi_square
+        )
+        assert locs["chi_square"].dtype == np.float32
+        # locs_from_fits sorts by frame; ids are already frame-ordered here
+        np.testing.assert_allclose(
+            locs["chi_square"].to_numpy(), chi_square, rtol=1e-6
+        )
+
+    def test_locs_from_fits_omits_column_by_default(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        theta = gausslq.fit_spots(spots)
+        locs = gausslq.locs_from_fits(self._ids(len(spots)), theta, BOX, False)
+        assert "chi_square" not in locs.columns

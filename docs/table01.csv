@@ -16,6 +16,7 @@ lpz,(Optional) The localization precision in z direction in nm.,float
 d_zcalib,"(Optional) The value of the D function used for z fitting with astigmatism, see the supplement to Huang et al. 2008.","float "
 log_likelihood,"(Optional) The log-likelihood of the fit. Only available for MLE fitting. Before v0.11.0, this column might be “likelihood”.","float "
 "iterations ",(Optional) The number of iterations of the fit procedure. Only available for MLE fitting.,"long "
+chi_square,"(Optional) The chi-square of the fit, i.e. the sum of squared residuals between the spot and the fitted model at the fit optimum, in photons squared. Only available for least-squares fitting, where it is the counterpart of the “log_likelihood” column of MLE fits.","float "
 "group ","(Optional) An identifier to assign multiple localizations to groups, for example by picking regions of interest or clustering. ","long "
 group_input," ""(Optional) Assigned after clustering if the input localizations had a “group” column. This allows to trace back which input group a clustered group originated from.""",long
 "len ","(Optional) The length of the event in frames, if localizations from consecutive frames have been linked.","long "

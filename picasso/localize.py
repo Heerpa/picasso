@@ -154,6 +154,7 @@ LOCALIZATION_COLUMNS = {
     "Rotation only": ["angle", "angle_unc"],
     "Picked spots only": ["n_id"],
     "MLE only": ["log_likelihood", "iterations"],
+    "Least squares only": ["chi_square"],
     "Uncertainty": ["photons_unc", "bg_unc", "sx_unc", "sy_unc"],
     "Multichannel only": (
         [f"photons_ch{c}" for c in range(_LINK_XYZ_MAX_CHANNELS)]
@@ -1833,7 +1834,11 @@ def _fit2d_gausslq(
     N = len(identifications)
     if multiprocess:
         fs = gausslq.fit_spots_parallel(
-            spots, asynch=True, spherical=spherical, rotated=rotated
+            spots,
+            asynch=True,
+            spherical=spherical,
+            rotated=rotated,
+            return_chi_square=True,
         )
         theta = _process_fitting_futures(
             fs, N, progress_callback, abort_callback
@@ -1842,14 +1847,23 @@ def _fit2d_gausslq(
             return
     else:
         theta = gausslq.fit_spots(
-            spots, progress_callback, spherical=spherical, rotated=rotated
+            spots,
+            progress_callback,
+            spherical=spherical,
+            rotated=rotated,
+            return_chi_square=True,
         )
+    # The chi-square rides along as the last column of theta (see
+    # gausslq.fit_spot); split it off so locs_from_fits sees the plain
+    # parameter layout it detects the rotated model from.
+    theta, chi_square = theta[:, :-1], theta[:, -1]
     locs = gausslq.locs_from_fits(
         identifications,
         theta,
         box,
         em,
         spherical=spherical,
+        chi_square=chi_square,
     )
     return locs
 
@@ -1910,7 +1924,12 @@ def fit_spots_gpufit(
     return_stats: bool = False,
 ) -> (
     lib.FloatArray2D
-    | tuple[lib.FloatArray2D, lib.FloatArray1D | None, lib.FloatArray1D]
+    | tuple[
+        lib.FloatArray2D,
+        lib.FloatArray1D | None,
+        lib.FloatArray1D,
+        lib.FloatArray1D | None,
+    ]
 ):
     """Fit multiple spots using GPU-based Gaussian fitting. Each spot is
     a 2D array representing the pixel values of the spot image. The
@@ -1951,8 +1970,8 @@ def fit_spots_gpufit(
         ``rotated``. Default is False.
     return_stats : bool, optional
         If True, additionally return the per-spot fit diagnostics
-        (log-likelihood and iteration counts) reported by Gpufit.
-        Default is False.
+        (log-likelihood, iteration counts and chi-square) reported by
+        Gpufit. Default is False.
 
     Returns
     -------
@@ -1964,11 +1983,16 @@ def fit_spots_gpufit(
         Only returned if ``return_stats``. The per-spot Poisson
         log-likelihood when ``mle`` (derived from Gpufit's chi-square,
         whose MLE value equals twice the negative log-likelihood), or
-        None for least squares, where Gpufit reports a residual sum of
-        squares rather than a likelihood.
+        None for least squares, which does not assume a noise model and
+        so has no likelihood to report (see ``chi_square`` instead).
     number_iterations : lib.FloatArray1D
         Only returned if ``return_stats``. The number of iterations
         taken to converge for each spot.
+    chi_square : lib.FloatArray1D or None
+        Only returned if ``return_stats``. The per-spot residual sum of
+        squares at the fit optimum for a least-squares fit, or None when
+        ``mle`` (there the chi-square is the likelihood in disguise and
+        is reported as ``log_likelihood``).
     """
     if not GPUFIT_INSTALLED:
         raise ImportError(
@@ -2020,10 +2044,12 @@ def fit_spots_gpufit(
         # Gpufit's MLE chi-square equals twice the negative Poisson
         # log-likelihood, so -0.5 * chi_square reproduces the CPU MLE
         # fit's log_likelihood (both Stirling-approximated). For least
-        # squares the chi-square is a residual sum of squares, not a
-        # likelihood, so there is nothing meaningful to return.
+        # squares the chi-square is the plain residual sum of squares -
+        # not a likelihood, since least squares assumes no noise model -
+        # and is reported as such, as this fit's goodness-of-fit metric.
         log_likelihood = -0.5 * chi_squares if mle else None
-        return parameters, log_likelihood, number_iterations
+        chi_square = None if mle else chi_squares
+        return parameters, log_likelihood, number_iterations, chi_square
     return parameters
 
 
@@ -2167,6 +2193,7 @@ def locs_from_fits_gpufit(
     log_likelihood: lib.FloatArray1D | None = None,
     iterations: lib.FloatArray1D | None = None,
     spherical: bool = False,
+    chi_square: lib.FloatArray1D | None = None,
 ) -> pd.DataFrame:
     """Convert the fit results from GPU-based fitting (Gaussian) into a
     data frame array of localizations.
@@ -2212,6 +2239,14 @@ def locs_from_fits_gpufit(
         ``sx == sy`` and the ellipticity is always 0. The
         ``ellipticity`` column is then omitted as it carries no
         information. Default is False.
+    chi_square : lib.FloatArray1D, optional
+        The per-spot residual sum of squares at the fit optimum (from a
+        least-squares fit). If provided, the ``chi_square`` column is
+        added. It is the least-squares counterpart of the MLE fits'
+        ``log_likelihood``: a goodness-of-fit measure in photons squared,
+        so it scales with the spot brightness and the box size and is
+        only comparable between fits of the same box size. Default is
+        None.
 
     Returns
     -------
@@ -2277,6 +2312,8 @@ def locs_from_fits_gpufit(
         columns["log_likelihood"] = log_likelihood.astype(np.float32)
     if iterations is not None:
         columns["iterations"] = iterations.astype(np.int32)
+    if chi_square is not None:
+        columns["chi_square"] = np.asarray(chi_square).astype(np.float32)
     locs = pd.DataFrame(columns)
     locs.sort_values(by="frame", kind="quicksort", inplace=True)
     return locs
@@ -2298,7 +2335,7 @@ def _fit2d_gauss_gpu(
     ``spherical``, an isotropic Gaussian with a single width is fitted
     and the resulting ``sx`` and ``sy`` columns are identical. See
     ``fit_2D`` for more details."""
-    theta, log_likelihood, iterations = fit_spots_gpufit(
+    theta, log_likelihood, iterations, chi_square = fit_spots_gpufit(
         spots, rotated=rotated, mle=mle, spherical=spherical, return_stats=True
     )
     locs = locs_from_fits_gpufit(
@@ -2310,6 +2347,7 @@ def _fit2d_gauss_gpu(
         log_likelihood=log_likelihood,
         iterations=iterations,
         spherical=spherical,
+        chi_square=chi_square,
     )
     return locs
 
@@ -2889,7 +2927,12 @@ def fit_spots_gpufit_spline(
     residuals: np.ndarray | None = None,
 ) -> (
     lib.FloatArray2D
-    | tuple[lib.FloatArray2D, lib.FloatArray1D | None, lib.FloatArray1D]
+    | tuple[
+        lib.FloatArray2D,
+        lib.FloatArray1D | None,
+        lib.FloatArray1D,
+        lib.FloatArray1D | None,
+    ]
 ):
     """Fit multiple spots with a cubic-spline PSF model on the GPU.
 
@@ -2918,7 +2961,8 @@ def fit_spots_gpufit_spline(
         runs once per seed, but liable to settle in the wrong axial minimum.
         2D models always use a single start.
     return_stats : bool, optional
-        Also return ``(log_likelihood, number_iterations)``. Default False.
+        Also return ``(log_likelihood, number_iterations, chi_square)``.
+        Default False.
     residuals : np.ndarray, optional
         Per-spot, per-channel sub-pixel ROI offsets ``(n_spots, n_channels,
         2)`` from ``get_spots_multichannel(..., return_residuals=True)``.
@@ -2932,8 +2976,11 @@ def fit_spots_gpufit_spline(
         Fitted parameters, columns ``[amplitude, x_shift, y_shift, offset]``
         (2D), ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D / shared
         multichannel) or ``[x_shift, y_shift, z_shift, N.., bg..]`` (link-XYZ).
-    log_likelihood, number_iterations
-        Only if ``return_stats`` (log_likelihood is None for least squares).
+    log_likelihood, number_iterations, chi_square
+        Only if ``return_stats``. ``log_likelihood`` is None for least
+        squares (which assumes no noise model) and ``chi_square`` - the
+        residual sum of squares at the optimum - is None for MLE, where the
+        chi-square *is* the likelihood and is reported as such.
     """
     if n_z_starts is None:
         n_z_starts = _default_n_z_starts(calibration)
@@ -2945,10 +2992,11 @@ def fit_spots_gpufit_spline(
         )
         if return_stats:
             # As in fit_spots_gpufit: Gpufit's MLE chi-square is twice the
-            # negative Poisson log-likelihood; for least squares it is a
-            # residual sum of squares, so there is no likelihood to report.
+            # negative Poisson log-likelihood; for least squares it is the
+            # plain residual sum of squares, reported as chi_square.
             log_likelihood = -0.5 * chi_squares if mle else None
-            return parameters, log_likelihood, number_iterations
+            chi_square = None if mle else chi_squares
+            return parameters, log_likelihood, number_iterations, chi_square
         return parameters
 
     best_params, best_chi, _ok, best_it = _fit_spline_z_multistart(
@@ -2960,7 +3008,8 @@ def fit_spots_gpufit_spline(
     )
     if return_stats:
         log_likelihood = -0.5 * best_chi if mle else None
-        return best_params, log_likelihood, best_it
+        chi_square = None if mle else best_chi
+        return best_params, log_likelihood, best_it, chi_square
     return best_params
 
 
@@ -5219,6 +5268,7 @@ def _locs_from_fits_spline_link_xyz(
         Callable[[int], None] | Literal["console"] | None
     ) = None,
     residuals: np.ndarray | None = None,
+    chi_square: lib.FloatArray1D | None = None,
 ) -> pd.DataFrame:
     """Localizations from a photon-decoupled (link-XYZ) multichannel spline fit.
 
@@ -5311,6 +5361,8 @@ def _locs_from_fits_spline_link_xyz(
         )
     if iterations is not None:
         columns["iterations"] = np.asarray(iterations).astype(np.int32)
+    if chi_square is not None:
+        columns["chi_square"] = np.asarray(chi_square).astype(np.float32)
     locs = pd.DataFrame(columns)
     locs.sort_values(by="frame", kind="quicksort", inplace=True)
     return locs
@@ -5329,6 +5381,7 @@ def locs_from_fits_spline(
         Callable[[int], None] | Literal["console"] | None
     ) = None,
     residuals: np.ndarray | None = None,
+    chi_square: lib.FloatArray1D | None = None,
 ) -> pd.DataFrame:
     """Convert spline fit results into a localizations data frame.
 
@@ -5340,7 +5393,12 @@ def locs_from_fits_spline(
     covariance for ``spline-gpu`` least-squares fits (``mle`` False). ``mle``
     must match the estimator that produced ``theta``. ``em`` doubles those
     variances for EMCCD excess noise, as in the Gaussian fits.
-    ``progress_callback`` is forwarded to :func:`_spline_crlb`."""
+    ``progress_callback`` is forwarded to :func:`_spline_crlb`.
+
+    ``log_likelihood`` (MLE) and ``chi_square`` (the least-squares residual
+    sum of squares at the optimum) are the per-estimator goodness-of-fit
+    metrics; each becomes a column when given. See
+    :func:`locs_from_fits_gpufit` for how to read ``chi_square``."""
     calibration = crop_spline_calibration(calibration, box)
     model = calibration["model"]
     if model == _LINK_XYZ_MODEL:
@@ -5358,6 +5416,7 @@ def locs_from_fits_spline(
             iterations=iterations,
             progress_callback=progress_callback,
             residuals=residuals,
+            chi_square=chi_square,
         )
     is_3d = model != "spline-2d"
     box_offset = int(box / 2)
@@ -5431,6 +5490,8 @@ def locs_from_fits_spline(
         columns["log_likelihood"] = log_likelihood.astype(np.float32)
     if iterations is not None:
         columns["iterations"] = iterations.astype(np.int32)
+    if chi_square is not None:
+        columns["chi_square"] = np.asarray(chi_square).astype(np.float32)
     locs = pd.DataFrame(columns)
     locs.sort_values(by="frame", kind="quicksort", inplace=True)
     return locs
@@ -5456,7 +5517,7 @@ def _fit2d_spline_gpu(
     ``n_z_starts`` is the axial multi-start (see
     :func:`fit_spots_gpufit_spline`); ``None`` picks it from the calibration.
     Pass 1 for the single in-focus start."""
-    theta, log_likelihood, iterations = fit_spots_gpufit_spline(
+    theta, log_likelihood, iterations, chi_square = fit_spots_gpufit_spline(
         spots,
         calibration,
         mle=mle,
@@ -5473,6 +5534,7 @@ def _fit2d_spline_gpu(
         log_likelihood=log_likelihood,
         iterations=iterations,
         progress_callback=progress_callback,
+        chi_square=chi_square,
     )
     return locs
 
@@ -6043,7 +6105,7 @@ def fit_spline_multichannel(
         progress_callback=progress_callback,
         return_residuals=True,
     )
-    theta, log_likelihood, iterations = fit_spots_gpufit_spline(
+    theta, log_likelihood, iterations, chi_square = fit_spots_gpufit_spline(
         spots,
         calibration,
         mle=mle,
@@ -6063,6 +6125,7 @@ def fit_spline_multichannel(
         iterations=iterations,
         progress_callback=progress_callback,
         residuals=residuals if apply_roi_residuals else None,
+        chi_square=chi_square,
     )
 
 
@@ -6206,6 +6269,7 @@ def fit_spline_multichannel_ratiometric(
     if n_z_starts is None:
         n_z_starts = _default_n_z_starts(calibration)
     thetas = []
+    chis = []  # raw per-hypothesis chi-squares, kept for the saved column
     scores = np.full((n_hyp, n_spots), np.inf)
     valid = np.zeros((n_hyp, n_spots), dtype=bool)
     for k in range(n_hyp):
@@ -6221,6 +6285,7 @@ def fit_spline_multichannel_ratiometric(
             residuals=roi_residuals,
         )
         thetas.append(params)
+        chis.append(np.asarray(chi_squares))
         finite = np.isfinite(params).all(axis=1) & np.isfinite(chi_squares)
         # LSE is robust here; for MLE keep only converged fits since its
         # chi-square is unreliable on the frequent negative-curvature exits.
@@ -6258,6 +6323,10 @@ def fit_spline_multichannel_ratiometric(
             calib_k,
             mle=mle,
             residuals=(None if roi_residuals is None else roi_residuals[rows]),
+            # The winning hypothesis's own score. Only for least squares:
+            # under MLE this chi-square is a likelihood, and the frequent
+            # negative-curvature exits make it unreliable anyway (see above).
+            chi_square=(None if mle else chis[k][rows]),
         )
         amp = pd.Series(np.asarray(theta_k[:, 0]), index=ids_k.index)
         ps = _photon_scales(calib_k, n_channels)

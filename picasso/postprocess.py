@@ -2633,9 +2633,10 @@ def _link_loc_groups(  # noqa: C901
         columns["net_gradient"] = _link_group_mean(
             locs["net_gradient"].to_numpy(), link_group, n_locs, n_groups, n_
         )
-    for col in ("log_likelihood", "likelihood"):
+    for col in ("log_likelihood", "likelihood", "chi_square"):
         # "likelihood" is the old name of the column, kept for files saved
-        # with earlier versions of Picasso.
+        # with earlier versions of Picasso. "chi_square" is its least-squares
+        # counterpart; averaged the same way (a mean over the linked locs).
         if col in locs.columns:
             columns[col] = _link_group_mean(
                 locs[col].to_numpy(), link_group, n_locs, n_groups, n_

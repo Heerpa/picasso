@@ -975,6 +975,54 @@ class TestFit2D:
         # camera_info keys merged into new_info
         assert new_info["Pixelsize"] == 130
 
+    @pytest.mark.parametrize("multiprocess", [False, True])
+    def test_gausslq_saves_chi_square_not_likelihood(
+        self, picasso_movie, real_identifications, movie_info, multiprocess
+    ):
+        """The CPU least-squares methods report their goodness of fit as
+        ``chi_square`` (the residual sum of squares at the optimum), the
+        least-squares counterpart of the MLE fits' ``log_likelihood``. Both
+        the serial and the multiprocessing path must carry it, since the
+        multiprocessing path ferries it as an extra ``theta`` column."""
+        locs, _ = localize.fit2D(
+            picasso_movie,
+            movie_info,
+            CAMERA_INFO_WITH_PIXELSIZE,
+            real_identifications,
+            BOX,
+            fitting_method="gausslq",
+            multiprocess=multiprocess,
+        )
+        assert "chi_square" in locs.columns
+        assert "log_likelihood" not in locs.columns
+        chi = locs["chi_square"].to_numpy()
+        assert np.all(chi >= 0) and np.all(np.isfinite(chi))
+        # the chi-square column must not have displaced a parameter column
+        for col in ["x", "y", "photons", "sx", "sy", "bg", "ellipticity"]:
+            assert col in locs.columns
+
+    @pytest.mark.parametrize(
+        "method", ["gausslq", "gausslq-spherical", "gausslq-rotated"]
+    )
+    def test_all_cpu_lq_variants_save_chi_square(
+        self, picasso_movie, real_identifications, movie_info, method
+    ):
+        """Every CPU least-squares model variant carries the column, and the
+        rotated one still recovers its ``angle`` (whose detection keys off the
+        parameter count, so the extra column must be split off first)."""
+        locs, _ = localize.fit2D(
+            picasso_movie,
+            movie_info,
+            CAMERA_INFO_WITH_PIXELSIZE,
+            real_identifications,
+            BOX,
+            fitting_method=method,
+            multiprocess=False,
+        )
+        assert "chi_square" in locs.columns
+        assert np.all(locs["chi_square"].to_numpy() >= 0)
+        assert ("angle" in locs.columns) == (method == "gausslq-rotated")
+
     def test_gaussmle_returns_locs(
         self, picasso_movie, real_identifications, movie_info
     ):
@@ -1612,12 +1660,13 @@ class TestGpufit:
 
     def test_spherical_mle_converged_recover(self, synthetic_spots_isotropic):
         spots, gt = synthetic_spots_isotropic
-        theta, ll, n_iter = localize.fit_spots_gpufit(
+        theta, ll, n_iter, chi2 = localize.fit_spots_gpufit(
             spots, spherical=True, mle=True, return_stats=True
         )
         assert theta.shape == (len(spots), 6)
         np.testing.assert_array_equal(theta[:, 3], theta[:, 4])
         assert ll is not None and ll.shape == (len(spots),)
+        assert chi2 is None
 
     def test_spherical_end_to_end_omits_ellipticity(
         self, synthetic_spots_isotropic
@@ -1687,7 +1736,7 @@ class TestGpufit:
 
     def test_return_stats_mle(self, synthetic_spots_noisy):
         spots, _ = synthetic_spots_noisy
-        theta, ll, n_iter = localize.fit_spots_gpufit(
+        theta, ll, n_iter, chi2 = localize.fit_spots_gpufit(
             spots, mle=True, return_stats=True
         )
         assert theta.shape == (len(spots), 6)
@@ -1695,15 +1744,43 @@ class TestGpufit:
         assert ll is not None and ll.shape == (len(spots),)
         assert np.all(np.isfinite(ll))
         assert n_iter.shape == (len(spots),)
+        # the chi-square IS the likelihood here, so it is not reported twice
+        assert chi2 is None
 
-    def test_return_stats_lse_has_no_likelihood(self, synthetic_spots):
+    def test_return_stats_lse_has_chi_square_not_likelihood(
+        self, synthetic_spots
+    ):
         spots, _ = synthetic_spots
-        theta, ll, n_iter = localize.fit_spots_gpufit(
+        theta, ll, n_iter, chi2 = localize.fit_spots_gpufit(
             spots, mle=False, return_stats=True
         )
-        # LSE reports a residual sum of squares, not a likelihood -> None
+        # LSE assumes no noise model, so there is no likelihood; what it does
+        # report is the residual sum of squares at the optimum.
         assert ll is None
         assert n_iter.shape == (len(spots),)
+        assert chi2 is not None and chi2.shape == (len(spots),)
+        assert np.all(chi2 >= 0)
+        assert np.all(np.isfinite(chi2))
+
+    def test_lse_end_to_end_saves_chi_square(self, synthetic_spots):
+        """The full GPU least-squares path emits a chi_square column and no
+        log_likelihood."""
+        spots, _ = synthetic_spots
+        n = len(spots)
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(n, dtype=np.uint32),
+                "x": np.full(n, 50, dtype=np.int64),
+                "y": np.full(n, 70, dtype=np.int64),
+                "net_gradient": np.full(n, 5000.0, dtype=np.float32),
+            }
+        )
+        locs = localize._fit2d_gauss_gpu(
+            spots, ids, spots.shape[1], em=False, mle=False
+        )
+        assert "chi_square" in locs.columns
+        assert "log_likelihood" not in locs.columns
+        assert np.all(locs["chi_square"].to_numpy() >= 0)
 
     # -- end-to-end: fit -> localizations ---------------------------------
 
@@ -4791,6 +4868,11 @@ class TestSaveableColumns:
             log_likelihood=np.array([-10.0, -11.0], dtype=np.float32),
             iterations=np.array([5, 6], dtype=np.int32),
         )
+        # Least-squares fits report a chi-square instead of a likelihood.
+        lsq_stats = dict(
+            chi_square=np.array([120.0, 95.0], dtype=np.float32),
+            iterations=np.array([5, 6], dtype=np.int32),
+        )
         frames = {}
 
         # gpufit Gaussian, [photons, x, y, sx, sy, bg] (+ angle if rotated)
@@ -4815,10 +4897,21 @@ class TestSaveableColumns:
             ids, theta_r, BOX, em=False, mle=True, **stats
         )
         frames["gpufit-lse"] = localize.locs_from_fits_gpufit(
-            ids, theta_e, BOX, em=False, mle=False
+            ids, theta_e, BOX, em=False, mle=False, **lsq_stats
         )
         frames["gpufit-lse-rotated"] = localize.locs_from_fits_gpufit(
-            ids, theta_r, BOX, em=False, mle=False
+            ids, theta_r, BOX, em=False, mle=False, **lsq_stats
+        )
+
+        # CPU least-squares Gaussian, [x, y, photons, bg, sx, sy]
+        theta_lq = np.array(
+            [
+                [3.0, 3.0, 500.0, 5.0, 1.2, 1.1],
+                [3.1, 2.9, 600.0, 4.0, 1.0, 1.3],
+            ]
+        )
+        frames["gausslq-cpu"] = gausslq.locs_from_fits(
+            ids, theta_lq, BOX, em=False, chi_square=lsq_stats["chi_square"]
         )
 
         # spline PSF, [amplitude, x_shift, y_shift, (z_shift,) offset]
@@ -4883,6 +4976,7 @@ class TestSaveableColumns:
             em=False,
             calibration=calib_link,
             mle=False,
+            **lsq_stats,
         )
 
         # Ratiometric multichannel spline: the shared-amplitude model plus the
@@ -4895,7 +4989,13 @@ class TestSaveableColumns:
             ]
         )
         locs_ratio = localize.locs_from_fits_spline(
-            ids, theta_mc, BOX, em=False, calibration=calib_mc, mle=False
+            ids,
+            theta_mc,
+            BOX,
+            em=False,
+            calibration=calib_mc,
+            mle=False,
+            **lsq_stats,
         )
         ratios = np.arange(1.0, n_channels + 1.0)
         ratios /= ratios.sum()
