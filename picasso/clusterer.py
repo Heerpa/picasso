@@ -24,6 +24,7 @@ from typing import Callable, Literal
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 from tqdm import tqdm
 from scipy.spatial import ConvexHull, KDTree, QhullError
 from scipy.ndimage import gaussian_filter
@@ -834,28 +835,54 @@ def extract_valid_labels(
     return locs
 
 
+# Column names that ``find_cluster_centers`` derives itself. Any input
+# column not listed here and not part of the coordinate/frame set is
+# simply averaged per cluster, so custom columns carry over.
+RESERVED_CENTER_COLUMNS = frozenset(
+    {
+        "group",
+        "group_input",
+        "std_frame",
+        "std_x",
+        "std_y",
+        "std_z",
+        "lpx",
+        "lpy",
+        "lpz",
+        "ellipticity",
+        "n_locs",
+        "n_events",
+        "area",
+        "volume",
+        "convexhull",
+    }
+)
+
+
 def _aggregate_cluster_stats(
     locs: pd.DataFrame, has_z: bool
 ) -> tuple[pd.core.groupby.DataFrameGroupBy, dict]:
     """One vectorised pass for per-group means, stds and sizes.
 
+    Every numeric column present in ``locs`` is averaged, except the
+    ones ``find_cluster_centers`` derives itself
+    (``RESERVED_CENTER_COLUMNS``).
+
     Returns the underlying ``groupby`` object (for downstream use such
     as ``group_input.first()``) and a dict of plain NumPy arrays, one
-    per statistic, indexed positionally by sorted group id."""
-    mean_cols = [
-        "frame",
-        "x",
-        "y",
-        "photons",
-        "sx",
-        "sy",
-        "bg",
-        "net_gradient",
+    per statistic, indexed positionally by sorted group id. The names of
+    the averaged non-coordinate columns are returned as ``extra_cols``.
+    """
+    coord_cols = ["frame", "x", "y", "z"] if has_z else ["frame", "x", "y"]
+    extra_cols = [
+        c
+        for c in locs.columns
+        if c not in coord_cols
+        and c not in RESERVED_CENTER_COLUMNS
+        and is_numeric_dtype(locs[c])
     ]
-    std_cols = ["frame", "x", "y"]
-    if has_z:
-        mean_cols.append("z")
-        std_cols.append("z")
+    mean_cols = coord_cols + extra_cols
+    std_cols = ["frame", "x", "y", "z"] if has_z else ["frame", "x", "y"]
 
     gb = locs.groupby("group", sort=True)
     means = gb[mean_cols].mean()
@@ -865,6 +892,7 @@ def _aggregate_cluster_stats(
     stats.update({f"{c}_std": stds[c].to_numpy() for c in std_cols})
     stats["n_locs"] = gb.size().to_numpy()
     stats["unique_groups"] = means.index.to_numpy()
+    stats["extra_cols"] = extra_cols
     return gb, stats
 
 
@@ -940,7 +968,17 @@ def _cluster_convex_hulls(
 def _weighted_z_means(
     locs: pd.DataFrame, group_arr: lib.IntArray1D
 ) -> lib.FloatArray1D:
-    """Per-cluster z mean weighted by 1/(lpx + lpy)^2 (per-row weights)."""
+    """Per-cluster z mean weighted by 1/(lpx + lpy)^2 (per-row weights).
+
+    Falls back to the unweighted mean if ``lpx``/``lpy`` are missing.
+    """
+    if not {"lpx", "lpy"}.issubset(locs.columns):
+        return (
+            pd.Series(locs["z"].to_numpy())
+            .groupby(group_arr, sort=True)
+            .mean()
+            .to_numpy()
+        )
     w = 1.0 / (locs["lpx"].to_numpy() + locs["lpy"].to_numpy()) ** 2
     wz = (
         pd.Series(locs["z"].to_numpy() * w).groupby(group_arr, sort=True).sum()
@@ -963,7 +1001,10 @@ def find_cluster_centers(
     Parameters
     ----------
     locs : pd.DataFrame
-        Clustered localizations (contain group info)
+        Clustered localizations (contain group info). Must contain
+        "frame", "x", "y" and "group" (and "z" for 3D). Any other
+        numeric column present is averaged per cluster. Other numeric
+        columns are carried over as means.
     pixelsize : float, optional
         Camera pixel size (used for finding volume and 3D convex hull).
         Only required for 3D localizations.
@@ -993,7 +1034,6 @@ def find_cluster_centers(
 
     lpx = s["x_std"] / np.sqrt(s["n_locs"])
     lpy = s["y_std"] / np.sqrt(s["n_locs"])
-    ellipticity = s["sx_mean"] / s["sy_mean"]
     n_events, order, group_s = _count_binding_events(group_arr, frame_arr)
     progress_cb = _resolve_progress(
         progress,
@@ -1015,12 +1055,11 @@ def find_cluster_centers(
     }
     if has_z:
         columns["z"] = _weighted_z_means(locs, group_arr).astype(np.float32)
+    # per-cluster means of every other numeric column found in locs
+    for col in s["extra_cols"]:
+        columns[col] = s[f"{col}_mean"].astype(np.float32)
     columns.update(
         {
-            "photons": s["photons_mean"].astype(np.float32),
-            "sx": s["sx_mean"].astype(np.float32),
-            "sy": s["sy_mean"].astype(np.float32),
-            "bg": s["bg_mean"].astype(np.float32),
             "lpx": lpx.astype(np.float32),
             "lpy": lpy.astype(np.float32),
         }
@@ -1028,10 +1067,12 @@ def find_cluster_centers(
     if has_z:
         columns["lpz"] = (s["z_std"] / np.sqrt(s["n_locs"])).astype(np.float32)
         columns["std_z"] = s["z_std"].astype(np.float32)
+    if {"sx", "sy"}.issubset(s["extra_cols"]):
+        columns["ellipticity"] = (s["sx_mean"] / s["sy_mean"]).astype(
+            np.float32
+        )
     columns.update(
         {
-            "ellipticity": ellipticity.astype(np.float32),
-            "net_gradient": s["net_gradient_mean"].astype(np.float32),
             "n_locs": s["n_locs"].astype(np.uint32),
             "n_events": n_events.astype(np.int32),
         }
