@@ -7798,6 +7798,110 @@ def _affine_plot_alignment(
     plt.show()
 
 
+def fit_affine_transform(
+    movie_ref,
+    movie_cyl,
+    calibration: dict,
+    box: int,
+    minimum_ng: float,
+    pixelsize: float | None = None,
+    ref_path: str = "",
+    cyl_path: str = "",
+) -> tuple[dict, dict]:
+    """Fit the cylindrical-lens -> reference affine transform and append it
+    to ``calibration``.
+
+    This is the computational half of :func:`calibrate_affine_transform`.
+    It touches no matplotlib state, so it is safe to call from a worker
+    thread; the returned ``qc`` dict carries everything
+    :func:`plot_affine_calibration` needs to draw the diagnostic figure
+    afterwards (on the GUI thread, where matplotlib must be driven from).
+
+    Parameters
+    ----------
+    See :func:`calibrate_affine_transform`; ``plot_path`` is the only
+    argument not accepted here.
+
+    Returns
+    -------
+    calibration : dict
+        The input calibration augmented with an "Affine transform" key.
+        Use ``io.save_calibration`` to save the result.
+    qc : dict
+        Inputs for :func:`plot_affine_calibration`: the reference,
+        cylindrical and corrected images, the matched reference bead
+        positions, the decomposition, the number of pairs, the pixel size
+        and the source paths.
+    """
+    img_ref = _movie_to_image(movie_ref)
+    img_cyl = _movie_to_image(movie_cyl)
+
+    coarse_ref = _affine_detect_beads(img_ref, box, minimum_ng)
+    coarse_cyl = _affine_detect_beads(img_cyl, box, minimum_ng)
+    refined_ref = _affine_refine_bead_positions(img_ref, coarse_ref, box)
+    refined_cyl = _affine_refine_bead_positions(img_cyl, coarse_cyl, box)
+    pairs_ref, pairs_cyl = _affine_match_bead_pairs(refined_ref, refined_cyl)
+
+    if len(pairs_ref) < 3:
+        raise ValueError(
+            f"Only {len(pairs_ref)} matched bead pair(s) — need >= 3 to "
+            "fit an affine transform. Check the input images / detection "
+            "parameters."
+        )
+
+    M = _affine_estimate_2d(pairs_cyl, pairs_ref)
+    decomp = _affine_decompose(M, pixelsize)
+
+    affine_entry = {
+        "Matrix": [[float(v) for v in row] for row in M],
+        "Direction": "cylindrical -> reference (x = col, y = row)",
+        "Reference image": ref_path or "N/A",
+        "Cylindrical image": cyl_path or "N/A",
+        "Bead pairs": int(len(pairs_ref)),
+        "Decomposition": decomp,
+    }
+    if pixelsize is not None:
+        affine_entry["Pixelsize (nm)"] = float(pixelsize)
+    calibration["Affine transform"] = affine_entry
+
+    qc = {
+        "img_ref": img_ref,
+        "img_cyl": img_cyl,
+        # the warp is part of the fit's output, not of the drawing, so it
+        # is computed here and only displayed by the plotting function
+        "img_cor": _affine_apply(img_cyl, M),
+        "pairs_ref": pairs_ref,
+        "decomposition": decomp,
+        "n_pairs": int(len(pairs_ref)),
+        "pixelsize": pixelsize,
+        "ref_path": ref_path,
+        "cyl_path": cyl_path,
+    }
+    return calibration, qc
+
+
+def plot_affine_calibration(qc: dict, save_path: str = "") -> None:
+    """Draw the affine-calibration diagnostic figure from the ``qc`` dict
+    returned by :func:`fit_affine_transform`.
+
+    Kept separate from the fit so a GUI can run the fit in a worker thread
+    and still draw from the main thread. ``save_path`` writes the figure to
+    disk; it is always shown interactively.
+    """
+    _affine_plot_alignment(
+        qc["img_ref"],
+        qc["img_cyl"],
+        qc["img_cor"],
+        qc["pairs_ref"],
+        qc["decomposition"],
+        n_pairs=qc["n_pairs"],
+        pixelsize=qc["pixelsize"],
+        save_path=save_path,
+        ref_path=qc.get("ref_path", ""),
+        cyl_path=qc.get("cyl_path", ""),
+    )
+
+
 def calibrate_affine_transform(
     movie_ref,
     movie_cyl,
@@ -7851,49 +7955,22 @@ def calibrate_affine_transform(
     calibration : dict
         The input calibration augmented with an "Affine transform" key.
         Use ``io.save_calibration`` to save the result.
+
+    Notes
+    -----
+    Fit and figure are also available separately as
+    :func:`fit_affine_transform` and :func:`plot_affine_calibration`, for
+    callers that must not touch matplotlib from the thread doing the fit.
     """
-    img_ref = _movie_to_image(movie_ref)
-    img_cyl = _movie_to_image(movie_cyl)
-
-    coarse_ref = _affine_detect_beads(img_ref, box, minimum_ng)
-    coarse_cyl = _affine_detect_beads(img_cyl, box, minimum_ng)
-    refined_ref = _affine_refine_bead_positions(img_ref, coarse_ref, box)
-    refined_cyl = _affine_refine_bead_positions(img_cyl, coarse_cyl, box)
-    pairs_ref, pairs_cyl = _affine_match_bead_pairs(refined_ref, refined_cyl)
-
-    if len(pairs_ref) < 3:
-        raise ValueError(
-            f"Only {len(pairs_ref)} matched bead pair(s) — need >= 3 to "
-            "fit an affine transform. Check the input images / detection "
-            "parameters."
-        )
-
-    M = _affine_estimate_2d(pairs_cyl, pairs_ref)
-    decomp = _affine_decompose(M, pixelsize)
-
-    img_cor = _affine_apply(img_cyl, M)
-    _affine_plot_alignment(
-        img_ref,
-        img_cyl,
-        img_cor,
-        pairs_ref,
-        decomp,
-        n_pairs=len(pairs_ref),
+    calibration, qc = fit_affine_transform(
+        movie_ref,
+        movie_cyl,
+        calibration,
+        box=box,
+        minimum_ng=minimum_ng,
         pixelsize=pixelsize,
-        save_path=plot_path,
         ref_path=ref_path,
         cyl_path=cyl_path,
     )
-
-    affine_entry = {
-        "Matrix": [[float(v) for v in row] for row in M],
-        "Direction": "cylindrical -> reference (x = col, y = row)",
-        "Reference image": ref_path or "N/A",
-        "Cylindrical image": cyl_path or "N/A",
-        "Bead pairs": int(len(pairs_ref)),
-        "Decomposition": decomp,
-    }
-    if pixelsize is not None:
-        affine_entry["Pixelsize (nm)"] = float(pixelsize)
-    calibration["Affine transform"] = affine_entry
+    plot_affine_calibration(qc, save_path=plot_path)
     return calibration

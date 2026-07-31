@@ -5609,3 +5609,291 @@ class TestMultichannelWorkerRouting:
         assert float(seen["ids"]["x"].iloc[0]) == 6.0
         # progress totals follow the linked subset, not the original count
         assert worker.N == 1
+
+
+# ---------------------------------------------------------------------------
+# Astigmatism: cylindrical-lens -> reference affine calibration
+# ---------------------------------------------------------------------------
+
+
+def _affine_bead_image(
+    positions: np.ndarray,
+    shape: tuple[int, int] = (256, 256),
+    sigma: float = 1.3,
+    amplitude: float = 6000.0,
+    baseline: float = 100.0,
+) -> np.ndarray:
+    """One-frame bead movie with Gaussian beads at ``positions`` (``(n, 2)``
+    in ``[x, y]``), as ``calibrate_affine_transform`` expects its inputs."""
+    yy, xx = np.mgrid[0 : shape[0], 0 : shape[1]]
+    img = np.full(shape, baseline, dtype=np.float64)
+    for x, y in positions:
+        img += amplitude * np.exp(
+            -((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma**2)
+        )
+    return img[np.newaxis].astype(np.uint16)
+
+
+def _affine_bead_grid(
+    n: int = 5, spacing: float = 48.0, offset: float = 32.0
+) -> np.ndarray:
+    """``(n*n, 2)`` grid of bead positions in ``[x, y]``, jittered off the
+    pixel grid so the sub-pixel refinement is actually exercised."""
+    rng = np.random.RandomState(0)
+    grid = np.array(
+        [
+            (offset + i * spacing, offset + j * spacing)
+            for i in range(n)
+            for j in range(n)
+        ],
+        dtype=np.float64,
+    )
+    return grid + rng.uniform(-0.4, 0.4, size=grid.shape)
+
+
+def _apply_homogeneous(matrix: np.ndarray, xy: np.ndarray) -> np.ndarray:
+    """Apply a 3x3 homogeneous (x, y) transform to ``(n, 2)`` points."""
+    return xy @ np.asarray(matrix)[:2, :2].T + np.asarray(matrix)[:2, 2]
+
+
+class TestAffineTransformMath:
+    """The estimator and the QR decomposition on synthetic point sets."""
+
+    def test_recovers_known_transform(self):
+        rng = np.random.RandomState(1)
+        src_xy = rng.uniform(10, 200, size=(30, 2))
+        truth = np.array(
+            [[1.004, -0.011, 3.5], [0.008, 0.997, -2.25], [0.0, 0.0, 1.0]]
+        )
+        dst_xy = _apply_homogeneous(truth, src_xy)
+        # the estimator takes [row, col] = [y, x] correspondences
+        matrix = localize._affine_estimate_2d(src_xy[:, ::-1], dst_xy[:, ::-1])
+        assert np.allclose(matrix, truth, atol=1e-8)
+
+    def test_translation_only_for_two_pairs(self):
+        src = np.array([[10.0, 20.0], [40.0, 60.0]])  # [row, col]
+        dst = src + np.array([2.0, -3.0])
+        matrix = localize._affine_estimate_2d(src, dst)
+        # 6 DOF are not determined by 2 pairs, so it degrades to the mean shift
+        assert np.allclose(matrix[:2, :2], np.eye(2))
+        assert matrix[0, 2] == pytest.approx(-3.0)  # tx, from the columns
+        assert matrix[1, 2] == pytest.approx(2.0)  # ty, from the rows
+
+    def test_identity_without_pairs(self):
+        matrix = localize._affine_estimate_2d(
+            np.empty((0, 2)), np.empty((0, 2))
+        )
+        assert np.allclose(matrix, np.eye(3))
+
+    def test_decomposition_recovers_rotation_and_scale(self):
+        angle = np.radians(1.5)
+        scale_x, scale_y = 1.01, 0.98
+        rotation = np.array(
+            [
+                [np.cos(angle), -np.sin(angle)],
+                [np.sin(angle), np.cos(angle)],
+            ]
+        )
+        matrix = np.eye(3)
+        matrix[:2, :2] = rotation @ np.diag([scale_x, scale_y])
+        matrix[:2, 2] = [4.0, -6.0]
+        decomposition = localize._affine_decompose(matrix, pixelsize=130)
+        assert decomposition["rotation_deg"] == pytest.approx(1.5, abs=1e-6)
+        assert decomposition["scale_x"] == pytest.approx(scale_x, abs=1e-9)
+        assert decomposition["scale_y"] == pytest.approx(scale_y, abs=1e-9)
+        assert decomposition["shear_deg"] == pytest.approx(0.0, abs=1e-6)
+        assert decomposition["tx_px"] == pytest.approx(4.0)
+        assert decomposition["tx_nm"] == pytest.approx(4.0 * 130)
+        assert decomposition["ty_nm"] == pytest.approx(-6.0 * 130)
+
+    def test_decomposition_omits_nm_without_pixelsize(self):
+        decomposition = localize._affine_decompose(np.eye(3))
+        assert "tx_nm" not in decomposition and "ty_nm" not in decomposition
+
+
+class TestFitAffineTransform:
+    """End-to-end calibration on synthetic bead images (no plotting)."""
+
+    TRUTH = np.array(
+        [[1.003, -0.009, 4.0], [0.007, 0.998, -2.5], [0.0, 0.0, 1.0]]
+    )
+
+    @pytest.fixture(scope="class")
+    def bead_movies(self):
+        """Reference and cylindrical bead movies related by ``TRUTH``
+        (which maps cylindrical -> reference, the direction that is fit)."""
+        ref_xy = _affine_bead_grid()
+        inverse = np.linalg.inv(self.TRUTH)
+        cyl_xy = _apply_homogeneous(inverse, ref_xy)
+        return _affine_bead_image(ref_xy), _affine_bead_image(cyl_xy), ref_xy
+
+    def test_recovers_the_applied_transform(self, bead_movies):
+        movie_ref, movie_cyl, ref_xy = bead_movies
+        calibration, qc = localize.fit_affine_transform(
+            movie_ref, movie_cyl, {}, box=BOX, minimum_ng=1000
+        )
+        matrix = np.asarray(calibration["Affine transform"]["Matrix"])
+        # compare where it sends points, not the coefficients: a small
+        # coefficient error far from the origin is what actually matters
+        cyl_xy = _apply_homogeneous(np.linalg.inv(self.TRUTH), ref_xy)
+        mapped = _apply_homogeneous(matrix, cyl_xy)
+        assert np.allclose(mapped, ref_xy, atol=0.2)
+        assert calibration["Affine transform"]["Bead pairs"] == len(ref_xy)
+        assert qc["n_pairs"] == len(ref_xy)
+
+    def test_calibration_entry_contents(self, bead_movies):
+        movie_ref, movie_cyl, _ = bead_movies
+        calibration = {"X Coefficients": [1, 2, 3]}
+        calibration, _ = localize.fit_affine_transform(
+            movie_ref,
+            movie_cyl,
+            calibration,
+            box=BOX,
+            minimum_ng=1000,
+            pixelsize=PIXELSIZE,
+            ref_path="ref.tif",
+            cyl_path="cyl.tif",
+        )
+        entry = calibration["Affine transform"]
+        # the existing 3D calibration is augmented, not replaced
+        assert calibration["X Coefficients"] == [1, 2, 3]
+        assert entry["Direction"].startswith("cylindrical -> reference")
+        assert entry["Reference image"] == "ref.tif"
+        assert entry["Cylindrical image"] == "cyl.tif"
+        assert entry["Pixelsize (nm)"] == float(PIXELSIZE)
+        assert entry["Decomposition"]["rotation_deg"] == pytest.approx(
+            0.46, abs=0.1
+        )
+        # plain floats, so yaml.dump can write the calibration
+        assert all(
+            isinstance(v, float) for row in entry["Matrix"] for v in row
+        )
+
+    def test_identical_movies_give_identity(self, bead_movies):
+        movie_ref, _, ref_xy = bead_movies
+        calibration, _ = localize.fit_affine_transform(
+            movie_ref, movie_ref, {}, box=BOX, minimum_ng=1000
+        )
+        matrix = np.asarray(calibration["Affine transform"]["Matrix"])
+        mapped = _apply_homogeneous(matrix, ref_xy)
+        assert np.allclose(mapped, ref_xy, atol=0.05)
+
+    def test_survives_a_yaml_round_trip(self, bead_movies, tmp_path):
+        movie_ref, movie_cyl, _ = bead_movies
+        calibration, _ = localize.fit_affine_transform(
+            movie_ref,
+            movie_cyl,
+            dict(CALIB_3D),  # io.load_calibration validates the 3D entries
+            box=BOX,
+            minimum_ng=1000,
+            pixelsize=PIXELSIZE,
+        )
+        path = str(tmp_path / "calib.yaml")
+        io.save_calibration(path, calibration)
+        loaded = io.load_calibration(path)
+        assert np.allclose(
+            loaded["Affine transform"]["Matrix"],
+            calibration["Affine transform"]["Matrix"],
+        )
+
+    def test_too_few_beads_raises(self):
+        movie = _affine_bead_image(np.array([[40.0, 40.0], [140.0, 140.0]]))
+        with pytest.raises(ValueError, match="matched bead pair"):
+            localize.fit_affine_transform(
+                movie, movie, {}, box=BOX, minimum_ng=1000
+            )
+
+    def test_qc_carries_the_plot_inputs(self, bead_movies):
+        movie_ref, movie_cyl, ref_xy = bead_movies
+        _, qc = localize.fit_affine_transform(
+            movie_ref,
+            movie_cyl,
+            {},
+            box=BOX,
+            minimum_ng=1000,
+            pixelsize=PIXELSIZE,
+        )
+        assert set(qc) == {
+            "img_ref",
+            "img_cyl",
+            "img_cor",
+            "pairs_ref",
+            "decomposition",
+            "n_pairs",
+            "pixelsize",
+            "ref_path",
+            "cyl_path",
+        }
+        assert qc["img_cor"].shape == qc["img_ref"].shape
+        assert qc["pixelsize"] == PIXELSIZE
+        # the warp brings the cylindrical image onto the reference: the
+        # corrected image must correlate better with the reference than the
+        # raw one does
+
+        def _corr(a, b):
+            a = a - a.mean()
+            b = b - b.mean()
+            return float((a * b).sum() / np.sqrt((a**2).sum() * (b**2).sum()))
+
+        assert _corr(qc["img_ref"], qc["img_cor"]) > _corr(
+            qc["img_ref"], qc["img_cyl"]
+        )
+
+    def test_fit_does_not_plot(self, bead_movies, monkeypatch):
+        """The fit half must not touch matplotlib - it runs off the GUI
+        thread, where drawing is not allowed."""
+        movie_ref, movie_cyl, _ = bead_movies
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("fit_affine_transform must not plot")
+
+        monkeypatch.setattr(localize.plt, "figure", _fail)
+        monkeypatch.setattr(localize.plt, "show", _fail)
+        localize.fit_affine_transform(
+            movie_ref, movie_cyl, {}, box=BOX, minimum_ng=1000
+        )
+
+    def test_calibrate_wrapper_fits_and_plots(self, bead_movies, monkeypatch):
+        """The one-call entry point still does both, with the plot fed from
+        the fit's qc dict."""
+        movie_ref, movie_cyl, _ = bead_movies
+        drawn = {}
+
+        def _plot(qc, save_path=""):
+            drawn["qc"] = qc
+            drawn["save_path"] = save_path
+
+        monkeypatch.setattr(localize, "plot_affine_calibration", _plot)
+        calibration = localize.calibrate_affine_transform(
+            movie_ref,
+            movie_cyl,
+            {},
+            box=BOX,
+            minimum_ng=1000,
+            pixelsize=PIXELSIZE,
+            plot_path="figure.png",
+        )
+        assert "Affine transform" in calibration
+        assert drawn["save_path"] == "figure.png"
+        assert drawn["qc"]["n_pairs"] == 25
+
+
+class TestAffineTransformInZFit:
+    """The fitted transform as ``zfit`` applies it to the localizations."""
+
+    def test_locs_are_mapped_into_the_reference_frame(self):
+        matrix = [[1.002, -0.01, 3.0], [0.009, 0.998, -1.5], [0.0, 0.0, 1.0]]
+        locs = pd.DataFrame({"x": [10.0, 100.0], "y": [20.0, 200.0]})
+        expected = _apply_homogeneous(
+            np.asarray(matrix), locs[["x", "y"]].to_numpy()
+        )
+        # mirrors the block in zfit._fit_z
+        x = locs["x"].to_numpy()
+        y = locs["y"].to_numpy()
+        moved = np.column_stack(
+            [
+                matrix[0][0] * x + matrix[0][1] * y + matrix[0][2],
+                matrix[1][0] * x + matrix[1][1] * y + matrix[1][2],
+            ]
+        )
+        assert np.allclose(moved, expected)

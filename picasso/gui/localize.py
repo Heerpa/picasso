@@ -1832,8 +1832,7 @@ class CalibrateAffineDialog(lib.Dialog):
 
     def _show(self, edit: QtWidgets.QLineEdit) -> None:
         """Load the image in ``edit`` into the main window and open the
-        parameters dialog with preview enabled, so the user can tune the
-        identification parameters before running the calibration."""
+        parameters dialog."""
         path = edit.text()
         if not path:
             QtWidgets.QMessageBox.warning(
@@ -1843,8 +1842,8 @@ class CalibrateAffineDialog(lib.Dialog):
             )
             return
         self.window.open(path)
-        if self.window.movie is None:
-            return
+        self.window.parameters_dialog.show()
+        self.window.parameters_dialog.raise_()
 
     def _show_reference(self) -> None:
         self._show(self.reference_edit)
@@ -3438,6 +3437,10 @@ class Window(QtWidgets.QMainWindow):
         self.info = []
         self.extra_info = []
         self._active_worker = None
+        # Affine-transform (astigmatism) calibration dialog and its worker;
+        # both created lazily when the calibration is first opened/run.
+        self._affine_dialog = None
+        self.affine_calibration_worker = None
         # Bookkeeping for a multichannel "Identify" (Ctrl+I) batch that runs
         # identification on every channel in turn; None when not running.
         self._multi_identify = None
@@ -3846,32 +3849,18 @@ class Window(QtWidgets.QMainWindow):
             )
             return
 
-        def _prompt(path: str):
-            return (
-                self.prompt_channel
-                if path.endswith(".ims")
-                else self.prompt_info
-            )
-
-        try:
-            movie_ref, info_ref = io.load_movie(
-                ref_path, prompt_info=_prompt(ref_path)
-            )
-            movie_cyl, info_cyl = io.load_movie(
-                cyl_path, prompt_info=_prompt(cyl_path)
-            )
-            calibration = io.load_calibration(calib_path)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
+        worker = getattr(self, "affine_calibration_worker", None)
+        if worker is not None and worker.isRunning():
+            QtWidgets.QMessageBox.information(
                 self,
                 "Calibrate affine transform",
-                f"Could not load inputs:\n{e}",
+                "An affine calibration is already running.",
             )
             return
 
-        # get camera pixel size
-        pixelsize = lib.get_from_metadata(info_ref, "Pixelsize", default=None)
-        if pixelsize is None:
+        def _pixelsize_prompt() -> float | None:
+            """Ask for the camera pixel size (GUI thread). ``None`` on
+            cancel, which aborts the calibration."""
             pixelsize, ok = QtWidgets.QInputDialog.getInt(
                 self,
                 "Camera pixel size (nm)",
@@ -3879,33 +3868,73 @@ class Window(QtWidgets.QMainWindow):
                 130,
                 min=0,
             )
-            if not ok:
-                return
+            return float(pixelsize) if ok else None
 
-        plot_path = os.path.splitext(calib_path)[0] + "_affine.png"
+        worker = AffineCalibrationWorker(
+            ref_path=ref_path,
+            cyl_path=cyl_path,
+            calibration_path=calib_path,
+            box=self.parameters["Box Size"],
+            minimum_ng=self.parameters["Min. Net Gradient"],
+            prompt_for_path=self._prompt_for_path,
+            pixelsize_prompt=_pixelsize_prompt,
+        )
+        worker.statusChanged.connect(self.status_bar.showMessage)
+        worker.promptRequested.connect(self._on_affine_prompt_requested)
+        worker.finished.connect(self.on_affine_calibration_finished)
+        worker.failed.connect(self.on_affine_calibration_failed)
+        worker.cancelled.connect(self.on_affine_calibration_cancelled)
+        self.affine_calibration_worker = worker
+        self.status_bar.showMessage("Calibrating affine transform ...")
+        worker.start()
+
+    def _on_affine_prompt_requested(
+        self, callback, args_kwargs, holder: dict
+    ) -> None:
+        """Run a worker-requested prompt on the GUI thread and hand the
+        result back, then unblock the worker (see
+        ``_on_load_prompt_requested``)."""
+        args, kwargs = args_kwargs
         try:
-            calibration = localize.calibrate_affine_transform(
-                movie_ref,
-                movie_cyl,
-                calibration,
-                box=self.parameters["Box Size"],
-                minimum_ng=self.parameters["Min. Net Gradient"],
-                pixelsize=pixelsize,
-                ref_path=ref_path,
-                cyl_path=cyl_path,
-                plot_path=plot_path,
-            )
-            io.save_calibration(calib_path, calibration)
+            holder["result"] = callback(*args, **kwargs)
+        finally:
+            self.affine_calibration_worker._prompt_event.set()
 
-            self.status_bar.showMessage(
-                f"Affine calibration appended to {os.path.basename(calib_path)}."
-            )
-        except ValueError as e:
+    def on_affine_calibration_finished(
+        self, path: str, n_pairs: int, qc: object
+    ) -> None:
+        """Save the augmented calibration and draw the diagnostic figure.
+
+        The figure is drawn here rather than in the worker because
+        matplotlib must be driven from the GUI thread."""
+        self.affine_calibration_worker = None
+        self.status_bar.showMessage(
+            f"Affine calibration appended to {os.path.basename(path)} "
+            f"({n_pairs} bead pairs)."
+        )
+        plot_path = os.path.splitext(path)[0] + "_affine.png"
+        try:
+            localize.plot_affine_calibration(qc, save_path=plot_path)
+        except Exception as e:  # a failed figure must not lose the fit
             QtWidgets.QMessageBox.warning(
-                self, "Calibrate affine transform", str(e)
+                self,
+                "Calibrate affine transform",
+                f"The transform was saved to {path}, but the diagnostic "
+                f"figure could not be drawn:\n{e}",
             )
-            self.status_bar.showMessage("Affine calibration failed.")
-            return
+
+    def on_affine_calibration_failed(self, message: str) -> None:
+        """Report a failed affine calibration."""
+        self.affine_calibration_worker = None
+        self.status_bar.showMessage("Affine calibration failed.")
+        QtWidgets.QMessageBox.warning(
+            self, "Calibrate affine transform", message
+        )
+
+    def on_affine_calibration_cancelled(self) -> None:
+        """The user cancelled one of the worker's prompts."""
+        self.affine_calibration_worker = None
+        self.status_bar.showMessage("Affine calibration cancelled.")
 
     def calibrate_spline(self) -> None:
         """Build a cubic-spline PSF calibration from the loaded bead z-stack
@@ -7402,6 +7431,114 @@ class SplineCalibrationWorker(QtCore.QThread):
             self.failed.emit(str(e))
             return
         self.finished.emit(self.path, int(calibration.get("n_beads", 0)))
+
+
+class AffineCalibrationWorker(QtCore.QThread):
+    """Fit the cylindrical-lens -> reference affine transform (astigmatism)
+    in a background thread and append it to a 3D calibration YAML.
+
+    Loading the two bead movies and fitting the transform both block for
+    seconds to minutes, so they run here instead of on the GUI thread.
+    Two things cannot: the metadata / pixel-size prompts, which are modal
+    dialogs, and the diagnostic figure. The prompts are proxied to the GUI
+    thread via ``promptRequested`` (the worker blocks on a
+    ``threading.Event`` until the main thread fills in ``holder``, exactly
+    as ``MovieLoadWorker`` does), and the figure is not drawn here at all -
+    ``localize.fit_affine_transform`` hands back a ``qc`` dict that the
+    window plots once ``finished`` arrives.
+    """
+
+    # (calibration path, number of matched bead pairs, qc dict for the plot)
+    finished = QtCore.pyqtSignal(str, int, object)
+    failed = QtCore.pyqtSignal(str)
+    cancelled = QtCore.pyqtSignal()
+    statusChanged = QtCore.pyqtSignal(str)
+    # callback, (args, kwargs), holder dict for the return value
+    promptRequested = QtCore.pyqtSignal(object, object, object)
+
+    def __init__(
+        self,
+        ref_path: str,
+        cyl_path: str,
+        calibration_path: str,
+        box: int,
+        minimum_ng: float,
+        prompt_for_path,
+        pixelsize_prompt,
+    ) -> None:
+        super().__init__()
+        self.ref_path = ref_path
+        self.cyl_path = cyl_path
+        self.calibration_path = calibration_path
+        self.box = box
+        self.minimum_ng = minimum_ng
+        # Window._prompt_for_path: path -> metadata prompt callback
+        self._prompt_for_path = prompt_for_path
+        self._pixelsize_prompt = pixelsize_prompt
+        self._prompt_event = threading.Event()
+
+    def _proxy(self, callback):
+        """Wrap a GUI prompt callback so the dialog runs on the main thread
+        while this thread blocks for the result."""
+
+        def wrapper(*args, **kwargs):
+            holder = {}
+            self._prompt_event.clear()
+            self.promptRequested.emit(callback, (args, kwargs), holder)
+            self._prompt_event.wait()
+            return holder.get("result")
+
+        return wrapper
+
+    def _load(self, path: str, label: str):
+        """Load one bead movie, prompting for metadata on the GUI thread.
+        Returns ``None`` if the user cancelled the prompt."""
+        self.statusChanged.emit(f"Loading {label} image ...")
+        prompt = self._proxy(self._prompt_for_path(path))
+        # io.load_movie returns None when the user cancels the info prompt
+        return io.load_movie(path, prompt_info=prompt)
+
+    def run(self) -> None:
+        try:
+            loaded_ref = self._load(self.ref_path, "reference")
+            if loaded_ref is None:
+                self.cancelled.emit()
+                return
+            movie_ref, info_ref = loaded_ref
+            loaded_cyl = self._load(self.cyl_path, "cylindrical lens")
+            if loaded_cyl is None:
+                self.cancelled.emit()
+                return
+            movie_cyl, _ = loaded_cyl
+            calibration = io.load_calibration(self.calibration_path)
+        except Exception as e:  # noqa: BLE001 - reported to the GUI
+            self.failed.emit(f"Could not load inputs:\n{e}")
+            return
+
+        pixelsize = lib.get_from_metadata(info_ref, "Pixelsize", default=None)
+        if pixelsize is None:
+            pixelsize = self._proxy(self._pixelsize_prompt)()
+            if pixelsize is None:  # prompt cancelled
+                self.cancelled.emit()
+                return
+
+        self.statusChanged.emit("Fitting affine transform ...")
+        try:
+            calibration, qc = localize.fit_affine_transform(
+                movie_ref,
+                movie_cyl,
+                calibration,
+                box=self.box,
+                minimum_ng=self.minimum_ng,
+                pixelsize=pixelsize,
+                ref_path=self.ref_path,
+                cyl_path=self.cyl_path,
+            )
+            io.save_calibration(self.calibration_path, calibration)
+        except Exception as e:  # noqa: BLE001 - reported to the GUI
+            self.failed.emit(str(e))
+            return
+        self.finished.emit(self.calibration_path, qc["n_pairs"], qc)
 
 
 class QualityWorker(QtCore.QThread):
