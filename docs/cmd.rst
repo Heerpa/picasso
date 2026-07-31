@@ -132,6 +132,14 @@ hdf2visp
 --------
 Convert hdf5 files to ViSP ``.3d`` files.
 
+smap2hdf
+--------
+Convert SMAP (`https://github.com/jries/SMAP <https://github.com/jries/SMAP>`_) ``_sml.mat`` files to ``.hdf5``. Type ``picasso smap2hdf filepath -p pixelsize`` (``-p/--pixelsize`` in nm is required, since SMAP stores coordinates in nm while Picasso uses camera pixels). Reads single-file MATLAB ``-v7`` and ``-v7.3`` saves; split ``_sml_p*.mat`` parts files are not supported (re-save them in SMAP as a single file).
+
+hdf2smap
+--------
+Convert hdf5 files to SMAP ``_sml.mat`` files. The output is named ``<file>_sml.mat`` (the ``_sml`` suffix is required for SMAP to recognize the file) and can be loaded directly in SMAP via File > Load.
+
 join
 ----
 Combine two hdf5 localization files. Type ``picasso join file1 file2``. A new joined file will be created. Note that the frame information of consecutive files is reindexed, i.e., frame 1 now can contain localizations from file 1 and file 2. Therefore, do not perform kinetic analysis and drift correction on joined files. Pass ``-k/--keepindex`` to keep the original frame numbers instead of reindexing.

@@ -190,7 +190,7 @@ def _picked_circular_locs(
         group_locs = block_locs.iloc[group_locs_idx].copy()
 
         if add_group:
-            group_locs["group"] = i
+            group_locs = lib.append_group(group_locs, i)
         group_locs.sort_values(
             by="frame",
             kind="quicksort",
@@ -239,7 +239,7 @@ def _picked_rectangular_locs(
         group_locs["x_pick_rot"] = x_pick_rot
         group_locs["y_pick_rot"] = y_pick_rot
         if add_group:
-            group_locs["group"] = i
+            group_locs = lib.append_group(group_locs, i)
         group_locs.sort_values(by="frame", kind="quicksort", inplace=True)
         picked_locs.append(group_locs)
 
@@ -276,7 +276,7 @@ def _picked_polygonal_locs(
         )
         group_locs = lib.locs_in_polygon(locs[mask], X, Y).copy()
         if add_group:
-            group_locs["group"] = i
+            group_locs = lib.append_group(group_locs, i)
         group_locs.sort_values(by="frame", kind="quicksort", inplace=True)
         picked_locs.append(group_locs)
 
@@ -313,7 +313,7 @@ def _picked_square_locs(
         )
         group_locs = locs[mask].copy()
         if add_group:
-            group_locs["group"] = i
+            group_locs = lib.append_group(group_locs, i)
         group_locs.sort_values(by="frame", kind="quicksort", inplace=True)
         picked_locs.append(group_locs)
 
@@ -508,8 +508,8 @@ def pick_similar(
     max_rmsd = mean_rmsd + std_range * std_rmsd
 
     # x, y coordinates of found regions:
-    x_similar = np.array([_[0] for _ in picks])
-    y_similar = np.array([_[1] for _ in picks])
+    x_similar = np.array([_[0] for _ in picks], dtype=np.float64)
+    y_similar = np.array([_[1] for _ in picks], dtype=np.float64)
 
     # preparations for grid search
     x_range = np.arange(d / 2, info[0]["Width"], np.sqrt(3) * d / 2)
@@ -1667,7 +1667,13 @@ def pick_kinetics(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
-) -> tuple[lib.FloatArray1D, lib.FloatArray1D, lib.IntArray1D, pd.DataFrame]:
+) -> tuple[
+    lib.FloatArray1D,
+    lib.FloatArray1D,
+    lib.IntArray1D,
+    pd.DataFrame,
+    lib.IntArray1D,
+]:
     """Calculate kinetics per picked region. Assumes picked
     localizations, see ``picked_locs``.
 
@@ -1703,6 +1709,10 @@ def pick_kinetics(
         added 'length', 'dark' and 'n' fields/columns. Pick regions
         where binding kinetics could not be estimated (e.g., because
         of too little data or unsuccessful fitting) are removed.
+    kept_indices : lib.IntArray1D
+        Indices (into ``picked_locs``) of the picks that were retained,
+        i.e., those for which kinetics could be estimated. Aligns
+        row-for-row with ``length``, ``dark`` and ``no_locs``.
     """
     use_tqdm = progress_callback == "console"
     if use_tqdm:
@@ -1716,6 +1726,7 @@ def pick_kinetics(
     dark = []  # estimated mean dark time
     length = []  # estimated mean bright time
     no_locs = []  # number of locs
+    kept_indices = []  # picks for which kinetics could be estimated
     for i in iter_range:
         if callable(progress_callback):
             progress_callback(i)
@@ -1727,13 +1738,15 @@ def pick_kinetics(
         dark.append(d_)
         no_locs.append(len(pick_locs))
         out_locs.append(pick_locs)
+        kept_indices.append(i)
     if callable(progress_callback):
         progress_callback(i + 1)
     length = np.array(length)
     dark = np.array(dark)
     no_locs = np.array(no_locs)
+    kept_indices = np.array(kept_indices, dtype=int)
     out_locs = pd.concat(out_locs, ignore_index=True)
-    return length, dark, no_locs, out_locs
+    return length, dark, no_locs, out_locs, kept_indices
 
 
 def pick_properties(
@@ -1782,7 +1795,7 @@ def pick_properties(
         warnings.simplefilter(
             "ignore", category=(OptimizeWarning, RuntimeWarning)
         )
-        length, dark, no_locs, out_locs = pick_kinetics(
+        length, dark, no_locs, out_locs, kept_indices = pick_kinetics(
             picked_locs=picked_locs,
             info=info,
             max_dark_time=max_dark_time,
@@ -1790,7 +1803,10 @@ def pick_properties(
         )
         pick_props = groupprops(out_locs, callback=groupprops_progress)
         if pick_areas is not None:
-            pick_props["pick_area_um2"] = pick_areas
+            # only the picks that survived kinetics estimation are present
+            # in pick_props, so subset the areas accordingly to avoid a
+            # length mismatch (e.g. picks empty in this channel are dropped)
+            pick_props["pick_area_um2"] = np.asarray(pick_areas)[kept_indices]
 
     pick_props["n_units"] = 1 / (influx_rate * dark)
     pick_props["locs"] = no_locs
@@ -2617,10 +2633,14 @@ def _link_loc_groups(  # noqa: C901
         columns["net_gradient"] = _link_group_mean(
             locs["net_gradient"].to_numpy(), link_group, n_locs, n_groups, n_
         )
-    if "likelihood" in locs.columns:
-        columns["likelihood"] = _link_group_mean(
-            locs["likelihood"].to_numpy(), link_group, n_locs, n_groups, n_
-        )
+    for col in ("log_likelihood", "likelihood", "chi_square"):
+        # "likelihood" is the old name of the column, kept for files saved
+        # with earlier versions of Picasso. "chi_square" is its least-squares
+        # counterpart; averaged the same way (a mean over the linked locs).
+        if col in locs.columns:
+            columns[col] = _link_group_mean(
+                locs[col].to_numpy(), link_group, n_locs, n_groups, n_
+            )
     if "iterations" in locs.columns:
         columns["iterations"] = _link_group_mean(
             locs["iterations"].to_numpy(), link_group, n_locs, n_groups, n_

@@ -190,6 +190,54 @@ def _hdf2visp(path: str) -> None:
     print("Complete.")
 
 
+def _smap2hdf(path: str, pixelsize: float) -> None:
+    """Convert SMAP _sml.mat localization files to HDF5 format.
+
+    Parameters
+    ----------
+    path : str
+        Path (unix style pattern) to the SMAP _sml.mat files.
+    pixelsize : float
+        Camera pixel size in nanometers.
+    """
+    from glob import glob
+    from tqdm import tqdm as _tqdm
+
+    paths = glob(path)
+    if paths:
+        import os.path
+        from .io import import_smap, save_locs
+
+        for path in _tqdm(paths, desc="Converting from SMAP"):
+            locs, info = import_smap(path, pixelsize)
+            base, ext = os.path.splitext(path)
+            save_locs(base + "_locs.hdf5", locs, info)
+    print("Complete.")
+
+
+def _hdf2smap(path: str) -> None:
+    """Convert HDF5 localization files to SMAP _sml.mat format."""
+    from glob import glob
+    from os.path import isdir
+
+    if isdir(path):
+        paths = glob(path + "/*.hdf5")
+    else:
+        paths = glob(path)
+    if paths:
+        import os.path
+        from .io import load_locs, export_smap
+
+        for path in paths:
+            base, ext = os.path.splitext(path)
+            if ext == ".hdf5":
+                print(f"Converting {path}")
+                out_path = base + "_sml.mat"
+                locs, info = load_locs(path)
+                export_smap(out_path, locs, info)
+    print("Complete.")
+
+
 def _link(files: str, d_max: float, tolerance: float) -> None:
     """Link localizations in HDF5 files, see ``postprocess.link`` for
     details."""
@@ -672,9 +720,11 @@ def _smlm_clusterer(
             print("Loading {} ...".format(path))
             locs, info = io.load_locs(path)
             locs, smlm_cluster_info = clusterer.cluster(
-                locs, **params, pixelsize=pixelsize
+                locs, **params, pixelsize=pixelsize, progress="console"
             )
-            clusters = clusterer.find_cluster_centers(locs, pixelsize)
+            clusters = clusterer.find_cluster_centers(
+                locs, pixelsize, progress="console"
+            )
             base, ext = os.path.splitext(path)
             info.append(smlm_cluster_info)
             io.save_locs(base + "_clusters.hdf5", locs, info)
@@ -1018,11 +1068,20 @@ def _localize_load_3d_calibration(
 
 _FIT_METHOD_MAP = {
     "lq": "gausslq",
+    "lq-spherical": "gausslq-spherical",
+    "lq-spherical-gpu": "gausslq-spherical-gpu",
+    "lq-rotated": "gausslq-rotated",
+    "lq-rotated-gpu": "gausslq-rotated-gpu",
     "lq-3d": "gausslq",
     "lq-gpu": "gausslq-gpu",
     "lq-gpu-3d": "gausslq-gpu",
     "mle": "gaussmle",
+    "mle-spherical": "gaussmle-spherical",
+    "mle-spherical-gpu": "gaussmle-spherical-gpu",
+    "mle-rotated-gpu": "gaussmle-rotated-gpu",
     "mle-3d": "gaussmle",
+    "spline": "spline-gpu",
+    "spline-mle": "spline-mle-gpu",
     "avg": "avg",
 }
 
@@ -1040,14 +1099,18 @@ def _localize_process_file(
     convergence: float,
     max_iterations: int,
     z_params,
+    spline_calibration: dict | None = None,
 ) -> None:
     """Identify, fit, save and optionally undrift one movie file.
 
     Parameters
     ----------
     z_params : tuple or None
-        If 3D fitting is active, a tuple
+        If 3D astigmatism fitting is active, a tuple
         ``(zpath, magnification_factor, z_calibration)``; else ``None``.
+    spline_calibration : dict or None
+        Cubic-spline PSF calibration when the fit method is a spline method;
+        else ``None``. A 3D spline fit recovers z directly (no ``zfit``).
     """
     from os.path import splitext
     from .io import load_movie, save_locs
@@ -1077,6 +1140,7 @@ def _localize_process_file(
         fitting_method=fitting_method,
         eps=convergence if convergence > 0 else 0.001,
         max_it=max_iterations if max_iterations > 0 else 100,
+        spline_calibration=spline_calibration,
         threaded=True,
         identification_progress_callback="console",
         fit_progress_callback="console",
@@ -1097,7 +1161,8 @@ def _localize_process_file(
             calibration=z_calibration,
             fitting_method=method,
             filter=0,
-            multiprocess=True,
+            multiprocess=not args.fit_z_gpu,
+            gpu=args.fit_z_gpu,
             progress_callback="console",
         )
         info[-1]["Z Calibration Path"] = zpath
@@ -1172,15 +1237,15 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     qe : float
         Not used in the calculations.
     """
-    from . import gausslq
+    from . import localize
     from .io import save_info
 
     picasso_logo()
     print("Localize - Parameters:")
     print("{:<8} {:<15} {:<10}".format("No", "Label", "Value"))
 
-    if args.fit_method == "lq-gpu":
-        if gausslq.gpufit_installed:
+    if args.fit_method in ("lq-gpu", "spline", "spline-mle"):
+        if localize.GPUFIT_INSTALLED:
             print("GPUfit installed")
         else:
             raise Exception("GPUfit not installed. Aborting.")
@@ -1236,6 +1301,34 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     z_params = None
     if "-3d" in args.fit_method:
         z_params = _localize_load_3d_calibration(args)
+        if args.fit_z_gpu:
+            from . import zfit
+
+            if zfit.CUDA_AVAILABLE:
+                print("GPU z fitting enabled (numba.cuda)")
+            else:
+                print(
+                    "Warning: GPU z fitting requested (--fit-z-gpu) but no "
+                    "CUDA-capable GPU is available. Falling back to "
+                    "multiprocessed CPU z fitting."
+                )
+                args.fit_z_gpu = False
+
+    spline_calibration = None
+    if args.fit_method in ("spline", "spline-mle"):
+        from .io import load_spline_calibration
+
+        if not args.spline_calibration:
+            raise Exception(
+                "Spline fitting requires --spline-calibration <file.hdf5>. "
+                "Build one with 'picasso spline-calibrate'."
+            )
+        spline_calibration = load_spline_calibration(args.spline_calibration)
+        print(
+            "Loaded spline PSF calibration "
+            f"({spline_calibration.get('model')}) from "
+            f"{args.spline_calibration}"
+        )
 
     for i, path in enumerate(paths):
         _localize_process_file(
@@ -1251,7 +1344,133 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             convergence,
             max_iterations,
             z_params,
+            spline_calibration=spline_calibration,
         )
+
+
+def _spline_calibrate(args: argparse.Namespace) -> None:
+    """Build a cubic-spline PSF calibration from a bead z-stack movie."""
+    from os.path import splitext
+    from . import localize, spline
+    from .io import load_movie
+
+    picasso_logo()
+    print("Spline PSF calibration")
+    print("------------------------------------------")
+
+    if not localize.GPUSPLINE_INSTALLED:
+        raise Exception(
+            "Gpuspline is required to build a spline PSF calibration but "
+            "could not be loaded. See picasso/ext/pygpuspline/README.txt."
+        )
+
+    camera_info = {
+        "Baseline": args.baseline,
+        "Sensitivity": args.sensitivity,
+        "Gain": args.gain,
+        "Pixelsize": args.pixelsize,
+    }
+    files = args.files
+    if args.output:
+        out_path = args.output
+    else:
+        base, _ = splitext(files[0])
+        out_path = base + "_spline_calib.hdf5"
+
+    # optional candidate per-channel photon ratios for ratiometric color
+    # assignment: "0.7,0.3;0.4,0.6" -> [[0.7, 0.3], [0.4, 0.6]]
+    def _parse_photon_ratios():
+        if getattr(args, "photon_ratios", None):
+            ratios = [
+                [float(v) for v in row.split(",")]
+                for row in args.photon_ratios.split(";")
+                if row.strip()
+            ]
+            print(f"  ratiometric: {len(ratios)} candidate ratios")
+            return ratios
+        return None
+
+    split_fov = getattr(args, "split_fov", None)
+    if split_fov and len(files) == 1:
+        # single movie; several rectangular FOV regions are the channels.
+        # "y0,x0,y1,x1;y0,x0,y1,x1;..." -> [[[y0,x0],[y1,x1]], ...]
+        regions = []
+        for row in split_fov.split(";"):
+            if not row.strip():
+                continue
+            v = [int(t) for t in row.split(",")]
+            if len(v) != 4:
+                raise ValueError(
+                    "Each --split-fov region needs 4 ints y0,x0,y1,x1; got "
+                    f"'{row}'."
+                )
+            regions.append([[v[0], v[1]], [v[2], v[3]]])
+        print(
+            f"Split-FOV calibration from {len(regions)} regions of one movie"
+        )
+        movie, info = load_movie(files[0])
+        calibration = spline.calibrate_spline_split_fov(
+            movie,
+            info=info,
+            camera_info=camera_info,
+            box=args.box_side_length,
+            minimum_ng=args.gradient,
+            d=args.step,
+            regions=regions,
+            reference=getattr(args, "reference", 0) or 0,
+            frames_per_step=args.frames_per_step,
+            frame_order=args.frame_order,
+            magnification_factor=args.magnification_factor,
+            correct_z_bias=args.correct_z_bias,
+            photon_ratios=_parse_photon_ratios(),
+            path=out_path,
+            progress_callback=lambda i: print(f"  step {i}/3"),
+        )
+    elif len(files) == 1:
+        movie, info = load_movie(files[0])
+        calibration = spline.calibrate_spline(
+            movie,
+            info=info,
+            camera_info=camera_info,
+            box=args.box_side_length,
+            minimum_ng=args.gradient,
+            d=args.step,
+            frames_per_step=args.frames_per_step,
+            frame_order=args.frame_order,
+            model=args.model,
+            magnification_factor=args.magnification_factor,
+            correct_z_bias=args.correct_z_bias,
+            path=out_path,
+            progress_callback=lambda i: print(f"  step {i}/3"),
+        )
+    else:
+        print(f"Multichannel calibration from {len(files)} channels")
+        movies, infos, camera_infos = [], [], []
+        for f in files:
+            movie, info = load_movie(f)
+            movies.append(movie)
+            infos.append(info)
+            camera_infos.append(dict(camera_info))
+        calibration = spline.calibrate_spline_multichannel(
+            movies,
+            infos=infos,
+            camera_infos=camera_infos,
+            box=args.box_side_length,
+            minimum_ng=args.gradient,
+            d=args.step,
+            frames_per_step=args.frames_per_step,
+            frame_order=args.frame_order,
+            magnification_factor=args.magnification_factor,
+            correct_z_bias=args.correct_z_bias,
+            photon_ratios=_parse_photon_ratios(),
+            path=out_path,
+            progress_callback=lambda i: print(f"  step {i}/3"),
+        )
+    print("------------------------------------------")
+    print(
+        f"Spline PSF calibration built from {calibration['n_beads']} beads "
+        f"and saved to {out_path}"
+    )
 
 
 def _render_many(
@@ -1859,6 +2078,8 @@ def _spinna_plot_nnd(
     save_filename: str,
 ) -> None:
     """Compute and save NND plots for all target pairs."""
+    import matplotlib.pyplot as plt
+
     nn_counts = {
         f"{t1}-{t2}": nn_plotted
         for i, t1 in enumerate(targets)
@@ -1905,6 +2126,9 @@ def _spinna_plot_nnd(
                 f"{save_filename}_NND_{t1}_{t2}.{_}" for _ in ["png", "svg"]
             ],
         )
+        # release the figure; otherwise pyplot keeps every figure of
+        # every batch row in memory (growing RAM + "too many figures")
+        plt.close(fig)
 
 
 def _spinna_process_row(
@@ -2354,9 +2578,11 @@ def _g5m(
     max_rounds: int = 3,
     bootstrap_sem: bool = False,
     calibration: str = "",
+    mode: Literal["astigmatism", "spline"] = "astigmatism",
     postprocess: bool = True,
     max_locs: int = 100000,
     asynch: bool = True,
+    group_column: Literal["group", "group_input"] = "group",
 ) -> None:
     """G5M analysis of clustered localizations. See ``picasso.g5m.g5m``
     for details on the parameters."""
@@ -2378,12 +2604,17 @@ def _g5m(
         print("------------------------------------------")
         print(f"Processing {path}")
         locs, info = load_locs(path)
-        if "z" in locs.columns:
-            if calibration != "":
-                with open(calibration, "r") as f:
-                    calib = yaml.full_load(f)
-        else:
-            calib = None
+        calib = None
+        # astigmatism 3D data needs a calibration; spline 3D data
+        # recovers z directly and needs none
+        if "z" in locs.columns and mode == "astigmatism":
+            if calibration == "":
+                raise ValueError(
+                    "A calibration file (-c/--calibration) is required "
+                    "for astigmatism 3D data."
+                )
+            with open(calibration, "r") as f:
+                calib = yaml.full_load(f)
         mols, _, g5m_info = g5m(
             locs,
             info,
@@ -2393,9 +2624,11 @@ def _g5m(
             max_rounds_without_best_bic=max_rounds,
             bootstrap_check=bootstrap_sem,
             calibration=calib,
+            mode=mode,
             postprocess=postprocess,
             max_locs_per_cluster=max_locs,
             asynch=asynch,
+            group_column=group_column,
             callback_parent="console",
         )
         new_path = splitext(path)[0] + "_molmap.hdf5"
@@ -2425,9 +2658,39 @@ def main():  # noqa: C901
     localize_parser.add_argument(
         "-a",
         "--fit-method",
-        choices=["mle", "lq", "lq-gpu", "lq-3d", "lq-gpu-3d", "mle-3d", "avg"],
+        choices=[
+            "mle",
+            "mle-spherical",
+            "mle-spherical-gpu",
+            "mle-rotated-gpu",
+            "lq",
+            "lq-spherical",
+            "lq-spherical-gpu",
+            "lq-rotated",
+            "lq-rotated-gpu",
+            "lq-gpu",
+            "lq-3d",
+            "lq-gpu-3d",
+            "mle-3d",
+            "spline",
+            "spline-mle",
+            "avg",
+        ],
         default="mle",
-        help="fitting method",
+        help=(
+            "fitting method ('spline'/'spline-mle' fit an experimental "
+            "cubic-spline PSF on the GPU and need --spline-calibration)"
+        ),
+    )
+    localize_parser.add_argument(
+        "-sc",
+        "--spline-calibration",
+        type=str,
+        default="",
+        help=(
+            "path to a cubic-spline PSF calibration (.hdf5) for the "
+            "'spline'/'spline-mle' fit methods"
+        ),
     )
     localize_parser.add_argument(
         "-g", "--gradient", type=int, default=5000, help="minimum net gradient"
@@ -2497,6 +2760,14 @@ def main():  # noqa: C901
         default="",
         help="path to 3D calibration file (3D only)",
     )
+    localize_parser.add_argument(
+        "-zg",
+        "--fit-z-gpu",
+        action="store_true",
+        help=(
+            "fit z coordinates on a CUDA-capable GPU (numba.cuda);" " 3D only"
+        ),
+    )
 
     localize_parser.add_argument(
         "-sf",
@@ -2511,6 +2782,135 @@ def main():  # noqa: C901
         "--database",
         action="store_true",
         help="add the run to the local database",
+    )
+
+    # spline-calibrate: build a cubic-spline PSF calibration from a bead
+    # z-stack movie (Gpuspline; CPU) for later use with the 'spline' fit
+    # methods.
+    spline_calib_parser = subparsers.add_parser(
+        "spline-calibrate",
+        help="build a cubic-spline PSF calibration from a bead z-stack",
+    )
+    spline_calib_parser.add_argument(
+        "files",
+        nargs="+",
+        help=(
+            "bead z-stack movie file(s); pass several (one per channel) to "
+            "build a multichannel calibration"
+        ),
+    )
+    spline_calib_parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default="",
+        help="output calibration path (.hdf5); default alongside the movie",
+    )
+    spline_calib_parser.add_argument(
+        "-b", "--box-side-length", type=int, default=13, help="box side length"
+    )
+    spline_calib_parser.add_argument(
+        "-g",
+        "--gradient",
+        type=int,
+        default=5000,
+        help="minimum net gradient for bead detection",
+    )
+    spline_calib_parser.add_argument(
+        "-s",
+        "--step",
+        type=float,
+        required=True,
+        help="z step size in nm between consecutive stage positions",
+    )
+    spline_calib_parser.add_argument(
+        "-fps",
+        "--frames-per-step",
+        type=int,
+        default=1,
+        help="number of frames acquired per z position (multi-FOV)",
+    )
+    spline_calib_parser.add_argument(
+        "-fo",
+        "--frame-order",
+        choices=["fov", "z"],
+        default="fov",
+        help="acquisition order when frames-per-step > 1",
+    )
+    spline_calib_parser.add_argument(
+        "-m",
+        "--model",
+        choices=["spline-3d", "spline-2d"],
+        default="spline-3d",
+        help="build a 3D (z-recovering) or 2D (single-plane) spline PSF",
+    )
+    spline_calib_parser.add_argument(
+        "-mf",
+        "--magnification-factor",
+        type=float,
+        default=0.79,
+        help=(
+            "magnification factor applied to the fitted z at localization "
+            "time (refractive-index mismatch), as in the astigmatism fit"
+        ),
+    )
+    spline_calib_parser.add_argument(
+        "-cz",
+        "--correct-z-bias",
+        action="store_true",
+        help=(
+            "define z = 0 at the axial intensity peak of the averaged PSF "
+            "(astigmatism); corrects a potential z bias in the stage scan"
+        ),
+    )
+    spline_calib_parser.add_argument(
+        "-pr",
+        "--photon-ratios",
+        type=str,
+        default="",
+        help=(
+            "multichannel only: candidate per-channel photon ratios for "
+            "ratiometric color assignment, hypotheses separated by ';' and "
+            "channels by ',' (e.g. '0.7,0.3;0.4,0.6'). Only relative values "
+            "matter; stored in the calibration for "
+            "fit_spline_multichannel_ratiometric"
+        ),
+    )
+    spline_calib_parser.add_argument(
+        "-sf",
+        "--split-fov",
+        type=str,
+        default="",
+        help=(
+            "single-movie multichannel: treat rectangular field-of-view "
+            "regions of ONE movie as the channels. Regions separated by ';' "
+            "and given as 'y0,x0,y1,x1' (all the same size); the first (or "
+            "--reference) region is the reference channel. e.g. "
+            "'0,0,512,256;0,256,512,512'"
+        ),
+    )
+    spline_calib_parser.add_argument(
+        "-rf",
+        "--reference",
+        type=int,
+        default=0,
+        help="split-fov only: index of the reference region (default 0)",
+    )
+    spline_calib_parser.add_argument(
+        "-bl", "--baseline", type=float, default=0, help="camera baseline"
+    )
+    spline_calib_parser.add_argument(
+        "-se",
+        "--sensitivity",
+        type=float,
+        default=1,
+        help="camera sensitivity",
+    )
+    spline_calib_parser.add_argument(
+        "-ga", "--gain", type=int, default=1, help="camera gain"
+    )
+    spline_calib_parser.add_argument(
+        "-px", "--pixelsize", type=int, default=130, help="pixelsize in nm"
     )
 
     subparsers.add_parser("filter", help="filter raw files based on SNR (GUI)")
@@ -3013,7 +3413,22 @@ def main():  # noqa: C901
         "--calibration",
         type=str,
         default="",
-        help="path to calibration file, used only for 3D data",
+        help=(
+            "path to astigmatism calibration file, used and required "
+            "only for astigmatism 3D data"
+        ),
+    )
+    g5m_parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["astigmatism", "spline"],
+        default="astigmatism",
+        help=(
+            "fitting mode of the input 3D localizations: 'astigmatism' "
+            "(couples x/y widths via the calibration, requires -c) or "
+            "'spline' (plain diagonal 3D model, reads z/lpz from the "
+            "locs, no calibration needed); ignored for 2D data"
+        ),
     )
     g5m_parser.add_argument(
         "-p",
@@ -3038,6 +3453,17 @@ def main():  # noqa: C901
         "--asynch",
         action="store_false",
         help="do not perform fitting asynchronously (multiprocessing)",
+    )
+    g5m_parser.add_argument(
+        "--group-column",
+        type=str,
+        choices=["group", "group_input"],
+        default="group",
+        help=(
+            "column used to group localizations into clusters; use "
+            "'group_input' if 'group' was overwritten but the original "
+            "cluster ids are kept in 'group_input'"
+        ),
     )
 
     # Dark time
@@ -3169,6 +3595,25 @@ def main():  # noqa: C901
     )
     hdf2visp_parser.add_argument("files", help="one or multiple hdf5 files")
 
+    smap2hdf_parser = subparsers.add_parser(
+        "smap2hdf", help="convert SMAP _sml.mat to hdf5 format"
+    )
+    smap2hdf_parser.add_argument(
+        "files", help="one or multiple _sml.mat files"
+    )
+    smap2hdf_parser.add_argument(
+        "-p",
+        "--pixelsize",
+        help="camera pixel size in nm",
+        type=float,
+        required=True,
+    )
+
+    hdf2smap_parser = subparsers.add_parser(
+        "hdf2smap", help="convert hdf5 to SMAP _sml.mat format"
+    )
+    hdf2smap_parser.add_argument("files", help="one or multiple hdf5 files")
+
     cluster_combine_parser = subparsers.add_parser(
         "cluster_combine",
         help=(
@@ -3237,6 +3682,8 @@ def main():  # noqa: C901
                 from picasso.gui import localize
 
                 localize.main()
+        elif args.command == "spline-calibrate":
+            _spline_calibrate(args)
         elif args.command == "filter":
             from .gui import filter
 
@@ -3348,9 +3795,11 @@ def main():  # noqa: C901
                 args.max_rounds,
                 args.bootstrap_sem,
                 args.calibration,
+                args.mode,
                 args.postprocess,
                 args.max_locs,
                 args.asynch,
+                args.group_column,
             )
         elif args.command == "nneighbor":
             _nneighbor(args.files)
@@ -3378,6 +3827,10 @@ def main():  # noqa: C901
             _hdf2chimera(args.files)
         elif args.command == "hdf2visp":
             _hdf2visp(args.files)
+        elif args.command == "smap2hdf":
+            _smap2hdf(args.files, args.pixelsize)
+        elif args.command == "hdf2smap":
+            _hdf2smap(args.files)
         elif args.command == "cluster_combine":
             _cluster_combine(args.files)
         elif args.command == "cluster_combine_dist":

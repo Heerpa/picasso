@@ -182,6 +182,31 @@ class TestSaveLoadLocs:
             loaded["x"].to_numpy(), locs["x"].to_numpy()
         )
 
+    def test_combine_channels_inner_join_preserves_all_rows(
+        self, tmp_path, locs, info
+    ):
+        # Regression test for "Combine all channels" only saving the first
+        # channel. The GUI combines channels with
+        # ``pd.concat(..., join="inner")``. If an outer join were used,
+        # columns missing from some channels would become NaN and
+        # io.save_locs -> lib.ensure_sanity (dropna how="any") would drop
+        # every row from those channels, silently discarding all but one.
+        ch0 = locs.copy()
+        # Second channel lacks a column present in the first (e.g. "z").
+        extra_col = "z" if "z" in ch0.columns else ch0.columns[-1]
+        ch1 = locs.copy().drop(columns=[extra_col])
+
+        combined = pd.concat([ch0, ch1], ignore_index=True, join="inner")
+        # No NaN-introducing columns survive, so no rows are dropped.
+        assert extra_col not in combined.columns
+        assert len(combined) == len(ch0) + len(ch1)
+
+        path = tmp_path / "combined.hdf5"
+        io.save_locs(str(path), combined, info)
+        loaded, _ = io.load_locs(str(path))
+        # Both channels' localizations are preserved after the round-trip.
+        assert len(loaded) == len(ch0) + len(ch1)
+
     def test_csv_extension_raises(self, tmp_path):
         # ThunderSTORM .csv files must go through import_ts, not load_locs
         path = tmp_path / "locs.csv"
@@ -467,6 +492,156 @@ class TestThunderstormRoundtrip:
 
 
 # ---------------------------------------------------------------------------
+# SMAP round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestSMAPRoundtrip:
+    def _locs_2d(self):
+        return pd.DataFrame(
+            {
+                "frame": np.array([0, 1, 2], dtype=np.uint32),
+                "x": np.array([5.0, 10.0, 15.0], dtype=np.float32),
+                "y": np.array([6.0, 11.0, 16.0], dtype=np.float32),
+                "sx": np.array([1.1, 1.2, 1.3], dtype=np.float32),
+                "sy": np.array([1.4, 1.5, 1.6], dtype=np.float32),
+                "photons": np.array(
+                    [1000.0, 2000.0, 3000.0], dtype=np.float32
+                ),
+                "bg": np.array([10.0, 20.0, 30.0], dtype=np.float32),
+                "lpx": np.array([0.05, 0.06, 0.07], dtype=np.float32),
+                "lpy": np.array([0.07, 0.08, 0.09], dtype=np.float32),
+            }
+        )
+
+    def _info(self):
+        return [
+            {"Pixelsize": PIXELSIZE, "Width": 64, "Height": 64, "Frames": 3}
+        ]
+
+    def test_export_import_2d(self, tmp_path):
+        locs = self._locs_2d()
+        info = self._info()
+        path = tmp_path / "data_sml.mat"
+        io.export_smap(str(path), locs, info)
+        assert path.exists()
+
+        out_locs, out_info = io.import_smap(str(path), pixelsize=PIXELSIZE)
+        np.testing.assert_allclose(
+            out_locs["x"].to_numpy(), locs["x"].to_numpy(), atol=1e-3
+        )
+        np.testing.assert_allclose(
+            out_locs["y"].to_numpy(), locs["y"].to_numpy(), atol=1e-3
+        )
+        # SMAP frames are 1-based on disk; import re-zeroes them.
+        np.testing.assert_array_equal(
+            out_locs["frame"].to_numpy(), locs["frame"].to_numpy()
+        )
+        np.testing.assert_allclose(
+            out_locs["photons"].to_numpy(),
+            locs["photons"].to_numpy(),
+            atol=1e-3,
+        )
+        # lpx and lpy collapse to the combined locprecnm on export, so
+        # both come back as the average of the original lpx/lpy.
+        expected_lp = (locs["lpx"].to_numpy() + locs["lpy"].to_numpy()) / 2
+        np.testing.assert_allclose(
+            out_locs["lpx"].to_numpy(), expected_lp, atol=1e-3
+        )
+        np.testing.assert_allclose(
+            out_locs["lpy"].to_numpy(), expected_lp, atol=1e-3
+        )
+        assert out_info[0]["Frames"] == 3
+
+    def test_export_import_3d(self, tmp_path):
+        locs = self._locs_2d()
+        locs["z"] = np.array([-100.0, 0.0, 100.0], dtype=np.float32)
+        locs["lpz"] = np.array([3.0, 4.0, 5.0], dtype=np.float32)
+        info = self._info()
+        path = tmp_path / "data3d_sml.mat"
+        io.export_smap(str(path), locs, info)
+
+        out_locs, _ = io.import_smap(str(path), pixelsize=PIXELSIZE)
+        # z and lpz are kept in nm in both formats.
+        np.testing.assert_allclose(
+            out_locs["z"].to_numpy(), locs["z"].to_numpy(), atol=1e-3
+        )
+        np.testing.assert_allclose(
+            out_locs["lpz"].to_numpy(), locs["lpz"].to_numpy(), atol=1e-3
+        )
+
+    def test_export_enforces_sml_suffix(self, tmp_path):
+        # SMAP recognizes localizations by the '_sml' suffix; export
+        # appends it when missing.
+        locs = self._locs_2d()
+        info = self._info()
+        io.export_smap(str(tmp_path / "plain.mat"), locs, info)
+        assert (tmp_path / "plain_sml.mat").exists()
+
+    def test_export_writes_smap_structure(self, tmp_path):
+        from scipy.io import loadmat
+
+        locs = self._locs_2d()
+        info = self._info()
+        path = tmp_path / "struct_sml.mat"
+        io.export_smap(str(path), locs, info)
+
+        mat = loadmat(str(path), struct_as_record=False, squeeze_me=True)
+        assert "saveloc" in mat
+        assert "fileformat" in mat
+        assert mat["fileformat"].name == "sml"
+        assert hasattr(mat["saveloc"].loc, "xnm")
+        assert hasattr(mat["saveloc"], "info")
+
+    def test_split_parts_raises(self, tmp_path):
+        # A SMAP split '_sml_p*.mat' file carries 'lds'/'partnames'
+        # variables; import should reject it with a clear message.
+        from scipy.io import savemat
+
+        path = tmp_path / "split_sml.mat"
+        savemat(
+            str(path),
+            {"lds": np.zeros((1, 1)), "partnames": np.zeros((1, 1))},
+        )
+        with pytest.raises(ValueError, match="split"):
+            io.import_smap(str(path), pixelsize=PIXELSIZE)
+
+    def test_import_v73_hdf5(self, tmp_path):
+        # MATLAB v7.3 files are HDF5-based and read via the h5py path.
+        # SMAP stores column vectors transposed, so each loc field is a
+        # (1, N) dataset under /saveloc/loc.
+        n = 10
+        path = tmp_path / "v73_sml.mat"
+        with h5py.File(str(path), "w") as f:
+            loc = f.create_group("saveloc").create_group("loc")
+            loc.create_dataset(
+                "xnm", data=np.linspace(130, 1300, n).reshape(1, n)
+            )
+            loc.create_dataset(
+                "ynm", data=np.linspace(260, 2600, n).reshape(1, n)
+            )
+            loc.create_dataset(
+                "frame", data=np.arange(1, n + 1, dtype=float).reshape(1, n)
+            )
+            loc.create_dataset("phot", data=np.full((1, n), 500.0))
+            loc.create_dataset("bg", data=np.full((1, n), 12.0))
+            loc.create_dataset("locprecnm", data=np.full((1, n), 13.0))
+
+        locs, info = io.import_smap(str(path), pixelsize=PIXELSIZE)
+        assert len(locs) == n
+        # SMAP frames are 1-based; import re-zeroes them.
+        assert int(locs["frame"].min()) == 0
+        np.testing.assert_allclose(
+            locs["x"].to_numpy(),
+            np.linspace(130, 1300, n) / PIXELSIZE,
+            atol=1e-3,
+        )
+        np.testing.assert_allclose(
+            locs["lpx"].to_numpy(), 13.0 / PIXELSIZE, atol=1e-3
+        )
+
+
+# ---------------------------------------------------------------------------
 # TIFF loading — TiffMap / TiffMultiMap / load_tif / to_raw
 #
 # Picasso reads TIFFs via ``tifffile`` (see picasso.io.TiffMap). Real
@@ -503,6 +678,28 @@ def _write_tif_stack(
                 contiguous=(compression is None),
                 **kw,
             )
+
+
+def _write_imagej_contiguous_stack(path, data):
+    """Write ``data`` (frames, H, W) in ImageJ's *contiguous stack*
+    layout: a single IFD whose ``ImageDescription`` declares the full
+    plane count, followed by every other plane's pixel data laid out
+    back-to-back. This mirrors ImageJ's own "Save As > Tiff" for large
+    stacks (as opposed to one-IFD-per-plane), which tifffile reports as
+    a single page plus an N-plane series."""
+    tifffile.imwrite(str(path), data[0], imagej=True)
+    with tifffile.TiffFile(str(path)) as t:
+        tag = t.pages[0].tags.get(270)  # ImageDescription
+        offset, count = tag.valueoffset, tag.count
+    n = len(data)
+    desc = f"ImageJ=1.54f\nimages={n}\nslices={n}\n".encode()
+    assert len(desc) <= count, "test description longer than reserved tag"
+    desc = desc + b" " * (count - len(desc))
+    with open(path, "r+b") as fh:
+        fh.seek(offset)
+        fh.write(desc)
+    with open(path, "ab") as fh:
+        fh.write(np.ascontiguousarray(data[1:]).tobytes())
 
 
 class TestTiffLoading:
@@ -613,6 +810,59 @@ class TestTiffLoading:
         finally:
             movie.close()
 
+    def test_imagej_contiguous_stack_all_frames_detected(self, tmp_path):
+        # ImageJ stores a large stack as one IFD + contiguous plane data,
+        # recording the count in its metadata. Picasso must read every
+        # plane, not just the single page tifffile reports.
+        rng = np.random.default_rng(30)
+        data = rng.integers(0, 60000, size=(50, 24, 32), dtype="<u2")
+        path = tmp_path / "ij_contiguous.tif"
+        _write_imagej_contiguous_stack(path, data)
+
+        movie, info = io.load_tif(str(path))
+        try:
+            assert movie.n_frames == 50
+            assert movie.shape == (50, 24, 32)
+            assert info[0]["Frames"] == 50
+            # Fast offset path is used (uncompressed contiguous planes).
+            assert movie.maps[0]._imagej_planes == 50
+            assert movie.maps[0]._offsets is not None
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+            np.testing.assert_array_equal(movie[37], data[37])
+            np.testing.assert_array_equal(movie[49], data[49])
+        finally:
+            movie.close()
+
+    def test_imagej_contiguous_big_endian(self, tmp_path):
+        # Real-world ImageJ stacks are often big-endian; values must be
+        # normalized to little-endian like every other TIFF path.
+        rng = np.random.default_rng(31)
+        data = rng.integers(0, 60000, size=(20, 16, 16), dtype="<u2")
+        path = tmp_path / "ij_be.tif"
+        _write_imagej_contiguous_stack(path, data.astype(">u2"))
+
+        movie, _ = io.load_tif(str(path))
+        try:
+            assert movie.n_frames == 20
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+        finally:
+            movie.close()
+
+    def test_imagej_single_plane_not_expanded(self, tmp_path):
+        # A genuine single-plane ImageJ image must stay one frame.
+        rng = np.random.default_rng(32)
+        frame = rng.integers(0, 60000, size=(16, 16), dtype="<u2")
+        path = tmp_path / "ij_single.tif"
+        tifffile.imwrite(str(path), frame, imagej=True)
+
+        movie, _ = io.load_tif(str(path))
+        try:
+            assert movie.n_frames == 1
+            assert movie.maps[0]._imagej_planes is None
+            np.testing.assert_array_equal(movie[0], frame)
+        finally:
+            movie.close()
+
     def test_micromanager_metadata_flattened(self, tmp_path):
         rng = np.random.default_rng(6)
         data = rng.integers(0, 500, size=(2, 8, 8), dtype="<u2")
@@ -695,6 +945,123 @@ class TestTiffLoading:
             np.testing.assert_array_equal(np.array(list(movie)), data)
         finally:
             movie.close()
+
+
+# ---------------------------------------------------------------------------
+# MicroManager "separate image files" acquisitions (one TIFF per frame).
+# ---------------------------------------------------------------------------
+
+
+def _write_single_frame(path, frame):
+    """Write one 2-D frame as a single-page TIFF (mimics one file of a
+    MicroManager separate-files acquisition)."""
+    with tifffile.TiffWriter(str(path), ome=False) as tw:
+        tw.write(frame, photometric="minisblack", contiguous=True)
+
+
+class TestMMSeparateFiles:
+    def _mm2_name(self, t, c=0, p=0, z=0):
+        return (
+            f"img_channel{c:03d}_position{p:03d}" f"_time{t:09d}_z{z:03d}.tif"
+        )
+
+    def _mm14_name(self, frame, channel="Default", z=0):
+        return f"img_{frame:09d}_{channel}_{z:03d}.tif"
+
+    def test_mm2_folder_loads_as_single_movie(self, tmp_path):
+        rng = np.random.default_rng(20)
+        data = rng.integers(0, 60000, size=(6, 16, 20), dtype="<u2")
+        for t, frame in enumerate(data):
+            _write_single_frame(tmp_path / self._mm2_name(t), frame)
+
+        # Opening any single frame assembles the whole sequence.
+        movie, info = io.load_tif(str(tmp_path / self._mm2_name(2)))
+        try:
+            assert isinstance(movie, io.MMSeparateTiffMovie)
+            assert movie.n_frames == 6
+            assert movie.shape == (6, 16, 20)
+            assert info[0]["Frames"] == 6
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+            np.testing.assert_array_equal(movie[4], data[4])
+            np.testing.assert_array_equal(movie[-1], data[-1])
+        finally:
+            movie.close()
+
+    def test_mm14_folder_loads_and_orders_frames(self, tmp_path):
+        rng = np.random.default_rng(21)
+        data = rng.integers(0, 60000, size=(5, 12, 8), dtype="<u2")
+        # Write out of order to prove sorting is by frame index.
+        for t in [3, 0, 4, 1, 2]:
+            _write_single_frame(tmp_path / self._mm14_name(t), data[t])
+
+        movie, info = io.load_movie(str(tmp_path / self._mm14_name(0)))
+        try:
+            assert isinstance(movie, io.MMSeparateTiffMovie)
+            assert movie.n_frames == 5
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+        finally:
+            movie.close()
+
+    def test_other_channels_not_interleaved(self, tmp_path):
+        rng = np.random.default_rng(22)
+        ch0 = rng.integers(0, 60000, size=(4, 10, 10), dtype="<u2")
+        ch1 = rng.integers(0, 60000, size=(4, 10, 10), dtype="<u2")
+        for t in range(4):
+            _write_single_frame(tmp_path / self._mm2_name(t, c=0), ch0[t])
+            _write_single_frame(tmp_path / self._mm2_name(t, c=1), ch1[t])
+
+        # Selecting a channel-0 frame yields only channel-0 frames.
+        movie, _ = io.load_tif(str(tmp_path / self._mm2_name(0, c=0)))
+        try:
+            assert movie.n_frames == 4
+            np.testing.assert_array_equal(np.array(list(movie)), ch0)
+        finally:
+            movie.close()
+
+    def test_lone_file_is_not_treated_as_series(self, tmp_path):
+        rng = np.random.default_rng(23)
+        frame = rng.integers(0, 60000, size=(8, 8), dtype="<u2")
+        path = tmp_path / self._mm2_name(0)
+        _write_single_frame(path, frame)
+
+        # A single matching file must not become a separate-files movie;
+        # it opens as an ordinary one-frame TIFF.
+        assert io._mm_separate_files(str(path)) is None
+        movie, _ = io.load_tif(str(path))
+        try:
+            assert not isinstance(movie, io.MMSeparateTiffMovie)
+            assert movie.n_frames == 1
+        finally:
+            movie.close()
+
+    def test_plain_tiff_name_not_detected(self, tmp_path):
+        rng = np.random.default_rng(24)
+        data = rng.integers(0, 60000, size=(3, 8, 8), dtype="<u2")
+        path = tmp_path / "acquisition.tif"
+        _write_tif_stack(path, data)
+        assert io._mm_separate_files(str(path)) is None
+
+    def test_find_mm_separate_first(self, tmp_path):
+        rng = np.random.default_rng(25)
+        data = rng.integers(0, 60000, size=(3, 8, 8), dtype="<u2")
+        for t in range(3):
+            _write_single_frame(tmp_path / self._mm2_name(t), data[t])
+        # A stray metadata.txt and unrelated file must be ignored.
+        (tmp_path / "metadata.txt").write_text("{}")
+
+        first = io.find_mm_separate_first(str(tmp_path))
+        assert first is not None
+        movie, _ = io.load_tif(first)
+        try:
+            assert movie.n_frames == 3
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+        finally:
+            movie.close()
+
+        # A folder without a sequence returns None.
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        assert io.find_mm_separate_first(str(empty)) is None
 
 
 # ---------------------------------------------------------------------------

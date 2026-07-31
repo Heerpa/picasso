@@ -63,9 +63,11 @@ The 3D rotation window allows the user to render 3D localization data. To use it
 
 The user may perform multiple actions in the rotation window, including: saving rotated localizations, building animations (.mp4 format), rotating by a specified angle, etc.
 
-Note that to build animations, the user must have ``ffmpeg`` installed on their system. 
+Note that to build animations, the user must have ``ffmpeg`` installed on their system.
 
-Rotation around z-axis is available by pressing Ctrl/Command. Rotation axis can be frozen by pressing x/y/z to freeze around the corresponding axes (to freeze around the z-axis, Ctrl/Command must be pressed as well).
+When rotating by a specified angle, the dialog offers a ``Rotate around`` choice between **Localizations** (the default) and **World**. ``Localizations`` rotates around the data's own axes - the axes shown by the axes icon, which rotate together with the data - so each entered angle changes the corresponding displayed angle by exactly that amount. ``World`` rotates around the fixed screen/camera axes instead.
+
+Rotation around the z-axis is available by pressing Ctrl/Command. Rotation axis can be frozen by pressing x/y/z to freeze around the corresponding axis. By default the frozen rotation is around the data's own axes (Localizations frame); holding Ctrl/Command together with x/y/z instead rotates around the fixed screen/World axes. The z-axis can now be frozen by pressing z alone (vertical dragging spins around it); Ctrl/Command is only needed for the z-axis if you want to rotate it in the World frame, or to spin around the screen z-axis when no axis is frozen.
 
 RESI
 ----
@@ -88,6 +90,8 @@ G5M
 In Picasso 0.9.5, a new algorithm for molecular mapping (i.e., finding the positions of individual molecules from localizations) was introduced: G5M (Gaussian Mixture Modeling with Modifications for Molecular Mapping; Kowalewski, Reinhardt et al. *Nature Comms*, 2026. DOI: 10.1038/s41467-026-70198-5). G5M is based on Gaussian Mixture Modeling (GMM) but includes several modifications to make it suitable for molecular mapping. All the technicalities as well as the user guide of the method are explained in the publication mentioned and its Supplementary Information. Please refer to ``picasso.g5m`` for the details of the implementation. Below is a brief summary of the user guide.
 
 G5M requires some preprocessing of localizations to filter out the badly fitted ones, especially the ones arising from crosstalk (overlapping blinking). These can be excluded from 2D data where the ellipticity and size of the image of an emitter in x and y can be filtered (in Picasso these are found under names “ellipticity”, “sx” and “sy”, respectively). Moreover, the photon count can be cut-off as crosstalk is likely to result in a higher-intensity signal. In 3D data these filters are less reliable due to astigmatism, however, “d_zcalib” could be used. We strongly encourage avoiding dense blinking, where emission signals from neighboring molecules overlap, especially during 3D image acquisition.
+
+Note that G5M assumes that the localization precision values (``lpx``, ``lpy`` and ``lpz`` columns) correspond to the real spread of the localization clouds. For example, drift correction needs to done precisely. In astigmatic imaging, great care needs to be taken if fiducials are used for drift correction, especially if they lie at a different plane from the target localizations. In fact, we recommend using the new fiducial-free algorithms such as `COMET <https://www.biorxiv.org/content/10.64898/2026.03.27.714864v1>`_ and `AIM <https://www.science.org/doi/10.1126/sciadv.adm7765>`_. This prevenents overfitting of too many molecules.
 
 Prior to molecular mapping, clustering of localizations is required to split the data into smaller chunks. For many datasets, DBSCAN works well. While in some cases some adjustments may be needed, we recommend the following DBSCAN parameters: In 2D, DBSCAN radius (epsilon) of 2*LP, in 3D - 3*LP (LP - average localization precision of the dataset, for example, NeNA or median localization precision). Default min. samples is set to 4. Clustering in Picasso adds the ``group`` column to the localization file, which is required for G5M. **Note: G5M relies on the information in the ``group`` column, therefore, if it is overwritten (for example, by picking localizations after DBSCAN clustering), G5M will not work.**
 
@@ -188,7 +192,7 @@ File
 
 Open [Ctrl+O]
 ^^^^^^^^^^^^^
-Open an .hdf5 file to open in render.
+Open a localization file in render. Picasso ``.hdf5`` files are loaded directly; ThunderSTORM ``.csv`` and SMAP ``_sml.mat`` files are imported (you will be asked for the camera pixel size in nm). Localization files can also be imported by dragging and dropping them onto the render window.
 
 Open rotated localizations [Ctrl+Shift+O]
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -256,6 +260,12 @@ Export as .txt file to be used for Chimera import.
 Export as .3d for ViSP
 ++++++++++++++++++++++
 Export as .3d file to be used ViSP.
+
+Export as .mat for SMAP
++++++++++++++++++++++++
+Export the dataset as a SMAP (`https://github.com/jries/SMAP <https://github.com/jries/SMAP>`_) ``_sml.mat`` file that can be loaded in SMAP via File > Load. The output is named ``<file>_sml.mat`` (the ``_sml`` suffix is required for SMAP to recognize the file).
+
+Coordinates and localization precision are converted from camera pixels to nm using the pixel size set in Display Settings; z and its precision (``lpz``) are written in nm; frames are made 1-based (SMAP convention). ``lpx`` and ``lpy`` are combined into SMAP's single ``locprecnm`` field as their mean.
 
 Remove all localizations
 ^^^^^^^^^^^^^^^^^^^^^^^^

@@ -52,13 +52,18 @@ except ImportError:
     liffile = None
 
 
-# MicroManager OME-TIFF continuation files store a non-ASCII
-# ImageDescription (tag 270), which makes tifffile log a benign
-# "coercing invalid ASCII to bytes" warning for every such file. The
-# bytes are unused by Picasso (frames and the metadata we read are
-# unaffected), so silence tifffile's logger below the error level to
-# keep the console clean.
-logging.getLogger("tifffile").setLevel(logging.ERROR)
+# MicroManager OME-TIFF files make tifffile log a couple of benign
+# messages that are unused by Picasso (frames and the metadata we read
+# are unaffected):
+#   * continuation files store a non-ASCII ImageDescription (tag 270),
+#     triggering a "coercing invalid ASCII to bytes" warning;
+#   * the MicroManagerMetadata tag (50839) can carry a zero value
+#     offset, which tifffile reports at ERROR level as
+#     "<TiffTag.fromfile> raised TiffFileError(... invalid value
+#     offset 0)" while still recovering and reading the file.
+# Silence tifffile's logger below CRITICAL so these don't reach the
+# console; genuine read failures still raise exceptions in load_tif.
+logging.getLogger("tifffile").setLevel(logging.CRITICAL)
 
 
 # Movie file extensions Picasso can open. TIFF_EXTENSIONS are routed to
@@ -86,6 +91,35 @@ def _user_settings_filename() -> str:
     """Return the path to the user settings file."""
     home = os.path.expanduser("~")
     return os.path.join(home, ".picasso", "settings.yaml")
+
+
+def plugins_directory() -> str:
+    """Return the user plugins directory (``~/.picasso/plugins``).
+
+    The directory is created if it does not yet exist. It sits next to
+    ``~/.picasso/settings.yaml`` so that every install type (one-click
+    installer, PyPI, source) shares one stable, user-writable location
+    that survives uninstalling Picasso.
+    """
+    home = os.path.expanduser("~")
+    directory = os.path.join(home, ".picasso", "plugins")
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+
+def notification_sounds_directory() -> str:
+    """Return the user notification sounds directory
+    (``~/.picasso/notification_sounds``).
+
+    The directory is created (empty) if it does not yet exist. It sits
+    next to ``~/.picasso/settings.yaml`` and ``~/.picasso/plugins`` so
+    that every install type (one-click installer, PyPI, source) shares
+    one stable, user-writable location that survives uninstalling
+    Picasso. Users add their own ``.mp3`` or ``.wav`` files here."""
+    home = os.path.expanduser("~")
+    directory = os.path.join(home, ".picasso", "notification_sounds")
+    os.makedirs(directory, exist_ok=True)
+    return directory
 
 
 def load_raw(
@@ -167,7 +201,6 @@ def load_ims(
             channel = "Channel 0"
         else:
             channel = prompt_info(file.channels)
-        print(f"Setting channel to {channel}")
         file.set_channel(channel)
 
     else:
@@ -256,17 +289,19 @@ def load_ims_all(path: str) -> tuple[list[np.memmap], list[list[dict]]]:
 
 
 def save_config(CONFIG: dict) -> None:
-    """Save the camera configuration dictionary to a YAML file. See
-    https://picassosr.readthedocs.io/en/latest/localize.html#camera-config.
+    """Save the camera configuration dictionary to the user config file
+    (``~/.picasso/config.yaml``). See https://picassosr.readthedocs.io/
+    en/latest/localize.html#camera-config.
 
     Parameters
     ----------
     CONFIG : dict
         The camera configuration dictionary to save.
     """
-    this_file = os.path.abspath(__file__)
-    this_directory = os.path.dirname(this_file)
-    with open(os.path.join(this_directory, "config.yaml"), "w") as config_file:
+    from . import config_filename, _user_config_dir
+
+    os.makedirs(_user_config_dir(), exist_ok=True)
+    with open(config_filename(), "w") as config_file:
         yaml.dump(CONFIG, config_file, width=1000)
 
 
@@ -307,7 +342,99 @@ def load_calibration(path: str) -> dict:
         A dictionary containing the 3D astigmatic calibration data.
     """
     with open(path, "r") as calibration_file:
-        calibration = yaml.full_load(calibration_file)
+        try:
+            calibration = yaml.full_load(calibration_file)
+        except yaml.composer.ComposerError:
+            raise ValueError(
+                "Invalid calibration file: expected a single-document YAML "
+                "file. This does not look like a 3D calibration file."
+            )
+
+    if not isinstance(calibration, dict) or (
+        "X Coefficients" not in calibration
+        or not isinstance(calibration["X Coefficients"], list)
+    ):
+        raise ValueError(
+            "Invalid calibration file: 'X Coefficients' must be present and "
+            "be a dictionary."
+        )
+
+    return calibration
+
+
+def _json_default(obj):
+    """Coerce numpy scalars/arrays into JSON-serializable Python objects."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    raise TypeError(
+        f"Object of type {type(obj).__name__} is not JSON serializable"
+    )
+
+
+def save_spline_calibration(path: str, calibration: dict) -> None:
+    """Save a cubic-spline PSF calibration to an HDF5 file.
+
+    Unlike the astigmatism calibration (a handful of polynomial coefficients
+    stored as YAML via ``zfit.calibrate_z``), a spline PSF calibration holds a
+    large coefficient table (64 coefficients per interval for a 3D tricubic
+    spline, times the number of intervals), so it is stored in HDF5. The
+    coefficient array goes into the ``coefficients`` dataset; all remaining
+    (scalar / list) metadata is stored as a JSON string in the file attribute
+    ``metadata``.
+
+    Parameters
+    ----------
+    path : str
+        Destination HDF5 path (conventionally ``*_spline_calib.hdf5``).
+    calibration : dict
+        Calibration dictionary. Must contain a numpy array under the key
+        ``"coefficients"``; every other key must be JSON-serializable (numpy
+        scalars/arrays are coerced automatically).
+    """
+    if "coefficients" not in calibration:
+        raise ValueError(
+            "Invalid spline calibration: missing 'coefficients' array."
+        )
+    coefficients = np.ascontiguousarray(
+        calibration["coefficients"], dtype=np.float32
+    )
+    metadata = {
+        key: value
+        for key, value in calibration.items()
+        if key != "coefficients"
+    }
+    with h5py.File(path, "w") as f:
+        f.create_dataset("coefficients", data=coefficients)
+        f.attrs["metadata"] = json.dumps(metadata, default=_json_default)
+
+
+def load_spline_calibration(path: str) -> dict:
+    """Load a cubic-spline PSF calibration saved by
+    ``save_spline_calibration``.
+
+    Parameters
+    ----------
+    path : str
+        Path to the spline calibration HDF5 file.
+
+    Returns
+    -------
+    calibration : dict
+        The calibration dictionary, with the coefficient table restored under
+        the ``"coefficients"`` key (float32 numpy array) and all metadata
+        keys alongside it.
+    """
+    with h5py.File(path, "r") as f:
+        if "coefficients" not in f or "metadata" not in f.attrs:
+            raise ValueError(
+                "Invalid spline calibration file: expected a 'coefficients' "
+                "dataset and a 'metadata' attribute. This does not look like "
+                "a Picasso spline PSF calibration."
+            )
+        calibration = json.loads(f.attrs["metadata"])
+        calibration["coefficients"] = f["coefficients"][:].astype(np.float32)
     return calibration
 
 
@@ -456,9 +583,10 @@ def load_tif(
         Called with the readable movie dimensions if the embedded
         metadata cannot be parsed, so the user can enter it manually.
         Must return ``(info, save)`` or None if cancelled.
-    progress : None, optional
-        A placeholder for progress tracking, not used in this function.
-        Default is None.
+    progress : callable, optional
+        ``callable(done, total)`` invoked as the per-page IFD scan
+        proceeds, so a smooth determinate progress bar can be shown while
+        a large movie is opened. Default is None (no reporting).
 
     Returns
     -------
@@ -471,7 +599,15 @@ def load_tif(
     Returns None if the metadata could not be read and the user
     cancelled the manual-metadata fallback dialog.
     """
-    movie = TiffMultiMap(path, memmap_frames=False)
+    # MicroManager can save an acquisition as one single-page TIFF per
+    # frame ("separate image files"). If ``path`` is one such frame,
+    # assemble the whole folder into a single movie instead of opening a
+    # one-frame file.
+    separate_paths = _mm_separate_files(path)
+    if separate_paths is not None:
+        movie = MMSeparateTiffMovie(separate_paths)
+    else:
+        movie = TiffMultiMap(path, memmap_frames=False, progress=progress)
     info = _movie_info_or_prompt(movie, path, prompt_info)
     if info is None:
         return None
@@ -508,6 +644,50 @@ def load_nd2(
     if info is None:
         return None
     return movie, [info]
+
+
+def load_nd2_all(
+    path: str,
+    prompt_info: Callable[[dict], tuple[dict, bool]] | None = None,
+) -> tuple[list[ND2Movie], list[list[dict]]] | None:
+    """Load all channels of a Nikon ND2 movie file and their metadata.
+
+    Each channel is returned as an independent ``ND2Movie`` so all
+    channels can be read at the same time. Single-channel files yield a
+    one-element list (identical to ``load_nd2``).
+
+    Parameters
+    ----------
+    path : str
+        The path to the ND2 movie file.
+    prompt_info : Callable, optional
+        Called with the readable movie dimensions if the embedded metadata
+        cannot be parsed, so the user can enter it manually. Must return
+        ``(info, save)`` or None if cancelled.
+
+    Returns
+    -------
+    movies : list of ND2Movie
+        One movie object per channel.
+    infos : list of lists of dicts
+        Per-channel metadata, each carrying a ``"Channel"`` key.
+
+    Returns None if the metadata could not be read and the user cancelled
+    the manual-metadata fallback dialog.
+    """
+    probe = ND2Movie(path)
+    n_channels = probe.n_channels
+    probe.close()
+    movies = []
+    infos = []
+    for i in range(n_channels):
+        movie = ND2Movie(path, channel=i)
+        info = _movie_info_or_prompt(movie, path, prompt_info)
+        if info is None:
+            return None
+        movies.append(movie)
+        infos.append([info])
+    return movies, infos
 
 
 def load_stk(
@@ -581,6 +761,44 @@ def load_czi(
     return movie, [movie.info()]
 
 
+def load_czi_all(path: str) -> tuple[list[CZIMovie], list[list[dict]]]:
+    """Load all channels of a Zeiss CZI movie file and their metadata.
+
+    Each channel is returned as an independent ``CZIMovie`` so all
+    channels can be read at the same time (e.g. for across-channel
+    fitting). The file is reopened once per channel; CZI readers are lazy,
+    so this is cheap for the handful of channels typical in SMLM.
+
+    Parameters
+    ----------
+    path : str
+        The path to the CZI movie file.
+
+    Returns
+    -------
+    movies : list of CZIMovie
+        One movie object per channel.
+    infos : list of lists of dicts
+        Per-channel metadata, each carrying a ``"Channel"`` key.
+    """
+    if czifile is None:
+        raise ImportError(
+            "Reading .czi files requires the optional 'czifile' package "
+            "(needs Python >= 3.12). Install it with: "
+            "pip install picassosr[czi]"
+        )
+    probe = CZIMovie(path)
+    channels = list(probe.channels)
+    probe.close()
+    movies = []
+    infos = []
+    for i in range(len(channels)):
+        movie = CZIMovie(path, channel=i)
+        movies.append(movie)
+        infos.append([movie.info()])
+    return movies, infos
+
+
 def load_lif(
     path: str,
     prompt_info: Callable[[list[str]], str] | None = None,
@@ -616,6 +834,44 @@ def load_lif(
     return movie, [movie.info()]
 
 
+def load_lif_all(path: str) -> tuple[list[LIFMovie], list[list[dict]]]:
+    """Load all channels of a Leica LIF movie file and their metadata.
+
+    Each channel is returned as an independent ``LIFMovie`` (the image
+    series with the most time frames is used, as in ``load_lif``) so all
+    channels can be read at the same time. The file is reopened once per
+    channel; LIF readers are lazy, so this is cheap.
+
+    Parameters
+    ----------
+    path : str
+        The path to the LIF movie file.
+
+    Returns
+    -------
+    movies : list of LIFMovie
+        One movie object per channel.
+    infos : list of lists of dicts
+        Per-channel metadata, each carrying a ``"Channel"`` key.
+    """
+    if liffile is None:
+        raise ImportError(
+            "Reading .lif files requires the optional 'liffile' package "
+            "(needs Python >= 3.12). Install it with: "
+            "pip install picassosr[lif]"
+        )
+    probe = LIFMovie(path)
+    channels = list(probe.channels)
+    probe.close()
+    movies = []
+    infos = []
+    for i in range(len(channels)):
+        movie = LIFMovie(path, channel=i)
+        movies.append(movie)
+        infos.append([movie.info()])
+    return movies, infos
+
+
 def load_movie(
     path: str,
     prompt_info=None,
@@ -634,8 +890,10 @@ def load_movie(
         Format-specific callback used to obtain missing metadata
         interactively (e.g. to select a channel for multi-channel files
         or to enter movie metadata manually when it cannot be read).
-    progress : None
-        Placeholder for progress tracking, not used in this function.
+    progress : callable, optional
+        ``callable(done, total)`` forwarded to the TIFF loader to report
+        per-page progress while a movie is opened. Other formats ignore
+        it (they open effectively instantly). Default is None.
 
     Returns
     -------
@@ -654,7 +912,7 @@ def load_movie(
     if ext == ".raw":
         return load_raw(path, prompt_info=prompt_info)
     elif ext in TIFF_EXTENSIONS:
-        return load_tif(path, prompt_info=prompt_info)
+        return load_tif(path, prompt_info=prompt_info, progress=progress)
     elif ext == ".ims":
         return load_ims(path, prompt_info=prompt_info)
     elif ext == ".nd2":
@@ -670,6 +928,57 @@ def load_movie(
             f"Unsupported movie format: {ext}. Supported formats are"
             f" {MOVIE_EXTENSIONS}."
         )
+
+
+def load_movie_all(
+    path: str,
+    prompt_info=None,
+    progress=None,
+) -> tuple[list[AbstractPicassoMovie], list[list[dict]]] | None:
+    """Load every channel of a movie file as independent movies.
+
+    Mirrors ``load_movie`` but returns parallel lists - one entry per
+    channel. Multi-channel formats (.ims, .czi, .lif, .nd2) expose all of
+    their channels; single-channel formats return one-element lists. Each
+    ``info[0]`` carries a ``"Channel"`` key identifying the channel.
+
+    Parameters
+    ----------
+    path : str
+        The path to the movie file.
+    prompt_info : Callable, optional
+        Manual-metadata fallback callback, forwarded to the formats that
+        may need it (.nd2 and the single-channel formats). Channel
+        selection is never prompted here - all channels are loaded.
+    progress : None
+        Placeholder for progress tracking, not used.
+
+    Returns
+    -------
+    movies : list of AbstractPicassoMovie
+        One movie object per channel.
+    infos : list of lists of dicts
+        Per-channel metadata.
+
+    Returns None if metadata could not be read and the user cancelled the
+    manual-metadata fallback dialog.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".ims":
+        return load_ims_all(path)
+    elif ext == ".czi":
+        return load_czi_all(path)
+    elif ext == ".lif":
+        return load_lif_all(path)
+    elif ext == ".nd2":
+        return load_nd2_all(path, prompt_info=prompt_info)
+    else:
+        # Single-channel formats: wrap load_movie into one-element lists.
+        result = load_movie(path, prompt_info=prompt_info, progress=progress)
+        if result is None:
+            return None
+        movie, info = result
+        return [movie], [info]
 
 
 def load_info(
@@ -828,7 +1137,10 @@ def save_drift(path: str, drift: pd.DataFrame) -> None:
         A DataFrame with 'x' and 'y' columns and drift values for each
         frame.
     """
-    np.savetxt(path, drift, newline="\r\n")
+    # Binary handle so the explicit "\r\n" is not itself newline-translated
+    # (a text handle writes "\r\r\n" on Windows).
+    with open(path, "wb") as f:
+        np.savetxt(f, drift, newline="\r\n")
 
 
 def load_drift(path: str) -> pd.DataFrame | None:
@@ -1090,7 +1402,7 @@ class ND2Movie(AbstractPicassoMovie):
 
     This class implements a version which uses only ``nd2``."""
 
-    def __init__(self, path: str, verbose: bool = False):
+    def __init__(self, path: str, verbose: bool = False, channel: int = 0):
         super().__init__()
         if verbose:
             print("Reading info from {}".format(path))
@@ -1099,7 +1411,7 @@ class ND2Movie(AbstractPicassoMovie):
         self.dask = self.nd2file.to_dask()
         self.sizes = self.nd2file.sizes
 
-        required_dims = ["T", "Y", "X"]  # exactly these, not more
+        required_dims = ["T", "Y", "X"]  # always required
         for dim in required_dims:
             if dim not in self.nd2file.sizes.keys():
                 raise KeyError(
@@ -1107,13 +1419,29 @@ class ND2Movie(AbstractPicassoMovie):
                         dim, self.path
                     )
                 )
-        if self.nd2file.ndim != len(required_dims):
+        # Allow an optional channel (C) axis; reject any other extra
+        # dimension (e.g. Z, P), as before.
+        allowed_dims = set(required_dims) | {"C"}
+        extra_dims = set(self.nd2file.sizes.keys()) - allowed_dims
+        if extra_dims:
             raise KeyError(
-                "File {:s} has dimensions {:s} ".format(
-                    self.path, str(self.nd2file.sizes.keys())
+                "File {:s} has unsupported dimensions {:s}; only T, Y, X "
+                "and C are supported.".format(
+                    self.path, str(sorted(extra_dims))
                 )
-                + "but should have exactly {:s}.".format(str(required_dims))
             )
+
+        # Channel selection. Single-channel files default to channel 0, so
+        # their behaviour is unchanged.
+        self.n_channels = int(self.nd2file.sizes.get("C", 1))
+        self._channel = channel if 0 <= channel < self.n_channels else 0
+        self.channels = [f"Channel {i}" for i in range(self.n_channels)]
+        try:
+            names = [c.channel.name for c in self.nd2file.metadata.channels]
+            if len(names) == self.n_channels and all(names):
+                self.channels = [str(n) for n in names]
+        except Exception:
+            pass
 
         # Pixel access only needs the dimensions checked above; parsing
         # the (often vendor-specific) metadata may still fail. Keep that
@@ -1130,7 +1458,11 @@ class ND2Movie(AbstractPicassoMovie):
         ]
 
     def info(self) -> dict:
-        return self.meta
+        if self.meta is None:
+            return None
+        info = dict(self.meta)
+        info["Channel"] = self.channels[self._channel]
+        return info
 
     def get_metadata(self, nd2file: nd2.ND2File) -> dict:
         """Bring the file metadata in a readable form, and preprocesses
@@ -1389,7 +1721,7 @@ class ND2Movie(AbstractPicassoMovie):
         self.nd2file.close()
 
     def get_frame(self, index: int) -> lib.IntArray2D:
-        """Load one frame of the movie.
+        """Load one frame of the movie at the selected channel.
 
         Parameters
         ----------
@@ -1401,7 +1733,17 @@ class ND2Movie(AbstractPicassoMovie):
         frame : lib.IntArray2D
             2D array representing the image data of the frame
         """
-        return self.dask[index].compute()
+        # Index the dask array along each axis in its native order. For a
+        # plain (T, Y, X) file this reduces to ``self.dask[index]``.
+        selection = []
+        for dim in self.sizes:
+            if dim == "T":
+                selection.append(index)
+            elif dim == "C":
+                selection.append(self._channel)
+            else:  # Y, X
+                selection.append(slice(None))
+        return np.squeeze(self.dask[tuple(selection)].compute())
 
     def tofile(self, file_handle, byte_order=None):
         raise NotImplementedError("Cannot write .nd2 file.")
@@ -1538,15 +1880,21 @@ class _MultiDimMovie(AbstractPicassoMovie):
         self,
         channels: list[str],
         prompt_info: Callable[[list[str]], str] | None,
+        channel: int | None = None,
     ) -> None:
         """Store the available channels and pick one.
 
-        Defaults to the first channel when there is only one or when no
-        prompt is supplied (e.g. command-line batch processing), matching
+        When ``channel`` is given (an index), it is pinned directly and no
+        prompt is shown - used to load every channel as an independent
+        movie (see ``load_czi_all`` / ``load_lif_all``). Otherwise defaults
+        to the first channel when there is only one or when no prompt is
+        supplied (e.g. command-line batch processing), matching
         ``load_ims``.
         """
         self.channels = list(channels) if channels else ["Channel 0"]
-        if len(self.channels) > 1 and prompt_info is not None:
+        if channel is not None:
+            self._channel = channel if 0 <= channel < len(self.channels) else 0
+        elif len(self.channels) > 1 and prompt_info is not None:
             choice = prompt_info(self.channels)
             if choice in self.channels:
                 self._channel = self.channels.index(choice)
@@ -1554,7 +1902,6 @@ class _MultiDimMovie(AbstractPicassoMovie):
                 self._channel = 0
         else:
             self._channel = 0
-        print(f"Setting channel to {self.channels[self._channel]}")
 
     def _read_plane(self, index: int) -> np.ndarray:
         """Return the raw 2D image of time point ``index`` at the selected
@@ -1631,6 +1978,7 @@ class CZIMovie(_MultiDimMovie):
         self,
         path: str,
         prompt_info: Callable[[list[str]], str] | None = None,
+        channel: int | None = None,
     ):
         super().__init__()
         self.path = os.path.abspath(path)
@@ -1665,7 +2013,7 @@ class CZIMovie(_MultiDimMovie):
                 channels = [str(n) for n in names]
         except Exception:
             pass
-        self._select_channel(channels, prompt_info)
+        self._select_channel(channels, prompt_info, channel)
 
     def _read_plane(self, index: int) -> np.ndarray:
         # Pin every non-spatial axis to a single coordinate so asarray
@@ -1716,6 +2064,7 @@ class LIFMovie(_MultiDimMovie):
         self,
         path: str,
         prompt_info: Callable[[list[str]], str] | None = None,
+        channel: int | None = None,
     ):
         super().__init__()
         self.path = os.path.abspath(path)
@@ -1741,8 +2090,14 @@ class LIFMovie(_MultiDimMovie):
         self.width = int(self.sizes["X"])
         self.n_frames = int(self.sizes.get("T", 1))
         self._dtype = np.dtype(self._image.dtype)
-        # Outer (non-frame) dimensions to index when reading one plane.
-        self._outer_dims = tuple(self._image.frames.dims)
+        # Outer (non-frame) dimensions to index when reading one plane. The
+        # frame itself is the innermost Y/X (plus optional S for RGB), so those
+        # are excluded here. Derive from ``sizes`` rather than ``frames.dims``
+        # for compatibility with older ``liffile`` versions that lack the
+        # ``frames`` accessor.
+        self._outer_dims = tuple(
+            d for d in self.sizes if d not in ("Y", "X", "S")
+        )
 
         n_channels = int(self.sizes.get("C", 1))
         channels = [f"Channel {i}" for i in range(n_channels)]
@@ -1752,7 +2107,7 @@ class LIFMovie(_MultiDimMovie):
                 channels = [str(n) for n in list(names)]
         except Exception:
             pass
-        self._select_channel(channels, prompt_info)
+        self._select_channel(channels, prompt_info, channel)
 
     def _read_plane(self, index: int) -> np.ndarray:
         indices = {}
@@ -1884,11 +2239,24 @@ class TiffMap:
     single frame even for multi-gigabyte movies. For the common case of
     an uncompressed, contiguous, single-strip page the frame is read
     directly from its file offset with ``np.fromfile``. Compressed or
-    tiled pages fall back to ``page.asarray()``."""
+    tiled pages fall back to ``page.asarray()``.
 
-    def __init__(self, path: str, verbose: bool = False):
+    For speed, pages are parsed as lightweight ``tifffile`` frames
+    (``useframes``). A few OME-TIFF / ImageJ files append a stray
+    trailing IFD that disagrees with the first one (strip count or
+    width), which makes tifffile raise ``"incompatible keyframe"``;
+    ``__init__`` then falls back to full, independent per-page parsing
+    (slower to open but reads the file) and drops the stray IFD so
+    ``n_frames`` matches the real number of image planes."""
+
+    def __init__(self, path: str, verbose: bool = False, progress=None):
         """Open the TIFF file with tifffile and extract the geometry,
-        data type and per-page layout needed for lazy frame access."""
+        data type and per-page layout needed for lazy frame access.
+
+        ``progress`` is an optional ``callable(done, total)`` invoked as
+        the per-page IFD scan in ``_build_offsets`` proceeds, so the GUI
+        can show a smooth determinate bar while a single large movie is
+        opened. It is throttled to at most ~200 calls per file."""
         if verbose:
             print("Reading info from {}".format(path))
         self.path = os.path.abspath(path)
@@ -1910,12 +2278,14 @@ class TiffMap:
         else:
             self._tif.pages.useframes = True
             self._pages = self._tif.pages
-        self.n_frames = len(self._pages)
 
         page0 = self._pages[0]
         self.height = int(page0.imagelength)
         self.width = int(page0.imagewidth)
         bits = int(page0.bitspersample)
+        # A genuine movie frame has the same array shape as page 0;
+        # _build_offsets uses this to drop stray trailing IFDs.
+        self._page_shape = tuple(page0.shape)
 
         # Picasso works internally with little-endian unsigned integers; the
         # file may be big-endian, so keep both the file dtype and the target.
@@ -1931,16 +2301,196 @@ class TiffMap:
         # The fast np.fromfile path only applies to uncompressed data.
         self._uncompressed = int(page0.compression) == 1
 
-        # Precompute every frame's byte offset in a single pass over the
-        # IFDs. This keeps `get_frame` a pure seek + np.fromfile (one
-        # large sequential read per frame) and avoids a per-frame IFD
-        # parse, which is costly on network storage. self._offsets stays
-        # None for compressed / tiled / multi-strip files, which fall
-        # back to tifffile's decoder in get_frame.
-        self._offsets = None
-        if self._uncompressed:
-            offsets = []
-            for page in self._pages:
+        # ImageJ writes an uncompressed multi-plane stack as a single IFD
+        # followed by every other plane's pixel data laid out
+        # contiguously, recording the plane count in the ImageJ metadata
+        # rather than as separate pages. tifffile then exposes only one
+        # page, so without this the movie would be counted as a single
+        # frame. When detected, _build_offsets derives every frame's
+        # offset arithmetically from the first plane (see
+        # _imagej_contiguous_count).
+        self._imagej_planes = self._imagej_contiguous_count(page0)
+
+        # Precompute every frame's byte offset and the true frame count
+        # in a single pass over the IFDs. The offset table keeps
+        # `get_frame` a pure seek + np.fromfile (one large sequential
+        # read per frame) and avoids a per-frame IFD parse, which is
+        # costly on network storage; it stays None for compressed /
+        # tiled / multi-strip files, which fall back to tifffile's
+        # decoder in get_frame.
+        #
+        # Building this touches pages 1..N as lightweight TiffFrames,
+        # each validated against page 0 (the keyframe). Some OME-TIFF /
+        # ImageJ files append a stray trailing IFD whose strip count or
+        # width disagrees with page 0, which makes tifffile raise
+        # "incompatible keyframe". In that case re-parse every IFD as a
+        # full, independent TiffPage (no keyframe comparison) and drop
+        # the stray IFD from the frame count - slower to open but reads
+        # the file with the right number of frames, as the pre-tifffile
+        # reader did.
+        try:
+            self._offsets, self.n_frames = self._build_offsets(progress)
+        except RuntimeError:
+            # Flipping useframes in place is cache-safe (Picasso never
+            # enables tifffile's page cache, so no stale TiffFrames are
+            # held) and keeps the already-discovered IFD offset list. The
+            # LSM branch above uses full TiffPages and never raises here.
+            self._tif.pages.useframes = False
+            self._pages = self._tif.pages
+            self._offsets, self.n_frames = self._build_offsets(progress)
+
+        # Per-thread binary handles for the fast offset-based read path.
+        # A single shared handle forces every concurrent reader to
+        # serialize on one file position (seek + read is stateful), so on
+        # network storage the per-frame round-trips cannot overlap. Giving
+        # each thread its own handle lets the OS / network stack keep
+        # several reads in flight at once, which hides per-frame latency.
+        # The lock only guards the slow tifffile-decode fallback used for
+        # compressed / tiled pages, which is not reentrant.
+        self._local = threading.local()
+        self._open_handles = []
+        self._handles_lock = threading.Lock()
+        self._decode_lock = threading.Lock()
+
+    # Read frames concurrently without the shared identify lock; each
+    # thread uses its own file handle (see ``_handle``).
+    supports_concurrent_reads = True
+
+    def _handle(self):
+        """Return this thread's private binary file handle, opening one
+        on first use. Per-thread handles let concurrent ``get_frame``
+        calls issue overlapping seek + read requests instead of
+        contending on a single shared file position."""
+        handle = getattr(self._local, "file", None)
+        if handle is None:
+            handle = open(self.path, "rb")
+            self._local.file = handle
+            with self._handles_lock:
+                self._open_handles.append(handle)
+        return handle
+
+    def _imagej_contiguous_count(self, page0) -> int | None:
+        """Return the plane count of an ImageJ contiguous stack, else None.
+
+        ImageJ stores an uncompressed multi-plane stack as one IFD whose
+        pixel data is followed by every other plane's data back-to-back
+        in the file, recording the plane count in the ImageJ metadata
+        instead of as separate pages. tifffile then reports a single
+        page, so the frames would otherwise be miscounted as 1. The true
+        plane count comes from ``tif.series[0]`` (parsed from the small
+        ImageJ ``ImageDescription``, not the potentially huge per-frame
+        ``Labels`` block). Every non-YX axis (z / t / channel) is
+        flattened into the frame axis, matching how a page-based reader
+        would see the planes.
+
+        Returns None - leaving the normal per-page logic in charge - for
+        anything that is not an uncompressed, single-strip, single-page
+        ImageJ stack, so genuine single-plane images and per-page stacks
+        are unaffected.
+        """
+        if not getattr(self._tif, "is_imagej", False):
+            return None
+        if len(self._pages) != 1 or not self._uncompressed:
+            return None
+        # Fast contiguous reads need exactly one strip of the expected size.
+        if (
+            len(page0.dataoffsets) != 1
+            or int(page0.databytecounts[0]) != self._frame_nbytes
+        ):
+            return None
+        try:
+            shape = tuple(int(d) for d in self._tif.series[0].shape)
+        except Exception:
+            return None
+        if len(shape) < 3 or shape[-2:] != self._page_shape:
+            return None
+        n = 1
+        for dim in shape[:-2]:
+            n *= dim
+        return n if n > 1 else None
+
+    def _build_offsets(self, progress=None) -> tuple[list[int] | None, int]:
+        """Return ``(offsets, n_frames)`` for the movie.
+
+        ``n_frames`` is the number of genuine image planes: a stray
+        trailing IFD whose array shape differs from page 0 (some
+        MicroManager / ImageJ OME-TIFFs append one - the same mismatch
+        that makes tifffile raise "incompatible keyframe") is dropped, so
+        the count matches the data as the pre-tifffile reader did.
+
+        ``offsets`` is each frame's byte offset for the fast np.fromfile
+        path, or ``None`` when any frame is compressed / tiled /
+        multi-strip (those are decoded by tifffile in get_frame).
+
+        Iterating the pages creates a TiffFrame per page validated
+        against the keyframe, so this is also where the "incompatible
+        keyframe" RuntimeError surfaces; __init__ catches it and retries
+        with full-page parsing, where the stray IFD has its real shape
+        and is dropped below."""
+        n_pages = len(self._pages)
+
+        # Throttle progress reports to at most ~200 per file so a
+        # multi-thousand-frame movie does not flood the GUI event queue
+        # with one cross-thread signal per page.
+        step = max(1, n_pages // 200)
+
+        def report(done: int) -> None:
+            if progress is not None and (done % step == 0 or done == n_pages):
+                progress(done, n_pages)
+
+        if self._imagej_planes is not None:
+            # ImageJ contiguous stack: one IFD, then every plane's data
+            # laid out back-to-back from the first plane's offset. Derive
+            # each frame's offset arithmetically instead of from
+            # (non-existent) per-page IFDs. Guard against a truncated file
+            # by keeping only the planes that physically fit.
+            base = int(self._pages[0].dataoffsets[0])
+            n = self._imagej_planes
+            try:
+                file_size = os.path.getsize(self.path)
+                fit = (file_size - base) // self._frame_nbytes
+                if fit < n:
+                    n = max(fit, 0)
+            except OSError:
+                pass
+            offsets = [base + i * self._frame_nbytes for i in range(n)]
+            if progress is not None:
+                progress(n, n)
+            return offsets, n
+
+        if not self._uncompressed:
+            # Compressed / tiled: no fast offset path. In the lightweight
+            # frame mode every frame reports page 0's shape, so a stray
+            # IFD cannot be told apart without reading every IFD (costly
+            # on network storage). Probe the first and last extra pages
+            # so an incompatible one triggers the full-page fallback;
+            # with full pages (after that fallback, or for LSM) the
+            # shapes are real, so drop trailing mismatched IFDs.
+            if (not self._tif.is_lsm) and self._tif.pages.useframes:
+                if n_pages > 1:
+                    _ = self._pages[1].dataoffsets
+                    _ = self._pages[n_pages - 1].dataoffsets
+                report(n_pages)
+                return None, n_pages
+            n_frames = 0
+            for i, page in enumerate(self._pages):
+                if tuple(page.shape) != self._page_shape:
+                    break
+                n_frames += 1
+                report(i + 1)
+            return None, n_frames
+
+        # Uncompressed: one pass collects each frame's byte offset and
+        # stops at the first IFD whose shape differs from page 0.
+        offsets = []
+        n_frames = 0
+        fast = True
+        for i, page in enumerate(self._pages):
+            if tuple(page.shape) != self._page_shape:
+                break
+            n_frames += 1
+            report(i + 1)
+            if fast:
                 data_offsets = page.dataoffsets
                 byte_counts = page.databytecounts
                 if (
@@ -1949,13 +2499,9 @@ class TiffMap:
                 ):
                     offsets.append(int(data_offsets[0]))
                 else:
-                    offsets = None
-                    break
-            self._offsets = offsets
-
-        # A persistent binary handle for the fast offset-based read path.
-        self.file = open(self.path, "rb")
-        self.lock = threading.Lock()
+                    # Valid frame, but not eligible for the fast path.
+                    fast = False
+        return (offsets if fast else None), n_frames
 
     def __enter__(self):
         return self
@@ -1964,40 +2510,40 @@ class TiffMap:
         self.close()
 
     def __getitem__(self, it):  # noqa: C901
-        with self.lock:  # for reading frames from multiple threads
-            if isinstance(it, tuple):
-                if isinstance(it, int) or np.issubdtype(it[0], np.integer):
-                    return self[it[0]][it[1:]]
-                elif isinstance(it[0], slice):
-                    indices = range(*it[0].indices(self.n_frames))
-                    stack = np.array([self.get_frame(_) for _ in indices])
-                    if len(indices) == 0:
-                        return stack
-                    else:
-                        if len(it) == 2:
-                            return stack[:, it[1]]
-                        elif len(it) == 3:
-                            return stack[:, it[1], it[2]]
-                        else:
-                            raise IndexError
-                elif it[0] == Ellipsis:
-                    stack = self[it[0]]
+        # No shared lock here: get_frame is thread-safe on its own (each
+        # thread reads through its private handle, and the compressed
+        # fallback takes _decode_lock), so concurrent reads can overlap.
+        if isinstance(it, tuple):
+            if isinstance(it, int) or np.issubdtype(it[0], np.integer):
+                return self[it[0]][it[1:]]
+            elif isinstance(it[0], slice):
+                indices = range(*it[0].indices(self.n_frames))
+                stack = np.array([self.get_frame(_) for _ in indices])
+                if len(indices) == 0:
+                    return stack
+                else:
                     if len(it) == 2:
                         return stack[:, it[1]]
                     elif len(it) == 3:
                         return stack[:, it[1], it[2]]
                     else:
                         raise IndexError
-            elif isinstance(it, slice):
-                indices = range(*it.indices(self.n_frames))
-                return np.array([self.get_frame(_) for _ in indices])
-            elif it == Ellipsis:
-                return np.array(
-                    [self.get_frame(_) for _ in range(self.n_frames)]
-                )
-            elif isinstance(it, int) or np.issubdtype(it, np.integer):
-                return self.get_frame(it)
-            raise TypeError
+            elif it[0] == Ellipsis:
+                stack = self[it[0]]
+                if len(it) == 2:
+                    return stack[:, it[1]]
+                elif len(it) == 3:
+                    return stack[:, it[1], it[2]]
+                else:
+                    raise IndexError
+        elif isinstance(it, slice):
+            indices = range(*it.indices(self.n_frames))
+            return np.array([self.get_frame(_) for _ in indices])
+        elif it == Ellipsis:
+            return np.array([self.get_frame(_) for _ in range(self.n_frames)])
+        elif isinstance(it, int) or np.issubdtype(it, np.integer):
+            return self.get_frame(it)
+        raise TypeError
 
     def __iter__(self):
         for i in range(self.n_frames):
@@ -2038,23 +2584,33 @@ class TiffMap:
         large sequential read, no decode overhead and no per-frame IFD
         parse); all other layouts fall back to ``tifffile``'s decoder."""
         if self._offsets is not None:
-            # Fast path: pure seek + read, no tifffile access per frame.
-            self.file.seek(self._offsets[index])
-            frame = np.fromfile(
-                self.file,
-                dtype=self._tif_dtype,
-                count=self.frame_size,
-            ).reshape(self.frame_shape)
+            # Fast path: pure seek + read on this thread's own handle, no
+            # tifffile access and no shared lock, so reads from different
+            # threads overlap instead of serializing.
+            handle = self._handle()
+            handle.seek(self._offsets[index])
+            # ``np.fromfile`` rejects a Python file object on some
+            # numpy/Windows builds ("expected str, bytes or os.PathLike
+            # object, not BufferedReader"); read into a preallocated
+            # array instead, which works with any binary handle.
+            frame = np.empty(self.frame_size, dtype=self._tif_dtype)
+            handle.readinto(frame)
+            frame = frame.reshape(self.frame_shape)
         else:
             # Compressed / tiled / multi-strip pages: let tifffile decode
             # this single page (still lazy - other frames stay on disk).
-            frame = np.asarray(self._pages[index].asarray())
+            # tifffile's reader is not reentrant, so serialize the decode.
+            with self._decode_lock:
+                frame = np.asarray(self._pages[index].asarray())
         # Downstream code expects little-endian unsigned integers; astype
         # is a no-op (no copy) when the data is already in that order.
         return frame.astype(self.dtype, copy=False)
 
     def close(self) -> None:
-        self.file.close()
+        with self._handles_lock:
+            for handle in self._open_handles:
+                handle.close()
+            self._open_handles = []
         self._tif.close()
 
     def tofile(self, file_handle, byte_order=None):
@@ -2118,9 +2674,29 @@ class STKMovie(AbstractPicassoMovie):
         self.frame_shape = (self.height, self.width)
         self.shape = (self.n_frames, self.height, self.width)
 
-        # Open a persistent binary file handle for lazy frame reading.
-        self._file = open(self.path, "rb")
-        self._lock = threading.Lock()
+        # Per-thread binary handles for lazy frame reading. A shared
+        # handle would serialize concurrent reads on one file position;
+        # a private handle per thread lets reads overlap, which hides
+        # per-frame latency on network storage. See ``TiffMap._handle``.
+        self._local = threading.local()
+        self._open_handles = []
+        self._handles_lock = threading.Lock()
+
+    # Read frames concurrently without the shared identify lock; each
+    # thread uses its own file handle (see ``_handle``).
+    supports_concurrent_reads = True
+
+    def _handle(self):
+        """Return this thread's private binary file handle, opening one
+        on first use, so concurrent ``get_frame`` calls do not contend
+        on a single shared file position."""
+        handle = getattr(self._local, "file", None)
+        if handle is None:
+            handle = open(self.path, "rb")
+            self._local.file = handle
+            with self._handles_lock:
+                self._open_handles.append(handle)
+        return handle
 
     # ------------------------------------------------------------------
     # AbstractPicassoMovie interface
@@ -2133,39 +2709,38 @@ class STKMovie(AbstractPicassoMovie):
         self.close()
 
     def __getitem__(self, it):  # noqa: C901
-        with self._lock:
-            if isinstance(it, tuple):
-                if isinstance(it[0], int) or np.issubdtype(it[0], np.integer):
-                    return self[it[0]][it[1:]]
-                elif isinstance(it[0], slice):
-                    indices = range(*it[0].indices(self.n_frames))
-                    stack = np.array([self.get_frame(_) for _ in indices])
-                    if len(indices) == 0:
-                        return stack
-                    if len(it) == 2:
-                        return stack[:, it[1]]
-                    elif len(it) == 3:
-                        return stack[:, it[1], it[2]]
-                    else:
-                        raise IndexError
-                elif it[0] == Ellipsis:
-                    stack = self[it[0]]
-                    if len(it) == 2:
-                        return stack[:, it[1]]
-                    elif len(it) == 3:
-                        return stack[:, it[1], it[2]]
-                    else:
-                        raise IndexError
-            elif isinstance(it, slice):
-                indices = range(*it.indices(self.n_frames))
-                return np.array([self.get_frame(_) for _ in indices])
-            elif it == Ellipsis:
-                return np.array(
-                    [self.get_frame(_) for _ in range(self.n_frames)]
-                )
-            elif isinstance(it, int) or np.issubdtype(it, np.integer):
-                return self.get_frame(it)
-            raise TypeError
+        # No shared lock: get_frame reads through this thread's private
+        # handle, so concurrent reads overlap instead of serializing.
+        if isinstance(it, tuple):
+            if isinstance(it[0], int) or np.issubdtype(it[0], np.integer):
+                return self[it[0]][it[1:]]
+            elif isinstance(it[0], slice):
+                indices = range(*it[0].indices(self.n_frames))
+                stack = np.array([self.get_frame(_) for _ in indices])
+                if len(indices) == 0:
+                    return stack
+                if len(it) == 2:
+                    return stack[:, it[1]]
+                elif len(it) == 3:
+                    return stack[:, it[1], it[2]]
+                else:
+                    raise IndexError
+            elif it[0] == Ellipsis:
+                stack = self[it[0]]
+                if len(it) == 2:
+                    return stack[:, it[1]]
+                elif len(it) == 3:
+                    return stack[:, it[1], it[2]]
+                else:
+                    raise IndexError
+        elif isinstance(it, slice):
+            indices = range(*it.indices(self.n_frames))
+            return np.array([self.get_frame(_) for _ in indices])
+        elif it == Ellipsis:
+            return np.array([self.get_frame(_) for _ in range(self.n_frames)])
+        elif isinstance(it, int) or np.issubdtype(it, np.integer):
+            return self.get_frame(it)
+        raise TypeError
 
     def __iter__(self):
         for i in range(self.n_frames):
@@ -2223,18 +2798,24 @@ class STKMovie(AbstractPicassoMovie):
                 f"{self.n_frames} frames."
             )
         offset = self._first_data_offset + index * self._frame_bytes
-        self._file.seek(offset)
-        frame = np.fromfile(
-            self._file,
-            dtype=self._tif_dtype,
-            count=self.height * self.width,
-        ).reshape(self.frame_shape)
+        handle = self._handle()
+        handle.seek(offset)
+        # ``np.fromfile`` rejects a Python file object on some
+        # numpy/Windows builds ("expected str, bytes or os.PathLike
+        # object, not BufferedReader"); read into a preallocated array
+        # instead, which works with any binary handle.
+        frame = np.empty(self.height * self.width, dtype=self._tif_dtype)
+        handle.readinto(frame)
+        frame = frame.reshape(self.frame_shape)
         if self._byte_order == ">":
             frame = frame.byteswap().view(self._dtype)
         return frame
 
     def close(self) -> None:
-        self._file.close()
+        with self._handles_lock:
+            for handle in self._open_handles:
+                handle.close()
+            self._open_handles = []
 
     def tofile(self, file_handle, byte_order=None):
         do_byteswap = byte_order != self._byte_order
@@ -2294,6 +2875,10 @@ class STKMultiMovie(AbstractPicassoMovie):
         self.height = self.maps[0].height
         self.width = self.maps[0].width
         self.shape = (self.n_frames, self.height, self.width)
+
+    # Reads dispatch to the underlying STKMovie maps, which each manage
+    # their own per-thread handles, so concurrent reads are safe.
+    supports_concurrent_reads = True
 
     def __enter__(self):
         return self
@@ -2387,6 +2972,7 @@ class TiffMultiMap(AbstractPicassoMovie):
         path: str,
         memmap_frames: bool = False,
         verbose: bool = False,
+        progress=None,
     ):
         super().__init__()
         self.path = os.path.abspath(path)
@@ -2411,7 +2997,28 @@ class TiffMultiMap(AbstractPicassoMovie):
         self.paths = [self.path] + [
             path for index, path in sorted(paths_indices)
         ]
-        self.maps = [TiffMap(path, verbose=verbose) for path in self.paths]
+        # A multi-file OME movie is opened as several TiffMaps. Give each
+        # an equal slice of the composite progress range (weighting by
+        # frame count is not possible before the maps are built) and
+        # rescale its per-page reports into the overall bar. SCALE keeps
+        # a single-file movie animating smoothly across 0..SCALE.
+        n_maps = len(self.paths)
+        SCALE = 1000
+
+        def map_progress(j):
+            if progress is None:
+                return None
+
+            def cb(done, total):
+                if total > 0:
+                    progress(int((j + done / total) * SCALE), n_maps * SCALE)
+
+            return cb
+
+        self.maps = [
+            TiffMap(path, verbose=verbose, progress=map_progress(j))
+            for j, path in enumerate(self.paths)
+        ]
         self.n_maps = len(self.maps)
         self.n_frames_per_map = [_.n_frames for _ in self.maps]
         self.n_frames = sum(self.n_frames_per_map)
@@ -2420,6 +3027,10 @@ class TiffMultiMap(AbstractPicassoMovie):
         self.height = self.maps[0].height
         self.width = self.maps[0].width
         self.shape = (self.n_frames, self.height, self.width)
+
+    # Reads dispatch to the underlying TiffMap maps, which each manage
+    # their own per-thread handles, so concurrent reads are safe.
+    supports_concurrent_reads = True
 
     def __enter__(self):
         return self
@@ -2587,6 +3198,167 @@ class TiffMultiMap(AbstractPicassoMovie):
     def tofile(self, file_handle, byte_order=None):
         for map in self.maps:
             map.tofile(file_handle, byte_order)
+
+
+# MicroManager can save an acquisition as one single-page TIFF per camera
+# frame ("separate image files" / "Image files" mode) inside a folder,
+# next to a ``metadata.txt``. The two naming schemes are:
+#   * MM 2.0: img_channel000_position000_time000000000_z000.tif
+#   * MM 1.4: img_000000000_Default_000.tif  (img_<frame>_<channel>_<z>)
+# The frame axis is the time index (MM 2.0) or the leading index (MM
+# 1.4). Channel, position and z are held fixed (they are part of the
+# prefix/suffix below) so a single 2-D time series is assembled and
+# multi-channel / multi-position sets are never interleaved into one
+# movie.
+_MM_SEPARATE_RES = (
+    re.compile(
+        r"^(?P<prefix>img_channel\d+_position\d+_time)\d+"
+        r"(?P<suffix>_z\d+\.tif)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?P<prefix>img_)\d+(?P<suffix>_.+_\d+\.tif)$",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _mm_separate_files(path: str) -> list[str] | None:
+    """Return the ordered sibling frames of a MicroManager "separate
+    image files" acquisition, or ``None`` if ``path`` is not part of one.
+
+    Given one ``img_*.tif`` file, discover every sibling in the same
+    folder that differs only in its frame (time) index - channel,
+    position and z are held at the selected file's values - and return
+    the paths sorted by that index. Returns ``None`` for a name that does
+    not match the MicroManager separate-file convention, or when only a
+    single matching file is present (a lone TIFF, opened as usual).
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    name = os.path.basename(path)
+    for regex in _MM_SEPARATE_RES:
+        m = regex.match(name)
+        if m is None:
+            continue
+        # Siblings share the fixed prefix + suffix and vary only in the
+        # frame index captured between them.
+        sibling_re = re.compile(
+            re.escape(m.group("prefix"))
+            + r"(\d+)"
+            + re.escape(m.group("suffix")),
+            re.IGNORECASE,
+        )
+        indexed = []
+        for entry in os.scandir(directory):
+            if not entry.is_file():
+                continue
+            sm = sibling_re.fullmatch(entry.name)
+            if sm is not None:
+                indexed.append((int(sm.group(1)), entry.path))
+        if len(indexed) <= 1:
+            # A lone file is not a series; open it as an ordinary TIFF.
+            return None
+        indexed.sort()
+        return [p for _, p in indexed]
+    return None
+
+
+class MMSeparateTiffMovie(TiffMultiMap):
+    """Read a MicroManager acquisition saved as *separate image files*.
+
+    In this mode every camera frame is written to its own single-page
+    TIFF inside one folder (see :func:`_mm_separate_files` for the naming
+    schemes), so a long movie can be tens of thousands of files. Unlike
+    ``TiffMultiMap`` - which opens a ``TiffMap`` per file up front - this
+    class reads geometry, dtype and metadata from the first frame only
+    and takes the frame count from the number of files, so opening the
+    movie stays O(1) instead of O(frames). Every other frame's file is
+    opened lazily when that frame is first read and closed again right
+    away, so the movie holds at most one extra file handle open and never
+    exhausts the OS descriptor limit. Frame reads are independent, so
+    they are safe to run concurrently.
+
+    Each file is assumed to hold one plane of identical shape and dtype
+    (always true for this MicroManager mode); the frame count comes from
+    the file list, not from re-parsing each file. The array-like access,
+    iteration and ``camera_parameters`` are inherited from
+    ``TiffMultiMap``.
+    """
+
+    def __init__(self, paths: list[str], verbose: bool = False):
+        # Deliberately skip TiffMultiMap.__init__ (which would eagerly
+        # open a TiffMap per file); build the composite geometry from the
+        # first frame only.
+        AbstractPicassoMovie.__init__(self)
+        if not paths:
+            raise ValueError("No TIFF files given for a separate-files movie.")
+        self.paths = list(paths)
+        self.path = os.path.abspath(self.paths[0])
+        self.dir = os.path.dirname(self.path)
+        self.n_frames = len(self.paths)
+        # Read geometry, dtype and metadata from the first frame only.
+        self._first = TiffMap(self.path, verbose=verbose)
+        self._dtype = self._first.dtype
+        self.height = self._first.height
+        self.width = self._first.width
+        self.frame_shape = (self.height, self.width)
+        self.shape = (self.n_frames, self.height, self.width)
+
+    # Each read opens its own file handle, so concurrent reads are safe.
+    supports_concurrent_reads = True
+
+    def get_frame(self, index: int) -> lib.IntArray2D:
+        if index < 0:
+            index += self.n_frames
+        if not 0 <= index < self.n_frames:
+            raise IndexError(
+                f"Frame {index} out of range for {self.n_frames} frames."
+            )
+        if index == 0:
+            # Frame 0's file stays open for metadata/geometry; reuse it.
+            return self._first.get_frame(0)
+        # Open every other file lazily and close it right away so the
+        # movie never holds thousands of file handles at once.
+        with TiffMap(self.paths[index]) as tif:
+            return tif.get_frame(0)
+
+    def info(self):
+        info = self._first.info()
+        info["Frames"] = self.n_frames
+        self.meta = info
+        return info
+
+    def close(self):
+        self._first.close()
+
+    def tofile(self, file_handle, byte_order=None):
+        self._first.tofile(file_handle, byte_order)
+        for path in self.paths[1:]:
+            with TiffMap(path) as tif:
+                tif.tofile(file_handle, byte_order)
+
+
+def find_mm_separate_first(directory: str) -> str | None:
+    """Return the first-frame path of a MicroManager "separate image
+    files" acquisition inside ``directory``, or ``None`` if the folder
+    holds no such sequence.
+
+    Passing the returned path to :func:`load_tif` (or :func:`load_movie`)
+    assembles the whole folder into a single movie, because those loaders
+    detect the separate-files layout via :func:`_mm_separate_files`.
+    """
+    try:
+        names = sorted(
+            entry.name for entry in os.scandir(directory) if entry.is_file()
+        )
+    except OSError:
+        return None
+    for name in names:
+        if any(regex.match(name) for regex in _MM_SEPARATE_RES):
+            candidate = os.path.join(directory, name)
+            if _mm_separate_files(candidate) is not None:
+                return candidate
+    return None
 
 
 def to_raw_combined(basename: str, paths: list[str]) -> None:
@@ -2931,13 +3703,16 @@ def export_txt_imagej(
         other export functions.
     """
     loctxt = locs[["frame", "x", "y"]]
-    np.savetxt(
-        path,
-        loctxt.to_records(index=False),
-        fmt=["%.1i", "%.5f", "%.5f"],
-        newline="\r\n",
-        delimiter="   ",
-    )
+    # Binary handle, as in the other .txt exporters: a text-mode handle would
+    # translate the newline of the explicit "\r\n" as well, writing "\r\r\n".
+    with open(path, "wb") as f:
+        np.savetxt(
+            f,
+            loctxt.to_records(index=False),
+            fmt=["%.1i", "%.5f", "%.5f"],
+            newline="\r\n",
+            delimiter="   ",
+        )
 
 
 def export_txt_nis(path: str, locs: pd.DataFrame, info: list[dict]) -> None:
@@ -3272,3 +4047,267 @@ def import_ts(path: str, pixelsize: float) -> tuple[pd.DataFrame, list[dict]]:
     out_path = base + "_locs.hdf5"
     save_locs(out_path, locs, [img_info])
     return locs, [img_info]
+
+
+# SMAP (https://github.com/jries/SMAP) stores localizations in a
+# proprietary ``_sml.mat`` MATLAB file. The localization data lives in
+# the ``saveloc.loc`` struct of column arrays (fields such as ``xnm``,
+# ``ynm``, ``znm``, ``frame``, ``phot``, ``bg``, ``locprecnm``,
+# ``locprecznm``, ``PSFxnm``). Coordinates and precisions are in nm and
+# frames are 1-based. The unit mapping below mirrors SMAP's own
+# Picasso exporter (``export_picasso_hdf5.m`` / ``savepicasso.m``).
+_SMAP_SPLIT_MSG = (
+    "This appears to be a SMAP split '_sml_p*.mat' file. Please re-save "
+    "it in SMAP as a single file (not split into parts) and try again."
+)
+
+
+def _read_smap_loc_hdf5(path: str) -> dict:
+    """Read the ``saveloc.loc`` struct from a MATLAB v7.3 (HDF5) SMAP
+    file using h5py (scipy cannot read v7.3 files)."""
+    with h5py.File(path, "r") as f:
+        if any(key in f for key in ("lds", "partnames", "S")):
+            raise ValueError(_SMAP_SPLIT_MSG)
+        if "saveloc" in f and "loc" in f["saveloc"]:
+            loc_group = f["saveloc"]["loc"]
+        elif "loc" in f:
+            loc_group = f["loc"]
+        else:
+            raise ValueError(
+                f"Could not find SMAP localizations ('saveloc.loc') in "
+                f"{path}. Is this a SMAP _sml.mat file?"
+            )
+        loc = {}
+        for field in loc_group.keys():
+            dataset = loc_group[field]
+            if not isinstance(dataset, h5py.Dataset):
+                continue
+            value = np.atleast_1d(np.asarray(dataset).ravel())
+            # Skip non-numeric fields (e.g. cell arrays stored as
+            # HDF5 object references).
+            if value.dtype.kind not in "fiu":
+                continue
+            loc[field] = value
+    return loc
+
+
+def _read_smap_loc(path: str) -> dict:
+    """Read the localization struct (``saveloc.loc``) from a SMAP
+    ``_sml.mat`` file as a dictionary mapping field names to 1-D numpy
+    arrays.
+
+    Supports both MATLAB v7/v5 (read with scipy) and v7.3/HDF5 (read
+    with h5py) single-file saves. SMAP's split ``_sml_p*.mat`` parts
+    format is detected and rejected with a clear message.
+
+    Parameters
+    ----------
+    path : str
+        Path to the SMAP ``_sml.mat`` file.
+
+    Returns
+    -------
+    loc : dict
+        Mapping of SMAP field name (e.g. ``"xnm"``) to a 1-D array.
+    """
+    from scipy.io import loadmat
+
+    # MATLAB v7.3 files are HDF5-based (with an HDF5 user block) and must
+    # be read with h5py; v7/v5 files are read with scipy.
+    if h5py.is_hdf5(path):
+        return _read_smap_loc_hdf5(path)
+
+    mat = loadmat(path, struct_as_record=False, squeeze_me=True)
+    if any(key in mat for key in ("lds", "partnames", "S")):
+        raise ValueError(_SMAP_SPLIT_MSG)
+    if "saveloc" in mat:
+        loc_struct = getattr(mat["saveloc"], "loc", None)
+    elif "loc" in mat:
+        loc_struct = mat["loc"]
+    else:
+        loc_struct = None
+    if loc_struct is None or not hasattr(loc_struct, "_fieldnames"):
+        raise ValueError(
+            f"Could not find SMAP localizations ('saveloc.loc') in "
+            f"{path}. Is this a SMAP _sml.mat file?"
+        )
+    loc = {}
+    for field in loc_struct._fieldnames:
+        value = np.atleast_1d(np.asarray(getattr(loc_struct, field)).ravel())
+        if value.dtype.kind not in "fiu":
+            continue
+        loc[field] = value
+    return loc
+
+
+def import_smap(
+    path: str, pixelsize: float
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Import localization data from a SMAP ``_sml.mat`` file.
+
+    Parameters
+    ----------
+    path : str
+        The path to the SMAP ``_sml.mat`` file.
+    pixelsize : float
+        Camera pixel size in nm. Picasso saves xy coordinates in units
+        of camera pixels, while SMAP stores them in nm.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        The localization data imported from the file.
+    info : list of dicts
+        Minimal metadata information.
+    """
+    loc = _read_smap_loc(path)
+    missing = [c for c in ("xnm", "ynm", "frame") if c not in loc]
+    if missing:
+        raise ValueError(
+            f"SMAP file {path} is missing required fields: {missing}. "
+            f"Found fields: {list(loc.keys())}."
+        )
+    n = len(loc["xnm"])
+
+    # SMAP frames are 1-based; make them start at zero (robust to any
+    # offset, mirroring import_ts).
+    frames = loc["frame"].astype(np.int64)
+    frames = frames - np.min(frames)
+    x = loc["xnm"] / pixelsize
+    y = loc["ynm"] / pixelsize
+
+    data = {
+        "frame": frames.astype(np.uint32),
+        "x": x.astype(np.float32),
+        "y": y.astype(np.float32),
+    }
+    # z is stored in nm in both SMAP and Picasso.
+    if "znm" in loc:
+        data["z"] = loc["znm"].astype(np.float32)
+
+    photons = loc["phot"] if "phot" in loc else np.ones(n)
+    data["photons"] = np.broadcast_to(photons, (n,)).astype(np.float32)
+
+    # PSF widths (nm -> px); use a neutral 1 px default when absent.
+    if "PSFxnm" in loc:
+        sx = loc["PSFxnm"] / pixelsize
+    else:
+        sx = np.ones(n)
+    if "PSFynm" in loc:
+        sy = loc["PSFynm"] / pixelsize
+    elif "PSFxnm" in loc:
+        sy = sx
+    else:
+        sy = np.ones(n)
+    data["sx"] = np.asarray(sx, dtype=np.float32)
+    data["sy"] = np.asarray(sy, dtype=np.float32)
+
+    bg = loc["bg"] if "bg" in loc else np.zeros(n)
+    data["bg"] = np.broadcast_to(bg, (n,)).astype(np.float32)
+
+    # Localization precision (nm -> px). SMAP stores a single combined
+    # value (locprecnm); some files use separate locprecxnm/locprecynm.
+    if "locprecnm" in loc:
+        lpx = loc["locprecnm"] / pixelsize
+        lpy = loc["locprecnm"] / pixelsize
+    elif "locprecxnm" in loc:
+        lpx = loc["locprecxnm"] / pixelsize
+        lpy = loc.get("locprecynm", loc["locprecxnm"]) / pixelsize
+    else:
+        lpx = np.zeros(n)
+        lpy = np.zeros(n)
+    data["lpx"] = np.asarray(lpx, dtype=np.float32)
+    data["lpy"] = np.asarray(lpy, dtype=np.float32)
+
+    if "znm" in loc and "locprecznm" in loc:
+        data["lpz"] = loc["locprecznm"].astype(np.float32)
+
+    locs = pd.DataFrame(data)
+    locs.sort_values(kind="quicksort", by="frame", inplace=True)
+
+    img_info = {}
+    img_info["Generated by"] = f"Picasso v{__version__} smap2hdf"
+    img_info["Frames"] = int(np.max(frames)) + 1
+    img_info["Height"] = int(np.ceil(np.max(y)))
+    img_info["Width"] = int(np.ceil(np.max(x)))
+    img_info["Pixelsize"] = float(pixelsize)
+
+    return locs, [img_info]
+
+
+def export_smap(path: str, locs: pd.DataFrame, info: list[dict]) -> None:
+    """Export localizations as a SMAP ``_sml.mat`` file.
+
+    The file is written as a MATLAB-5 (``-v7``-compatible) file that
+    SMAP's loader reads natively: it contains the top-level ``saveloc``
+    struct (with ``loc`` and ``info`` sub-structs) and a ``fileformat``
+    struct. SMAP recognizes the file as localizations via the ``_sml``
+    suffix, which is enforced here.
+
+    Parameters
+    ----------
+    path : str
+        The path where the .mat file will be saved. The ``_sml.mat``
+        suffix is enforced.
+    locs : pd.DataFrame
+        The localization data to be exported.
+    info : list of dicts
+        Metadata dictionaries.
+    """
+    from scipy.io import savemat
+
+    pixelsize = lib.get_from_metadata(info, "Pixelsize", raise_error=True)
+
+    # SMAP recognizes a localization file by the '_sml' suffix.
+    base, ext = os.path.splitext(path)
+    if not base.endswith("_sml"):
+        base = base + "_sml"
+    path = base + ".mat"
+
+    n = len(locs)
+
+    def column(name: str, default: float = 0.0) -> np.ndarray:
+        """Return a (N, 1) float64 column for a Picasso field, or a
+        default-filled column if the field is absent."""
+        if name in locs.columns:
+            values = locs[name].to_numpy(dtype=np.float64)
+        else:
+            values = np.full(n, default, dtype=np.float64)
+        return values.reshape(-1, 1)
+
+    loc = {
+        # SMAP frames are 1-based.
+        "frame": column("frame") + 1,
+        "xnm": column("x") * pixelsize,
+        "ynm": column("y") * pixelsize,
+        "phot": column("photons"),
+        "bg": column("bg"),
+        "locprecnm": (column("lpx") + column("lpy")) / 2 * pixelsize,
+        "PSFxnm": column("sx") * pixelsize,
+        "PSFynm": column("sy") * pixelsize,
+        "channel": np.zeros((n, 1)),
+    }
+    if "z" in locs.columns:
+        loc["znm"] = column("z")  # already in nm
+        if "lpz" in locs.columns:
+            loc["locprecznm"] = column("lpz")  # already in nm
+
+    width = lib.get_from_metadata(info, "Width")
+    height = lib.get_from_metadata(info, "Height")
+    if width is None:
+        width = int(np.ceil(locs["x"].max()))
+    if height is None:
+        height = int(np.ceil(locs["y"].max()))
+    px_um = float(pixelsize) / 1000.0
+    smap_info = {
+        "Width": float(width),
+        "Height": float(height),
+        "roi": np.array([[0.0, 0.0, float(width), float(height)]]),
+        "cam_pixelsize_um": np.array([[px_um, px_um]]),
+    }
+
+    out = {
+        "saveloc": {"loc": loc, "info": smap_info},
+        "fileformat": {"name": "sml"},
+    }
+    savemat(path, out, do_compression=True)

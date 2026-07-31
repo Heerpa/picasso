@@ -90,6 +90,17 @@ class ModelID:
     SPLINE_3D = 10
     SPLINE_3D_MULTICHANNEL = 11
     SPLINE_3D_PHASE_MULTICHANNEL = 12
+    # "link-XYZ" sharing: x, y, z are global, photons and background are
+    # free per channel. Params: [x, y, z, N_0..N_{C-1}, bg_0..bg_{C-1}],
+    # i.e. n_parameters = 3 + 2 * C. Custom models added to Gpufit.dll.
+    # Gpufit fixes n_parameters per ModelID at compile time, so the channel
+    # count C is encoded in the id (the _Cn suffix); it must match the
+    # n_channels written into user_info[0].
+    SPLINE_3D_MULTICHANNEL_LINK_XYZ = 15  # C = 2,  7 params
+    SPLINE_3D_MULTICHANNEL_LINK_XYZ_C3 = 16  # C = 3,  9 params
+    SPLINE_3D_MULTICHANNEL_LINK_XYZ_C4 = 17  # C = 4, 11 params
+    SPLINE_3D_MULTICHANNEL_LINK_XYZ_C5 = 18  # C = 5, 13 params
+    SPLINE_3D_MULTICHANNEL_LINK_XYZ_C6 = 19  # C = 6, 15 params
 
 
 class EstimatorID:

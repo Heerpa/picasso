@@ -487,6 +487,9 @@ def plot_NN(  # noqa: C901
     fontsize_ticks: int = 10,
     fontsize_labels: int = 12,
     fontsize_title: int = 12,
+    fontname_ticks: str | None = None,
+    fontname_labels: str | None = None,
+    fontname_title: str | None = None,
     show_legend: bool = True,
     alpha: float = 0.6,
     edgecolor: str = "black",
@@ -533,6 +536,12 @@ def plot_NN(  # noqa: C901
         https://matplotlib.org/stable/tutorials/colors/colors.html.
     title, xlabel, ylabel : strs
         Title and label of x and y axes, respectively.
+    fontsize_ticks, fontsize_labels, fontsize_title : int
+        Font sizes of the tick labels, axis labels and title,
+        respectively.
+    fontname_ticks, fontname_labels, fontname_title : str or None
+        Font family (e.g. "Arial") of the tick labels, axis labels and
+        title, respectively. If None, the matplotlib default is used.
     xlim, ylim : tuples of floats (default=None, None)
         Limits in which x and y axes are plotted. If None, the
         automatic limits are used.
@@ -635,17 +644,29 @@ def plot_NN(  # noqa: C901
 
     # display parameters
     if show_legend:
-        ax.legend(prop={"size": fontsize_ticks})
+        legend_prop = {"size": fontsize_ticks}
+        if fontname_ticks is not None:
+            legend_prop["family"] = fontname_ticks
+        ax.legend(prop=legend_prop)
 
     if xlim is not None:
         ax.set_xlim(xlim)
     if ylim is not None:
         ax.set_ylim(ylim)
 
-    ax.set_title(title, fontsize=fontsize_title)
-    ax.set_xlabel(xlabel, fontsize=fontsize_labels)
-    ax.set_ylabel(ylabel, fontsize=fontsize_labels)
+    title_kwargs = {"fontsize": fontsize_title}
+    if fontname_title is not None:
+        title_kwargs["fontname"] = fontname_title
+    label_kwargs = {"fontsize": fontsize_labels}
+    if fontname_labels is not None:
+        label_kwargs["fontname"] = fontname_labels
+    ax.set_title(title, **title_kwargs)
+    ax.set_xlabel(xlabel, **label_kwargs)
+    ax.set_ylabel(ylabel, **label_kwargs)
     ax.tick_params(axis="both", which="major", labelsize=fontsize_ticks)
+    if fontname_ticks is not None:
+        for tick_label in ax.get_xticklabels() + ax.get_yticklabels():
+            tick_label.set_fontname(fontname_ticks)
     ax.grid(False)
 
     # save figure(s)
@@ -3210,6 +3231,8 @@ class SPINNA:
 
         if save:
             props = self.mixer.convert_counts_to_props(N_structures)
+            # convert_counts_to_props squeezes to 1D for a single row
+            props = np.atleast_2d(props)
             df = pd.DataFrame(
                 np.hstack((N_structures, props, scores.reshape(-1, 1))),
                 columns=[
@@ -3369,8 +3392,13 @@ class SPINNA:
         )
         if save:
             # save the results of both the coarse and fine pass
-            props_coarse = self.mixer.convert_counts_to_props(N_coarse)
-            props_fine = self.mixer.convert_counts_to_props(N_fine)
+            # convert_counts_to_props squeezes to 1D for a single row
+            props_coarse = np.atleast_2d(
+                self.mixer.convert_counts_to_props(N_coarse)
+            )
+            props_fine = np.atleast_2d(
+                self.mixer.convert_counts_to_props(N_fine)
+            )
             # get the fine scores ((non)bootstrapped results have
             # different structure)
             if bootstrap:
@@ -3584,7 +3612,10 @@ class SPINNA:
 
     def _save_bayesian_csv(self, N_evaluated, scores_evaluated, path):
         """Write evaluated candidates and their scores to ``path``."""
-        props_eval = self.mixer.convert_counts_to_props(N_evaluated)
+        # convert_counts_to_props squeezes to 1D for a single row
+        props_eval = np.atleast_2d(
+            self.mixer.convert_counts_to_props(N_evaluated)
+        )
         names = self.mixer.get_structure_names()
         df = pd.DataFrame(
             np.hstack(

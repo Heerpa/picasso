@@ -188,6 +188,123 @@ def synthetic_spots_noisy():
     return spots, gt
 
 
+@pytest.fixture(scope="module")
+def synthetic_spots_isotropic():
+    """Return ``(spots, ground_truth_df)`` for a batch of *isotropic*
+    Gaussian spots (``sx == sy``).
+
+    Used to test the spherical (single-width) fitters — least squares and
+    MLE, CPU and GPU. Because the ground truth already has ``sx == sy``,
+    a correct spherical fit must recover the shared width and the
+    ellipticity of the resulting localizations is exactly 0 (which is why
+    the spherical output drops the ``ellipticity`` column altogether).
+    """
+    box = 7
+    n = 48
+    rng = np.random.default_rng(7)
+    s = rng.uniform(0.9, 1.4, n)
+    gt = pd.DataFrame(
+        {
+            "x": rng.uniform(-0.5, 0.5, n),
+            "y": rng.uniform(-0.5, 0.5, n),
+            "sx": s,
+            "sy": s.copy(),
+            "photons": rng.uniform(2000.0, 8000.0, n),
+            "bg": rng.uniform(5.0, 30.0, n),
+        }
+    )
+    spots = np.empty((n, box, box), dtype=np.float32)
+    for i in range(n):
+        spots[i] = _make_gaussian_spot(
+            box,
+            gt.x[i],
+            gt.y[i],
+            gt.sx[i],
+            gt.sy[i],
+            gt.photons[i],
+            gt.bg[i],
+        )
+    return spots, gt
+
+
+def make_rotated_gaussian_spot(
+    box: int,
+    x0: float,
+    y0: float,
+    sx: float,
+    sy: float,
+    photons: float,
+    bg: float,
+    angle: float,
+) -> np.ndarray:
+    """Point-sampled rotated elliptical Gaussian spot.
+
+    Matches the model both ``gausslq._compute_model_rotated`` (CPU) and
+    Gpufit's ``GAUSS_2D_ROTATED`` (GPU) optimize::
+
+        mu = photons / (2 pi sx sy) * exp(-0.5 (u^2/sx^2 + w^2/sy^2)) + bg
+        u = dx cos(a) - dy sin(a),  w = dx sin(a) + dy cos(a)
+
+    where ``dx``/``dy`` are pixel offsets from the spot center (``x0``/``y0``
+    are offsets from the box center) and ``x`` varies along columns.
+    """
+    half = box // 2
+    g = np.arange(-half, half + 1, dtype=np.float64)
+    X, Y = np.meshgrid(g, g)  # X varies along columns (x), Y along rows (y)
+    dx, dy = X - x0, Y - y0
+    ct, st = np.cos(angle), np.sin(angle)
+    u = dx * ct - dy * st
+    w = dx * st + dy * ct
+    e = np.exp(-0.5 * (u**2 / sx**2 + w**2 / sy**2))
+    return (photons / (2 * np.pi * sx * sy) * e + bg).astype(np.float32)
+
+
+@pytest.fixture(scope="module")
+def synthetic_spots_rotated():
+    """Return ``(spots, ground_truth_df)`` for a batch of *rotated*
+    elliptical Gaussian spots.
+
+    ``ground_truth_df`` has the usual ``x, y, sx, sy, photons, bg`` columns
+    plus ``angle`` (radians). The widths are deliberately anisotropic so
+    the rotation angle is well-defined, and the angles span roughly
+    ``(-pi/2, pi/2)`` (the range over which the ellipse orientation is
+    unique). Used to test the rotated fitters — LQ (CPU/GPU) and MLE (GPU).
+    """
+    box = 9
+    rng = np.random.default_rng(2026)
+    angles = np.array(
+        [-1.3, -0.9, -0.45, -0.1, 0.15, 0.5, 0.85, 1.2], dtype=np.float64
+    )
+    n = len(angles)
+    gt = pd.DataFrame(
+        {
+            "x": rng.uniform(-0.3, 0.3, n),
+            "y": rng.uniform(-0.3, 0.3, n),
+            # Keep the widths well separated so the ellipse orientation is
+            # well conditioned — a near-circular spot has an ill-defined
+            # angle and is not a meaningful recovery target.
+            "sx": rng.uniform(1.6, 1.9, n),
+            "sy": rng.uniform(0.8, 1.0, n),
+            "photons": rng.uniform(5000.0, 9000.0, n),
+            "bg": rng.uniform(5.0, 20.0, n),
+            "angle": angles,
+        }
+    )
+    spots = np.empty((n, box, box), dtype=np.float32)
+    for i in range(n):
+        spots[i] = make_rotated_gaussian_spot(
+            box,
+            gt.x[i],
+            gt.y[i],
+            gt.sx[i],
+            gt.sy[i],
+            gt.photons[i],
+            gt.bg[i],
+            gt.angle[i],
+        )
+    return spots, gt
+
+
 # ---------------------------------------------------------------------------
 # Convenience: identifications + spots extracted from the bundled movie
 # (used by both test_localize and test_gausslq / test_gaussmle).

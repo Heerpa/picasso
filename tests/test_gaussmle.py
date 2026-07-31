@@ -278,6 +278,109 @@ class TestLocsFromFits:
 
 
 # ---------------------------------------------------------------------------
+# Spherical (isotropic, single-width "sigma" method) MLE fit
+# ---------------------------------------------------------------------------
+
+
+class TestSphericalMLE:
+    """The 'sigma' MLE method fits a single width (``sx == sy``); the
+    spherical locs output then drops the always-zero ellipticity column."""
+
+    def _ids(self, n):
+        return pd.DataFrame(
+            {
+                "frame": np.arange(n, dtype=np.uint32),
+                "x": np.arange(n, dtype=np.int64) + 10,
+                "y": np.arange(n, dtype=np.int64) + 20,
+                "net_gradient": np.full(n, 5000.0, dtype=np.float32),
+            }
+        )
+
+    def test_sigma_method_recovers_isotropic_truth(
+        self, synthetic_spots_isotropic
+    ):
+        """MLE 'sigma' recovers position and the shared width of noiseless
+        isotropic spots."""
+        spots, gt = synthetic_spots_isotropic
+        theta, _, _, _ = gaussmle.gaussmle(spots, EPS, MAX_IT, method="sigma")
+        np.testing.assert_array_equal(theta[:, 4], theta[:, 5])
+        np.testing.assert_allclose(
+            theta[:, 0] - BOX_HALF, gt.x.values, atol=0.05
+        )
+        np.testing.assert_allclose(
+            theta[:, 1] - BOX_HALF, gt.y.values, atol=0.05
+        )
+        # MLE fits an integrated-Gaussian model to point-sampled spots, so
+        # the photon count and width carry a systematic model-mismatch bias.
+        np.testing.assert_allclose(theta[:, 2], gt.photons.values, rtol=0.10)
+        np.testing.assert_allclose(theta[:, 4], gt.sx.values, atol=0.15)
+
+    def test_spherical_locs_omit_ellipticity(self, synthetic_spots_isotropic):
+        spots, _ = synthetic_spots_isotropic
+        theta, crlbs, lls, its = gaussmle.gaussmle(
+            spots, EPS, MAX_IT, method="sigma"
+        )
+        ids = self._ids(len(spots))
+        locs = gaussmle.locs_from_fits(
+            ids, theta, crlbs, lls, its, BOX, spherical=True
+        )
+        assert "ellipticity" not in locs.columns
+        # all the MLE columns are still there
+        for col in [
+            "frame",
+            "x",
+            "y",
+            "photons",
+            "sx",
+            "sy",
+            "bg",
+            "lpx",
+            "lpy",
+            "net_gradient",
+            "log_likelihood",
+            "iterations",
+            "photons_unc",
+            "bg_unc",
+            "sx_unc",
+            "sy_unc",
+        ]:
+            assert col in locs.columns
+
+    def test_non_spherical_keeps_ellipticity(self, synthetic_spots_isotropic):
+        spots, _ = synthetic_spots_isotropic
+        theta, crlbs, lls, its = gaussmle.gaussmle(
+            spots, EPS, MAX_IT, method="sigma"
+        )
+        ids = self._ids(len(spots))
+        locs = gaussmle.locs_from_fits(
+            ids, theta, crlbs, lls, its, BOX, spherical=False
+        )
+        assert "ellipticity" in locs.columns
+        np.testing.assert_allclose(locs["ellipticity"], 0.0, atol=1e-6)
+
+    def test_spherical_flag_only_drops_ellipticity(
+        self, synthetic_spots_isotropic
+    ):
+        """Toggling the flag must not perturb any other column."""
+        spots, _ = synthetic_spots_isotropic
+        theta, crlbs, lls, its = gaussmle.gaussmle(
+            spots, EPS, MAX_IT, method="sigma"
+        )
+        ids = self._ids(len(spots))
+        sph = gaussmle.locs_from_fits(
+            ids, theta, crlbs, lls, its, BOX, spherical=True
+        )
+        full = gaussmle.locs_from_fits(
+            ids, theta, crlbs, lls, its, BOX, spherical=False
+        )
+        for col in sph.columns:
+            np.testing.assert_array_equal(
+                sph[col].to_numpy(), full[col].to_numpy()
+            )
+        assert set(full.columns) - set(sph.columns) == {"ellipticity"}
+
+
+# ---------------------------------------------------------------------------
 # sigma_uncertainty — Rieger/Stallinga formula
 # ---------------------------------------------------------------------------
 

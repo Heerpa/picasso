@@ -474,7 +474,6 @@ def _fill3d(
     x = x.astype(np.int32)
     y = y.astype(np.int32)
     z = z.astype(np.int32)
-    z += np.min(z)  # because z takes also negative values
     for i, j, k in zip(x, y, z):
         image[j, i, k] += 1
 
@@ -490,6 +489,11 @@ def _draw_gaussian_loc(
     n_pixel_y: int,
 ) -> None:
     """Render a single separable 2D Gaussian into ``image``."""
+    if not (sx_ > 0.0 and sy_ > 0.0):
+        # Degenerate localization (e.g. lpx/lpy of exactly 0 from a
+        # singular CRLB fit); also catches NaN. Skip instead of
+        # dividing by zero.
+        return
     max_y_off = _DRAW_MAX_SIGMA * sy_
     i_min = np.int32(y_ - max_y_off)
     if i_min < 0:
@@ -564,24 +568,116 @@ def _fill_gaussian(
 
 
 @numba.njit(cache=True)
-def _draw_gaussian_rot_loc(
+def _draw_gaussian_theta_loc(
     image: lib.FloatArray2D,
     x_: float,
     y_: float,
     sx_: float,
     sy_: float,
-    sz_: float,
+    angle_: float,
+    n_pixel_x: int,
+    n_pixel_y: int,
+) -> None:
+    """Render a single in-plane rotated 2D Gaussian into ``image``.
+
+    The elliptical Gaussian with standard deviations (``sx_``, ``sy_``)
+    is rotated in the image plane by ``angle_`` (radians) via its 2x2
+    covariance matrix. Unlike ``_draw_gaussian_loc`` the rotated kernel
+    is not separable (it has a cross term), so pixels are evaluated with
+    the full bivariate quadratic form, as in ``_draw_gaussian_rot_loc``.
+    """
+    c = np.cos(angle_)
+    s = np.sin(angle_)
+    vx = sx_ * sx_
+    vy = sy_ * sy_
+    cxx = vx * c * c + vy * s * s
+    cyy = vx * s * s + vy * c * c
+    cxy = (vx - vy) * s * c
+    det2d = cxx * cyy - cxy * cxy
+    if det2d < 1e-10:
+        return
+    inv_xx = cyy / det2d
+    inv_yy = cxx / det2d
+    inv_xy = -cxy / det2d
+    norm = 1.0 / (2.0 * np.pi * np.sqrt(det2d))
+    max_x_off = _DRAW_MAX_SIGMA * np.sqrt(cxx)
+    max_y_off = _DRAW_MAX_SIGMA * np.sqrt(cyy)
+    j_min = int(x_ - max_x_off)
+    if j_min < 0:
+        j_min = 0
+    j_max = int(x_ + max_x_off + 1)
+    if j_max > n_pixel_x:
+        j_max = n_pixel_x
+    i_min = int(y_ - max_y_off)
+    if i_min < 0:
+        i_min = 0
+    i_max = int(y_ + max_y_off + 1)
+    if i_max > n_pixel_y:
+        i_max = n_pixel_y
+    for i in range(i_min, i_max):
+        b = np.float32(i + 0.5 - y_)
+        for j in range(j_min, j_max):
+            a = np.float32(j + 0.5 - x_)
+            exponent = a * a * inv_xx + 2.0 * a * b * inv_xy + b * b * inv_yy
+            image[i, j] += norm * np.exp(-0.5 * exponent)
+
+
+@numba.njit(cache=True)
+def _fill_gaussian_theta(
+    image: lib.FloatArray2D,
+    x: lib.FloatArray1D,
+    y: lib.FloatArray1D,
+    sx: lib.FloatArray1D,
+    sy: lib.FloatArray1D,
+    angle: lib.FloatArray1D,
+    n_pixel_x: int,
+    n_pixel_y: int,
+) -> None:
+    """Fill image with in-plane rotated gaussian-blurred localizations.
+
+    Each localization is rendered as a 2D Gaussian centered at (x, y)
+    with standard deviations (sx, sy) rotated in the image plane by its
+    own ``angle`` (radians).
+
+    Parameters
+    ----------
+    image : lib.FloatArray2D
+        Empty image array.
+    x, y : lib.FloatArray1D
+        x and y coordinates to be rendered.
+    sx, sy : lib.FloatArray1D
+        Localization precision in x and y for each localization.
+    angle : lib.FloatArray1D
+        In-plane rotation angle (radians) for each localization.
+    n_pixel_x, n_pixel_y : int
+        Number of pixels in x and y.
+    """
+    n_locs = len(x)
+    if n_locs == 0:
+        return
+
+    for i in range(n_locs):
+        _draw_gaussian_theta_loc(
+            image, x[i], y[i], sx[i], sy[i], angle[i], n_pixel_x, n_pixel_y
+        )
+
+
+@numba.njit(cache=True)
+def _draw_gaussian_cov3d_loc(
+    image: lib.FloatArray2D,
+    x_: float,
+    y_: float,
+    cov: lib.Array3x3,
     n_pixel_x: int,
     n_pixel_y: int,
     rot_matrix: lib.Array3x3,
     rot_matrixT: lib.Array3x3,
 ) -> None:
-    """Render a single rotated 2D Gaussian (projected from 3D) into
-    ``image``."""
-    cov = np.zeros((3, 3), dtype=np.float32)
-    cov[0, 0] = sx_ * sx_
-    cov[1, 1] = sy_ * sy_
-    cov[2, 2] = sz_ * sz_
+    """Render a single 3D Gaussian with local covariance ``cov`` into
+    ``image``: ``cov`` is rotated by the global ``rot_matrix`` and the
+    top-left 2x2 block is projected, inverted and drawn as a bivariate
+    Gaussian. Shared by ``_draw_gaussian_rot_loc`` (diagonal ``cov``) and
+    ``_draw_gaussian_rot_theta_loc`` (in-plane rotated ``cov``)."""
     cov_rot = rot_matrix @ cov @ rot_matrixT
     s00 = cov_rot[0, 0]
     s01 = cov_rot[0, 1]
@@ -615,6 +711,63 @@ def _draw_gaussian_rot_loc(
             a = np.float32(j + 0.5 - x_)
             exponent = a * a * inv00 + a * b * (inv01 + inv10) + b * b * inv11
             image[i, j] += norm * np.exp(-0.5 * exponent)
+
+
+@numba.njit(cache=True)
+def _draw_gaussian_rot_loc(
+    image: lib.FloatArray2D,
+    x_: float,
+    y_: float,
+    sx_: float,
+    sy_: float,
+    sz_: float,
+    n_pixel_x: int,
+    n_pixel_y: int,
+    rot_matrix: lib.Array3x3,
+    rot_matrixT: lib.Array3x3,
+) -> None:
+    """Render a single rotated 2D Gaussian (projected from 3D) into
+    ``image``."""
+    cov = np.zeros((3, 3), dtype=np.float32)
+    cov[0, 0] = sx_ * sx_
+    cov[1, 1] = sy_ * sy_
+    cov[2, 2] = sz_ * sz_
+    _draw_gaussian_cov3d_loc(
+        image, x_, y_, cov, n_pixel_x, n_pixel_y, rot_matrix, rot_matrixT
+    )
+
+
+@numba.njit(cache=True)
+def _draw_gaussian_rot_theta_loc(
+    image: lib.FloatArray2D,
+    x_: float,
+    y_: float,
+    sx_: float,
+    sy_: float,
+    sz_: float,
+    angle_: float,
+    n_pixel_x: int,
+    n_pixel_y: int,
+    rot_matrix: lib.Array3x3,
+    rot_matrixT: lib.Array3x3,
+) -> None:
+    """Render a single rotated 2D Gaussian (projected from 3D) into
+    ``image``. The in-plane precision ellipse (``sx_``, ``sy_``) is
+    first rotated by ``angle_`` (radians) about the z-axis, then the
+    full 3D covariance is rotated by the global ``rot_matrix``."""
+    c = np.cos(angle_)
+    s = np.sin(angle_)
+    vx = sx_ * sx_
+    vy = sy_ * sy_
+    cov = np.zeros((3, 3), dtype=np.float32)
+    cov[0, 0] = vx * c * c + vy * s * s
+    cov[1, 1] = vx * s * s + vy * c * c
+    cov[0, 1] = (vx - vy) * c * s
+    cov[1, 0] = cov[0, 1]
+    cov[2, 2] = sz_ * sz_
+    _draw_gaussian_cov3d_loc(
+        image, x_, y_, cov, n_pixel_x, n_pixel_y, rot_matrix, rot_matrixT
+    )
 
 
 @numba.njit(cache=True)
@@ -660,6 +813,63 @@ def _fill_gaussian_rot(
             sx[i],
             sy[i],
             sz[i],
+            n_pixel_x,
+            n_pixel_y,
+            rot_matrix,
+            rot_matrixT,
+        )
+
+
+@numba.njit(cache=True)
+def _fill_gaussian_rot_theta(
+    image: lib.FloatArray2D,
+    x: lib.FloatArray1D,
+    y: lib.FloatArray1D,
+    sx: lib.FloatArray1D,
+    sy: lib.FloatArray1D,
+    sz: lib.FloatArray1D,
+    angle: lib.FloatArray1D,
+    n_pixel_x: int,
+    n_pixel_y: int,
+    rot_matrix: lib.Array3x3,
+) -> None:
+    """Fill image with rotated gaussian-blurred localizations, each with
+    its own in-plane rotation.
+
+    Same as ``_fill_gaussian_rot`` but the precision ellipse (sx, sy) of
+    every localization is first rotated in the image plane by its own
+    ``angle`` (radians) about the z-axis, before the global rotation.
+
+    Parameters
+    ----------
+    image : lib.FloatArray2D
+        Empty image array.
+    x, y, z : lib.FloatArray1D
+        3D coordinates to be rendered.
+    sx, sy, sz : lib.FloatArray1D
+        Localization precision in x, y and z for each localization.
+    angle : lib.FloatArray1D
+        In-plane rotation angle (radians) for each localization,
+        applied about the z-axis before the global ``rot_matrix``.
+    n_pixel_x, n_pixel_y : int
+        Number of pixels in x and y.
+    rot_matrix : lib.Array3x3
+        Rotation matrix (float32) applied to the localizations.
+    """
+    n_locs = len(x)
+    if n_locs == 0:
+        return
+    rot_matrixT = np.ascontiguousarray(rot_matrix.T)
+
+    for i in range(n_locs):
+        _draw_gaussian_rot_theta_loc(
+            image,
+            x[i],
+            y[i],
+            sx[i],
+            sy[i],
+            sz[i],
+            angle[i],
             n_pixel_x,
             n_pixel_y,
             rot_matrix,
@@ -1011,7 +1221,15 @@ def _render_gaussian(
         sy = blur_height[in_view]
         sx = blur_width[in_view]
 
-        _fill_gaussian(image, x, y, sx, sy, n_pixel_x, n_pixel_y)
+        if "angle" in locs:
+            # per-localization in-plane rotation of the precision ellipse;
+            # the stored column is in degrees, the kernel expects radians
+            angle = np.deg2rad(locs["angle"].to_numpy()[in_view])
+            _fill_gaussian_theta(
+                image, x, y, sx, sy, angle, n_pixel_x, n_pixel_y
+            )
+        else:
+            _fill_gaussian(image, x, y, sx, sy, n_pixel_x, n_pixel_y)
 
     else:  # rotated
         x, y, in_view, z = locs_rotation(
@@ -1043,9 +1261,26 @@ def _render_gaussian(
         rot_matrix = np.ascontiguousarray(
             to_rotation(ang).as_matrix(), dtype=np.float32
         )
-        _fill_gaussian_rot(
-            image, x, y, sx, sy, sz, n_pixel_x, n_pixel_y, rot_matrix
-        )
+        if "angle" in locs:
+            # per-localization in-plane rotation (degrees in the stored
+            # column), composed with the global rotation
+            angle = np.deg2rad(locs["angle"].to_numpy())[in_view]
+            _fill_gaussian_rot_theta(
+                image,
+                x,
+                y,
+                sx,
+                sy,
+                sz,
+                angle,
+                n_pixel_x,
+                n_pixel_y,
+                rot_matrix,
+            )
+        else:
+            _fill_gaussian_rot(
+                image, x, y, sx, sy, sz, n_pixel_x, n_pixel_y, rot_matrix
+            )
 
     n = len(x)
     return n, image
@@ -1112,6 +1347,7 @@ def _render_gaussian_iso(
         sx = sy
         sz = blur_depth[in_view]
 
+        # isotropic in-plane blur: per-loc rotation about z has no effect
         rot_matrix = np.ascontiguousarray(
             to_rotation(ang).as_matrix(), dtype=np.float32
         )
@@ -2607,6 +2843,7 @@ def render_scene(
     single_channel_colormap: str | lib.FloatArray2D = "magma",
     colors: list | None = None,
     relative_intensities: list[float] | None = None,
+    background_color: tuple[float, float, float] | None = None,
     raw_image_cache: lib.FloatArray2D | lib.FloatArray3D | None = None,
     return_contrast_limits: bool = False,
     return_raw_image: bool = False,
@@ -2702,6 +2939,13 @@ def render_scene(
         List of relative intensities for each channel. Only needs to be
         specified for multi-channel data. Default is None, in which
         case all channels are rendered with the same intensity.
+    background_color : tuple of float, optional
+        ``(r, g, b)`` background color with values between 0 and 1 that
+        the additively-blended channels are composited over (multi-channel
+        data only). The background shows through where there are few/no
+        localizations, while bright regions keep their true channel
+        colors. Default is None (equivalent to a black background, i.e.
+        the image is left unchanged).
     raw_image_cache: lib.FloatArray2D or lib.FloatArray3D, optional
         If provided, this raw grayscale image of localizations, i.e.,
         obtained with ``render.render`` (2D array for single-channel
@@ -2773,6 +3017,7 @@ def render_scene(
             contrast=contrast,
             relative_intensities=relative_intensities,
             invert_colors=invert_colors,
+            background_color=background_color,
             raw_image_cache=raw_image_cache,
         )
     qimage = rgb_to_qimage(rgb)
@@ -2801,6 +3046,7 @@ def _render_multi_channel(
     contrast: tuple[float, float] | None = None,
     relative_intensities: list[float] | None = None,
     invert_colors: bool = False,
+    background_color: tuple[float, float, float] | None = None,
     raw_image_cache: lib.FloatArray3D | None = None,
 ) -> tuple[int, lib.IntArray3D, tuple[float, float], lib.FloatArray3D]:
     """Render multi-channel localizations into an RGB 8bit image
@@ -2810,8 +3056,7 @@ def _render_multi_channel(
     behaviour: each channel rendered as ``intensity × rgb``, additive
     blend) or a list of ``(256, 3)`` LUTs (each channel indexed into
     its LUT before additive blending — supports per-channel
-    matplotlib colormaps and user-defined colormaps from the GUI).
-    """
+    matplotlib colormaps and user-defined colormaps from the GUI)."""
     if raw_image_cache is not None:
         assert raw_image_cache.ndim == 3, "raw_image_cache must be a 3D array."
         raw_image = raw_image_cache
@@ -2860,6 +3105,15 @@ def _render_multi_channel(
             rgb += colors_arr[c][idx[c]]
     # clip to max value of 1 (preserves relative brightness)
     np.minimum(rgb, 1.0, out=rgb)
+    # composite over a background color (default black = no change). The
+    # background shows through where there are few/no localizations,
+    # while bright regions keep their true channel colors. Alpha is the
+    # total per-pixel coverage summed across channels.
+    if background_color is not None and any(c > 0 for c in background_color):
+        bg = np.asarray(background_color, dtype=np.float32)
+        alpha = np.clip(images_f32.sum(axis=0), 0.0, 1.0)[..., None]
+        rgb = rgb + bg * (1.0 - alpha)
+        np.minimum(rgb, 1.0, out=rgb)
     rgb = to_8bit(rgb)
     if invert_colors:
         rgb = 255 - rgb

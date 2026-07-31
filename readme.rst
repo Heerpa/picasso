@@ -48,6 +48,8 @@ Installation
 
 Check out the `Picasso release page <https://github.com/jungmannlab/picasso/releases/>`__ to download and run the latest compiled one-click installer for Windows or MacOS (the latter is experimental and feedback is welcome). Here you will also find the Nature Protocols legacy version (v0.1.0).
 
+For Windows, two one-click installers are provided: a default (CPU) build and a **GPU** build. The GPU build additionally bundles the CUDA runtime so that GPU-accelerated (numba.cuda) code can run. It is larger and requires an NVIDIA (CUDA-capable) GPU; on machines without one, GPU-only options are simply hidden, so most users can stay with the default build. Choose the GPU installer only if you have a compatible NVIDIA GPU and want to use the accelerated tools. Picasso uses Cuda12 in the one-click-installer.
+
 Python is also distributed as a PyPI package that is platform-independent (``pip install picassosr``) which grants not only GUI but also access to Picasso’s internal routines in custom Python programs. For more details, see the `Via PyPI <https://github.com/jungmannlab/picasso#via-pypi>`__ section below. For examples of how to use Picasso in Python scripts, see the section `Example Usage <https://github.com/jungmannlab/picasso#example-usage>`__ below.
 
 Note: Since v0.10.0 Picasso is more flexible in terms of dependencies and Python versions. Previously only Python 3.10 was supported, now newer versions are encouraged.
@@ -61,6 +63,12 @@ Via PyPI
 4. You can now run any Picasso function directly from the console/terminal by running: ``picasso render``, ``picasso localize``, etc, or import Picasso functions in your own Python scripts.
 5. To update Picasso (you should get a notification about available updates since v0.10.0) run ``pip install --upgrade picassosr``.
 6. You can optionally install dependencies for .czi and .lif formats by passing ``pip install picassosr[czi]`` or ``pip install picassosr[lif]``.
+7. To enable GPU-accelerated (numba.cuda) code, install the CUDA dependencies with ``pip install picassosr[gpu]``. This requires an NVIDIA (CUDA-capable) GPU. The ``gpu`` extra targets CUDA toolkit 12.x; for other toolkits use ``pip install picassosr[cuda11]`` or ``pip install picassosr[cuda13]`` instead. Without these extras, Picasso runs fine on the CPU and GPU-only options are hidden.
+
+GPU fitting (optional)
+^^^^^^^^^^^^^^^^^^^^^^^
+
+Picasso: Localize can accelerate several of its fitting algorithms on a CUDA-capable NVIDIA GPU via `Gpufit <https://github.com/gpufit/Gpufit>`__. On **Windows** the pre-compiled library is bundled with Picasso and works out of the box. On **Linux** there is no pre-compiled binary, so you have to build ``libGpufit.so`` yourself and copy it into ``picasso/ext/pygpufit/``. Build it from our fork, `github.com/rafalkowalewski1/Gpufit <https://github.com/rafalkowalewski1/Gpufit>`__, which adds the fit models Picasso needs (upstream Gpufit does not provide them); see the `GPU fitting on Linux <https://picassosr.readthedocs.io/en/latest/localize.html#gpu-fitting-on-linux>`__ section of the documentation for step-by-step instructions. Without the GPU library, Picasso transparently uses the native fitting algorithms (LQ, MLE Gaussian 2D elliptical fitting). A few fit models run **only** on the GPU, namely the rotated elliptical Gaussian and the `experimental PSF (cubic spline) <https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting>`__ model.
 
 For Developers (local, editable installation)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -134,8 +142,10 @@ If you use Picasso in your research, please cite our Nature Protocols publicatio
 - Theoretical lateral localization precision (Gauss LQ). DOI: `10.1038/nmeth.1447 <https://doi.org/10.1038/nmeth.1447>`__
 - Theoretical axial localization precision (Gauss LQ and MLE). DOI: `10.1038/s41467-026-70198-5 <https://doi.org/10.1038/s41467-026-70198-5>`__
 - MLE fitting. DOI: `10.1038/nmeth.1449 <https://doi.org/10.1038/nmeth.1449>`__
-- GPU fitting (LQ). DOI: `10.1038/s41598-017-15313-9 <https://doi.org/10.1038/s41598-017-15313-9>`__. License can be found `here <https://github.com/jungmannlab/picasso/tree/master/picasso/ext/pygpufit>`__.
+- GPU fitting (LQ and MLE, also used for experimental-PSF spline fitting). DOI: `10.1038/s41598-017-15313-9 <https://doi.org/10.1038/s41598-017-15313-9>`__. License can be found `here <https://github.com/jungmannlab/picasso/tree/master/picasso/ext/pygpufit>`__.
 - 3D fitting via astigmatism. DOI: `10.1126/science.1153529 <https://www.science.org/doi/10.1126/science.1153529>`__.
+- Experimental PSF (cubic-spline) fitting. DOIs: `10.1038/nmeth.4661 <https://doi.org/10.1038/nmeth.4661>`__ (Li et al., experimental-PSF localization and bead alignment) and `10.1038/s41598-017-00622-w <https://doi.org/10.1038/s41598-017-00622-w>`__ (Babcock & Zhuang, cubic-spline PSF model).
+- Multichannel (global) experimental-PSF fitting. DOI: `10.1038/s41467-022-30719-4 <https://doi.org/10.1038/s41467-022-30719-4>`__ (Li et al., globLoc).
 - RCC undrifting: DOI: `10.1364/OE.22.015982 <https://doi.org/10.1364/OE.22.015982>`__
 - AIM undrifting. DOI: `10.1126/sciadv.adm776 <https://www.science.org/doi/10.1126/sciadv.adm7765>`__
 - SMLM clusterer. DOIs: `10.1038/s41467-021-22606-1 <https://doi.org/10.1038/s41467-021-22606-1>`__ and `10.1038/s41586-023-05925-9 <https://doi.org/10.1038/s41586-023-05925-9>`__
