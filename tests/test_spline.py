@@ -1466,8 +1466,20 @@ class TestCliWiring:
     def test_fit_method_map(self):
         from picasso import __main__ as cli
 
-        assert cli._FIT_METHOD_MAP["spline"] == "spline-gpu"
-        assert cli._FIT_METHOD_MAP["spline-mle"] == "spline-mle-gpu"
+        # bare names are the CPU fit, "-gpu" the Gpufit one - the convention
+        # the Gaussian methods already follow
+        assert cli._FIT_METHOD_MAP["spline"] == "spline"
+        assert cli._FIT_METHOD_MAP["spline-mle"] == "spline-mle"
+        assert cli._FIT_METHOD_MAP["spline-gpu"] == "spline-gpu"
+        assert cli._FIT_METHOD_MAP["spline-mle-gpu"] == "spline-mle-gpu"
+
+    def test_only_the_gpu_codes_require_gpufit(self):
+        """The CPU spline codes must not trip the GPUfit precheck."""
+        import inspect
+        from picasso import __main__ as cli
+
+        src = inspect.getsource(cli._localize)
+        assert '("lq-gpu", "spline-gpu", "spline-mle-gpu")' in src
 
     def test_spline_calibrate_handler_exists(self):
         from picasso import __main__ as cli
@@ -1480,34 +1492,50 @@ class TestCliWiring:
         import inspect
 
         src = inspect.getsource(localize.fit2D)
-        assert "spline-gpu" in src and "spline-mle-gpu" in src
+        for code in ("spline", "spline-mle", "spline-gpu", "spline-mle-gpu"):
+            assert f'"{code}"' in src
 
 
 class TestGuiWiring:
-    def test_fit_code_resolves_spline(self, monkeypatch):
+    def test_spline_model_is_offered_without_gpufit(self):
+        """The spline model must be in the menu on every machine: it now has a
+        CPU backend, so it is no longer deleted when Gpufit is missing."""
         from picasso.gui import localize as glocalize
 
-        models = dict(glocalize.FIT_MODELS)
-        models["Experimental PSF (cubic spline)"] = {
-            "optimizers": {
-                "Least squares": "spline-gpu",
-                "MLE": "spline-mle-gpu",
-            },
-            "needs_spline_calibration": True,
-        }
-        monkeypatch.setattr(glocalize, "FIT_MODELS", models)
+        assert "Experimental PSF (cubic spline)" in glocalize.FIT_MODELS
+
+    def test_fit_code_resolves_spline(self):
+        from picasso.gui import localize as glocalize
+
+        # bare (CPU) codes; FitWorker appends "-gpu" when the GPUfit
+        # checkbox is ticked, as for the Gaussian models
         assert (
             glocalize._fit_code(
                 "Experimental PSF (cubic spline)", "Least squares"
             )
-            == "spline-gpu"
+            == "spline"
         )
         assert (
             glocalize._fit_code("Experimental PSF (cubic spline)", "MLE")
-            == "spline-mle-gpu"
+            == "spline-mle"
         )
 
-    def test_fit_worker_preserves_spline_method_and_calibration(self):
+    def test_spline_honours_the_convergence_controls(self):
+        """The CPU spline iterates under both estimators, so both must show
+        the convergence page - and with the spline's own schedule, not the
+        Gaussian MLE's."""
+        from picasso.gui import localize as glocalize
+        from picasso import splinefit
+
+        assert "spline" in glocalize._CONVERGENCE_CODES
+        assert "spline-mle" in glocalize._CONVERGENCE_CODES
+        assert glocalize._CONVERGENCE_DEFAULTS["spline"] == (
+            splinefit.TOLERANCE_MULTI_START,
+            splinefit.MAX_ITERATIONS_MULTI_START,
+        )
+
+    @staticmethod
+    def _fit_worker(method, use_gpufit, calib):
         import sys
         import pandas as pd
         from PyQt6 import QtWidgets
@@ -1516,22 +1544,41 @@ class TestGuiWiring:
         app = QtWidgets.QApplication.instance()
         if app is None:
             app = QtWidgets.QApplication(sys.argv)
-
-        calib = {"model": "spline-3d"}
-        worker = glocalize.FitWorker(
+        return glocalize.FitWorker(
             None,
             [],
             {},
             pd.DataFrame({"x": [], "y": [], "frame": []}),
             BOX,
-            "spline-mle-gpu",
+            method,
             0.001,
             100,
             False,
             False,
-            True,  # use_gpufit
+            use_gpufit,
             spline_calibration=calib,
         )
+
+    def test_fit_worker_preserves_spline_method_and_calibration(self):
+        calib = {"model": "spline-3d"}
+        worker = self._fit_worker("spline-mle-gpu", True, calib)
         # the "-gpu" suffix must not be appended to an already-gpu spline code
         assert worker.method == "spline-mle-gpu"
         assert worker.spline_calibration is calib
+
+    @pytest.mark.parametrize(
+        "method, use_gpufit, expected",
+        [
+            ("spline", False, "spline"),
+            ("spline-mle", False, "spline-mle"),
+            ("spline", True, "spline-gpu"),
+            ("spline-mle", True, "spline-mle-gpu"),
+        ],
+    )
+    def test_fit_worker_routes_spline_by_gpufit_checkbox(
+        self, method, use_gpufit, expected
+    ):
+        """The GPUfit checkbox selects the device for the spline model exactly
+        as it does for the Gaussian ones."""
+        worker = self._fit_worker(method, use_gpufit, {"model": "spline-3d"})
+        assert worker.method == expected

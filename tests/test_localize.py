@@ -2554,6 +2554,100 @@ class TestSplineHelpers:
         with pytest.raises(ImportError):
             localize.fit_spots_gpufit_spline(spots, calib)
 
+    def test_spline_kind_covers_every_model(self):
+        from picasso import splinefit
+
+        assert localize._spline_kind("spline-2d") == splinefit.KIND_2D
+        assert localize._spline_kind("spline-3d") == splinefit.KIND_3D
+        assert (
+            localize._spline_kind("spline-3d-multichannel")
+            == splinefit.KIND_3D
+        )
+        assert (
+            localize._spline_kind(localize._LINK_XYZ_MODEL)
+            == splinefit.KIND_LINK_XYZ
+        )
+        with pytest.raises(ValueError, match="Unknown spline"):
+            localize._spline_kind("nonsense")
+
+    def test_single_channel_spots_are_not_copied(self):
+        """The CPU kernels want channel-major spots. For a single channel that
+        must stay a view - transposing instead would copy the whole spot stack
+        (hundreds of MB for a real movie) for no reason."""
+        spots = np.zeros((32, BOX, BOX), np.float32)
+        reshaped = localize._spline_channel_major(spots, 1)
+        assert reshaped.shape == (32, 1, BOX, BOX)
+        assert np.shares_memory(reshaped, spots)
+
+    def test_multichannel_spots_become_channel_major(self):
+        spots = np.arange(2 * BOX * BOX * 3, dtype=np.float32).reshape(
+            2, BOX, BOX, 3
+        )
+        reshaped = localize._spline_channel_major(spots, 3)
+        assert reshaped.shape == (2, 3, BOX, BOX)
+        np.testing.assert_array_equal(reshaped[0, 1], spots[0, :, :, 1])
+        with pytest.raises(ValueError, match="channels"):
+            localize._spline_channel_major(spots, 2)
+
+    def test_cpu_z_seeds_match_the_gpu_grid(self):
+        """CPU and GPU must explore the same axial minima, or the two devices
+        disagree for reasons that have nothing to do with the fit."""
+        calib = _fake_spline_calibration(model="spline-3d")
+        n_starts = localize._default_n_z_starts(calib)
+        seeds, apply_seeds = localize._spline_z_seeds(calib, n_starts)
+        assert apply_seeds
+        # the grid _fit_spline_z_multistart builds for the GPU
+        n_z = int(calib["n_data"][2])
+        np.testing.assert_allclose(
+            seeds, np.linspace(-(n_z - 1), 0.0, n_starts)
+        )
+        assert localize._spline_z_seeds(calib, 1)[1] is False
+        calib_2d = _fake_spline_calibration(model="spline-2d")
+        assert localize._spline_z_seeds(calib_2d, 9)[1] is False
+
+    def test_cpu_schedule_defaults_and_overrides(self):
+        from picasso import splinefit
+
+        assert localize._spline_cpu_schedule(True, None, None) == (
+            splinefit.TOLERANCE_MULTI_START,
+            splinefit.MAX_ITERATIONS_MULTI_START,
+        )
+        assert localize._spline_cpu_schedule(False, None, None) == (
+            splinefit.TOLERANCE_SINGLE_START,
+            splinefit.MAX_ITERATIONS_SINGLE_START,
+        )
+        assert localize._spline_cpu_schedule(True, 1e-7, 3) == (1e-7, 3)
+
+    @pytest.mark.parametrize("apply_seeds", [False, True])
+    def test_cpu_and_gpu_use_the_same_schedule(self, apply_seeds):
+        """Both devices must stop in the same place, or a CPU and a GPU fit of
+        the same spots differ for reasons unrelated to the fit. The convergence
+        test is relative, so a different tolerance is a real difference - and
+        the multi-start ranks its axial seeds on that chi-square."""
+        import inspect
+        from picasso import splinefit
+
+        shared = splinefit.convergence_schedule(apply_seeds)
+        assert localize._spline_cpu_schedule(apply_seeds, None, None) == shared
+        assert splinefit.resolve_schedule(apply_seeds) == shared
+        # ...and the Gpufit call sites read the same function rather than
+        # repeating the numbers.
+        gpu_single = inspect.getsource(localize._run_gpufit_spline)
+        gpu_multi = inspect.getsource(localize._fit_spline_z_multistart)
+        assert "splinefit.resolve_schedule" in gpu_single
+        assert "splinefit.convergence_schedule(True)" in gpu_multi
+        for source in (gpu_single, gpu_multi):
+            assert "TOLERANCE_MULTI_START" not in source
+            assert "TOLERANCE_SINGLE_START" not in source
+
+    def test_spline_use_gpu_resolution(self):
+        # no GPU on this machine unless Gpufit is installed
+        assert localize._spline_use_gpu(None) is localize.GPUFIT_INSTALLED
+        assert localize._spline_use_gpu(False) is False
+        if not localize.GPUFIT_INSTALLED:
+            with pytest.raises(ImportError, match="use_gpu=False"):
+                localize._spline_use_gpu(True)
+
     def test_affine_transform_roundtrip(self):
         src = np.array([[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [5.0, 7.0]])
         m_true = np.array([[1.02, -0.03, 3.0], [0.01, 0.98, -2.0]])
@@ -2951,7 +3045,11 @@ class TestSplineHelpers:
             )
 
         monkeypatch.setattr(
-            localize, "_fit_spline_z_multistart", fake_multistart
+            # the device-agnostic dispatcher, which is what the ratiometric
+            # fitter calls (it routes to the GPU or CPU multi-start)
+            localize,
+            "_fit_spline_multistart",
+            fake_multistart,
         )
         # exercise only the hypothesis loop; locs building needs a real fit
         monkeypatch.setattr(

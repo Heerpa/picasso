@@ -25,7 +25,7 @@ The reconstruction parameters can be specified by adding respective arguments. I
 ::
 
    '-b', '--box-side-length', type=int, default=7, help='box side length'
-   '-a', '--fit-method', choices=["mle", "lq", "lq-gpu", "lq-3d", "lq-gpu-3d", "mle-3d", "avg"], default='mle', help='fitting method'
+   '-a', '--fit-method', choices=["mle", "mle-spherical", "mle-spherical-gpu", "mle-rotated-gpu", "lq", "lq-spherical", "lq-spherical-gpu", "lq-rotated", "lq-rotated-gpu", "lq-gpu", "lq-3d", "lq-gpu-3d", "mle-3d", "spline", "spline-mle", "spline-gpu", "spline-mle-gpu", "avg"], default='mle', help='fitting method'
    '-g', '--gradient', type=int, default=5000, help='minimum net gradient'
    '-d', '--drift', type=int, default=1000, help='segmentation size for subsequent RCC, 0 to deactivate'
    '-r', '--roi', type=int, nargs=4, default=None, help='ROI (y_min, x_min, y_max, x_max) in camera pixels'
@@ -33,8 +33,8 @@ The reconstruction parameters can be specified by adding respective arguments. I
    '-bl', '--baseline', type=int, default=0, help='camera baseline'
    '-s', '--sensitivity', type=float, default=1, help='camera sensitivity'
    '-ga', '--gain', type=int, default=1, help='camera gain'
-   '-qe', '--qe', type=float, default=1, help='camera quantum efficiency'
    '-px', '--pixelsize', type=int, default=130, help='pixel size in nm'
+   '-sc', '--spline-calibration', type=str, default='', help='path to a cubic-spline PSF calibration (.hdf5), required by the spline fit methods'
    '-mf', '--mf', type=float, default=0, help='magnification factor (3D only)'
    '-zc', '--zc', type=str, default='', help='path to 3D calibration file (3D only)'
    '-sf', '--suffix', type=str, default='', help='suffix to add to output files'

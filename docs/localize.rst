@@ -11,7 +11,7 @@ Localize allows performing super-resolution reconstruction of image stacks. For 
 - LQ, Gaussian (least squares). Fits an elliptical Gaussian with independent widths ``sx`` and ``sy``.
 - Spherical (isotropic) Gaussian, least squares or MLE. Fits a single shared width, so ``sx`` and ``sy`` are always equal. The ``ellipticity`` column is not saved for this model. Available on both CPU and GPU.
 - Rotated elliptical Gaussian. The fitted in-plane rotation angle is saved in the ``angle`` column, in degrees. Least squares runs on both CPU and GPU; MLE is GPU only (see `GPU fitting`_ below).
-- Experimental PSF (cubic spline), least squares or MLE (GPU only). Fits an experimentally measured PSF and a 3D calibration recovers ``z`` directly; see `Experimental PSF (cubic-spline) fitting`_ below.
+- Experimental PSF (cubic spline), least squares or MLE. Fits an experimentally measured PSF and a 3D calibration recovers ``z`` directly; see `Experimental PSF (cubic-spline) fitting`_ below.
 - Average of ROI (finds summed intensity of spots)
 
 Picasso uses `Gpufit <https://github.com/gpufit/Gpufit>`_ for fitting on CUDA-capable GPUs (see `GPU fitting`_ below). On Windows the pre-compiled library (``Gpufit.dll``) is vendored into Picasso (``picasso/ext/pygpufit/``) and works automatically — no extra install step. On Linux there is no pre-compiled binary; you have to build ``libGpufit.so`` yourself from our fork of Gpufit (`github.com/rafalkowalewski1/Gpufit <https://github.com/rafalkowalewski1/Gpufit>`_), which contains the additional fit models Picasso needs, and drop it next to the Windows DLL (see `GPU fitting on Linux`_ below). When no GPU library is available, the GPU fitting option simply does not appear and Picasso uses the accessible CPU algorithms.
@@ -287,13 +287,13 @@ As with the z-calibration, the matching spline calibration is loaded automatical
 Experimental PSF (cubic-spline) fitting
 ---------------------------------------
 
-Picasso can fit an **experimentally measured PSF** to every spot. The measured PSF is stored as a cubic spline — a smooth, piecewise-polynomial model built from a bead z-stack — and each spot is fit to that spline on the GPU. This captures aberrations and engineered PSFs (e.g. astigmatism) that a Gaussian cannot describe, and a 3D calibration recovers the axial position ``z`` directly: a single fit returns ``x``, ``y``, ``z``, photons and background, with no separate astigmatism z-calibration step. A 2D calibration models a single focal plane (no ``z``).
+Picasso can fit an **experimentally measured PSF** to every spot. The measured PSF is stored as a cubic spline — a smooth, piecewise-polynomial model built from a bead z-stack — and each spot is fit to that spline. This captures aberrations and engineered PSFs (e.g. astigmatism) that a Gaussian cannot describe, and a 3D calibration recovers the axial position ``z`` directly: a single fit returns ``x``, ``y``, ``z``, photons and background, with no separate astigmatism z-calibration step. A 2D calibration models a single focal plane (no ``z``).
 
 *This feature is experimental — please report any unexpected behavior on our `GitHub issues page <https://github.com/jungmannlab/picasso/issues>`_.*
 
-**Requirements.** Fitting runs only on a CUDA-capable NVIDIA GPU through `Gpufit <https://github.com/gpufit/Gpufit>`_ (see `GPU fitting`_ above); if no GPU library is available, the model and its controls do not appear. *Building* a calibration additionally uses Gpuspline, which — despite the name — is a CPU library, so the calibration step needs no GPU but is only distributed on Windows directly. The .so file for Linux needs to be built and distributed by the user. When Gpuspline cannot be loaded, the ``Calibration`` menu shows neither ``Calibrate spline PSF`` nor ``Re-align channels (current signal)``.
+CPU fitting is available. For GPU, `Gpufit <https://github.com/gpufit/Gpufit>`_ is used and readily available for Windows users with CUDA-capable GPU. *Building* a calibration additionally uses Gpuspline, which — despite the name — is a CPU library, so the calibration step needs no GPU but is only distributed on Windows directly. The .so file for Linux needs to be built and distributed by the user. When Gpuspline cannot be loaded, the ``Calibration`` menu shows neither ``Calibrate spline PSF`` nor ``Re-align channels (current signal)``.
 
-**Localization precision.** Gpufit returns the fitted parameters but no uncertainties, so Picasso evaluates the Cramer-Rao lower bound separately to fill ``lpx``, ``lpy``, ``lpz``, ``photons_unc`` and ``bg_unc``. GPU with CUDA is used if detected, otherwise the process runs on the CPU.
+**Localization precision.** The fit returns the fitted parameters but no uncertainties, so Picasso evaluates the Cramer-Rao lower bound separately to fill ``lpx``, ``lpy``, ``lpz``, ``photons_unc`` and ``bg_unc``. GPU with CUDA is used if detected, otherwise the process runs on the CPU.
 
 The method combines three published works: the experimental-PSF localization workflow and bead alignment of `Li et al., Nature Methods 15, 367–369 (2018) <https://doi.org/10.1038/nmeth.4661>`_, the cubic-spline PSF model for single-molecule data introduced by `Babcock & Zhuang, Scientific Reports 7, 552 (2017) <https://doi.org/10.1038/s41598-017-00622-w>`_, and the GPU localization-fitting and calibration-building backend of `Przybylski et al., Scientific Reports 7, 15722 (2017) <https://doi.org/10.1038/s41598-017-15313-9>`_. The multichannel variant (see `Multichannel spline PSF (e.g. biplane)`_ below) additionally follows the global-fitting approach of globLoc, `Li et al., Nature Communications 13, 3133 (2022) <https://doi.org/10.1038/s41467-022-30719-4>`_.
 
@@ -340,10 +340,12 @@ Fitting with the spline PSF
 
 1. Open ``Analyze`` > ``Parameters`` and set **Model** to ``Experimental PSF (cubic spline)``.
 2. In the **Experimental PSF (spline)** box, click ``Load calibration`` and choose your ``.hdf5``. The last-used calibration is remembered between sessions, and calibrations can be loaded automatically per camera and emission wavelength via the ``spline-calibrations`` config field described above.
-3. Choose the **Optimizer**: ``Least squares`` or ``MLE`` (Poisson maximum likelihood). Both run on the GPU. ``MLE`` is recommended.
-4. Run ``Analyze`` > ``Localize (Identify & Fit)`` (or ``Fit`` for already-identified spots).
+3. Choose the **Optimizer**: ``Least squares`` or ``MLE`` (Poisson maximum likelihood). ``MLE`` is recommended.
+4. Tick **Use GPUfit** to run the fit on the GPU (much faster); leave it unticked to fit on the CPU. The checkbox is only available when Gpufit is installed.
+5. For a CPU fit, the **Convergence criterion** and **Max. iterations** boxes apply and are pre-filled with the values the spline fit uses by default. GPU fitting uses Gpufit's own schedule, so they are greyed out.
+6. Run ``Analyze`` > ``Localize (Identify & Fit)`` (or ``Fit`` for already-identified spots).
 
-In addition to the usual columns, spline fits report per-localization precisions (``lpx``, ``lpy``, and ``lpz`` for 3D, in nm), ``photons`` and ``bg`` with their uncertainties (``photons_unc``, ``bg_unc``), and, for MLE, ``log_likelihood`` and ``iterations``. A 3D calibration adds the recovered ``z`` (and ``lpz``). The accompanying ``_locs.yaml`` records the spline calibration model and file path used.
+In addition to the usual columns, spline fits report per-localization precisions (``lpx``, ``lpy``, and ``lpz`` for 3D, in nm), ``photons`` and ``bg`` with their uncertainties (``photons_unc``, ``bg_unc``), and, for MLE, ``log_likelihood`` and ``iterations``. A 3D calibration adds the recovered ``z`` (and ``lpz``). The accompanying ``_locs.yaml`` records the spline calibration model and file path used, and which device performed the fit.
 
 Multichannel spline PSF (e.g. biplane)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

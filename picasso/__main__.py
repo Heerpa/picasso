@@ -1080,8 +1080,10 @@ _FIT_METHOD_MAP = {
     "mle-spherical-gpu": "gaussmle-spherical-gpu",
     "mle-rotated-gpu": "gaussmle-rotated-gpu",
     "mle-3d": "gaussmle",
-    "spline": "spline-gpu",
-    "spline-mle": "spline-mle-gpu",
+    "spline": "spline",
+    "spline-mle": "spline-mle",
+    "spline-gpu": "spline-gpu",
+    "spline-mle-gpu": "spline-mle-gpu",
     "avg": "avg",
 }
 
@@ -1138,8 +1140,8 @@ def _localize_process_file(
         frame_bounds=frame_bounds,
         movie_info=info,
         fitting_method=fitting_method,
-        eps=convergence if convergence > 0 else 0.001,
-        max_it=max_iterations if max_iterations > 0 else 100,
+        eps=convergence if convergence > 0 else None,
+        max_it=max_iterations if max_iterations > 0 else None,
         spline_calibration=spline_calibration,
         threaded=True,
         identification_progress_callback="console",
@@ -1244,7 +1246,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     print("Localize - Parameters:")
     print("{:<8} {:<15} {:<10}".format("No", "Label", "Value"))
 
-    if args.fit_method in ("lq-gpu", "spline", "spline-mle"):
+    if args.fit_method in ("lq-gpu", "spline-gpu", "spline-mle-gpu"):
         if localize.GPUFIT_INSTALLED:
             print("GPUfit installed")
         else:
@@ -1315,7 +1317,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
                 args.fit_z_gpu = False
 
     spline_calibration = None
-    if args.fit_method in ("spline", "spline-mle"):
+    if args.fit_method.startswith("spline"):
         from .io import load_spline_calibration
 
         if not args.spline_calibration:
@@ -2674,12 +2676,16 @@ def main():  # noqa: C901
             "mle-3d",
             "spline",
             "spline-mle",
+            "spline-gpu",
+            "spline-mle-gpu",
             "avg",
         ],
         default="mle",
         help=(
-            "fitting method ('spline'/'spline-mle' fit an experimental "
-            "cubic-spline PSF on the GPU and need --spline-calibration)"
+            "fitting method. 'spline'/'spline-mle' fit an experimental "
+            "cubic-spline PSF on the CPU by least squares / maximum "
+            "likelihood, 'spline-gpu'/'spline-mle-gpu' do the same on the "
+            "GPU (needs GPUfit); all four need --spline-calibration"
         ),
     )
     localize_parser.add_argument(
@@ -2689,7 +2695,8 @@ def main():  # noqa: C901
         default="",
         help=(
             "path to a cubic-spline PSF calibration (.hdf5) for the "
-            "'spline'/'spline-mle' fit methods"
+            "'spline', 'spline-mle', 'spline-gpu' and 'spline-mle-gpu' "
+            "fit methods"
         ),
     )
     localize_parser.add_argument(

@@ -473,7 +473,7 @@ def gaussmle_async(
 ) -> tuple[
     list, lib.FloatArray2D, lib.FloatArray2D, lib.FloatArray1D, lib.IntArray1D
 ]:
-    """Runs ``gaussmle`` asynchronously (multiprocessing) to fit
+    """Runs ``gaussmle`` asynchronously on several CPU threads to fit
     Gaussians using Maximum Likelihood Estimation (MLE) to the
     extracted spots. See ``gaussmle`` for parameter details.
 

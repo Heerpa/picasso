@@ -33,6 +33,7 @@ from .. import (
     lib,
     postprocess,
     spline,
+    splinefit,
     __version__,
     zfit,
 )
@@ -149,8 +150,8 @@ FIT_MODELS = {
     },
     "Experimental PSF (cubic spline)": {
         "optimizers": {
-            "Least squares": "spline-gpu",
-            "MLE": "spline-mle-gpu",
+            "Least squares": "spline",
+            "MLE": "spline-mle",
         },
         "needs_spline_calibration": True,
     },
@@ -159,13 +160,12 @@ FIT_MODELS = {
         "code": "avg",
     },
 }
-# The cubic-spline PSF is only implemented in GPUfit (codes ending in "-gpu"),
-# so offer it only when a CUDA-capable GPU is found. The rotated
-# elliptical Gaussian has a CPU least-squares implementation but its MLE
-# optimizer is GPU-only.
+# The rotated elliptical Gaussian has a CPU least-squares implementation but
+# its MLE optimizer is GPU-only. The cubic-spline PSF has both: the bare codes
+# above run on the CPU (picasso.splinefit) and FitWorker appends "-gpu" when
+# the GPUfit checkbox is ticked, exactly as for the Gaussian models.
 if not GPUFIT_INSTALLED:
     del FIT_MODELS["2D rotated elliptical Gaussian"]["optimizers"]["MLE"]
-    del FIT_MODELS["Experimental PSF (cubic spline)"]
 
 
 MODEL_TOOLTIP = (
@@ -177,7 +177,8 @@ MODEL_TOOLTIP = (
     "2D spherical Gaussian: Gaussian with one common width for x and y.\n\n"
     "Experimental PSF (cubic spline): fits a cubic spline interpolation of"
     " a measured 3D PSF (requires a spline calibration file). Most accurate"
-    " model and yields z directly, also for aberrated PSFs. GPU only.\n\n"
+    " model and yields z directly, also for aberrated PSFs. Runs on the CPU;"
+    " tick GPUfit to run it on the GPU instead (much faster).\n\n"
     "Average of ROI: reports the spot's center of mass and integrated "
     "intensity in the fit box."
 )
@@ -201,6 +202,28 @@ def _fit_code(model: str, optimizer: str) -> str:
     if entry["optimizers"] is None:
         return entry["code"]
     return entry["optimizers"][optimizer]
+
+
+# Fit codes that iterate on the CPU and therefore honour the convergence
+# criterion and maximum-iteration settings, with the default schedule of each.
+# Gpufit uses its own settings, and the least-squares Gaussian is solved by
+# scipy, so neither appears here. The spline defaults are the ones its axial
+# multi-start needs (see picasso.splinefit), which are much tighter than the
+# Gaussian MLE's - showing the latter for a spline fit would silently make the
+# CPU fit stop earlier than the GPU one.
+_CONVERGENCE_DEFAULTS = {
+    "gaussmle": (0.001, 100),
+    "gaussmle-spherical": (0.001, 100),
+    "spline": (
+        splinefit.TOLERANCE_MULTI_START,
+        splinefit.MAX_ITERATIONS_MULTI_START,
+    ),
+    "spline-mle": (
+        splinefit.TOLERANCE_MULTI_START,
+        splinefit.MAX_ITERATIONS_MULTI_START,
+    ),
+}
+_CONVERGENCE_CODES = frozenset(_CONVERGENCE_DEFAULTS)
 
 
 # Steps allotted to each file in the load progress dialog, so the bar can
@@ -1775,9 +1798,12 @@ class ParametersDialog(lib.Dialog):
         self.spline_calibration = {}
         self.spline_calibration_path = None
         # calibration group boxes, toggled by the selected fit model; set up
-        # further below (spline box only exists when GPUfit is available)
+        # further below
         self.z_groupbox = None
         self.spline_groupbox = None
+        # last resolved fit2D code, so the convergence defaults are only
+        # reapplied when the method actually changes
+        self._last_fit_code = None
 
         self.scroll_area = QtWidgets.QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -2281,67 +2307,68 @@ class ParametersDialog(lib.Dialog):
         fit_z_row.addWidget(self.fit_z_gpu_checkbox)
         z_grid.addLayout(fit_z_row, 2, 0, 1, 2)
 
-        # Experimental PSF (cubic spline). Only meaningful with GPUfit, which
-        # runs the spline fit; the calibration is loaded here and passed to
-        # the fit when the "Experimental PSF (cubic spline)" model is chosen.
-        if GPUFIT_INSTALLED:
-            self.spline_groupbox = spline_groupbox = QtWidgets.QGroupBox(
-                "Experimental PSF (spline)"
-            )
-            spline_groupbox.setToolTip(
-                "Fit an experimentally measured PSF, modelled as a cubic "
-                "spline, on the GPU.\n\n"
-                "Li, Y., Mund, M., Hoess, P. et al. Real-time 3D "
-                "single-molecule localization using experimental point "
-                "spread functions. Nat Methods 15, 367-369 (2018). "
-                "https://doi.org/10.1038/nmeth.4661\n\n"
-                "Babcock, H.P., Zhuang, X. Analyzing Single Molecule "
-                "Localization Microscopy Data Using Cubic Splines. Sci Rep "
-                "7, 552 (2017). https://doi.org/10.1038/s41598-017-00622-w"
-                "\n\n"
-                "Przybylski, A., Thiel, B., Keller-Findeisen, J. et al. "
-                "Gpufit: An open-source toolkit for GPU-accelerated curve "
-                "fitting. Sci Rep 7, 15722 (2017). "
-                "https://doi.org/10.1038/s41598-017-15313-9"
-                "\n\n"
-                "Multichannel (global) fitting follows globLoc:\n"
-                "Li, Y., Shi, W., Liu, S. et al. Global fitting for "
-                "high-accuracy multi-channel single-molecule localization. "
-                "Nat Commun 13, 3133 (2022). "
-                "https://doi.org/10.1038/s41467-022-30719-4"
-            )
-            vbox.addWidget(spline_groupbox)
-            spline_grid = QtWidgets.QGridLayout(spline_groupbox)
-            load_spline_calib = QtWidgets.QPushButton("Load calibration")
-            load_spline_calib.setToolTip(
-                "Load a cubic-spline PSF calibration (.hdf5), built via\n"
-                "3D > Calibrate spline PSF. Used by the 'Experimental PSF\n"
-                "(cubic spline)' fit model."
-            )
-            load_spline_calib.setAutoDefault(False)
-            load_spline_calib.clicked.connect(self.load_spline_calib)
-            spline_grid.addWidget(load_spline_calib, 0, 1)
-            spline_grid.addWidget(lib.HelpButton(self.SPLINE_URL), 0, 2)
-            self.spline_calib_label = QtWidgets.QLabel(
-                "-- no calibration loaded --"
-            )
-            self.spline_calib_label.setAlignment(
-                QtCore.Qt.AlignmentFlag.AlignCenter
-            )
-            self.spline_calib_label.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Ignored,
-                QtWidgets.QSizePolicy.Policy.Fixed,
-            )
-            spline_grid.addWidget(self.spline_calib_label, 0, 0)
+        # Experimental PSF (cubic spline). The calibration is loaded here and
+        # passed to the fit when the "Experimental PSF (cubic spline)" model
+        # is chosen. Always available: the fit runs on the CPU
+        # (picasso.splinefit) and, with GPUfit installed, on the GPU.
+        self.spline_groupbox = spline_groupbox = QtWidgets.QGroupBox(
+            "Experimental PSF (spline)"
+        )
+        spline_groupbox.setToolTip(
+            "Fit an experimentally measured PSF, modelled as a cubic "
+            "spline. Runs on the CPU, or on the GPU with GPUfit "
+            "installed.\n\n"
+            "Li, Y., Mund, M., Hoess, P. et al. Real-time 3D "
+            "single-molecule localization using experimental point "
+            "spread functions. Nat Methods 15, 367-369 (2018). "
+            "https://doi.org/10.1038/nmeth.4661\n\n"
+            "Babcock, H.P., Zhuang, X. Analyzing Single Molecule "
+            "Localization Microscopy Data Using Cubic Splines. Sci Rep "
+            "7, 552 (2017). https://doi.org/10.1038/s41598-017-00622-w"
+            "\n\n"
+            "Przybylski, A., Thiel, B., Keller-Findeisen, J. et al. "
+            "Gpufit: An open-source toolkit for GPU-accelerated curve "
+            "fitting. Sci Rep 7, 15722 (2017). "
+            "https://doi.org/10.1038/s41598-017-15313-9"
+            "\n\n"
+            "Multichannel (global) fitting follows globLoc:\n"
+            "Li, Y., Shi, W., Liu, S. et al. Global fitting for "
+            "high-accuracy multi-channel single-molecule localization. "
+            "Nat Commun 13, 3133 (2022). "
+            "https://doi.org/10.1038/s41467-022-30719-4"
+        )
+        vbox.addWidget(spline_groupbox)
+        spline_grid = QtWidgets.QGridLayout(spline_groupbox)
+        load_spline_calib = QtWidgets.QPushButton("Load calibration")
+        load_spline_calib.setToolTip(
+            "Load a cubic-spline PSF calibration (.hdf5), built via\n"
+            "3D > Calibrate spline PSF. Used by the 'Experimental PSF\n"
+            "(cubic spline)' fit model."
+        )
+        load_spline_calib.setAutoDefault(False)
+        load_spline_calib.clicked.connect(self.load_spline_calib)
+        spline_grid.addWidget(load_spline_calib, 0, 1)
+        spline_grid.addWidget(lib.HelpButton(self.SPLINE_URL), 0, 2)
+        self.spline_calib_label = QtWidgets.QLabel(
+            "-- no calibration loaded --"
+        )
+        self.spline_calib_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignCenter
+        )
+        self.spline_calib_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        spline_grid.addWidget(self.spline_calib_label, 0, 0)
 
-            self.link_photons_checkbox = QtWidgets.QCheckBox(
-                "Link photon counts across channels"
-            )
-            self.link_photons_checkbox.setToolTip(LINK_PHOTONS_TIP)
-            self.link_photons_checkbox.setTristate(False)
-            self.link_photons_checkbox.setChecked(True)
-            self.link_photons_checkbox.hide()  # shown for 2-6 channel calibs
-            spline_grid.addWidget(self.link_photons_checkbox, 1, 0, 1, 3)
+        self.link_photons_checkbox = QtWidgets.QCheckBox(
+            "Link photon counts across channels"
+        )
+        self.link_photons_checkbox.setToolTip(LINK_PHOTONS_TIP)
+        self.link_photons_checkbox.setTristate(False)
+        self.link_photons_checkbox.setChecked(True)
+        self.link_photons_checkbox.hide()  # shown for 2-6 channel calibs
+        spline_grid.addWidget(self.link_photons_checkbox, 1, 0, 1, 3)
 
         # show the calibration box that matches the initial fit model
         self._update_calib_group_visibility()
@@ -2571,11 +2598,25 @@ class ParametersDialog(lib.Dialog):
     def on_fit_optimizer_changed(self) -> None:
         """Switch the optimizer parameter page and enable/disable the GPU
         fitting checkbox based on the selected model and optimizer."""
-        index = self.fit_optimizer.currentIndex()
-        if index >= 0:
-            self.fit_stack.setCurrentIndex(index)
         model = self.fit_model.currentText()
         optimizer = self.fit_optimizer.currentText()
+        # The convergence/max-iterations page belongs to whichever methods
+        # actually iterate on the CPU. That is not the same as "the optimizer
+        # is MLE": the CPU spline fit iterates under least squares too, so the
+        # page is chosen by fit code rather than by combobox index.
+        if optimizer:
+            code = _fit_code(model, optimizer)
+            self.fit_stack.setCurrentIndex(
+                1 if code in _CONVERGENCE_CODES else 0
+            )
+            if code != self._last_fit_code:
+                # Only on an actual change of method, so a value the user
+                # typed survives unrelated updates of this dialog.
+                self._last_fit_code = code
+                defaults = _CONVERGENCE_DEFAULTS.get(code)
+                if defaults is not None:
+                    self.convergence_criterion.setValue(defaults[0])
+                    self.max_it.setValue(defaults[1])
         if optimizer and _fit_code(model, optimizer).endswith("-gpu"):
             # GPU-only method (e.g. the rotated elliptical Gaussian):
             # fitting always runs on the GPU, so pin the checkbox.
@@ -5716,8 +5757,19 @@ class Window(QtWidgets.QMainWindow):
         model = self.parameters_dialog.fit_model.currentText()
         optimizer = self.parameters_dialog.fit_optimizer.currentText()
         method = _fit_code(model, optimizer)
-        eps = self.parameters_dialog.convergence_criterion.value()
-        max_it = self.parameters_dialog.max_it.value()
+        # Disabled means the selected method has its own schedule (Gpufit's, or
+        # the CPU spline's multi-start default). Pass None so fit2D picks it
+        # rather than silently applying whatever the greyed-out boxes show.
+        eps = (
+            self.parameters_dialog.convergence_criterion.value()
+            if self.parameters_dialog.convergence_criterion.isEnabled()
+            else None
+        )
+        max_it = (
+            self.parameters_dialog.max_it.value()
+            if self.parameters_dialog.max_it.isEnabled()
+            else None
+        )
         fit_z = self.parameters_dialog.fit_z_checkbox.isChecked()
         use_gpufit = self.parameters_dialog.gpufit_checkbox.isChecked()
         spline_calibration = None
@@ -5834,7 +5886,8 @@ class Window(QtWidgets.QMainWindow):
             reference.identifications,
             self.parameters["Box Size"],
             calibration,
-            mle=method == "spline-mle-gpu",
+            mle=method in ("spline-mle", "spline-mle-gpu"),
+            use_gpu=method.endswith("-gpu"),
             link_photons=self.parameters_dialog._link_photons_enabled(),
             identifications_per_channel=ids_per_channel,
         )
@@ -5906,7 +5959,8 @@ class Window(QtWidgets.QMainWindow):
             self.identifications,
             self.parameters["Box Size"],
             calibration,
-            mle=method == "spline-mle-gpu",
+            mle=method in ("spline-mle", "spline-mle-gpu"),
+            use_gpu=method.endswith("-gpu"),
             split_fov=True,
             regions=regions,
             link_photons=self.parameters_dialog._link_photons_enabled(),
@@ -6124,7 +6178,13 @@ class Window(QtWidgets.QMainWindow):
             # extraction, GPU fit and per-spot CRLB share this callback
             message = f"Fitting multichannel spline: {curr:,} / {total:,} ..."
             self.status_bar.showMessage(message)
-        elif getattr(worker, "method", "").startswith("spline"):
+        elif getattr(worker, "method", "").endswith("-gpu") and getattr(
+            worker, "method", ""
+        ).startswith("spline"):
+            # The GPU spline fit is a single Gpufit call, so this callback
+            # only ever reports the per-spot CRLB pass that follows it. The
+            # CPU spline reports the fit itself and falls through to the
+            # generic per-spot message below.
             self.status_bar.showMessage("Calculating localization precision")
         elif self.parameters_dialog.gpufit_checkbox.isChecked():
             self.status_bar.showMessage("Fitting spots by GPUfit...")
@@ -6708,12 +6768,14 @@ class FitWorker(QtCore.QThread):
             "gaussmle-spherical",
             "gaussmle-rotated-gpu",
             "gaussmle-spherical-gpu",
+            "spline",
+            "spline-mle",
             "spline-gpu",
             "spline-mle-gpu",
             "avg",
         ],
-        eps: float,
-        max_it: int,
+        eps: float | None,
+        max_it: int | None,
         fit_z: bool,
         calibrate_z: bool,
         use_gpufit: bool,
@@ -6738,6 +6800,8 @@ class FitWorker(QtCore.QThread):
             "gausslq-spherical",
             "gaussmle-spherical",
             "gausslq-rotated",
+            "spline",
+            "spline-mle",
         ):
             method += "-gpu"
         self.method = method
@@ -6805,6 +6869,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         regions: list | None = None,
         link_photons: bool = True,
         identifications_per_channel: list | None = None,
+        use_gpu: bool | None = None,
     ) -> None:
         super().__init__()
         self.movies = movies
@@ -6814,6 +6879,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         self.box = box
         self.calibration = calibration
         self.mle = mle
+        self.use_gpu = use_gpu
         # Link photons across channels (shared amplitude, model 11). When False
         # and the calibration has 2 to 6 channels, fit the photon-decoupled
         # link-XYZ model (one Gpufit id per channel count, 15..19): per-channel
@@ -6922,6 +6988,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     self.calibration,
                     regions=self.regions,
                     mle=self.mle,
+                    use_gpu=self.use_gpu,
                     link_photons=self.link_photons,
                     progress_callback=self.on_progress,
                 )
@@ -6937,6 +7004,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     self.box,
                     self.calibration,
                     mle=self.mle,
+                    use_gpu=self.use_gpu,
                     link_photons=False,
                     progress_callback=self.on_progress,
                 )
@@ -6951,6 +7019,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     self.box,
                     self.calibration,
                     mle=self.mle,
+                    use_gpu=self.use_gpu,
                     progress_callback=self.on_progress,
                 )
             else:
@@ -6961,6 +7030,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     self.box,
                     self.calibration,
                     mle=self.mle,
+                    use_gpu=self.use_gpu,
                     progress_callback=self.on_progress,
                 )
         except Exception as e:
