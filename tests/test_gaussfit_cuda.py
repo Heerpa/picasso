@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(
     not lmfit_cuda.CUDA_AVAILABLE, reason="no CUDA device"
 )
 
-BOX = 13
+BOX = 7
 MODELS = [
     pytest.param(gaussfit_cuda.SPHERICAL, id="spherical"),
     pytest.param(gaussfit_cuda.ELLIPTIC, id="elliptic"),
@@ -79,7 +79,7 @@ def _seed(model, spots):
         gaussfit_cuda.ELLIPTIC: {},
         gaussfit_cuda.ROTATED: dict(rotated=True),
     }[model]
-    return localize._initial_parameters_gpufit(spots, BOX, **kwargs).astype(
+    return localize._initial_parameters_gauss(spots, BOX, **kwargs).astype(
         np.float64
     )
 
@@ -252,11 +252,51 @@ class TestWidthAndAngleDegeneracies:
         """With ``sx == sy`` the angle derivative is identically zero.
 
         The first Hessian is then singular and the fit cannot start, which is
-        why ``_initial_parameters_gpufit`` perturbs the two widths apart. Pinned
+        why ``_initial_parameters_gauss`` perturbs the two widths apart. Pinned
         here because it looks like an arbitrary fudge at the call site."""
         spots = np.zeros((1, BOX, BOX), dtype=np.float32)
         seed = _seed(gaussfit_cuda.ROTATED, spots)
         assert seed[0, 3] != seed[0, 4]
+
+
+class TestNonPositiveModelIsAbandoned:
+    """A Gaussian whose model goes non-positive aborts; it is never floored.
+
+    The cubic-spline models floor such a pixel, because a cubic genuinely rings
+    negative in the tails of a peaked profile - that is the basis, not the
+    parameters. A Gaussian cannot ring: ``amp * exp(...) + bg`` only drops below
+    zero when ``bg`` does. Flooring it there would zero exactly the gradient
+    that pushes the background back up, so the chi-square would stop moving and
+    the *relative* convergence test would then accept a badly wrong fit as
+    converged. Reported as ``NEG_CURVATURE_MLE`` instead, matching the
+    behaviour Picasso shipped before the port.
+    """
+
+    def test_negative_background_is_reported_not_floored(self):
+        theta = _truth(gaussfit_cuda.ELLIPTIC)
+        spots = _reference(gaussfit_cuda.ELLIPTIC, theta)[None].astype(
+            np.float32
+        )
+        # A seed whose background is well below zero: the model is negative
+        # across the whole box, so the very first evaluation is infeasible.
+        seed = np.array([[theta[0], theta[1], theta[2], 1.3, 1.3, -500.0]])
+        _, _, states, _ = gaussfit_cuda.fit_spots(
+            gaussfit_cuda.ELLIPTIC, spots, seed, mle=True
+        )
+        assert states[0] == splinefit.FIT_STATE_NEG_CURVATURE_MLE
+
+    def test_least_squares_is_unaffected(self):
+        """Least squares has no logarithm, so a negative model is legal."""
+        theta = _truth(gaussfit_cuda.ELLIPTIC)
+        spots = _reference(gaussfit_cuda.ELLIPTIC, theta)[None].astype(
+            np.float32
+        )
+        seed = np.array([[theta[0], theta[1], theta[2], 1.3, 1.3, -500.0]])
+        fitted, _, states, _ = gaussfit_cuda.fit_spots(
+            gaussfit_cuda.ELLIPTIC, spots, seed, mle=False
+        )
+        assert states[0] == splinefit.FIT_STATE_CONVERGED
+        np.testing.assert_allclose(fitted[0, 5], theta[5], atol=0.5)
 
 
 class TestApi:

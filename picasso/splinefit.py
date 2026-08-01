@@ -7,7 +7,7 @@ driver together with its four spline models, for both the least-squares and
 the Poisson maximum-likelihood estimator.
 
 This is the CPU twin of the Gpufit path in ``picasso.localize``
-(``fit_spots_gpufit_spline``). The models, the estimators, the damping rule
+(``picasso.splinefit_cuda``). The models, the estimators, the damping rule
 and the convergence test are ported from the CUDA sources
 (``Gpufit/models/spline_*.cuh``, ``Gpufit/estimators/{lse,mle}.cuh``,
 ``Gpufit/cuda_kernels.cu``) and from Gpufit's own serial reference
@@ -139,8 +139,7 @@ def convergence_schedule(apply_seeds: bool) -> tuple:
     """``(tolerance, max_iterations)`` a spline fit uses, on either device.
 
     The single source of truth for both backends, so a CPU fit stops where the
-    GPU fit would: ``localize._run_gpufit_spline`` and
-    ``localize._fit_spline_z_multistart`` read it for Gpufit, and
+    GPU fit would: ``picasso.splinefit_cuda`` reads it too, and
     :func:`fit_spots` / :func:`fit_spots_async` for the CPU kernels. Splitting
     it in two is how the devices silently drift apart - the convergence test is
     *relative* (``|dchi2| < tol * max(1, chi2)``), so a factor of 100 in the
@@ -891,7 +890,7 @@ def _fit_spline_spot(
 
     When ``apply_seeds`` is set, the whole fit is repeated from every axial
     seed in ``z_seeds`` and the best result is kept, ranked exactly as
-    ``localize._fit_spline_z_multistart`` ranks the GPU multi-start: the
+    ``picasso.splinefit_cuda`` ranks the GPU multi-start: the
     lowest chi-square among *converged* fits, falling back to the lowest
     chi-square among merely finite ones. Running the seeds here rather than
     re-running whole passes keeps each spot's data in cache and reports

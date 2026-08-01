@@ -186,8 +186,21 @@ def _floored_chi_square(data):
 
 
 @cuda.jit(device=True, inline=True)
+def _poisson_terms(value, data):
+    """The Poisson terms for a strictly positive model value."""
+    if data > 0.0:
+        return (
+            2.0 * ((value - data) - data * math.log(value / data)),
+            data / (value * value),
+            -(1.0 - data / value),
+        )
+    # An empty (or clipped) pixel: Gpufit's data == 0 term.
+    return 2.0 * value, 0.0, -1.0
+
+
+@cuda.jit(device=True, inline=True)
 def _estimator_terms(mle, value, data):
-    """Per-pixel ``(chi_square, weight, factor, ok)`` for one model value.
+    """Per-pixel ``(chi_square, weight, factor, ok)``, flooring a low model.
 
     ``weight`` multiplies the Hessian outer product and ``factor`` the gradient,
     so a caller accumulates ``grad_k += d_k * factor`` and
@@ -197,9 +210,13 @@ def _estimator_terms(mle, value, data):
 
     ``ok`` is False only for a non-finite model value under the maximum
     likelihood estimator, where the caller must abandon the fit. A merely
-    *non-positive* value is floored instead of rejected - see :data:`MU_FLOOR`,
-    which documents at length why reproducing Gpufit's ``NEG_CURVATURE_MLE``
-    abort here would make the spline MLE useless on bright spots.
+    *non-positive* value is floored instead of rejected - see :data:`MU_FLOOR`.
+
+    **For the cubic-spline models only.** The floor is justified by the spline
+    *basis*: a cubic rings slightly negative in the tails of a peaked profile,
+    so a bright, low-background spot drives the model below zero in the corners
+    of the box through no fault of the parameters. Do not use it for a model
+    that cannot ring - see :func:`_estimator_terms_strict`.
     """
     if mle:
         if not math.isfinite(value):
@@ -210,15 +227,30 @@ def _estimator_terms(mle, value, data):
             # and, through the monotone scaling vector, would damp every
             # parameter to a standstill for the rest of the fit.
             return _floored_chi_square(data), 0.0, 0.0, True
-        if data > 0.0:
-            return (
-                2.0 * ((value - data) - data * math.log(value / data)),
-                data / (value * value),
-                -(1.0 - data / value),
-                True,
-            )
-        # An empty (or clipped) pixel: Gpufit's data == 0 term.
-        return 2.0 * value, 0.0, -1.0, True
+        chi, weight, factor = _poisson_terms(value, data)
+        return chi, weight, factor, True
+    deviation = value - data
+    return deviation * deviation, 1.0, -deviation, True
+
+
+@cuda.jit(device=True, inline=True)
+def _estimator_terms_strict(mle, value, data):
+    """:func:`_estimator_terms`, but a non-positive model value aborts the fit.
+
+    For models that cannot ring negative - the Gaussians, whose value only
+    drops below zero if the *background* parameter does. There the floor is not
+    just unnecessary but harmful: it zeroes that pixel's gradient and Hessian
+    contribution, so nothing pushes the background back up, the chi-square stops
+    moving and the relative convergence test then reports a badly wrong fit as
+    converged. Gpufit aborts such a fit with ``NEG_CURVATURE_MLE`` and so does
+    this; the caller reports the state and the parameters stay at the last
+    accepted iterate.
+    """
+    if mle:
+        if not (math.isfinite(value) and value >= MU_FLOOR):
+            return _INF, 0.0, 0.0, False
+        chi, weight, factor = _poisson_terms(value, data)
+        return chi, weight, factor, True
     deviation = value - data
     return deviation * deviation, 1.0, -deviation, True
 

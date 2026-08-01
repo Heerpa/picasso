@@ -584,10 +584,10 @@ class TestCalibrateSpline:
         assert calib["model"] == "spline-3d"
         assert calib["coefficients"].shape[0] == 64
         assert list(calib["n_data"]) == [BOX, BOX, movie.shape[0]]
-        # the saved calibration loads and can drive the fitter's packer
+        # the saved calibration loads and can drive the fitter
         loaded = io.load_spline_calibration(path)
-        user_info = localize._pack_spline_user_info(loaded)
-        assert user_info.dtype == np.float32
+        coefficients = localize._spline_coeff_reshaped(loaded)
+        assert coefficients.ndim == 7  # (C, niz, niy, nix, 4, 4, 4)
 
     def test_calibrate_spline_2d(self):
         movie, _, _ = _synthetic_bead_movie()
@@ -818,10 +818,10 @@ class TestCalibrateSplineMultichannel:
         assert calib["coefficients"].shape[0] == 64
         assert calib["coefficients"].shape[-1] == 2
         assert len(calib["channel_transforms"]) == 2
-        # round-trips and drives the multichannel user_info packer
+        # round-trips and drives the multichannel fitter
         loaded = io.load_spline_calibration(path)
-        user_info = localize._pack_spline_user_info(loaded)
-        assert user_info.dtype == np.float32
+        coefficients = localize._spline_coeff_reshaped(loaded)
+        assert coefficients.shape[0] == 2  # one coefficient block per channel
         # co-focal channels: both planes at the same focus
         np.testing.assert_allclose(
             calib["plane_offsets"], [0.0, 0.0], atol=25.0

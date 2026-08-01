@@ -562,12 +562,12 @@ def fit_spots_parallel(
     return fits_from_futures(fs)
 
 
-def fit_spots_gpufit(spots: lib.FloatArray3D) -> lib.FloatArray2D:
+def fit_spots_gauss_gpu(spots: lib.FloatArray3D) -> lib.FloatArray2D:
     """Fit multiple spots with a (non-rotated) elliptical 2D Gaussian
     using least-squares fitting on the GPU.
 
     Kept for backward compatibility - the GPU fitting now lives in
-    ``picasso.localize.fit_spots_gpufit``, which additionally supports
+    ``picasso.localize.fit_spots_gauss_gpu``, which additionally supports
     the rotated elliptical Gaussian model and the MLE estimator.
 
     Parameters
@@ -586,7 +586,7 @@ def fit_spots_gpufit(spots: lib.FloatArray3D) -> lib.FloatArray2D:
     """
     from picasso import localize
 
-    return localize.fit_spots_gpufit(spots)
+    return localize.fit_spots_gauss_gpu(spots)
 
 
 def fits_from_futures(futures: list[futures.Future]) -> lib.FloatArray2D:
@@ -672,7 +672,7 @@ def locs_from_fits(
         np.float32
     )
     if rotated:
-        # Match the GPU convention (see localize.locs_from_fits_gpufit):
+        # Match the GPU convention (see localize.locs_from_fits_gauss_gpu):
         # negate, convert to degrees and normalize to [-90, 90) since the
         # ellipse repeats every half turn.
         angle = -np.rad2deg(theta[:, 6])
@@ -691,7 +691,7 @@ def locs_from_fits(
     return locs
 
 
-def locs_from_fits_gpufit(
+def locs_from_fits_gauss_gpu(
     identifications: pd.DataFrame,
     theta: lib.FloatArray2D,
     box: int,
@@ -702,7 +702,7 @@ def locs_from_fits_gpufit(
 
     Kept for backward compatibility - the GPU fitting now lives in
     ``picasso.localize``, see
-    ``picasso.localize.locs_from_fits_gpufit``.
+    ``picasso.localize.locs_from_fits_gauss_gpu``.
 
     Parameters
     ----------
@@ -726,7 +726,7 @@ def locs_from_fits_gpufit(
     """
     from picasso import localize
 
-    return localize.locs_from_fits_gpufit(identifications, theta, box, em)
+    return localize.locs_from_fits_gauss_gpu(identifications, theta, box, em)
 
 
 def localization_precision(

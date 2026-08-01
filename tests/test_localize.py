@@ -22,7 +22,7 @@ import pytest
 from scipy.interpolate import CubicSpline
 from PyQt6 import QtWidgets
 
-from picasso import gaussmle, gausslq, io, localize, spline
+from picasso import gaussfit_cuda, gaussmle, gausslq, io, localize, spline
 from picasso.gui import localize as localize_gui
 
 from tests.conftest import BOX, CALIB_3D, CAMERA_INFO, MIN_NG, PIXELSIZE
@@ -1505,8 +1505,8 @@ class TestMovieLoadWorker:
 # ---------------------------------------------------------------------------
 
 
-# Gpufit reports a per-spot termination code; 0 is a converged fit. The MLE
-# (Poisson) estimator additionally emits code 3 (NEG_CURVATURE_MLE) when the
+# The GPU fit reports a per-spot termination code; 0 is a converged fit. The
+# MLE (Poisson) estimator additionally emits code 3 (NEG_CURVATURE_MLE) when the
 # likelihood Hessian loses positive-definiteness - the returned parameters are
 # then the last (unconverged, unreliable) iterate, so tests that assert
 # numerical recovery must restrict to converged spots.
@@ -1514,31 +1514,19 @@ _GPUFIT_CONVERGED = 0
 
 
 def _gpufit_gauss_with_states(spots, rotated=False, mle=False):
-    """Run the low-level Gpufit Gaussian fit while keeping the per-spot fit
-    states that :func:`localize.fit_spots_gpufit` drops. Mirrors that function
+    """Run the low-level GPU Gaussian fit while keeping the per-spot fit
+    states that :func:`localize.fit_spots_gauss_gpu` drops. Mirrors that function
     exactly (same initial parameters, model, estimator, tolerance and iteration
     cap) and applies the same ``photons = amplitude * 2*pi*sx*sy`` conversion,
     returning ``(theta, states, n_iterations)``."""
-    gf = localize.gf
     data = np.maximum(spots, 0) if mle else spots
     size = data.shape[1]
-    init = localize._initial_parameters_gpufit(data, size, rotated=rotated)
-    model_id = (
-        gf.ModelID.GAUSS_2D_ROTATED
-        if rotated
-        else gf.ModelID.GAUSS_2D_ELLIPTIC
+    init = localize._initial_parameters_gauss(data, size, rotated=rotated)
+    model = gaussfit_cuda.ROTATED if rotated else gaussfit_cuda.ELLIPTIC
+    params, _chi_squares, states, n_iter = gaussfit_cuda.fit_spots(
+        model, data, init.astype(np.float64), mle=mle
     )
-    estimator_id = gf.EstimatorID.MLE if mle else gf.EstimatorID.LSE
-    params, states, chi_squares, n_iter, _ = gf.fit(
-        data.reshape((len(data), size * size)),
-        None,
-        model_id,
-        init,
-        tolerance=1e-2,
-        max_number_iterations=20,
-        estimator_id=estimator_id,
-    )
-    params = params.copy()
+    params = params.astype(np.float32)
     params[:, 0] *= 2.0 * np.pi * params[:, 3] * params[:, 4]
     return params, states, n_iter
 
@@ -1563,7 +1551,7 @@ def _make_rotated_spot(box, x0, y0, sx, sy, photons, bg, angle):
     not localize.GPU_FITTING_AVAILABLE, reason="no CUDA device"
 )
 class TestGpufit:
-    """Thorough tests for the Gpufit Gaussian codepath (``fit_spots_gpufit``).
+    """Thorough tests for the Gpufit Gaussian codepath (``fit_spots_gauss_gpu``).
     Requires a CUDA-capable GPU, so skipped in the typical test environment.
 
     Parameter order returned by Gpufit is ``[photons, x, y, sx, sy, bg]`` and,
@@ -1577,7 +1565,7 @@ class TestGpufit:
         """On noiseless spots the model matches the data exactly, so LSE must
         recover every parameter - not just photons - to tight tolerance."""
         spots, gt = synthetic_spots
-        theta = localize.fit_spots_gpufit(spots, mle=False)
+        theta = localize.fit_spots_gauss_gpu(spots, mle=False)
         assert theta.shape == (len(spots), 6)
         half = spots.shape[1] // 2
         np.testing.assert_allclose(theta[:, 0], gt.photons.values, rtol=1e-3)
@@ -1591,30 +1579,26 @@ class TestGpufit:
         """With Poisson noise LSE still recovers ground truth, at looser
         (noise-limited) tolerance."""
         spots, gt = synthetic_spots_noisy
-        theta = localize.fit_spots_gpufit(spots, mle=False)
+        theta = localize.fit_spots_gauss_gpu(spots, mle=False)
         half = spots.shape[1] // 2
         np.testing.assert_allclose(theta[:, 0], gt.photons.values, rtol=0.05)
         np.testing.assert_allclose(theta[:, 1] - half, gt.x.values, atol=0.1)
         np.testing.assert_allclose(theta[:, 2] - half, gt.y.values, atol=0.1)
 
     def test_photons_are_amplitude_times_2pi_sxsy(self, synthetic_spots):
-        """The reported photon count is the raw Gpufit Gaussian amplitude
-        scaled by its integral ``2*pi*sx*sy`` - the conversion
-        fit_spots_gpufit applies to Gpufit's peak-height parameter."""
-        gf = localize.gf
+        """The reported photon count is the raw Gaussian amplitude scaled by
+        its integral ``2*pi*sx*sy`` - the conversion fit_spots_gauss_gpu
+        applies to the model's peak-height parameter."""
         spots, _ = synthetic_spots
         size = spots.shape[1]
-        init = localize._initial_parameters_gpufit(spots, size)
-        raw, _, _, _, _ = gf.fit(
-            spots.reshape((len(spots), size * size)),
-            None,
-            gf.ModelID.GAUSS_2D_ELLIPTIC,
-            init,
-            tolerance=1e-2,
-            max_number_iterations=20,
-            estimator_id=gf.EstimatorID.LSE,
+        init = localize._initial_parameters_gauss(spots, size)
+        raw, _, _, _ = gaussfit_cuda.fit_spots(
+            gaussfit_cuda.ELLIPTIC,
+            spots,
+            init.astype(np.float64),
+            mle=False,
         )
-        theta = localize.fit_spots_gpufit(spots, mle=False)
+        theta = localize.fit_spots_gauss_gpu(spots, mle=False)
         expected = raw[:, 0] * 2.0 * np.pi * raw[:, 3] * raw[:, 4]
         np.testing.assert_allclose(theta[:, 0], expected, rtol=1e-5)
 
@@ -1631,7 +1615,7 @@ class TestGpufit:
                 for a in angles
             ]
         )
-        theta = localize.fit_spots_gpufit(spots, rotated=True, mle=False)
+        theta = localize.fit_spots_gauss_gpu(spots, rotated=True, mle=False)
         assert theta.shape == (len(angles), 7)
         np.testing.assert_allclose(theta[:, 6], angles, atol=1e-3)
         # widths recovered along the rotated axes
@@ -1641,7 +1625,7 @@ class TestGpufit:
     def test_rotated_and_spherical_mutually_exclusive(self, synthetic_spots):
         spots, _ = synthetic_spots
         with pytest.raises(ValueError):
-            localize.fit_spots_gpufit(spots, rotated=True, spherical=True)
+            localize.fit_spots_gauss_gpu(spots, rotated=True, spherical=True)
 
     # -- spherical (isotropic, single-width GAUSS_2D model) ---------------
 
@@ -1649,7 +1633,7 @@ class TestGpufit:
         """The GAUSS_2D model recovers the shared width and returns the
         expanded elliptical layout with sx == sy."""
         spots, gt = synthetic_spots_isotropic
-        theta = localize.fit_spots_gpufit(spots, spherical=True, mle=False)
+        theta = localize.fit_spots_gauss_gpu(spots, spherical=True, mle=False)
         assert theta.shape == (len(spots), 6)
         np.testing.assert_array_equal(theta[:, 3], theta[:, 4])
         half = spots.shape[1] // 2
@@ -1660,7 +1644,7 @@ class TestGpufit:
 
     def test_spherical_mle_converged_recover(self, synthetic_spots_isotropic):
         spots, gt = synthetic_spots_isotropic
-        theta, ll, n_iter, chi2 = localize.fit_spots_gpufit(
+        theta, ll, n_iter, chi2 = localize.fit_spots_gauss_gpu(
             spots, spherical=True, mle=True, return_stats=True
         )
         assert theta.shape == (len(spots), 6)
@@ -1716,7 +1700,7 @@ class TestGpufit:
         """Where the MLE fit converges, its photon estimate agrees with the
         (always-converging) LSE fit on the same data."""
         spots, _ = synthetic_spots_noisy
-        lse = localize.fit_spots_gpufit(spots, mle=False)
+        lse = localize.fit_spots_gauss_gpu(spots, mle=False)
         mle, states, _ = _gpufit_gauss_with_states(spots, mle=True)
         idx = np.where(states == _GPUFIT_CONVERGED)[0]
         np.testing.assert_allclose(mle[idx, 0], lse[idx, 0], rtol=0.1)
@@ -1736,7 +1720,7 @@ class TestGpufit:
 
     def test_return_stats_mle(self, synthetic_spots_noisy):
         spots, _ = synthetic_spots_noisy
-        theta, ll, n_iter, chi2 = localize.fit_spots_gpufit(
+        theta, ll, n_iter, chi2 = localize.fit_spots_gauss_gpu(
             spots, mle=True, return_stats=True
         )
         assert theta.shape == (len(spots), 6)
@@ -1751,7 +1735,7 @@ class TestGpufit:
         self, synthetic_spots
     ):
         spots, _ = synthetic_spots
-        theta, ll, n_iter, chi2 = localize.fit_spots_gpufit(
+        theta, ll, n_iter, chi2 = localize.fit_spots_gauss_gpu(
             spots, mle=False, return_stats=True
         )
         # LSE assumes no noise model, so there is no likelihood; what it does
@@ -1785,7 +1769,7 @@ class TestGpufit:
     # -- end-to-end: fit -> localizations ---------------------------------
 
     def test_end_to_end_locs_absolute_position(self, synthetic_spots):
-        """fit_spots_gpufit + locs_from_fits_gpufit place each spot at its true
+        """fit_spots_gauss_gpu + locs_from_fits_gauss_gpu place each spot at its true
         absolute position (identification pixel + sub-pixel fit offset)."""
         spots, gt = synthetic_spots
         n = len(spots)
@@ -1798,8 +1782,8 @@ class TestGpufit:
                 "net_gradient": np.full(n, 5000.0, dtype=np.float32),
             }
         )
-        theta = localize.fit_spots_gpufit(spots, mle=False)
-        locs = localize.locs_from_fits_gpufit(ids, theta, box, em=False)
+        theta = localize.fit_spots_gauss_gpu(spots, mle=False)
+        locs = localize.locs_from_fits_gauss_gpu(ids, theta, box, em=False)
         box_offset = int(box / 2)
         # x_abs = x_id + (x_fit - box_offset); x_fit - box//2 == gt.x
         np.testing.assert_allclose(locs["x"], 50 + gt.x.values, atol=3e-3)
@@ -1817,7 +1801,7 @@ class TestGpufit:
 
 
 class TestInitialParametersGpufit:
-    """``localize._initial_parameters_gpufit`` seeds the Levenberg-Marquardt
+    """``localize._initial_parameters_gauss`` seeds the Levenberg-Marquardt
     fit; it is pure NumPy and needs no GPU."""
 
     def test_elliptic_layout_and_values(self):
@@ -1829,7 +1813,7 @@ class TestInitialParametersGpufit:
         spots[0, 3, 3] = 103.0  # peak
         spots[1] = 7.0
         spots[1, 2, 4] = 57.0
-        init = localize._initial_parameters_gpufit(spots, box)
+        init = localize._initial_parameters_gauss(spots, box)
 
         assert init.shape == (2, 6)
         assert init.dtype == np.float32
@@ -1850,7 +1834,7 @@ class TestInitialParametersGpufit:
         # box / 5 < 1 -> the width floor of 1.0 kicks in.
         box = 4
         spots = np.ones((1, box, box), dtype=np.float32)
-        init = localize._initial_parameters_gpufit(spots, box)
+        init = localize._initial_parameters_gauss(spots, box)
         np.testing.assert_allclose(init[:, 3], 1.0)
         np.testing.assert_allclose(init[:, 4], 1.0)
 
@@ -1861,7 +1845,7 @@ class TestInitialParametersGpufit:
         box = 7
         spots = np.zeros((3, box, box), dtype=np.float32)
         spots[:, 3, 3] = 100.0
-        init = localize._initial_parameters_gpufit(spots, box, rotated=True)
+        init = localize._initial_parameters_gauss(spots, box, rotated=True)
         assert init.shape == (3, 7)
         width = max(box / 5.0, 1.0)
         np.testing.assert_allclose(init[:, 3], width * 1.1)
@@ -1879,7 +1863,7 @@ class TestInitialParametersGpufit:
         spots[0, 3, 3] = 103.0
         spots[1] = 7.0
         spots[1, 2, 4] = 57.0
-        init = localize._initial_parameters_gpufit(spots, box, spherical=True)
+        init = localize._initial_parameters_gauss(spots, box, spherical=True)
         assert init.shape == (2, 5)
         assert init.dtype == np.float32
         center = box / 2.0 - 0.5
@@ -1892,7 +1876,7 @@ class TestInitialParametersGpufit:
 
 
 class TestLocsFromFitsGpufit:
-    """``localize.locs_from_fits_gpufit`` maps gpufit theta
+    """``localize.locs_from_fits_gauss_gpu`` maps gpufit theta
     ``[photons, x, y, sx, sy, bg, (angle)]`` to a localizations frame. Pure
     pandas/NumPy - no GPU needed."""
 
@@ -1921,7 +1905,7 @@ class TestLocsFromFitsGpufit:
             dtype=np.float32,
         )
         ids = self._ids(2)
-        locs = localize.locs_from_fits_gpufit(ids, theta, BOX, em=False)
+        locs = localize.locs_from_fits_gauss_gpu(ids, theta, BOX, em=False)
         box_offset = int(BOX / 2)
         np.testing.assert_allclose(
             locs["x"], theta[:, 1] + ids["x"].to_numpy() - box_offset
@@ -1936,7 +1920,7 @@ class TestLocsFromFitsGpufit:
 
     def test_ellipticity_formula(self):
         theta = np.array([[500.0, 3.0, 3.0, 1.4, 1.0, 5.0]], dtype=np.float32)
-        locs = localize.locs_from_fits_gpufit(
+        locs = localize.locs_from_fits_gauss_gpu(
             theta=theta, box=BOX, em=False, identifications=self._ids(1)
         )
         # (max - min) / max = (1.4 - 1.0) / 1.4
@@ -1948,7 +1932,7 @@ class TestLocsFromFitsGpufit:
         # A spherical fit has sx == sy, so ellipticity is always 0 and is
         # dropped entirely. The rest of the columns are unaffected.
         theta = np.array([[500.0, 3.0, 3.0, 1.2, 1.2, 5.0]], dtype=np.float32)
-        locs = localize.locs_from_fits_gpufit(
+        locs = localize.locs_from_fits_gauss_gpu(
             self._ids(1), theta, BOX, em=False, spherical=True
         )
         assert "ellipticity" not in locs.columns
@@ -1968,10 +1952,10 @@ class TestLocsFromFitsGpufit:
 
     def test_spherical_flag_only_drops_ellipticity(self):
         theta = np.array([[500.0, 3.2, 3.7, 1.2, 1.2, 5.0]], dtype=np.float32)
-        full = localize.locs_from_fits_gpufit(
+        full = localize.locs_from_fits_gauss_gpu(
             self._ids(1), theta, BOX, em=False, mle=True, spherical=False
         )
-        sph = localize.locs_from_fits_gpufit(
+        sph = localize.locs_from_fits_gauss_gpu(
             self._ids(1), theta, BOX, em=False, mle=True, spherical=True
         )
         assert set(full.columns) - set(sph.columns) == {"ellipticity"}
@@ -1982,7 +1966,7 @@ class TestLocsFromFitsGpufit:
 
     def test_lse_precision_is_mortensen_no_unc_columns(self):
         theta = np.array([[500.0, 3.2, 3.7, 1.3, 1.1, 5.0]], dtype=np.float32)
-        locs = localize.locs_from_fits_gpufit(
+        locs = localize.locs_from_fits_gauss_gpu(
             self._ids(1), theta, BOX, em=False, mle=False
         )
         expected_lpx = gausslq.localization_precision(
@@ -1999,7 +1983,7 @@ class TestLocsFromFitsGpufit:
 
     def test_mle_precision_is_crlb_with_unc_columns(self):
         theta = np.array([[500.0, 3.2, 3.7, 1.3, 1.1, 5.0]], dtype=np.float32)
-        locs = localize.locs_from_fits_gpufit(
+        locs = localize.locs_from_fits_gauss_gpu(
             self._ids(1), theta, BOX, em=False, mle=True
         )
         crlb = localize._gauss_crlb(theta, BOX, em=False)
@@ -2026,7 +2010,7 @@ class TestLocsFromFitsGpufit:
             [[500.0, 3.0, 3.0, 1.4, 1.0, 5.0, np.deg2rad(100.0)]],
             dtype=np.float32,
         )
-        locs = localize.locs_from_fits_gpufit(
+        locs = localize.locs_from_fits_gauss_gpu(
             self._ids(1), theta, BOX, em=False, mle=True
         )
         assert "angle" in locs.columns
@@ -2040,19 +2024,19 @@ class TestLocsFromFitsGpufit:
             (3, 1),
         )
         ids = self._ids(3, frames=[2, 0, 1])
-        locs = localize.locs_from_fits_gpufit(ids, theta, BOX, em=False)
+        locs = localize.locs_from_fits_gauss_gpu(ids, theta, BOX, em=False)
         assert list(locs["frame"]) == [0, 1, 2]
 
     def test_stats_columns_optional(self):
         theta = np.array([[500.0, 3.0, 3.0, 1.2, 1.2, 5.0]], dtype=np.float32)
         # without stats, no log_likelihood / iterations
-        locs = localize.locs_from_fits_gpufit(
+        locs = localize.locs_from_fits_gauss_gpu(
             self._ids(1), theta, BOX, em=False
         )
         assert "log_likelihood" not in locs.columns
         assert "iterations" not in locs.columns
         # with stats they appear, correctly typed
-        locs = localize.locs_from_fits_gpufit(
+        locs = localize.locs_from_fits_gauss_gpu(
             self._ids(1),
             theta,
             BOX,
@@ -2067,10 +2051,10 @@ class TestLocsFromFitsGpufit:
 
     def test_em_scales_lse_precision_by_sqrt2(self):
         theta = np.array([[500.0, 3.2, 3.7, 1.3, 1.1, 5.0]], dtype=np.float32)
-        no_em = localize.locs_from_fits_gpufit(
+        no_em = localize.locs_from_fits_gauss_gpu(
             self._ids(1), theta, BOX, em=False, mle=False
         )
-        em = localize.locs_from_fits_gpufit(
+        em = localize.locs_from_fits_gauss_gpu(
             self._ids(1), theta, BOX, em=True, mle=False
         )
         np.testing.assert_allclose(
@@ -2402,67 +2386,6 @@ class TestSplineCalibrationIO:
 class TestSplineHelpers:
     """Pure-logic tests for the spline backend (run without a GPU)."""
 
-    def test_model_id_mapping(self):
-        if not localize.GPUFIT_INSTALLED:
-            pytest.skip("ModelID enum needs the Gpufit binding")
-        assert localize._spline_model_id("spline-2d") == (
-            localize.gf.ModelID.SPLINE_2D
-        )
-        assert localize._spline_model_id("spline-3d") == (
-            localize.gf.ModelID.SPLINE_3D
-        )
-        with pytest.raises(ValueError):
-            localize._spline_model_id("nonsense")
-
-    def test_pack_user_info_3d_layout(self):
-        calib = _fake_spline_calibration(model="spline-3d")
-        user_info = localize._pack_spline_user_info(calib)
-        # dtype must be float32 (matches single-precision Gpufit build)
-        assert user_info.dtype == np.float32
-        nx, ny, _ = calib["n_data"]
-        ix, iy, iz = calib["n_intervals"]
-        # header: [n_data_x, n_data_y, n_data_z=1, n_int_x, n_int_y, n_int_z]
-        np.testing.assert_array_equal(
-            user_info[:6], np.array([nx, ny, 1, ix, iy, iz], np.float32)
-        )
-        expected_len = 6 + calib["coefficients"].size
-        assert user_info.size == expected_len
-        # The coefficient block is REORDERED into Gpufit's forward axis order
-        # (see _reorder_spline_coefficients_for_gpufit) - not the raw
-        # Gpuspline-binding C-order ravel, which is the layout the axis-packing
-        # bug shipped. It must be a permutation of the same values...
-        coeff = calib["coefficients"]
-        np.testing.assert_array_equal(
-            np.sort(user_info[6:]), np.sort(coeff.ravel(order="C"))
-        )
-        # ...matching the reorder helper exactly...
-        np.testing.assert_array_equal(
-            user_info[6:],
-            localize._reorder_spline_coefficients_for_gpufit(
-                coeff, "spline-3d"
-            ),
-        )
-        # ...and NOT the raw forward ravel (guards against a regression to the
-        # un-reordered packing that made Gpufit read scrambled coefficients).
-        assert not np.array_equal(user_info[6:], coeff.ravel(order="C"))
-
-    def test_pack_user_info_2d_layout(self):
-        calib = _fake_spline_calibration(model="spline-2d")
-        user_info = localize._pack_spline_user_info(calib)
-        nx, ny = calib["n_data"]
-        ix, iy = calib["n_intervals"]
-        np.testing.assert_array_equal(
-            user_info[:4], np.array([nx, ny, ix, iy], np.float32)
-        )
-        assert user_info.size == 4 + calib["coefficients"].size
-        # coefficient block is reordered into Gpufit's forward axis order
-        np.testing.assert_array_equal(
-            user_info[4:],
-            localize._reorder_spline_coefficients_for_gpufit(
-                calib["coefficients"], "spline-2d"
-            ),
-        )
-
     def test_initial_parameters_shape(self, synthetic_spots):
         spots, _ = synthetic_spots
         calib_3d = _fake_spline_calibration(model="spline-3d")
@@ -2552,7 +2475,7 @@ class TestSplineHelpers:
         spots, _ = synthetic_spots
         calib = _fake_spline_calibration(model="spline-3d")
         with pytest.raises(ImportError):
-            localize.fit_spots_gpufit_spline(spots, calib)
+            localize.fit_spots_spline(spots, calib)
 
     def test_spline_kind_covers_every_model(self):
         from picasso import splinefit
@@ -2596,7 +2519,7 @@ class TestSplineHelpers:
         n_starts = localize._default_n_z_starts(calib)
         seeds, apply_seeds = localize._spline_z_seeds(calib, n_starts)
         assert apply_seeds
-        # the grid _fit_spline_z_multistart builds for the GPU
+        # the seed grid both devices build
         n_z = int(calib["n_data"][2])
         np.testing.assert_allclose(
             seeds, np.linspace(-(n_z - 1), 0.0, n_starts)
@@ -2619,33 +2542,61 @@ class TestSplineHelpers:
         assert localize._spline_cpu_schedule(True, 1e-7, 3) == (1e-7, 3)
 
     @pytest.mark.parametrize("apply_seeds", [False, True])
-    def test_cpu_and_gpu_use_the_same_schedule(self, apply_seeds):
+    def test_cpu_and_gpu_use_the_same_schedule(self, apply_seeds, monkeypatch):
         """Both devices must stop in the same place, or a CPU and a GPU fit of
         the same spots differ for reasons unrelated to the fit. The convergence
         test is relative, so a different tolerance is a real difference - and
-        the multi-start ranks its axial seeds on that chi-square."""
-        import inspect
-        from picasso import splinefit
+        the multi-start ranks its axial seeds on that chi-square.
+
+        Asserted behaviourally rather than by reading the source: whatever
+        ``splinefit.convergence_schedule`` returns is what *both* backends are
+        handed."""
+        from picasso import splinefit, splinefit_cuda
 
         shared = splinefit.convergence_schedule(apply_seeds)
         assert localize._spline_cpu_schedule(apply_seeds, None, None) == shared
         assert splinefit.resolve_schedule(apply_seeds) == shared
-        # ...and the Gpufit call sites read the same function rather than
-        # repeating the numbers.
-        gpu_single = inspect.getsource(localize._run_gpufit_spline)
-        gpu_multi = inspect.getsource(localize._fit_spline_z_multistart)
-        assert "splinefit.resolve_schedule" in gpu_single
-        assert "splinefit.convergence_schedule(True)" in gpu_multi
-        for source in (gpu_single, gpu_multi):
-            assert "TOLERANCE_MULTI_START" not in source
-            assert "TOLERANCE_SINGLE_START" not in source
+
+        sentinel = (0.1234, 7)
+        monkeypatch.setattr(
+            splinefit, "convergence_schedule", lambda seeded: sentinel
+        )
+        calib = _fake_spline_calibration(model="spline-3d")
+        box = calib["box"]
+        spots = np.zeros((2, box, box), np.float32)
+        n_z_starts = localize._default_n_z_starts(calib) if apply_seeds else 1
+
+        for module, use_gpu in (
+            (splinefit, False),
+            (splinefit_cuda, True),
+        ):
+            if use_gpu and not localize.GPU_FITTING_AVAILABLE:
+                continue
+            seen = {}
+
+            def fake_fit_spots(*args, _seen=seen, **kwargs):
+                _seen.update(kwargs)
+                n = len(args[1])
+                return (
+                    np.zeros((n, args[5].shape[1])),
+                    np.zeros(n),
+                    np.zeros(n, np.int32),
+                    np.zeros(n, np.int32),
+                )
+
+            monkeypatch.setattr(module, "fit_spots", fake_fit_spots)
+            localize._run_splinefit(
+                spots,
+                calib,
+                n_z_starts=n_z_starts,
+                multiprocess=False,
+                use_gpu=use_gpu,
+            )
+            assert (seen["tolerance"], seen["max_iterations"]) == sentinel
 
     def test_spline_use_gpu_resolution(self):
         # no GPU on this machine unless Gpufit is installed
-        assert (
-            localize._spline_use_gpu(None)
-            is localize.GPU_FITTING_AVAILABLE
-        )
+        assert localize._spline_use_gpu(None) is localize.GPU_FITTING_AVAILABLE
         assert localize._spline_use_gpu(False) is False
         if not localize.GPU_FITTING_AVAILABLE:
             with pytest.raises(ImportError, match="use_gpu=False"):
@@ -2663,50 +2614,6 @@ class TestSplineHelpers:
             localize.estimate_affine_transform(
                 np.zeros((2, 2)), np.zeros((2, 2))
             )
-
-    @pytest.mark.parametrize("n_channels", [2, 3, 4, 5, 6])
-    @pytest.mark.parametrize("link_xyz", [False, True])
-    def test_pack_user_info_multichannel_layout(self, link_xyz, n_channels):
-        n_channels = 3
-        calib = _fake_spline_calibration(
-            model="spline-3d-multichannel", n_channels=n_channels
-        )
-        # the photon-decoupled model reuses the multichannel blob verbatim -
-        # only the parameter handling differs
-        if link_xyz:
-            calib = localize._as_link_xyz_calibration(calib)
-        model = calib["model"]
-        user_info = localize._pack_spline_user_info(calib)
-        assert user_info.dtype == np.float32
-        nx, ny, _ = calib["n_data"]
-        ix, iy, iz = calib["n_intervals"]
-        # header: [n_channels, nx, ny, nz=1, ix, iy, iz]
-        np.testing.assert_array_equal(
-            user_info[:7],
-            np.array([n_channels, nx, ny, 1, ix, iy, iz], np.float32),
-        )
-        n_coeff = calib["coefficients"].size
-        # coefficients, then the per-channel lateral affine channel-major (4
-        # reals each). The CUDA models detect that trailing block purely by the
-        # total size, so its length is part of the contract.
-        assert user_info.size == 7 + n_coeff + 4 * n_channels
-        # each channel's block is reordered to forward axis order and the
-        # blocks are concatenated channel-major (outermost axis)
-        np.testing.assert_array_equal(
-            user_info[7 : 7 + n_coeff],
-            localize._reorder_spline_coefficients_for_gpufit(
-                calib["coefficients"], model
-            ),
-        )
-        np.testing.assert_array_equal(
-            user_info[7 + n_coeff :],
-            np.tile(np.array([1.0, 0.0, 0.0, 1.0], np.float32), n_channels),
-        )
-        # without transforms the blob stops after the coefficients and the
-        # CUDA models fall back to an identity per channel
-        calib = dict(calib)
-        calib.pop("channel_transforms")
-        assert localize._pack_spline_user_info(calib).size == 7 + n_coeff
 
     def test_channel_roi_residuals_pure_translation_is_constant(self):
         # Detections sit on integer pixels, so a pure translation shifts every
@@ -2784,65 +2691,6 @@ class TestSplineHelpers:
             ),
             np.ndarray,
         )
-
-    def test_pack_user_info_multichannel_residual_block(self):
-        n_channels = 2
-        n_fits = 5
-        calib = _fake_spline_calibration(
-            model="spline-3d-multichannel", n_channels=n_channels
-        )
-        n_coeff = calib["coefficients"].size
-        rng = np.random.default_rng(0)
-        residuals = rng.uniform(-0.5, 0.5, (n_fits, n_channels, 2)).astype(
-            np.float32
-        )
-        user_info = localize._pack_spline_user_info(calib, residuals)
-        assert user_info.dtype == np.float32
-        # the CUDA model locates the block by total size, so the length and the
-        # [fit][channel][x, y] order are both part of the wire contract
-        base = 7 + n_coeff + 4 * n_channels
-        assert user_info.size == base + n_fits * n_channels * 2
-        np.testing.assert_array_equal(
-            user_info[base:], residuals.ravel(order="C")
-        )
-        # omitting them leaves the previous blob byte for byte
-        np.testing.assert_array_equal(
-            localize._pack_spline_user_info(calib),
-            user_info[:base],
-        )
-
-    def test_pack_user_info_rejects_unusable_residuals(self):
-        calib = _fake_spline_calibration(
-            model="spline-3d-multichannel", n_channels=2
-        )
-        good = np.zeros((3, 2, 2), np.float32)
-        # wrong channel count / rank
-        with pytest.raises(ValueError, match="n_channels, 2"):
-            localize._pack_spline_user_info(calib, np.zeros((3, 3, 2)))
-        with pytest.raises(ValueError, match="n_channels, 2"):
-            localize._pack_spline_user_info(calib, np.zeros((3, 2)))
-        # the model finds the block at a fixed offset past the affine, so
-        # without the affine the two would be confused for each other
-        no_affine = dict(calib)
-        no_affine.pop("channel_transforms")
-        with pytest.raises(ValueError, match="affine"):
-            localize._pack_spline_user_info(no_affine, good)
-        # single-channel models have nowhere to put them
-        with pytest.raises(ValueError, match="multichannel"):
-            localize._pack_spline_user_info(
-                _fake_spline_calibration(model="spline-3d"), good
-            )
-
-    def test_gpufit_batch_size_stays_within_bounds(self):
-        # batching is what keeps Gpufit's chunk_index at 0, which the model's
-        # residual indexing relies on; both bounds must hold for any input
-        for n_points in (1, 169, 338, 2646, 10**7, 10**9):
-            batch = localize._gpufit_batch_size(n_points)
-            assert 1 <= batch <= localize._GPUFIT_MAX_FITS_PER_CALL
-            assert (
-                batch == 1
-                or batch * n_points <= localize._GPUFIT_MAX_POINTS_PER_CALL
-            )
 
     @pytest.mark.parametrize("gpu", SPLINE_CRLB_DEVICES)
     def test_spline_crlb_residual_equals_a_lateral_shift(self, gpu):
@@ -2985,46 +2833,58 @@ class TestSplineHelpers:
         # a calibration that does not describe a z axis cannot be multi-started
         assert localize._default_n_z_starts({"n_data": [7, 7]}) == 1
 
+    @staticmethod
+    def _capture_kernel_call(monkeypatch):
+        """Record the arguments ``_run_splinefit`` hands to the kernel.
+
+        The multi-start runs *inside* the per-spot kernel on both devices, so
+        it is no longer visible as a repeated call - what has to be asserted is
+        the seed grid and the schedule the kernel is given."""
+        from picasso import splinefit
+
+        calls = []
+
+        def fake_fit_spots(*args, **kwargs):
+            calls.append((args, kwargs))
+            n_spots = len(args[1])
+            n_params = args[5].shape[1]
+            return (
+                np.zeros((n_spots, n_params)),
+                np.full(n_spots, 1.0),
+                np.zeros(n_spots, np.int32),
+                np.ones(n_spots, np.int32),
+            )
+
+        monkeypatch.setattr(splinefit, "fit_spots", fake_fit_spots)
+        return calls
+
     @pytest.mark.parametrize("model", ["spline-3d", "spline-3d-multichannel"])
     def test_fit_spots_multistarts_by_default(self, monkeypatch, model):
-        # the whole fit runs once per seed, so "did it multi-start" is exactly
-        # "how many times was the fitter called"
         calib = _fake_spline_calibration(model=model)
         expected = localize._default_n_z_starts(calib)
         assert expected > 1
         n_channels = localize._spline_n_channels(calib)
-        n_params = 5
         box = calib["box"]
         spots = np.zeros((3, box, box), np.float32)
         if model == "spline-3d-multichannel":
             spots = np.zeros((3, box, box, n_channels), np.float32)
 
-        calls = []
-
-        def fake_run(spots_, calibration, **kw):
-            calls.append(kw)
-            n = len(spots_)
-            return (
-                np.zeros((n, n_params), np.float32),
-                np.zeros(n, np.int32),
-                np.full(n, 1.0),
-                np.ones(n, np.int32),
-                0.0,
-            )
-
-        monkeypatch.setattr(localize, "_run_gpufit_spline", fake_run)
-        localize.fit_spots_gpufit_spline(spots, calib, mle=True)
-        assert len(calls) == expected
+        calls = self._capture_kernel_call(monkeypatch)
+        localize.fit_spots_splinefit(
+            spots, calib, mle=True, multiprocess=False
+        )
+        assert len(calls) == 1
+        args, kwargs = calls[0]
+        z_seeds, apply_seeds = args[6], args[7]
+        assert apply_seeds is True
+        # the seeds must actually differ, spanning the calibration stack
+        assert len(set(z_seeds.tolist())) == expected
+        assert z_seeds.min() == pytest.approx(-(calib["n_data"][2] - 1))
+        assert z_seeds.max() == pytest.approx(0.0)
         # seeded runs must use the tight convergence, else neighbouring axial
         # minima are indistinguishable and the multi-start is pointless
-        assert all(c["tolerance"] == 1e-4 for c in calls)
-        assert all(c["max_number_iterations"] == 100 for c in calls)
-        # and the seeds must actually differ, spanning the stack
-        z_col = 3
-        seeds = [float(c["initial_parameters"][0, z_col]) for c in calls]
-        assert len(set(seeds)) == expected
-        assert min(seeds) == pytest.approx(-(calib["n_data"][2] - 1))
-        assert max(seeds) == pytest.approx(0.0)
+        assert kwargs["tolerance"] == 1e-4
+        assert kwargs["max_iterations"] == 100
 
     def test_ratiometric_multistarts_every_hypothesis(self, monkeypatch):
         # colour is decided by comparing hypotheses' residuals, so they all
@@ -3098,58 +2958,19 @@ class TestSplineHelpers:
     def test_fit_spots_single_start_is_still_reachable(self, monkeypatch):
         calib = _fake_spline_calibration(model="spline-3d")
         box = calib["box"]
-        calls = []
-
-        def fake_run(spots_, calibration, **kw):
-            calls.append(kw)
-            n = len(spots_)
-            return (
-                np.zeros((n, 5), np.float32),
-                np.zeros(n, np.int32),
-                np.full(n, 1.0),
-                np.ones(n, np.int32),
-                0.0,
-            )
-
-        monkeypatch.setattr(localize, "_run_gpufit_spline", fake_run)
-        localize.fit_spots_gpufit_spline(
-            np.zeros((3, box, box), np.float32), calib, n_z_starts=1
+        calls = self._capture_kernel_call(monkeypatch)
+        localize.fit_spots_splinefit(
+            np.zeros((3, box, box), np.float32),
+            calib,
+            n_z_starts=1,
+            multiprocess=False,
         )
         assert len(calls) == 1
+        args, kwargs = calls[0]
+        assert args[7] is False  # apply_seeds
         # the single-start path keeps the loose defaults
-        assert "tolerance" not in calls[0]
-
-    def test_link_xyz_model_ids_cover_the_supported_range(self):
-        # the map and the advertised maximum must not drift apart
-        assert sorted(localize._LINK_XYZ_MODEL_ID_NAMES) == list(
-            range(2, localize._LINK_XYZ_MAX_CHANNELS + 1)
-        )
-
-    def test_model_id_mapping_link_xyz(self):
-        if not localize.GPUFIT_INSTALLED:
-            pytest.skip("ModelID enum needs the Gpufit binding")
-        model = localize._LINK_XYZ_MODEL
-        # Gpufit fixes a model's parameter count at compile time, and link-XYZ
-        # needs 3 + 2*n_channels, so the channel count is encoded in the id.
-        # These literals are the wire contract with Gpufit.dll.
-        for n_channels, model_id in {
-            2: 15,
-            3: 16,
-            4: 17,
-            5: 18,
-            6: 19,
-        }.items():
-            assert localize._spline_model_id(model, n_channels) == model_id
-        # a bare call keeps meaning the original 2-channel model
-        assert localize._spline_model_id(model) == 15
-        for bad in (0, 1, localize._LINK_XYZ_MAX_CHANNELS + 1):
-            with pytest.raises(ValueError):
-                localize._spline_model_id(model, bad)
-        # the shared-amplitude model has 5 parameters whatever the channel
-        # count, so it ignores the argument
-        assert localize._spline_model_id("spline-3d-multichannel", 6) == (
-            localize.gf.ModelID.SPLINE_3D_MULTICHANNEL
-        )
+        assert kwargs["tolerance"] == 1e-2
+        assert kwargs["max_iterations"] == 20
 
     @pytest.mark.parametrize("n_channels", [2, 3, 4, 5, 6])
     def test_as_link_xyz_calibration_accepts_supported_channels(
@@ -3206,26 +3027,6 @@ class TestSplineHelpers:
         np.testing.assert_allclose(
             init[:, 3 + n_channels :], ch_min, rtol=1e-5
         )
-
-    def test_run_gpufit_spline_rejects_mismatched_parameter_width(self):
-        # Gpufit sizes its output from initial_parameters but strides the
-        # device buffers by the ModelID's parameter count, so a too-narrow
-        # array would corrupt memory instead of raising. The guard runs before
-        # anything reaches the GPU.
-        if not localize.GPUFIT_INSTALLED:
-            pytest.skip("needs the Gpufit binding")
-        n_channels = 3
-        calib = localize._as_link_xyz_calibration(
-            _fake_spline_calibration(
-                model="spline-3d-multichannel", n_channels=n_channels
-            )
-        )
-        spots = np.zeros((2, BOX, BOX, n_channels), dtype=np.float32)
-        too_narrow = np.zeros((2, 3 + 2 * (n_channels - 1)), dtype=np.float32)
-        with pytest.raises(ValueError, match="initial parameters"):
-            localize._run_gpufit_spline(
-                spots, calib, initial_parameters=too_narrow
-            )
 
     def test_initial_parameters_multichannel_stacked(self):
         calib = _fake_spline_calibration(
@@ -3694,7 +3495,7 @@ class TestSplineGpufit:
             np.float32
         )
         spots = np.stack([spot] * 4)
-        theta = localize.fit_spots_gpufit_spline(spots, calib)
+        theta = localize.fit_spots_spline(spots, calib)
         assert theta.shape == (len(spots), 5)
         # The fitted z_shift maps to the taken native slice with magnitude
         # ~= z_slice; the sign encodes the native_z = -z_shift convention
@@ -3712,7 +3513,7 @@ class TestSplineGpufit:
         spot = (amplitude * template[:, :, z_slice] + offset).astype(
             np.float32
         )
-        amp, xs, ys, zs, off = localize.fit_spots_gpufit_spline(
+        amp, xs, ys, zs, off = localize.fit_spots_spline(
             np.stack([spot]), calib
         )[0]
         box, _, nz = calib["n_data"]
@@ -3737,7 +3538,7 @@ class TestSplineGpufit:
         wrong_box = BOX + 2
         spots = np.zeros((2, wrong_box, wrong_box), dtype=np.float32)
         with pytest.raises(ValueError):
-            localize.fit_spots_gpufit_spline(spots, calib)
+            localize.fit_spots_spline(spots, calib)
 
     def test_spline_3d_recovers_amplitude_offset_at_focus(self):
         """A centered in-focus spot recovers its amplitude, offset and (near)
@@ -3746,7 +3547,7 @@ class TestSplineGpufit:
         calib, template, amp, off = _synthetic_spline_3d_calibration()
         z_slice = int(calib["z_center"])
         spot = (amp * template[:, :, z_slice] + off).astype(np.float32)
-        theta = localize.fit_spots_gpufit_spline(np.stack([spot] * 3), calib)
+        theta = localize.fit_spots_spline(np.stack([spot] * 3), calib)
         np.testing.assert_allclose(theta[:, 0], amp, rtol=1e-3)  # amplitude
         np.testing.assert_allclose(theta[:, 4], off, atol=1e-2)  # offset
         np.testing.assert_allclose(theta[:, 1], 0.0, atol=1e-2)  # x_shift
@@ -3769,7 +3570,7 @@ class TestSplineGpufit:
                 np.array([z_focus], np.float32),
             )[:, :, 0]
             spots.append((off + amp * phi).astype(np.float32))
-        theta = localize.fit_spots_gpufit_spline(np.stack(spots), calib)
+        theta = localize.fit_spots_spline(np.stack(spots), calib)
         np.testing.assert_allclose(theta[:, 1], shifts, atol=5e-3)
         np.testing.assert_allclose(theta[:, 2], shifts, atol=5e-3)
 
@@ -3785,7 +3586,7 @@ class TestSplineGpufit:
                 for k in slices
             ]
         )
-        theta = localize.fit_spots_gpufit_spline(spots, calib)
+        theta = localize.fit_spots_spline(spots, calib)
         native_z = -theta[:, 3]
         diffs = np.diff(native_z)
         # strictly monotonic (all steps share one sign)
@@ -3802,8 +3603,8 @@ class TestSplineGpufit:
                 for k in slices
             ]
         )
-        lse = localize.fit_spots_gpufit_spline(spots, calib, mle=False)
-        mle = localize.fit_spots_gpufit_spline(spots, calib, mle=True)
+        lse = localize.fit_spots_spline(spots, calib, mle=False)
+        mle = localize.fit_spots_spline(spots, calib, mle=True)
         np.testing.assert_allclose(
             mle[:, 0], lse[:, 0], rtol=1e-3
         )  # amplitude
@@ -3818,9 +3619,9 @@ class TestSplineGpufit:
         box, _, nz = calib["n_data"]
         z_slice = int(calib["z_center"])
         spot = (amp * template[:, :, z_slice] + off).astype(np.float32)
-        a, xs, ys, zs, o = localize.fit_spots_gpufit_spline(
-            np.stack([spot]), calib
-        )[0]
+        a, xs, ys, zs, o = localize.fit_spots_spline(np.stack([spot]), calib)[
+            0
+        ]
         grid = np.arange(box, dtype=np.float32)
         phi = localize.gs.spline_values(
             calib["coefficients"],
@@ -3850,7 +3651,7 @@ class TestSplineGpufit:
             if phi.ndim == 3:
                 phi = phi[:, :, 0]
             spots.append((off + amp * phi).astype(np.float32))
-        theta = localize.fit_spots_gpufit_spline(np.stack(spots), calib)
+        theta = localize.fit_spots_spline(np.stack(spots), calib)
         assert theta.shape == (len(shifts), 4)  # [amp, x_shift, y_shift, off]
         np.testing.assert_allclose(theta[:, 0], amp, rtol=1e-3)
         np.testing.assert_allclose(theta[:, 3], off, atol=1e-2)
@@ -3858,7 +3659,7 @@ class TestSplineGpufit:
         np.testing.assert_allclose(theta[:, 2], shifts, atol=5e-3)
 
     def test_spline_3d_locs_end_to_end(self):
-        """fit_spots_gpufit_spline + locs_from_fits_spline yields a valid
+        """fit_spots_spline + locs_from_fits_spline yields a valid
         localizations frame with finite, positive CRLB precisions and a z
         column for the 3D model."""
         calib, template, amp, off = _synthetic_spline_3d_calibration()
@@ -3874,7 +3675,7 @@ class TestSplineGpufit:
                 "net_gradient": np.full(n, 1000.0),
             }
         )
-        theta = localize.fit_spots_gpufit_spline(spots, calib)
+        theta = localize.fit_spots_spline(spots, calib)
         box = calib["n_data"][0]
         locs = localize.locs_from_fits_spline(ids, theta, box, False, calib)
         assert len(locs) == n
@@ -3993,8 +3794,8 @@ class TestFit2DGpu:
         spots = localize.get_spots(
             picasso_movie, real_identifications, BOX, self.CAMERA_INFO
         )
-        theta = localize.fit_spots_gpufit(spots, mle=False)
-        direct = localize.locs_from_fits_gpufit(
+        theta = localize.fit_spots_gauss_gpu(spots, mle=False)
+        direct = localize.locs_from_fits_gauss_gpu(
             real_identifications, theta, BOX, em=False
         )
         np.testing.assert_allclose(
@@ -4991,16 +4792,16 @@ class TestSaveableColumns:
             ],
             dtype=np.float32,
         )
-        frames["gpufit-mle"] = localize.locs_from_fits_gpufit(
+        frames["gpufit-mle"] = localize.locs_from_fits_gauss_gpu(
             ids, theta_e, BOX, em=False, mle=True, **stats
         )
-        frames["gpufit-mle-rotated"] = localize.locs_from_fits_gpufit(
+        frames["gpufit-mle-rotated"] = localize.locs_from_fits_gauss_gpu(
             ids, theta_r, BOX, em=False, mle=True, **stats
         )
-        frames["gpufit-lse"] = localize.locs_from_fits_gpufit(
+        frames["gpufit-lse"] = localize.locs_from_fits_gauss_gpu(
             ids, theta_e, BOX, em=False, mle=False, **lsq_stats
         )
-        frames["gpufit-lse-rotated"] = localize.locs_from_fits_gpufit(
+        frames["gpufit-lse-rotated"] = localize.locs_from_fits_gauss_gpu(
             ids, theta_r, BOX, em=False, mle=False, **lsq_stats
         )
 
@@ -5272,8 +5073,8 @@ class TestSplineRatiometric:
             ck["coefficients"] = localize.scale_channel_blocks(
                 calib["coefficients"], r
             )
-            params, states, chi, *_ = localize._run_gpufit_spline(
-                spots, ck, mle=False
+            params, chi, _states, _n_it = localize._run_splinefit(
+                spots, ck, mle=False, use_gpu=True
             )
             fin = np.isfinite(params).all(1) & np.isfinite(chi)
             scores[k] = np.where(fin, chi, np.inf)

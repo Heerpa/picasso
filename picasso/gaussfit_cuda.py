@@ -27,6 +27,14 @@ The amplitude parameter is the Gaussian's *peak height*, not its integral;
 multi-start here - these models have no axial coordinate - so each spot is
 fitted once from its initial parameters.
 
+Unlike the spline models these use
+:func:`picasso.lmfit_cuda._estimator_terms_strict`, which abandons a
+maximum-likelihood fit whose model value goes non-positive rather than flooring
+it. A Gaussian cannot ring negative the way a cubic spline does: the model only
+drops below zero when the *background* parameter does, and flooring those pixels
+would remove the very gradient that pushes it back up - leaving the fit stalled
+at a badly wrong optimum that the relative convergence test then accepts.
+
 :authors: Rafal Kowalewski
 :copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry
 """
@@ -45,7 +53,7 @@ from picasso.splinefit import _allocate_outputs
 from picasso.lmfit_cuda import (
     CUDA_THREADS,
     _INF,
-    _estimator_terms,
+    _estimator_terms_strict,
     make_fit_kernel,
     make_lm_driver,
 )
@@ -106,7 +114,7 @@ def _make_accumulate_spherical(ftype):
                 d2 = amp * ex * dy * inv_s2
                 d3 = amp * ex * (dx * dx + dy * dy) * inv_s3
                 # d4 == 1 (offset).
-                contrib, weight, factor, ok = _estimator_terms(
+                contrib, weight, factor, ok = _estimator_terms_strict(
                     mle, value, data
                 )
                 if not ok:
@@ -210,7 +218,7 @@ def _make_accumulate_elliptic(ftype):
                 d3 = amp * ex * dx * dx * inv_sx3
                 d4 = amp * ex * dy * dy * inv_sy3
                 # d5 == 1 (offset).
-                contrib, weight, factor, ok = _estimator_terms(
+                contrib, weight, factor, ok = _estimator_terms_strict(
                     mle, value, data
                 )
                 if not ok:
@@ -284,7 +292,7 @@ def _make_accumulate_rotated(ftype):
     """Rotated elliptic Gaussian, ``[photons, x, y, sx, sy, bg, angle]``.
 
     The angle derivative vanishes identically when ``sx == sy``, which makes the
-    first Hessian singular; ``localize._initial_parameters_gpufit`` breaks that
+    first Hessian singular; ``localize._initial_parameters_gauss`` breaks that
     symmetry in its seed on purpose, and this model relies on it."""
     half = ftype(0.5)
 
@@ -348,7 +356,7 @@ def _make_accumulate_rotated(ftype):
                 d4 = amp * argb * argb * inv_sy3 * ex
                 # d5 == 1 (offset).
                 d6 = amp * arga * argb * (inv_sx2 - inv_sy2) * ex
-                contrib, weight, factor, ok = _estimator_terms(
+                contrib, weight, factor, ok = _estimator_terms_strict(
                     mle, value, data
                 )
                 if not ok:
@@ -490,7 +498,7 @@ def fit_spots(
         ``(n_spots, box, box)`` photon counts, indexed ``[spot, y, x]``.
     initial_parameters : np.ndarray
         ``(n_spots, n_params)`` seeds, from
-        ``localize._initial_parameters_gpufit``.
+        ``localize._initial_parameters_gauss``.
     mle : bool, optional
         Use the Poisson maximum-likelihood estimator instead of least squares.
     tolerance, max_iterations : optional
