@@ -1,13 +1,13 @@
 """
-picasso.splinefit
-~~~~~~~~~~~~~~~~~
+picasso.fitting.splinefit
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
 CPU cubic-spline PSF fitting: a numba port of Gpufit's Levenberg-Marquardt
 driver together with its four spline models, for both the least-squares and
 the Poisson maximum-likelihood estimator.
 
-This is the CPU twin of the Gpufit path in ``picasso.localize``
-(``picasso.splinefit_cuda``). The models, the estimators, the damping rule
+This is the CPU twin of ``picasso.fitting.splinefit_cuda``, which fits
+the same models on the GPU. The models, the estimators, the damping rule
 and the convergence test are ported from the CUDA sources
 (``Gpufit/models/spline_*.cuh``, ``Gpufit/estimators/{lse,mle}.cuh``,
 ``Gpufit/cuda_kernels.cu``) and from Gpufit's own serial reference
@@ -36,10 +36,11 @@ circular dependency. ``localize`` owns the dict handling
 
 References
 ----------
-Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Sauer, M.
+Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
 "Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
 Scientific Reports 7, 15722 (2017).
 https://doi.org/10.1038/s41598-017-15313-9
+Licence (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
 
 Li, Y., Mund, M., Hoess, P. et al. "Real-time 3D single-molecule
 localization using experimental point spread functions." Nature Methods
@@ -139,7 +140,7 @@ def convergence_schedule(apply_seeds: bool) -> tuple:
     """``(tolerance, max_iterations)`` a spline fit uses, on either device.
 
     The single source of truth for both backends, so a CPU fit stops where the
-    GPU fit would: ``picasso.splinefit_cuda`` reads it too, and
+    GPU fit would: ``picasso.fitting.splinefit_cuda`` reads it too, and
     :func:`fit_spots` / :func:`fit_spots_async` for the CPU kernels. Splitting
     it in two is how the devices silently drift apart - the convergence test is
     *relative* (``|dchi2| < tol * max(1, chi2)``), so a factor of 100 in the
@@ -177,11 +178,7 @@ def resolve_schedule(
 # produces: ``(n_channels, niz, niy, nix, 4, 4, 4)`` indexed
 # ``[c, k, j, i, z_power, y_power, x_power]`` (3D) or
 # ``(n_channels, niy, nix, 4, 4)`` indexed ``[c, j, i, y_power, x_power]``
-# (2D). That is the natural NumPy view of Gpuspline's raw buffer - NOT the
-# axis-reordered blob ``_reorder_spline_coefficients_for_gpufit`` builds for
-# Gpufit's ``user_info``. Feeding the reordered blob to these kernels would
-# scramble the model silently, which is why the tests pin this against
-# ``localize._spline_model_and_grad``.
+# (2D).
 # ----------------------------------------------------------------------
 
 
@@ -890,7 +887,7 @@ def _fit_spline_spot(
 
     When ``apply_seeds`` is set, the whole fit is repeated from every axial
     seed in ``z_seeds`` and the best result is kept, ranked exactly as
-    ``picasso.splinefit_cuda`` ranks the GPU multi-start: the
+    ``picasso.fitting.splinefit_cuda`` ranks the GPU multi-start: the
     lowest chi-square among *converged* fits, falling back to the lowest
     chi-square among merely finite ones. Running the seeds here rather than
     re-running whole passes keeps each spot's data in cache and reports

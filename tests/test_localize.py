@@ -11,6 +11,7 @@ Tests for ``gausslq``, ``gaussmle`` and ``zfit`` live in their own files
 
 from __future__ import annotations
 
+import inspect
 import sys
 import time
 import warnings
@@ -22,7 +23,8 @@ import pytest
 from scipy.interpolate import CubicSpline
 from PyQt6 import QtWidgets
 
-from picasso import gaussfit_cuda, gaussmle, gausslq, io, localize, spline
+from picasso import gaussmle, gausslq, io, localize, spline
+from picasso.fitting import gaussfit_cuda
 from picasso.gui import localize as localize_gui
 
 from tests.conftest import BOX, CALIB_3D, CAMERA_INFO, MIN_NG, PIXELSIZE
@@ -2478,7 +2480,7 @@ class TestSplineHelpers:
             localize.fit_spots_spline(spots, calib)
 
     def test_spline_kind_covers_every_model(self):
-        from picasso import splinefit
+        from picasso.fitting import splinefit
 
         assert localize._spline_kind("spline-2d") == splinefit.KIND_2D
         assert localize._spline_kind("spline-3d") == splinefit.KIND_3D
@@ -2528,18 +2530,18 @@ class TestSplineHelpers:
         calib_2d = _fake_spline_calibration(model="spline-2d")
         assert localize._spline_z_seeds(calib_2d, 9)[1] is False
 
-    def test_cpu_schedule_defaults_and_overrides(self):
-        from picasso import splinefit
+    def test_schedule_defaults_and_overrides(self):
+        from picasso.fitting import splinefit
 
-        assert localize._spline_cpu_schedule(True, None, None) == (
+        assert localize._spline_schedule(True, None, None) == (
             splinefit.TOLERANCE_MULTI_START,
             splinefit.MAX_ITERATIONS_MULTI_START,
         )
-        assert localize._spline_cpu_schedule(False, None, None) == (
+        assert localize._spline_schedule(False, None, None) == (
             splinefit.TOLERANCE_SINGLE_START,
             splinefit.MAX_ITERATIONS_SINGLE_START,
         )
-        assert localize._spline_cpu_schedule(True, 1e-7, 3) == (1e-7, 3)
+        assert localize._spline_schedule(True, 1e-7, 3) == (1e-7, 3)
 
     @pytest.mark.parametrize("apply_seeds", [False, True])
     def test_cpu_and_gpu_use_the_same_schedule(self, apply_seeds, monkeypatch):
@@ -2551,10 +2553,10 @@ class TestSplineHelpers:
         Asserted behaviourally rather than by reading the source: whatever
         ``splinefit.convergence_schedule`` returns is what *both* backends are
         handed."""
-        from picasso import splinefit, splinefit_cuda
+        from picasso.fitting import splinefit, splinefit_cuda
 
         shared = splinefit.convergence_schedule(apply_seeds)
-        assert localize._spline_cpu_schedule(apply_seeds, None, None) == shared
+        assert localize._spline_schedule(apply_seeds, None, None) == shared
         assert splinefit.resolve_schedule(apply_seeds) == shared
 
         sentinel = (0.1234, 7)
@@ -2840,7 +2842,7 @@ class TestSplineHelpers:
         The multi-start runs *inside* the per-spot kernel on both devices, so
         it is no longer visible as a repeated call - what has to be asserted is
         the seed grid and the schedule the kernel is given."""
-        from picasso import splinefit
+        from picasso.fitting import splinefit
 
         calls = []
 
@@ -3684,6 +3686,296 @@ class TestSplineGpufit:
         for col in ("lpx", "lpy", "lpz"):
             assert np.all(np.isfinite(locs[col])) and (locs[col] > 0).all()
         np.testing.assert_allclose(locs["photons"], amp, rtol=1e-3)
+
+
+class TestConvergenceSchedulePlumbing:
+    """The convergence criterion and the iteration cap must reach *every*
+    fitting method, on either device, and be recorded as what the fit actually
+    used. Both used to be greyed out for GPU fitting and unavailable for the
+    least-squares Gaussians, so a user could not touch them at all for
+    Picasso's default method."""
+
+    CAMERA_INFO = {**CAMERA_INFO, "Pixelsize": PIXELSIZE}
+
+    @pytest.mark.parametrize(
+        "method,default",
+        [
+            ("gausslq", (gausslq.TOLERANCE, gausslq.MAX_ITERATIONS)),
+            ("gausslq-spherical", (gausslq.TOLERANCE, gausslq.MAX_ITERATIONS)),
+            ("gausslq-rotated", (gausslq.TOLERANCE, gausslq.MAX_ITERATIONS)),
+            ("gaussmle", (0.001, 100)),
+            ("gaussmle-spherical", (0.001, 100)),
+            (
+                "gausslq-gpu",
+                (gaussfit_cuda.TOLERANCE, gaussfit_cuda.MAX_ITERATIONS),
+            ),
+            (
+                "gaussmle-rotated-gpu",
+                (gaussfit_cuda.TOLERANCE, gaussfit_cuda.MAX_ITERATIONS),
+            ),
+        ],
+    )
+    def test_metadata_records_the_schedule(
+        self, picasso_movie, movie_info, real_identifications, method, default
+    ):
+        """Asked for None, the metadata reports that method's own default;
+        asked for a value, it reports the value."""
+        if method.endswith("-gpu") and not localize.GPU_FITTING_AVAILABLE:
+            pytest.skip("no CUDA device")
+
+        def run(eps, max_it):
+            _, info = localize.fit2D(
+                picasso_movie,
+                movie_info,
+                self.CAMERA_INFO,
+                real_identifications[:20],
+                BOX,
+                fitting_method=method,
+                eps=eps,
+                max_it=max_it,
+                multiprocess=False,
+            )
+            return info["Convergence criterion"], info["Max iterations"]
+
+        assert run(None, None) == default
+        assert run(1e-5, 7) == (1e-5, 7)
+
+    def test_avg_records_no_schedule(
+        self, picasso_movie, movie_info, real_identifications
+    ):
+        """The one method that does not iterate must not claim one."""
+        _, info = localize.fit2D(
+            picasso_movie,
+            movie_info,
+            self.CAMERA_INFO,
+            real_identifications[:20],
+            BOX,
+            fitting_method="avg",
+            multiprocess=False,
+        )
+        assert "Convergence criterion" not in info
+        assert "Max iterations" not in info
+
+    @pytest.mark.parametrize("mle", [False, True])
+    def test_gpu_gauss_iteration_cap_bites(self, mle):
+        """The cap has to reach the kernel, not just the metadata."""
+        if not localize.GPU_FITTING_AVAILABLE:
+            pytest.skip("no CUDA device")
+        rng = np.random.default_rng(0)
+        yy, xx = np.mgrid[0:BOX, 0:BOX].astype(float)
+        centre = (BOX - 1) / 2.0
+        spots = np.stack(
+            [
+                rng.poisson(
+                    900.0
+                    * np.exp(
+                        -0.5
+                        * (
+                            ((xx - centre - dx) / 1.3) ** 2
+                            + ((yy - centre - dy) / 1.7) ** 2
+                        )
+                    )
+                    + 12.0
+                ).astype(np.float32)
+                for dx, dy in rng.uniform(-0.5, 0.5, (24, 2))
+            ]
+        )
+        capped = localize.fit_spots_gauss_gpu(
+            spots, mle=mle, return_stats=True, max_iterations=2
+        )[2]
+        free = localize.fit_spots_gauss_gpu(
+            spots, mle=mle, return_stats=True, max_iterations=40
+        )[2]
+        assert capped.max() <= 2
+        assert free.max() > 2
+
+    def test_gpu_gauss_tolerance_bites(self):
+        """A looser stop must take strictly fewer iterations."""
+        if not localize.GPU_FITTING_AVAILABLE:
+            pytest.skip("no CUDA device")
+        rng = np.random.default_rng(1)
+        yy, xx = np.mgrid[0:BOX, 0:BOX].astype(float)
+        centre = (BOX - 1) / 2.0
+        spots = np.stack(
+            [
+                rng.poisson(
+                    900.0
+                    * np.exp(
+                        -0.5
+                        * (
+                            ((xx - centre) / 1.3) ** 2
+                            + ((yy - centre) / 1.7) ** 2
+                        )
+                    )
+                    + 12.0
+                ).astype(np.float32)
+                for _ in range(24)
+            ]
+        )
+        loose = localize.fit_spots_gauss_gpu(
+            spots, return_stats=True, tolerance=1e-1, max_iterations=60
+        )[2]
+        tight = localize.fit_spots_gauss_gpu(
+            spots, return_stats=True, tolerance=1e-8, max_iterations=60
+        )[2]
+        assert loose.mean() < tight.mean()
+
+    def test_spline_schedule_reaches_the_gpu_backend(self, monkeypatch):
+        """``_fit2d_spline_gpu`` used to drop the caller's schedule on the
+        floor - the GPU boxes were greyed out, so there was never one to
+        pass."""
+        calib = _fake_spline_calibration(model="spline-3d")
+        box = calib["box"]
+        seen = {}
+
+        def fake(*args, **kwargs):
+            seen.update(kwargs)
+            n = len(args[0])
+            return (
+                np.zeros((n, 5), np.float32),
+                np.zeros(n, np.float32),
+                np.zeros(n, np.float32),
+                np.zeros(n, np.float32),
+            )
+
+        monkeypatch.setattr(localize, "fit_spots_splinefit", fake)
+        monkeypatch.setattr(
+            localize, "locs_from_fits_spline", lambda *a, **k: pd.DataFrame()
+        )
+        localize._fit2d_spline_gpu(
+            spots=np.zeros((2, box, box), np.float32),
+            identifications=pd.DataFrame(),
+            box=box,
+            em=False,
+            calibration=calib,
+            tolerance=1e-7,
+            max_iterations=3,
+        )
+        assert seen["tolerance"] == 1e-7
+        assert seen["max_iterations"] == 3
+
+
+class TestGuiConvergenceDefaults:
+    """The GUI's per-method default table has to agree with the values the
+    backends use when asked for None; otherwise the boxes show one schedule
+    and the fit runs another."""
+
+    def test_every_iterating_method_has_defaults(self):
+        """Every ``fit2D`` code except "avg" iterates and must be listed."""
+        codes = set()
+        for entry in localize_gui.FIT_MODELS.values():
+            optimizers = entry["optimizers"]
+            if optimizers is None:
+                codes.add(entry["code"])
+                continue
+            for code in optimizers.values():
+                codes.add(code)
+                codes.add(localize_gui._effective_fit_code(code, True))
+        assert codes - localize_gui._CONVERGENCE_CODES == {"avg"}
+
+    def test_defaults_match_the_backends(self):
+        table = localize_gui._CONVERGENCE_DEFAULTS
+        assert table["gausslq"] == (
+            gausslq.TOLERANCE,
+            gausslq.MAX_ITERATIONS,
+        )
+        assert table["gausslq-gpu"] == (
+            gaussfit_cuda.TOLERANCE,
+            gaussfit_cuda.MAX_ITERATIONS,
+        )
+        assert table["gaussmle"] == (0.001, 100)
+        assert table["spline-gpu"] == table["spline"]
+        assert table["spline"] == localize._spline_schedule(True, None, None)
+
+    def test_gpu_capable_codes_are_real_fit2d_codes(self):
+        """``_effective_fit_code`` appends "-gpu"; the result has to be a
+        method ``fit2D`` accepts."""
+        for code in localize_gui._GPU_CAPABLE_CODES:
+            assert not code.endswith("-gpu")
+            assert code + "-gpu" in localize_gui._CONVERGENCE_CODES
+
+    def test_z_fitting_follows_the_fit_gpu_checkbox(self):
+        """The astigmatism box no longer carries its own GPU checkbox, so a
+        user cannot put the two devices in disagreement."""
+        source = inspect.getsource(localize_gui)
+        assert "fit_z_gpu_checkbox" not in source
+        assert (
+            "self.parameters_dialog.gpu_checkbox.isChecked(),"
+            in inspect.getsource(localize_gui.Window.fit_z)
+        )
+
+    def test_dialog_refills_the_boxes_per_method_and_device(self):
+        """Drive the real dialog: the schedule shown has to follow the model,
+        the optimizer *and* the GPU checkbox, and a value the user typed must
+        survive an unrelated update."""
+
+        class _StubWindow(QtWidgets.QMainWindow):
+            movie = None
+
+            def draw_frame(self):
+                pass
+
+        dialog = localize_gui.ParametersDialog(_StubWindow())
+        try:
+            assert dialog.current_fit_code() == "gausslq"
+            assert (
+                dialog.convergence_criterion.value(),
+                dialog.max_it.value(),
+            ) == localize_gui._GAUSSLQ_SCHEDULE
+
+            if localize.GPU_FITTING_AVAILABLE:
+                dialog.gpu_checkbox.setChecked(True)
+                assert dialog.current_fit_code() == "gausslq-gpu"
+                assert (
+                    dialog.convergence_criterion.value(),
+                    dialog.max_it.value(),
+                ) == localize_gui._GAUSS_GPU_SCHEDULE
+                dialog.gpu_checkbox.setChecked(False)
+                assert (
+                    dialog.convergence_criterion.value(),
+                    dialog.max_it.value(),
+                ) == localize_gui._GAUSSLQ_SCHEDULE
+
+            dialog.fit_optimizer.setCurrentIndex(
+                dialog.fit_optimizer.findText("MLE")
+            )
+            assert dialog.current_fit_code() == "gaussmle"
+            assert (
+                dialog.convergence_criterion.value(),
+                dialog.max_it.value(),
+            ) == localize_gui._GAUSSMLE_SCHEDULE
+
+            # An unrelated refresh must not overwrite a typed value.
+            dialog.convergence_criterion.setValue(0.05)
+            dialog.on_gpu_fitting_changed()
+            assert dialog.convergence_criterion.value() == 0.05
+
+            # The one non-iterating method hides the page entirely.
+            dialog.fit_model.setCurrentIndex(
+                dialog.fit_model.findText("Average of ROI")
+            )
+            assert dialog.current_fit_code() == "avg"
+            assert dialog.fit_stack.currentIndex() == 0
+        finally:
+            dialog.deleteLater()
+
+    def test_convergence_criterion_cannot_be_zero(self):
+        """``fit2D`` asserts a positive tolerance, so the box must not offer
+        0 - it used to, which made the fit raise on a valid-looking value."""
+
+        class _StubWindow(QtWidgets.QMainWindow):
+            movie = None
+
+            def draw_frame(self):
+                pass
+
+        dialog = localize_gui.ParametersDialog(_StubWindow())
+        try:
+            assert dialog.convergence_criterion.minimum() > 0
+            dialog.convergence_criterion.setValue(0.0)
+            assert dialog.convergence_criterion.value() > 0
+        finally:
+            dialog.deleteLater()
 
 
 @pytest.mark.skipif(

@@ -1,10 +1,10 @@
 """
-picasso.gaussfit_cuda
-~~~~~~~~~~~~~~~~~~~~~
+picasso.fitting.gaussfit_cuda
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 GPU Gaussian PSF fitting: the three two-dimensional Gaussian models Picasso
 fits on the GPU, over the same Levenberg-Marquardt driver as
-:mod:`picasso.splinefit_cuda`.
+:mod:`picasso.fitting.splinefit_cuda`.
 
 Transcribed from Gpufit's ``models/gauss_2d.cuh``, ``gauss_2d_elliptic.cuh``
 and ``gauss_2d_rotated.cuh``, which is what ``picasso/ext/pygpufit`` used to
@@ -28,12 +28,23 @@ multi-start here - these models have no axial coordinate - so each spot is
 fitted once from its initial parameters.
 
 Unlike the spline models these use
-:func:`picasso.lmfit_cuda._estimator_terms_strict`, which abandons a
+:func:`picasso.fitting.lmfit_cuda._estimator_terms_strict`, which abandons a
 maximum-likelihood fit whose model value goes non-positive rather than flooring
 it. A Gaussian cannot ring negative the way a cubic spline does: the model only
 drops below zero when the *background* parameter does, and flooring those pixels
 would remove the very gradient that pushes it back up - leaving the fit stalled
 at a badly wrong optimum that the relative convergence test then accepts.
+
+References
+----------
+The fitting algorithm and all three Gaussian models are a port of Gpufit
+(``models/gauss_2d*.cuh``, ``cuda_kernels.cu``):
+
+Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
+"Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
+Scientific Reports 7, 15722 (2017).
+https://doi.org/10.1038/s41598-017-15313-9
+Licence (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
 
 :authors: Rafal Kowalewski
 :copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry
@@ -48,9 +59,9 @@ import numpy as np
 from numba import cuda
 from tqdm import tqdm
 
-from picasso import lmfit_cuda
-from picasso.splinefit import _allocate_outputs
-from picasso.lmfit_cuda import (
+from picasso.fitting import lmfit_cuda
+from picasso.fitting.splinefit import _allocate_outputs
+from picasso.fitting.lmfit_cuda import (
     CUDA_THREADS,
     _INF,
     _estimator_terms_strict,
@@ -504,7 +515,7 @@ def fit_spots(
     tolerance, max_iterations : optional
         ``None`` uses :data:`TOLERANCE` / :data:`MAX_ITERATIONS`.
     progress_callback, abort_callback, single_precision
-        As :func:`picasso.splinefit_cuda.fit_spots`.
+        As :func:`picasso.fitting.splinefit_cuda.fit_spots`.
 
     Returns
     -------

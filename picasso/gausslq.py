@@ -4,6 +4,16 @@ picasso.gausslq
 
 Fit spots (single-molecule images) with 2D Gaussian least squares.
 
+The optimizer here is SciPy's ``leastsq`` (MINPACK) and is *not* derived from
+Gpufit. Its GPU counterpart is: ``fit_spots_gauss_gpu`` below is a thin shim
+onto :mod:`picasso.fitting.gaussfit_cuda`, whose Levenberg-Marquardt driver and
+models are a port of Gpufit (Przybylski et al., Scientific Reports 7,
+15722, 2017; licence in ``LICENSES/Gpufit-LICENSE.txt``). Both sample the
+Gaussian at the pixel centre, but they parameterize the amplitude differently
+(here ``photons`` scales a normalized PDF; there it is the peak height, which
+``picasso.localize`` converts afterwards), so the two are not interchangeable
+at the array level even though the fitted positions and widths agree.
+
 :authors: Joerg Schnitzbauer, Maximilian Thomas Strauss
 :copyright: Copyright (c) 2016-2026 Jungmann Lab, MPI of Biochemistry
 """
@@ -21,6 +31,16 @@ from scipy import optimize
 from tqdm import tqdm
 
 from picasso import lib
+
+# Convergence schedule. ``TOLERANCE`` is MINPACK's relative reduction in both
+# the sum of squares (``ftol``) and the parameter vector (``xtol``).
+TOLERANCE = 1e-2
+MAX_ITERATIONS = 200
+
+
+def _max_function_evaluations(max_iterations: int, n_parameters: int) -> int:
+    """``leastsq``'s ``maxfev`` for ``max_iterations`` LM iterations."""
+    return int(max_iterations) * (int(n_parameters) + 1)
 
 
 @numba.jit(nopython=True, nogil=True)
@@ -309,6 +329,8 @@ def fit_spot(
     spherical: bool = False,
     rotated: bool = False,
     return_chi_square: bool = False,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
 ) -> lib.FloatArray1D:
     """Fit a single spot using least squares optimization. The spot is a
     2D array representing the pixel values of the spot image. The
@@ -345,6 +367,13 @@ def fit_spot(
         ``locs_from_fits`` takes it as its own ``chi_square`` argument, so
         callers split it off (see ``localize._fit2d_gausslq``). Default is
         False.
+    tolerance : float or None, optional
+        Convergence criterion, passed to ``leastsq`` as both ``ftol`` and
+        ``xtol``. None (the default) uses :data:`TOLERANCE`.
+    max_iterations : int or None, optional
+        Maximum number of Levenberg-Marquardt iterations. None (the default)
+        uses :data:`MAX_ITERATIONS`. See :func:`_max_function_evaluations` for
+        the conversion to ``leastsq``'s ``maxfev``.
 
     Returns
     -------
@@ -362,6 +391,8 @@ def fit_spot(
     model_y = np.empty(size, dtype=np.float32)
     model = np.empty((size, size), dtype=np.float32)
     residuals = np.empty((size, size), dtype=np.float32)
+    tol = TOLERANCE if tolerance is None else float(tolerance)
+    max_it = MAX_ITERATIONS if max_iterations is None else int(max_iterations)
     # full_output exposes leastsq's infodict, whose "fvec" is the residual
     # vector at the returned parameters - the chi-square is then free, with
     # no extra model evaluation.
@@ -374,8 +405,9 @@ def fit_spot(
             _compute_residuals_rotated,
             theta0,
             args=(spot, grid, size, model, residuals),
-            ftol=1e-2,
-            xtol=1e-2,
+            ftol=tol,
+            xtol=tol,
+            maxfev=_max_function_evaluations(max_it, len(theta0)),
             full_output=full_output,
         )
         return _with_chi_square(result, return_chi_square)
@@ -387,8 +419,9 @@ def fit_spot(
             _compute_residuals_sigma,
             theta0,
             args=args,
-            ftol=1e-2,
-            xtol=1e-2,
+            ftol=tol,
+            xtol=tol,
+            maxfev=_max_function_evaluations(max_it, len(theta0)),
             full_output=full_output,
         )
         fitted = result[0]
@@ -406,8 +439,9 @@ def fit_spot(
         _compute_residuals,
         theta0,
         args=args,
-        ftol=1e-2,
-        xtol=1e-2,
+        ftol=tol,
+        xtol=tol,
+        maxfev=_max_function_evaluations(max_it, len(theta0)),
         full_output=full_output,
     )  # leastsq is much faster than least_squares
     return _with_chi_square(result, return_chi_square)
@@ -421,6 +455,8 @@ def fit_spots(
     spherical: bool = False,
     rotated: bool = False,
     return_chi_square: bool = False,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
 ) -> lib.FloatArray2D:
     """Fit multiple spots using least squares optimization. Each spot is
     a 2D array representing the pixel values of the spot image. The
@@ -452,6 +488,12 @@ def fit_spots(
         If True, append the per-spot chi-square (residual sum of squares
         at the fit optimum) as one extra trailing column. See
         ``fit_spot``. Default is False.
+    tolerance : float or None, optional
+        Convergence criterion; None (the default) uses :data:`TOLERANCE`.
+        See ``fit_spot``.
+    max_iterations : int or None, optional
+        Maximum number of iterations per spot; None (the default) uses
+        :data:`MAX_ITERATIONS`. See ``fit_spot``.
 
     Returns
     -------
@@ -478,6 +520,8 @@ def fit_spots(
             spherical=spherical,
             rotated=rotated,
             return_chi_square=return_chi_square,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
         )
         if callable(progress_callback):
             progress_callback(i)
@@ -490,6 +534,8 @@ def fit_spots_parallel(
     spherical: bool = False,
     rotated: bool = False,
     return_chi_square: bool = False,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
 ) -> lib.FloatArray2D | list[futures.Future]:
     """Allows for running ``fit_spots`` asynchronously
     (multiprocessing).
@@ -517,6 +563,12 @@ def fit_spots_parallel(
         If True, append the per-spot chi-square (residual sum of squares
         at the fit optimum) as one extra trailing column. See
         ``fit_spot``. Default is False.
+    tolerance : float or None, optional
+        Convergence criterion; None (the default) uses :data:`TOLERANCE`.
+        See ``fit_spot``.
+    max_iterations : int or None, optional
+        Maximum number of iterations per spot; None (the default) uses
+        :data:`MAX_ITERATIONS`. See ``fit_spot``.
 
     Returns
     -------
@@ -552,6 +604,8 @@ def fit_spots_parallel(
                 spherical=spherical,
                 rotated=rotated,
                 return_chi_square=return_chi_square,
+                tolerance=tolerance,
+                max_iterations=max_iterations,
             )
         )
     if asynch:

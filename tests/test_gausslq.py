@@ -132,6 +132,62 @@ class TestFitSpots:
         assert calls == list(range(len(spots)))
 
 
+class TestConvergenceSchedule:
+    """``tolerance``/``max_iterations`` are exposed so the GUI and the CLI can
+    offer them for every fitting method, this one included."""
+
+    def test_defaults_reproduce_minpacks_own(self):
+        """MAX_ITERATIONS must map to exactly ``leastsq``'s default
+        ``maxfev``, so passing the default explicitly is a no-op and the
+        historical behaviour of ``gausslq`` is unchanged."""
+        for n_parameters in (5, 6, 7):
+            assert gausslq._max_function_evaluations(
+                gausslq.MAX_ITERATIONS, n_parameters
+            ) == 200 * (n_parameters + 1)
+
+    def test_defaults_match_passing_none(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        np.testing.assert_array_equal(
+            gausslq.fit_spots(spots),
+            gausslq.fit_spots(
+                spots,
+                tolerance=gausslq.TOLERANCE,
+                max_iterations=gausslq.MAX_ITERATIONS,
+            ),
+        )
+
+    def test_iteration_cap_bites(self, synthetic_spots):
+        """One iteration cannot reach the optimum a full fit finds."""
+        spots, gt = synthetic_spots
+        converged = gausslq.fit_spots(spots)
+        starved = gausslq.fit_spots(spots, max_iterations=1)
+        assert not np.allclose(converged, starved)
+        # ...and it is the starved fit that is wrong, not merely different
+        assert np.max(np.abs(starved[:, 0] - gt.x.values)) > np.max(
+            np.abs(converged[:, 0] - gt.x.values)
+        )
+
+    def test_tighter_tolerance_does_not_move_a_converged_fit(
+        self, synthetic_spots
+    ):
+        """The default stop is already at the optimum for clean spots, so
+        tightening it changes the position by far less than a pixel."""
+        spots, _ = synthetic_spots
+        loose = gausslq.fit_spots(spots)
+        tight = gausslq.fit_spots(spots, tolerance=1e-8, max_iterations=400)
+        assert np.max(np.abs(loose[:, :2] - tight[:, :2])) < 0.05
+
+    @pytest.mark.parametrize(
+        "kwargs", [{"spherical": True}, {"rotated": True}, {}]
+    )
+    def test_every_model_accepts_the_schedule(self, synthetic_spots, kwargs):
+        spots, _ = synthetic_spots
+        theta = gausslq.fit_spots(
+            spots[:3], tolerance=1e-3, max_iterations=50, **kwargs
+        )
+        assert np.all(np.isfinite(theta))
+
+
 # ---------------------------------------------------------------------------
 # fit_spots_parallel + fits_from_futures
 # ---------------------------------------------------------------------------

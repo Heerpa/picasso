@@ -1525,7 +1525,7 @@ class TestGuiWiring:
         the convergence page - and with the spline's own schedule, not the
         Gaussian MLE's."""
         from picasso.gui import localize as glocalize
-        from picasso import splinefit
+        from picasso.fitting import splinefit
 
         assert "spline" in glocalize._CONVERGENCE_CODES
         assert "spline-mle" in glocalize._CONVERGENCE_CODES

@@ -2,7 +2,7 @@
 test_splinefit_cuda
 ~~~~~~~~~~~~~~~~~~~
 
-Tests for ``picasso.splinefit_cuda``, the GPU cubic-spline PSF fitter.
+Tests for ``picasso.fitting.splinefit_cuda``, the GPU cubic-spline PSF fitter.
 
 The analytic calibrations, the closed-form reference model and the spot
 builders are imported from :mod:`tests.test_splinefit` rather than duplicated:
@@ -33,7 +33,8 @@ import numpy as np
 import pytest
 from numba import cuda
 
-from picasso import localize, lmfit_cuda, splinefit, splinefit_cuda
+from picasso import localize
+from picasso.fitting import lmfit_cuda, splinefit, splinefit_cuda
 
 from tests.test_splinefit import (
     BOX,

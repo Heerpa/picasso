@@ -1296,12 +1296,10 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
         "Qe": args.qe,
     }
 
-    if args.fit_method == "mle":
-        convergence = 0.001
-        max_iterations = 100
-    else:
-        convergence = 0
-        max_iterations = 0
+    # 0 means "let the fitting method use its own default", which differs
+    # per model and per device - see localize.fit2D's eps / max_it.
+    convergence = args.convergence
+    max_iterations = args.max_iterations
 
     z_params = None
     if "-3d" in args.fit_method:
@@ -2688,7 +2686,8 @@ def main():  # noqa: C901
             "fitting method. 'spline'/'spline-mle' fit an experimental "
             "cubic-spline PSF on the CPU by least squares / maximum "
             "likelihood, 'spline-gpu'/'spline-mle-gpu' do the same on the "
-            "GPU (needs GPUfit); all four need --spline-calibration"
+            "GPU (needs a CUDA-capable GPU); all four need "
+            "--spline-calibration"
         ),
     )
     localize_parser.add_argument(
@@ -2704,6 +2703,32 @@ def main():  # noqa: C901
     )
     localize_parser.add_argument(
         "-g", "--gradient", type=int, default=5000, help="minimum net gradient"
+    )
+    localize_parser.add_argument(
+        "-cc",
+        "--convergence",
+        type=float,
+        default=0,
+        help=(
+            "convergence criterion: the fit stops once the chi-square"
+            " changes by less than this, relative to its own magnitude."
+            " 0 (the default) uses the selected fit method's own value"
+            " (0.001 for 'mle', 0.01 for 'lq' and the GPU Gaussians, and"
+            " for the splines 1e-4 with the axial multi-start, 1e-2"
+            " without)"
+        ),
+    )
+    localize_parser.add_argument(
+        "-mi",
+        "--max-iterations",
+        type=int,
+        default=0,
+        help=(
+            "maximum number of iterations per spot. 0 (the default) uses"
+            " the selected fit method's own value (100 for 'mle', 200 for"
+            " 'lq', 20 for the GPU Gaussians, and for the splines 100 with"
+            " the axial multi-start, 20 without)"
+        ),
     )
     localize_parser.add_argument(
         "-d",

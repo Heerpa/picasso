@@ -2,7 +2,8 @@
 test_lmfit_cuda
 ~~~~~~~~~~~~~~~
 
-Tests for ``picasso.lmfit_cuda``, the CUDA device machinery shared by the
+Tests for ``picasso.fitting.lmfit_cuda``, the CUDA device machinery shared by
+the
 numba fitting backends.
 
 The PTX-compilation tests need no GPU: ``cuda.compile_ptx`` goes through
@@ -21,7 +22,7 @@ import numpy as np
 import pytest
 from numba import cuda, types
 
-from picasso import lmfit_cuda, splinefit
+from picasso.fitting import lmfit_cuda, splinefit
 
 requires_cuda = pytest.mark.skipif(
     not lmfit_cuda.CUDA_AVAILABLE, reason="no CUDA device"

@@ -2,7 +2,7 @@
 test_gaussfit_cuda
 ~~~~~~~~~~~~~~~~~~
 
-Tests for ``picasso.gaussfit_cuda``, the GPU Gaussian PSF fitter.
+Tests for ``picasso.fitting.gaussfit_cuda``, the GPU Gaussian PSF fitter.
 
 Unlike the spline backend, these models have no CPU twin to compare against -
 ``gausslq`` fits a normalized Gaussian with SciPy and ``gaussmle`` an
@@ -21,7 +21,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from picasso import gaussfit_cuda, lmfit_cuda, localize, splinefit
+from picasso import localize
+from picasso.fitting import gaussfit_cuda, lmfit_cuda, splinefit
 
 pytestmark = pytest.mark.skipif(
     not lmfit_cuda.CUDA_AVAILABLE, reason="no CUDA device"

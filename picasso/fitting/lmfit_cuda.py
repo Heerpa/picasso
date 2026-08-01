@@ -1,19 +1,19 @@
 """
-picasso.lmfit_cuda
-~~~~~~~~~~~~~~~~~~
+picasso.fitting.lmfit_cuda
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 CUDA device machinery shared by the numba fitting backends: the
 Levenberg-Marquardt damping and linear solve, the least-squares and Poisson
 maximum-likelihood estimators, and the host-side launch bookkeeping.
 
-This is the device twin of the driver in :mod:`picasso.splinefit`, which is
-itself a numba port of Gpufit's ``cuda_kernels.cu`` and ``Cpufit/lm_fit_cpp.cpp``.
-Every constant that defines *where a fit stops* - the damping factors, the fit
-states, the Poisson model floor, the convergence schedule - is imported from
-:mod:`picasso.splinefit` rather than redefined here, so the two devices cannot
-drift apart. A fit is a sequence of accept/reject decisions on a chi-square, so
-a schedule that differs by a factor of ten is not a rounding difference, it is a
-different answer.
+This is the device twin of the driver in :mod:`picasso.fitting.splinefit`,
+which is itself a numba port of Gpufit's ``cuda_kernels.cu`` and
+``Cpufit/lm_fit_cpp.cpp``. Every constant that defines *where a fit stops* -
+the damping factors, the fit states, the Poisson model floor, the convergence
+schedule - is imported from :mod:`picasso.fitting.splinefit` rather than
+redefined here, so the two devices cannot drift apart. A fit is a sequence of
+accept/reject decisions on a chi-square, so a schedule that differs by a factor
+of ten is not a rounding difference, it is a different answer.
 
 Three things about the CUDA target differ from the CPU kernels and are easy to
 get wrong when transcribing:
@@ -27,10 +27,10 @@ get wrong when transcribing:
     plain Python, where all the NumPy forms work fine, so it cannot.
 
 ``fastmath`` is deliberately off
-    ``picasso.splinefit`` uses a restricted LLVM flag set that excludes ``nnan``
-    and ``ninf``, because those let the compiler assume no NaN can occur and
-    fold the divergence guards to a constant True. That specific hazard does not
-    exist here - ``numba.cuda.jit`` takes a boolean ``fastmath`` that maps to
+    ``picasso.fitting.splinefit`` uses a restricted LLVM flag set that
+    excludes ``nnan`` and ``ninf``, because those let the compiler assume no
+    NaN can occur and fold the divergence guards to a constant True. That
+    specific hazard does not exist here - ``numba.cuda.jit`` takes a boolean ``fastmath`` that maps to
     NVVM's ``ftz``/``prec_div``/``prec_sqrt``/``fma``, not to LLVM's
     ``nnan``/``ninf``. It is still left off, because flushing denormals and
     approximating division would change results against the CPU backend for no
@@ -43,6 +43,18 @@ One thread per fit
     It also means **no ``cuda.syncthreads()`` may ever be added**: the driver
     loop breaks out at different iterations in different lanes, so a barrier
     would be unmatched and hang the warp.
+
+References
+----------
+The Levenberg-Marquardt driver, the damping rule, the Gauss-Jordan solve and
+both estimators in this module are a port of Gpufit's ``cuda_kernels.cu``,
+``estimators/{lse,mle}.cuh`` and ``Cpufit/lm_fit_cpp.cpp``:
+
+Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
+"Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
+Scientific Reports 7, 15722 (2017).
+https://doi.org/10.1038/s41598-017-15313-9
+Licence (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
 
 :authors: Rafal Kowalewski
 :copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry
@@ -57,7 +69,7 @@ import warnings
 import numpy as np
 from numba import cuda, float64
 
-from picasso.splinefit import (  # noqa: F401  (re-exported for the backends)
+from picasso.fitting.splinefit import (  # noqa: F401  (re-exported below)
     FIT_STATE_CONVERGED,
     FIT_STATE_MAX_ITERATION,
     FIT_STATE_NEG_CURVATURE_MLE,
@@ -205,7 +217,8 @@ def _estimator_terms(mle, value, data):
     ``weight`` multiplies the Hessian outer product and ``factor`` the gradient,
     so a caller accumulates ``grad_k += d_k * factor`` and
     ``hess_kl += weight * d_k * d_l``. This is the one place the least-squares
-    and Poisson branches are written down; ``picasso.splinefit`` spells the same
+    and Poisson branches are written down; ``picasso.fitting.splinefit``
+    spells the same
     table out three times, once per model.
 
     ``ok`` is False only for a non-finite model value under the maximum
@@ -355,7 +368,8 @@ def make_lm_driver(accumulate, n_params: int, z_col: int, seedable: bool):
 
     ``accumulate(spots, index, coeff, aff, res, theta, mle, hess, grad)`` must
     return ``(chi_square, ok)`` and fill the full symmetric ``hess`` and
-    ``grad``, exactly like the ``picasso.splinefit._accumulate_*`` family.
+    ``grad``, exactly like the ``picasso.fitting.splinefit._accumulate_*``
+    family.
 
     The driver is generated rather than shared because ``cuda.local.array``
     needs a compile-time shape, so ``n_params`` has to be a closure constant.

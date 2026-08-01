@@ -1,15 +1,17 @@
 """
-picasso.splinefit_cuda
-~~~~~~~~~~~~~~~~~~~~~~
+picasso.fitting.splinefit_cuda
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-GPU cubic-spline PSF fitting: the CUDA twin of :mod:`picasso.splinefit`.
+GPU cubic-spline PSF fitting: the CUDA twin of
+:mod:`picasso.fitting.splinefit`.
 
 :func:`fit_spots` takes and returns exactly what ``splinefit.fit_spots`` does,
 so the two are interchangeable backends and ``picasso.localize`` can dispatch
 between them on a single flag. The models, the estimators, the damping rule and
-the seed ranking all come from the shared code in :mod:`picasso.lmfit_cuda`,
-which imports its constants from :mod:`picasso.splinefit` - so the CPU and GPU
-fits stop in the same place by construction rather than by agreement.
+the seed ranking all come from the shared code in
+:mod:`picasso.fitting.lmfit_cuda`, which imports its constants from
+:mod:`picasso.fitting.splinefit` - so the CPU and GPU fits stop in the same
+place by construction rather than by agreement.
 
 One thread fits one spot, including its whole axial multi-start. Gpufit instead
 spreads a single fit across threads and reduces in shared memory; for Picasso's
@@ -48,6 +50,31 @@ Precision
     in double too; the tests use it to compare against the CPU kernels without
     a rounding excuse.
 
+References
+----------
+The fitting algorithm and the spline models are a port of Gpufit
+(``models/spline_*.cuh``, ``cuda_kernels.cu``):
+
+Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
+"Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
+Scientific Reports 7, 15722 (2017).
+https://doi.org/10.1038/s41598-017-15313-9
+Licence (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
+
+The cubic-spline PSF model and its use for single-molecule localization:
+
+Li, Y., Mund, M., Hoess, P. et al. "Real-time 3D single-molecule
+localization using experimental point spread functions." Nature Methods
+15, 367-369 (2018). https://doi.org/10.1038/nmeth.4661
+
+Babcock, H. P. & Zhuang, X. "Analyzing Single Molecule Localization
+Microscopy Data Using Cubic Splines." Scientific Reports 7, 552 (2017).
+https://doi.org/10.1038/s41598-017-00622-w
+
+Li, Y., Shi, W., Liu, S. et al. "Global fitting for high-accuracy
+multi-channel single-molecule localization." Nature Communications 13,
+3133 (2022). https://doi.org/10.1038/s41467-022-30719-4
+
 :authors: Rafal Kowalewski
 :copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry
 """
@@ -61,8 +88,8 @@ import numpy as np
 from numba import cuda, float64
 from tqdm import tqdm
 
-from picasso import lmfit_cuda
-from picasso.splinefit import (
+from picasso.fitting import lmfit_cuda
+from picasso.fitting.splinefit import (
     KIND_2D,
     KIND_3D,
     KIND_LINK_XYZ,
@@ -70,7 +97,7 @@ from picasso.splinefit import (
     _check_inputs,
     resolve_schedule,
 )
-from picasso.lmfit_cuda import (
+from picasso.fitting.lmfit_cuda import (
     CUDA_THREADS,
     CUDA_THREADS_WIDE,
     _INF,

@@ -2,7 +2,7 @@
 test_splinefit
 ~~~~~~~~~~~~~~
 
-Tests for ``picasso.splinefit``, the CPU cubic-spline PSF fitter.
+Tests for ``picasso.fitting.splinefit``, the CPU cubic-spline PSF fitter.
 
 Everything here runs without a GPU, without Gpufit and without Gpuspline:
 the calibrations are built analytically from tensor products of 1D cubic
@@ -20,7 +20,8 @@ import pandas as pd
 import pytest
 from scipy.interpolate import CubicSpline
 
-from picasso import localize, splinefit
+from picasso import localize
+from picasso.fitting import splinefit
 
 BOX = 13
 NZ = 21

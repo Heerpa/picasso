@@ -255,7 +255,7 @@ Picasso can fit an **experimentally measured PSF** to every spot. The measured P
 
 *This feature is experimental — please report any unexpected behavior on our `GitHub issues page <https://github.com/jungmannlab/picasso/issues>`_.*
 
-CPU fitting is available. For GPU, `Gpufit <https://github.com/gpufit/Gpufit>`_ is used and readily available for Windows users with CUDA-capable GPU. *Building* a calibration additionally uses Gpuspline, which — despite the name — is a CPU library, so the calibration step needs no GPU but is only distributed on Windows directly. The .so file for Linux needs to be built and distributed by the user. When Gpuspline cannot be loaded, the ``Calibration`` menu shows neither ``Calibrate spline PSF`` nor ``Re-align channels (current signal)``.
+Fitting runs on the CPU, or on any CUDA-capable GPU — see `GPU fitting`_ above; the kernels are compiled at run time by Numba, so no platform-specific binary is involved. *Building* a calibration additionally uses Gpuspline, which — despite the name — is a CPU library, so the calibration step needs no GPU but is only distributed on Windows directly. The .so file for Linux needs to be built and distributed by the user. When Gpuspline cannot be loaded, the ``Calibration`` menu shows neither ``Calibrate spline PSF`` nor ``Re-align channels (current signal)``.
 
 **Localization precision.** The fit returns the fitted parameters but no uncertainties, so Picasso evaluates the Cramer-Rao lower bound separately to fill ``lpx``, ``lpy``, ``lpz``, ``photons_unc`` and ``bg_unc``. GPU with CUDA is used if detected, otherwise the process runs on the CPU.
 
@@ -264,7 +264,7 @@ The method combines three published works: the experimental-PSF localization wor
 Building a spline calibration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-A calibration is built from a **bead z-stack**: image a sample of sparse, bright, sub-diffraction beads while scanning the stage through focus in even steps. Picasso detects the beads (once, near focus — they are static in x/y), cuts a box around each, averages them across all beads and fields of view, registers them in 3D, normalizes the result to a clean PSF volume, and computes the cubic-spline coefficients. This is the workflow described in `Li et al., Nature Methods 15, 367–369 (2018) <https://doi.org/10.1038/nmeth.4661>`_, however, PSF scaling was adapted to fit GPUfit's workflow.
+A calibration is built from a **bead z-stack**: image a sample of sparse, bright, sub-diffraction beads while scanning the stage through focus in even steps. Picasso detects the beads (once, near focus — they are static in x/y), cuts a box around each, averages them across all beads and fields of view, registers them in 3D, normalizes the result to a clean PSF volume, and computes the cubic-spline coefficients. This is the workflow described in `Li et al., Nature Methods 15, 367–369 (2018) <https://doi.org/10.1038/nmeth.4661>`_, however, PSF scaling was adapted to fit Gpufit's workflow.
 
 In the GUI, load the bead movie and select ``Calibration`` > ``Calibrate spline PSF``. A dialog collects:
 

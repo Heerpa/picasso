@@ -27,16 +27,17 @@ import imageio
 from .. import (
     aim,
     CONFIG,
+    gausslq,
     imageprocess,
     io,
     localize,
     lib,
     postprocess,
     spline,
-    splinefit,
     __version__,
     zfit,
 )
+from ..fitting import gaussfit_cuda, splinefit
 from PyQt6 import QtCore, QtGui, QtWidgets
 from playsound3 import playsound
 
@@ -162,8 +163,8 @@ FIT_MODELS = {
 }
 # The rotated elliptical Gaussian has a CPU least-squares implementation but
 # its MLE optimizer is GPU-only. The cubic-spline PSF has both: the bare codes
-# above run on the CPU (picasso.splinefit) and FitWorker appends "-gpu" when
-# the GPU checkbox is ticked, exactly as for the Gaussian models.
+# above run on the CPU (picasso.fitting.splinefit) and FitWorker appends "-gpu"
+# when the GPU checkbox is ticked, exactly as for the Gaussian models.
 if not GPU_FITTING_AVAILABLE:
     del FIT_MODELS["2D rotated elliptical Gaussian"]["optimizers"]["MLE"]
 
@@ -204,24 +205,55 @@ def _fit_code(model: str, optimizer: str) -> str:
     return entry["optimizers"][optimizer]
 
 
-# Fit codes that iterate on the CPU and therefore honour the convergence
-# criterion and maximum-iteration settings, with the default schedule of each.
-# The GPU fit uses its own settings, and the least-squares Gaussian is solved by
-# scipy, so neither appears here. The spline defaults are the ones its axial
-# multi-start needs (see picasso.splinefit), which are much tighter than the
-# Gaussian MLE's - showing the latter for a spline fit would silently make the
-# CPU fit stop earlier than the GPU one.
+# Fit codes with both a CPU and a GPU implementation, selected by the "Use
+# GPU" checkbox rather than by the model/optimizer comboboxes. The remaining
+# codes are either GPU-only (they already end in "-gpu") or CPU-only.
+_GPU_CAPABLE_CODES = frozenset(
+    {
+        "gausslq",
+        "gausslq-spherical",
+        "gausslq-rotated",
+        "gaussmle",
+        "gaussmle-spherical",
+        "spline",
+        "spline-mle",
+    }
+)
+
+
+def _effective_fit_code(code: str, use_gpu: bool) -> str:
+    """The ``fit2D`` code a (code, GPU checkbox) pair actually runs."""
+    if use_gpu and code in _GPU_CAPABLE_CODES:
+        return code + "-gpu"
+    return code
+
+
+# Fit codes that iterate, and the default convergence schedule of each. Every
+# method except "avg" is here: all of them run an iterative solver, so all of
+# them honor the convergence criterion and the maximum-iteration count.
+_GAUSSMLE_SCHEDULE = (0.001, 100)
+_GAUSSLQ_SCHEDULE = (gausslq.TOLERANCE, gausslq.MAX_ITERATIONS)
+_GAUSS_GPU_SCHEDULE = (gaussfit_cuda.TOLERANCE, gaussfit_cuda.MAX_ITERATIONS)
+_SPLINE_SCHEDULE = (
+    splinefit.TOLERANCE_MULTI_START,
+    splinefit.MAX_ITERATIONS_MULTI_START,
+)
 _CONVERGENCE_DEFAULTS = {
-    "gaussmle": (0.001, 100),
-    "gaussmle-spherical": (0.001, 100),
-    "spline": (
-        splinefit.TOLERANCE_MULTI_START,
-        splinefit.MAX_ITERATIONS_MULTI_START,
-    ),
-    "spline-mle": (
-        splinefit.TOLERANCE_MULTI_START,
-        splinefit.MAX_ITERATIONS_MULTI_START,
-    ),
+    "gausslq": _GAUSSLQ_SCHEDULE,
+    "gausslq-spherical": _GAUSSLQ_SCHEDULE,
+    "gausslq-rotated": _GAUSSLQ_SCHEDULE,
+    "gausslq-gpu": _GAUSS_GPU_SCHEDULE,
+    "gausslq-spherical-gpu": _GAUSS_GPU_SCHEDULE,
+    "gausslq-rotated-gpu": _GAUSS_GPU_SCHEDULE,
+    "gaussmle": _GAUSSMLE_SCHEDULE,
+    "gaussmle-spherical": _GAUSSMLE_SCHEDULE,
+    "gaussmle-gpu": _GAUSS_GPU_SCHEDULE,
+    "gaussmle-spherical-gpu": _GAUSS_GPU_SCHEDULE,
+    "gaussmle-rotated-gpu": _GAUSS_GPU_SCHEDULE,
+    "spline": _SPLINE_SCHEDULE,
+    "spline-mle": _SPLINE_SCHEDULE,
+    "spline-gpu": _SPLINE_SCHEDULE,
+    "spline-mle-gpu": _SPLINE_SCHEDULE,
 }
 _CONVERGENCE_CODES = frozenset(_CONVERGENCE_DEFAULTS)
 
@@ -1731,14 +1763,13 @@ class ParametersDialog(lib.Dialog):
     fit_z_checkbox : QtWidgets.QCheckBox
         Checkbox for enabling/disabling fitting in the z-dimension using
         astigmatism.
-    fit_z_gpu_checkbox : QtWidgets.QCheckBox
-        Checkbox for fitting z coordinates on a CUDA-capable GPU
-        (numba.cuda). Only shown if a compatible GPU is available.
     gain : QtWidgets.QSpinBox
         Spin box for selecting camera EM gain.
     gpu_checkbox : QtWidgets.QCheckBox
         Checkbox for enabling/disabling GPU fitting. Only shown if a
-        CUDA-capable GPU is available.
+        CUDA-capable GPU is available. Also selects the device for the
+        astigmatism z fit, which has its own CUDA kernel
+        (``picasso.zfit``).
     magnification_factor : QtWidgets.QDoubleSpinBox
         Spin box for setting the magnification factor for 3D fitting.
     max_it : QtWidgets.QSpinBox
@@ -2202,10 +2233,16 @@ class ParametersDialog(lib.Dialog):
 
         mle_grid = QtWidgets.QGridLayout(mle_widget)
         cc_label = QtWidgets.QLabel("Convergence criterion:")
-        cc_label.setToolTip("Tolerance for testing if fitting has converged.")
+        cc_label.setToolTip(
+            "Tolerance for testing if fitting has converged: the fit stops\n"
+            " once the chi-square changes by less than this, relative to\n"
+            " its own magnitude."
+        )
         mle_grid.addWidget(cc_label, 0, 0)
         self.convergence_criterion = QtWidgets.QDoubleSpinBox()
-        self.convergence_criterion.setRange(0, 1e6)
+        # Never 0: fit2D requires a positive tolerance, and below ~1e-6 the
+        # test is answering noise in the chi-square rather than convergence.
+        self.convergence_criterion.setRange(1e-6, 1e6)
         self.convergence_criterion.setDecimals(6)
         self.convergence_criterion.setValue(0.001)
         self.convergence_criterion.setSingleStep(0.0001)
@@ -2218,12 +2255,11 @@ class ParametersDialog(lib.Dialog):
         self.max_it.setValue(100)
         mle_grid.addWidget(self.max_it, 1, 1)
 
-        # LQ has no optimizer-specific parameters; an empty page keeps
-        # the stack indices matching the optimizer combobox indices.
+        # Shown for the one method that does not iterate ("Average of ROI");
+        # an empty page keeps the stack indices stable.
         lq_widget = QtWidgets.QWidget()
 
-        # Stack pages are ordered to match the optimizer combobox indices:
-        # 0 -> "Least squares" (empty), 1 -> "MLE" (convergence/max_it).
+        # 0 -> no optimizer parameters, 1 -> convergence criterion/max_it.
         fit_stack.addWidget(lq_widget)
         fit_stack.addWidget(mle_widget)
 
@@ -2296,24 +2332,18 @@ class ParametersDialog(lib.Dialog):
         self.magnification_factor.setValue(0.79)
         z_grid.addWidget(self.magnification_factor, 1, 1)
 
-        self.fit_z_gpu_checkbox = QtWidgets.QCheckBox("Use GPU")
-        self.fit_z_gpu_checkbox.setTristate(False)
-        self.fit_z_gpu_checkbox.setToolTip("Fit z coordinates on a GPU?")
-        self.fit_z_gpu_checkbox.setEnabled(self.fit_z_checkbox.isChecked())
-        self.fit_z_checkbox.toggled.connect(self.fit_z_gpu_checkbox.setEnabled)
-        if not zfit.CUDA_AVAILABLE:
-            self.fit_z_gpu_checkbox.hide()
+        # The astigmatism z fit runs on whichever device the fit box's
+        # 'Use GPU' checkbox selects
         fit_z_row = QtWidgets.QHBoxLayout()
         fit_z_row.addWidget(lib.HelpButton(self.CALIB_URL))
         fit_z_row.addWidget(self.fit_z_checkbox)
-        fit_z_row.addWidget(self.fit_z_gpu_checkbox)
         z_grid.addLayout(fit_z_row, 2, 0, 1, 2)
 
         # Experimental PSF (cubic spline). The calibration is loaded here and
         # passed to the fit when the "Experimental PSF (cubic spline)" model
         # is chosen. Always available: the fit runs on the CPU
-        # (picasso.splinefit) and, with a CUDA GPU, on the GPU
-        # (picasso.splinefit_cuda).
+        # (picasso.fitting.splinefit) and, with a CUDA GPU, on the GPU
+        # (picasso.fitting.splinefit_cuda).
         self.spline_groupbox = spline_groupbox = QtWidgets.QGroupBox(
             "Experimental PSF (spline)"
         )
@@ -2571,6 +2601,7 @@ class ParametersDialog(lib.Dialog):
             self.optimizer_label.hide()
             self.fit_optimizer.hide()
             self.fit_stack.hide()
+            self._apply_convergence_defaults()
         else:
             self.optimizer_label.show()
             self.fit_optimizer.show()
@@ -2597,28 +2628,35 @@ class ParametersDialog(lib.Dialog):
         if self.spline_groupbox is not None:
             self.spline_groupbox.setVisible(needs_spline)
 
-    def on_fit_optimizer_changed(self) -> None:
-        """Switch the optimizer parameter page and enable/disable the GPU
-        fitting checkbox based on the selected model and optimizer."""
+    def current_fit_code(self) -> str:
+        """The ``fit2D`` code the current selection would run."""
         model = self.fit_model.currentText()
         optimizer = self.fit_optimizer.currentText()
-        # The convergence/max-iterations page belongs to whichever methods
-        # actually iterate on the CPU. That is not the same as "the optimizer
-        # is MLE": the CPU spline fit iterates under least squares too, so the
-        # page is chosen by fit code rather than by combobox index.
-        if optimizer:
-            code = _fit_code(model, optimizer)
-            self.fit_stack.setCurrentIndex(
-                1 if code in _CONVERGENCE_CODES else 0
-            )
-            if code != self._last_fit_code:
-                # Only on an actual change of method, so a value the user
-                # typed survives unrelated updates of this dialog.
-                self._last_fit_code = code
-                defaults = _CONVERGENCE_DEFAULTS.get(code)
-                if defaults is not None:
-                    self.convergence_criterion.setValue(defaults[0])
-                    self.max_it.setValue(defaults[1])
+        if not optimizer and FIT_MODELS[model]["optimizers"] is not None:
+            return ""
+        return _effective_fit_code(
+            _fit_code(model, optimizer), self.gpu_checkbox.isChecked()
+        )
+
+    def _apply_convergence_defaults(self) -> None:
+        """Show the selected method's own convergence schedule."""
+        code = self.current_fit_code()
+        if not code:
+            return
+        self.fit_stack.setCurrentIndex(1 if code in _CONVERGENCE_CODES else 0)
+        if code == self._last_fit_code:
+            return
+        self._last_fit_code = code
+        defaults = _CONVERGENCE_DEFAULTS.get(code)
+        if defaults is not None:
+            self.convergence_criterion.setValue(defaults[0])
+            self.max_it.setValue(defaults[1])
+
+    def on_fit_optimizer_changed(self) -> None:
+        """Enable/disable the GPU fitting checkbox based on the selected
+        model and optimizer, then show that method's convergence schedule."""
+        model = self.fit_model.currentText()
+        optimizer = self.fit_optimizer.currentText()
         if optimizer and _fit_code(model, optimizer).endswith("-gpu"):
             # GPU-only method (e.g. the rotated elliptical Gaussian):
             # fitting always runs on the GPU, so pin the checkbox.
@@ -2957,12 +2995,8 @@ class ParametersDialog(lib.Dialog):
         self.window.draw_frame()
 
     def on_gpu_fitting_changed(self) -> None:
-        """Handle changes to the GPU fitting option. The GPU fit uses its own
-        convergence settings, so the CPU MLE controls are greyed out
-        while GPU fitting is selected."""
-        use_gpu = self.gpu_checkbox.isChecked()
-        self.convergence_criterion.setEnabled(not use_gpu)
-        self.max_it.setEnabled(not use_gpu)
+        """Handle changes to the GPU fitting option."""
+        self._apply_convergence_defaults()
         # this dialog is created before the window's movie attribute
         if getattr(self.window, "movie", None) is not None:
             self.window.draw_frame()
@@ -3358,9 +3392,6 @@ class Window(QtWidgets.QMainWindow):
             self.parameters_dialog.box_spinbox.setValue(box_size)
         if type(gradient) is int:
             self.parameters_dialog.mng_slider.setValue(gradient)
-        self.parameters_dialog.fit_z_gpu_checkbox.setChecked(
-            bool(settings["Localize"].get("fit_z_gpu", False))
-        )
 
         # Restore the last-used fitting model and optimizer. The model must
         # be set first, since it repopulates the optimizer combobox.
@@ -3391,9 +3422,6 @@ class Window(QtWidgets.QMainWindow):
             settings["Localize"][
                 "gradient"
             ] = self.parameters_dialog.mng_slider.value()
-        settings["Localize"][
-            "fit_z_gpu"
-        ] = self.parameters_dialog.fit_z_gpu_checkbox.isChecked()
         settings["Localize"][
             "fit_model"
         ] = self.parameters_dialog.fit_model.currentText()
@@ -4381,7 +4409,6 @@ class Window(QtWidgets.QMainWindow):
             "magnification": pd.magnification_factor.value(),
             "fit_z": pd.fit_z_checkbox.isChecked(),
             "fit_z_enabled": pd.fit_z_checkbox.isEnabled(),
-            "fit_z_gpu": pd.fit_z_gpu_checkbox.isChecked(),
             "z_calibration": pd.z_calibration,
             "z_calibration_path": pd.z_calibration_path,
             "z_calib_label": pd.z_calib_label.text(),
@@ -4431,7 +4458,6 @@ class Window(QtWidgets.QMainWindow):
         pd.z_calib_label.setText(params["z_calib_label"])
         pd.fit_z_checkbox.setEnabled(params["fit_z_enabled"])
         pd.fit_z_checkbox.setChecked(params["fit_z"])
-        pd.fit_z_gpu_checkbox.setChecked(params.get("fit_z_gpu", False))
         # Saved parameter files written before the Numba CUDA port use the
         # old "gpufit" key.
         pd.gpu_checkbox.setChecked(
@@ -5763,19 +5789,19 @@ class Window(QtWidgets.QMainWindow):
         model = self.parameters_dialog.fit_model.currentText()
         optimizer = self.parameters_dialog.fit_optimizer.currentText()
         method = _fit_code(model, optimizer)
-        # Disabled means the selected method has its own schedule (the GPU's, or
-        # the CPU spline's multi-start default). Pass None so fit2D picks it
-        # rather than silently applying whatever the greyed-out boxes show.
+        # get the convergence criterion and max iterations
+        iterates = (
+            _effective_fit_code(
+                method, self.parameters_dialog.gpu_checkbox.isChecked()
+            )
+            in _CONVERGENCE_CODES
+        )
         eps = (
             self.parameters_dialog.convergence_criterion.value()
-            if self.parameters_dialog.convergence_criterion.isEnabled()
+            if iterates
             else None
         )
-        max_it = (
-            self.parameters_dialog.max_it.value()
-            if self.parameters_dialog.max_it.isEnabled()
-            else None
-        )
+        max_it = self.parameters_dialog.max_it.value() if iterates else None
         fit_z = self.parameters_dialog.fit_z_checkbox.isChecked()
         use_gpu = self.parameters_dialog.gpu_checkbox.isChecked()
         spline_calibration = None
@@ -5800,7 +5826,9 @@ class Window(QtWidgets.QMainWindow):
             # astigmatism z-fitting step must not run.
             fit_z = False
             if spline_calibration.get("model") == "spline-3d-multichannel":
-                self._start_multichannel_spline_fit(spline_calibration, method)
+                self._start_multichannel_spline_fit(
+                    spline_calibration, method, eps, max_it
+                )
                 return
         self.fit_worker = FitWorker(
             self.movie,
@@ -5825,14 +5853,18 @@ class Window(QtWidgets.QMainWindow):
         self.fit_worker.start()
 
     def _start_multichannel_spline_fit(
-        self, calibration: dict, method: str
+        self,
+        calibration: dict,
+        method: str,
+        eps: float | None = None,
+        max_it: int | None = None,
     ) -> None:
         """Fit a multichannel spline PSF across all loaded channels
         simultaneously. The first loaded channel is the reference; its
         identifications are mapped into every channel via the calibration's
         stored transforms."""
         if calibration.get("split_fov"):
-            self._start_split_fov_spline_fit(calibration, method)
+            self._start_split_fov_spline_fit(calibration, method, eps, max_it)
             return
         n_channels = int(calibration.get("n_channels", 0))
         # persist the displayed channel's identifications, so the per-channel
@@ -5896,6 +5928,8 @@ class Window(QtWidgets.QMainWindow):
             use_gpu=method.endswith("-gpu"),
             link_photons=self.parameters_dialog._link_photons_enabled(),
             identifications_per_channel=ids_per_channel,
+            eps=eps,
+            max_it=max_it,
         )
         self.fit_worker.linkMade.connect(self.on_link_progress)
         self.fit_worker.linkFinished.connect(self.on_link_finished)
@@ -5907,7 +5941,11 @@ class Window(QtWidgets.QMainWindow):
         self.fit_worker.start()
 
     def _start_split_fov_spline_fit(
-        self, calibration: dict, method: str
+        self,
+        calibration: dict,
+        method: str,
+        eps: float | None = None,
+        max_it: int | None = None,
     ) -> None:
         """Fit a split-FOV multichannel spline PSF from the single loaded movie.
         The channels are placed at the drawn ROIs when they match the
@@ -5970,6 +6008,8 @@ class Window(QtWidgets.QMainWindow):
             split_fov=True,
             regions=regions,
             link_photons=self.parameters_dialog._link_photons_enabled(),
+            eps=eps,
+            max_it=max_it,
         )
         self.fit_worker.linkMade.connect(self.on_link_progress)
         self.fit_worker.linkFinished.connect(self.on_link_finished)
@@ -6142,7 +6182,7 @@ class Window(QtWidgets.QMainWindow):
             self.parameters_dialog.magnification_factor.value(),
             self.parameters_dialog.pixelsize.value(),
             fitting_method,
-            self.parameters_dialog.fit_z_gpu_checkbox.isChecked(),
+            self.parameters_dialog.gpu_checkbox.isChecked(),
         )
         self.fit_z_worker.progressMade.connect(self.on_fit_z_progress)
         self.fit_z_worker.finished.connect(self.on_fit_z_finished)
@@ -6800,17 +6840,7 @@ class FitWorker(QtCore.QThread):
         self.spline_calibration = spline_calibration
         self.N = len(identifications)
         self._last_cut_emit = 0
-        if use_gpu and method in (
-            "gausslq",
-            "gaussmle",
-            "gausslq-spherical",
-            "gaussmle-spherical",
-            "gausslq-rotated",
-            "spline",
-            "spline-mle",
-        ):
-            method += "-gpu"
-        self.method = method
+        self.method = _effective_fit_code(method, use_gpu)
 
     def on_progress(self, n_done: int) -> None:
         self.progressMade.emit(n_done, self.N)
@@ -6876,6 +6906,8 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         link_photons: bool = True,
         identifications_per_channel: list | None = None,
         use_gpu: bool | None = None,
+        eps: float | None = None,
+        max_it: int | None = None,
     ) -> None:
         super().__init__()
         self.movies = movies
@@ -6886,6 +6918,8 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         self.calibration = calibration
         self.mle = mle
         self.use_gpu = use_gpu
+        self.eps = eps
+        self.max_it = max_it
         # Link photons across channels (shared amplitude, model 11). When False
         # and the calibration has 2 to 6 channels, fit the photon-decoupled
         # link-XYZ model: per-channel
@@ -6996,6 +7030,8 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     mle=self.mle,
                     use_gpu=self.use_gpu,
                     link_photons=self.link_photons,
+                    tolerance=self.eps,
+                    max_iterations=self.max_it,
                     progress_callback=self.on_progress,
                 )
             elif not self.link_photons and (
@@ -7012,6 +7048,8 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     mle=self.mle,
                     use_gpu=self.use_gpu,
                     link_photons=False,
+                    tolerance=self.eps,
+                    max_iterations=self.max_it,
                     progress_callback=self.on_progress,
                 )
             elif self.calibration.get("photon_ratios") is not None:
@@ -7026,6 +7064,8 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     self.calibration,
                     mle=self.mle,
                     use_gpu=self.use_gpu,
+                    tolerance=self.eps,
+                    max_iterations=self.max_it,
                     progress_callback=self.on_progress,
                 )
             else:
@@ -7037,6 +7077,8 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     self.calibration,
                     mle=self.mle,
                     use_gpu=self.use_gpu,
+                    tolerance=self.eps,
+                    max_iterations=self.max_it,
                     progress_callback=self.on_progress,
                 )
         except Exception as e:
