@@ -1560,7 +1560,7 @@ def _make_rotated_spot(box, x0, y0, sx, sy, photons, bg, angle):
 
 
 @pytest.mark.skipif(
-    not localize.GPUFIT_INSTALLED, reason="GPUfit/CUDA not available"
+    not localize.GPU_FITTING_AVAILABLE, reason="no CUDA device"
 )
 class TestGpufit:
     """Thorough tests for the Gpufit Gaussian codepath (``fit_spots_gpufit``).
@@ -2545,8 +2545,8 @@ class TestSplineHelpers:
             assert np.all(np.isfinite(locs[col])) and np.all(locs[col] > 0)
 
     @pytest.mark.skipif(
-        localize.GPUFIT_INSTALLED,
-        reason="ImportError only raised when Gpufit is unavailable",
+        localize.GPU_FITTING_AVAILABLE,
+        reason="ImportError only raised when no CUDA device is present",
     )
     def test_fit_spots_spline_without_gpu_raises(self, synthetic_spots):
         spots, _ = synthetic_spots
@@ -2642,9 +2642,12 @@ class TestSplineHelpers:
 
     def test_spline_use_gpu_resolution(self):
         # no GPU on this machine unless Gpufit is installed
-        assert localize._spline_use_gpu(None) is localize.GPUFIT_INSTALLED
+        assert (
+            localize._spline_use_gpu(None)
+            is localize.GPU_FITTING_AVAILABLE
+        )
         assert localize._spline_use_gpu(False) is False
-        if not localize.GPUFIT_INSTALLED:
+        if not localize.GPU_FITTING_AVAILABLE:
             with pytest.raises(ImportError, match="use_gpu=False"):
                 localize._spline_use_gpu(True)
 
@@ -3668,8 +3671,8 @@ def _synthetic_spline_2d_calibration(box=13, sigma=1.4):
 
 
 @pytest.mark.skipif(
-    not (localize.GPUFIT_INSTALLED and localize.GPUSPLINE_INSTALLED),
-    reason="Gpufit (CUDA GPU) + Gpuspline not available",
+    not (localize.GPU_FITTING_AVAILABLE and localize.GPUSPLINE_INSTALLED),
+    reason="CUDA GPU + Gpuspline not available",
 )
 class TestSplineGpufit:
     """End-to-end spline fitting. The fit itself runs on Gpufit (CUDA GPU);
@@ -3883,7 +3886,7 @@ class TestSplineGpufit:
 
 
 @pytest.mark.skipif(
-    not localize.GPUFIT_INSTALLED, reason="GPUfit/CUDA not available"
+    not localize.GPU_FITTING_AVAILABLE, reason="no CUDA device"
 )
 class TestFit2DGpu:
     """End-to-end ``localize.fit2D`` through every GPU fitting method, driven by
@@ -5232,8 +5235,8 @@ class TestSplinePerChannelPhotonScale:
 
 
 @pytest.mark.skipif(
-    not (localize.GPUFIT_INSTALLED and localize.GPUSPLINE_INSTALLED),
-    reason="Gpufit (CUDA GPU) + Gpuspline not available",
+    not (localize.GPU_FITTING_AVAILABLE and localize.GPUSPLINE_INSTALLED),
+    reason="CUDA GPU + Gpuspline not available",
 )
 class TestSplineRatiometric:
     """End-to-end ratiometric color assignment on a real (Gpuspline) PSF,
@@ -5452,8 +5455,8 @@ class TestFitSplineSplitFovValidation:
 
 
 @pytest.mark.skipif(
-    not (localize.GPUFIT_INSTALLED and localize.GPUSPLINE_INSTALLED),
-    reason="Gpufit (CUDA GPU) + Gpuspline not available",
+    not (localize.GPU_FITTING_AVAILABLE and localize.GPUSPLINE_INSTALLED),
+    reason="CUDA GPU + Gpuspline not available",
 )
 class TestFitSplineSplitFov:
     """End-to-end split-FOV fit on a single movie built + calibrated from the

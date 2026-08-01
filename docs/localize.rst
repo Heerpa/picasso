@@ -14,7 +14,7 @@ Localize allows performing super-resolution reconstruction of image stacks. For 
 - Experimental PSF (cubic spline), least squares or MLE. Fits an experimentally measured PSF and a 3D calibration recovers ``z`` directly; see `Experimental PSF (cubic-spline) fitting`_ below.
 - Average of ROI (finds summed intensity of spots)
 
-Picasso uses `Gpufit <https://github.com/gpufit/Gpufit>`_ for fitting on CUDA-capable GPUs (see `GPU fitting`_ below). On Windows the pre-compiled library (``Gpufit.dll``) is vendored into Picasso (``picasso/ext/pygpufit/``) and works automatically — no extra install step. On Linux there is no pre-compiled binary; you have to build ``libGpufit.so`` yourself from our fork of Gpufit (`github.com/rafalkowalewski1/Gpufit <https://github.com/rafalkowalewski1/Gpufit>`_), which contains the additional fit models Picasso needs, and drop it next to the Windows DLL (see `GPU fitting on Linux`_ below). When no GPU library is available, the GPU fitting option simply does not appear and Picasso uses the accessible CPU algorithms.
+Fitting can run on a CUDA-capable GPU (see `GPU fitting`_ below). The kernels are compiled at run time by Numba, so there is no library to build or install beyond the CUDA runtime (``pip install picassosr[gpu]``), on Windows and Linux alike. When no CUDA GPU is available, the GPU fitting option simply does not appear and Picasso uses the CPU algorithms.
 
 **Please note:** Picasso Localize supports file formats:
 
@@ -37,57 +37,21 @@ Zeiss ``.czi`` and Leica ``.lif`` movies are read via the optional `czifile <htt
 GPU fitting
 -----------
 
-Picasso can run several of its fitting algorithms on a CUDA-capable NVIDIA GPU via `Gpufit <https://github.com/gpufit/Gpufit>`_, a CUDA Levenberg-Marquardt library that serves as Picasso's GPU fitting backend. Picasso loads it through a small Python binding in ``picasso/ext/pygpufit/``, which expects a compiled Gpufit library next to it:
+Picasso can run all of its Gaussian and cubic-spline fitting on a CUDA-capable NVIDIA GPU. The fitting kernels are written in Python and compiled for the GPU at run time by numba.
 
-- ``Gpufit.dll`` on Windows — **shipped with Picasso**, so GPU fitting works out of the box.
-- ``libGpufit.so`` on Linux — **not shipped**, because the binary depends on your CUDA toolkit and GPU. You have to compile it yourself (see `GPU fitting on Linux`_), and copy it into ``picasso/ext/pygpufit/``.
+The fitting algorithm — the Levenberg-Marquardt driver, its damping rule, its estimators and its PSF models — is a port of `Gpufit <https://github.com/gpufit/Gpufit>`_ (Przybylski et al., *Scientific Reports* **7**, 15722, 2017), which earlier versions of Picasso used as a compiled dependency. Picasso no longer ships or links against the Gpufit binary; its licence is reproduced in ``LICENSES/Gpufit-LICENSE.txt``.
 
-.. important::
+Installation
+~~~~~~~~~~~~
 
-   Picasso needs fit models that are not part of upstream Gpufit. Build the library from our fork, `github.com/rafalkowalewski1/Gpufit <https://github.com/rafalkowalewski1/Gpufit>`_.
+The GPU kernels need the CUDA runtime, which is pulled in as an optional dependency::
 
-When the library is present and a CUDA GPU is detected, the GPU fitting option becomes available in the ``Parameters`` dialog (Picasso checks ``gpufit.cuda_available()`` at startup) for both optimizers, since Gpufit implements a least-squares and a maximum likelihood estimator. Otherwise the option stays hidden and Picasso uses the CPU implementations. For least squares the CPU and GPU implementations are equivalent, so results are the same — only slower; for MLE the CPU implementation fits an integrated Gaussian (Smith et al., 2010) whereas Gpufit fits a sampled Gaussian with its own convergence settings, so results can differ slightly. Using the GPU is entirely optional and only available if you have an NVIDIA (CUDA-capable) GPU.
+   pip install picassosr[gpu]
 
-GPU fitting on Linux
-~~~~~~~~~~~~~~~~~~~~~
+Using it
+~~~~~~~~
 
-The remainder of this section explains how to build ``libGpufit.so`` so that GPU fitting becomes available on Linux. (On Windows nothing needs to be done.)
-
-Prerequisites
-^^^^^^^^^^^^^
-
-- An NVIDIA GPU with the matching `CUDA toolkit <https://developer.nvidia.com/cuda-downloads>`_ installed.
-- ``CMake`` 3.11 or later.
-- A C/C++ compiler (GCC). CUDA only supports GCC up to a certain version; if ``make`` later complains *"unsupported GNU version! gcc versions later than X are not supported"*, install an older GCC and point CMake at it (see below).
-- ``git``.
-
-Building ``libGpufit.so``
-^^^^^^^^^^^^^^^^^^^^^^^^^
-
-From a terminal (note the fork — see the box above)::
-
-   git clone https://github.com/rafalkowalewski1/Gpufit.git Gpufit
-   mkdir Gpufit-build
-   cd Gpufit-build
-   cmake -DCMAKE_BUILD_TYPE=RELEASE ../Gpufit
-   make
-
-If ``make`` aborts with an *"unsupported GNU version"* error, your CUDA toolkit needs an older GCC. Install one (e.g. ``gcc-5``) and pass it to CMake::
-
-   cmake -DCMAKE_BUILD_TYPE=RELEASE -DCMAKE_C_COMPILER=gcc-5 ../Gpufit
-
-After a successful build, ``libGpufit.so`` is created inside the build directory (under ``Gpufit-build/Gpufit/``).
-
-Installing the library into Picasso
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Copy the freshly built ``libGpufit.so`` into Picasso's ``picasso/ext/pygpufit/`` folder (the same folder that already contains ``Gpufit.dll`` and ``gpufit.py``)::
-
-   cp Gpufit-build/Gpufit/libGpufit.so /path/to/picasso/picasso/ext/pygpufit/
-
-To locate that folder for a ``pip``-installed Picasso, run ``pip show picassosr`` and look at the ``Location:`` line; the target is ``<Location>/picasso/ext/pygpufit/``. For a cloned repository it is simply ``picasso/ext/pygpufit/`` inside your Picasso folder.
-
-Restart Picasso: Localize. If the library loaded and CUDA is available, the GPU fitting option appears in the ``Parameters`` dialog next to the supported fit methods, as described in `GPU fitting`_ above.
+When a CUDA GPU is detected, the **Use GPU** checkbox becomes available in the ``Parameters`` dialog for both optimizers, since Picasso implements a least-squares and a maximum-likelihood estimator on the GPU. Otherwise the checkbox stays hidden and the CPU implementations are used. GPU fitting is entirely optional; it is typically one to two orders of magnitude faster than a serial CPU fit.
 
 Identification and fitting of single-molecule spots
 ---------------------------------------------------
@@ -341,8 +305,7 @@ Fitting with the spline PSF
 1. Open ``Analyze`` > ``Parameters`` and set **Model** to ``Experimental PSF (cubic spline)``.
 2. In the **Experimental PSF (spline)** box, click ``Load calibration`` and choose your ``.hdf5``. The last-used calibration is remembered between sessions, and calibrations can be loaded automatically per camera and emission wavelength via the ``spline-calibrations`` config field described above.
 3. Choose the **Optimizer**: ``Least squares`` or ``MLE`` (Poisson maximum likelihood). ``MLE`` is recommended.
-4. Tick **Use GPUfit** to run the fit on the GPU (much faster); leave it unticked to fit on the CPU. The checkbox is only available when Gpufit is installed.
-5. For a CPU fit, the **Convergence criterion** and **Max. iterations** boxes apply and are pre-filled with the values the spline fit uses by default. GPU fitting uses Gpufit's own schedule, so they are greyed out.
+4. Tick **Use GPU** to run the fit on the GPU; leave it unticked to fit on the CPU. The checkbox is only available when a CUDA GPU is detected.
 6. Run ``Analyze`` > ``Localize (Identify & Fit)`` (or ``Fit`` for already-identified spots).
 
 In addition to the usual columns, spline fits report per-localization precisions (``lpx``, ``lpy``, and ``lpz`` for 3D, in nm), ``photons`` and ``bg`` with their uncertainties (``photons_unc``, ``bg_unc``), and, for MLE, ``log_likelihood`` and ``iterations``. A 3D calibration adds the recovered ``z`` (and ``lpz``). The accompanying ``_locs.yaml`` records the spline calibration model and file path used, and which device performed the fit.

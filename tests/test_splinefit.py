@@ -1275,8 +1275,8 @@ class TestMultichannelIntegration:
 
     def test_explicit_gpu_request_without_gpufit_raises(self, scene):
         calibration, movies, camera_infos, identifications, _ = scene
-        if localize.GPUFIT_INSTALLED:
-            pytest.skip("Gpufit is installed")
+        if localize.GPU_FITTING_AVAILABLE:
+            pytest.skip("a CUDA device is available")
         with pytest.raises(ImportError, match="use_gpu=False"):
             localize.fit_spline_multichannel(
                 movies,

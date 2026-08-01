@@ -9,8 +9,8 @@ stage is scanned through z. This module averages the beads into a clean,
 3D-registered PSF volume, normalizes it, and computes cubic-spline
 coefficients with Gpuspline. The resulting calibration (coefficients +
 metadata) is saved via ``picasso.io.save_spline_calibration`` and later fitted
-per spot with Gpufit's SPLINE_2D / SPLINE_3D models (see
-``picasso.localize.fit_spots_gpufit_spline``).
+per spot with the cubic-spline PSF models (see
+``picasso.localize.fit_spots_spline``).
 
 Note: Gpuspline is a CPU library (no GPU/CUDA); only the subsequent fitting
 step needs a CUDA GPU. Building a calibration therefore only needs Gpuspline,
@@ -46,7 +46,7 @@ References
   Scientific Reports 7, 15722 (2017).
 
 :authors: Rafal Kowalewski
-:copyright: Copyright (c) 2016-2026 Jungmann Lab, MPI of Biochemistry
+:copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry
 """
 
 from __future__ import annotations
@@ -1042,7 +1042,7 @@ def calibrate_spline(
     -------
     calibration : dict
         The spline PSF calibration (see ``io.save_spline_calibration`` /
-        ``io.load_spline_calibration`` and ``localize.fit_spots_gpufit_spline``).
+        ``io.load_spline_calibration`` and ``localize.fit_spots_spline``).
     """
     if not localize.GPUSPLINE_INSTALLED:
         raise ImportError(
@@ -3055,7 +3055,7 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
         are absent, or when GPU spline fitting is unavailable or fails, so the
         caller can fall back to the model-vs-data RMSE panel.
     """
-    if not localize.GPUFIT_INSTALLED:
+    if not localize.GPU_FITTING_AVAILABLE:
         return None
     if calibration["model"] == "spline-2d":
         return None  # no axial coordinate to assess
@@ -3075,7 +3075,9 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
         # spots and stays closer to the CRLB than least squares, especially for
         # the dim, defocused spots in the tails. The axial multi-start is left
         # at its default so this measures what the fitting path delivers.
-        theta = localize.fit_spots_gpufit_spline(spots, calibration, mle=True)
+        theta = localize.fit_spots_spline(
+            spots, calibration, mle=True, use_gpu=True
+        )
     except Exception:
         return None
     return _axial_precision_from_theta(
@@ -3154,7 +3156,7 @@ def _axial_precision_multichannel(
     ``spot_residuals`` (``(n_spots, n_channels, 2)``, see
     :func:`_spot_roi_residuals`) are the sub-pixel ROI offsets of the bead
     spots being refitted."""
-    if not localize.GPUFIT_INSTALLED:
+    if not localize.GPU_FITTING_AVAILABLE:
         return None
     # only the plain multichannel spline fitter is used here
     if calibration.get("model") != "spline-3d-multichannel":
@@ -3188,10 +3190,11 @@ def _axial_precision_multichannel(
     ):
         spot_residuals = None
     try:
-        theta = localize.fit_spots_gpufit_spline(
+        theta = localize.fit_spots_spline(
             spots,
             fit_cal,
             mle=True,
+            use_gpu=True,
             residuals=spot_residuals,
         )
     except Exception:

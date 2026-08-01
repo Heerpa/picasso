@@ -42,7 +42,9 @@ from . import (
     gaussmle,
     avgroi,
     postprocess,
+    gaussfit_cuda,
     splinefit,
+    splinefit_cuda,
     zfit,
     __version__,
 )
@@ -54,12 +56,45 @@ try:
 except Exception:
     SPLINE_CRLB_CUDA_AVAILABLE = False
 
+# Whether spline fitting can run on the GPU with the numba kernels
+# (``picasso.splinefit_cuda``). Same condition as the CRLB kernels - it is a
+# separate name only because the two are separate features.
+GPU_FITTING_AVAILABLE = SPLINE_CRLB_CUDA_AVAILABLE
+
 try:
     from .ext.pygpufit import gpufit as gf
 
     GPUFIT_INSTALLED = bool(gf.cuda_available())
 except Exception:
     GPUFIT_INSTALLED = False
+
+# Which implementation a GPU fit uses: the numba CUDA kernels
+# (``picasso.splinefit_cuda`` / ``picasso.gaussfit_cuda``) or the vendored
+# Gpufit.dll they replace.
+#
+# The numba kernels are the default and the Gpufit branch is deprecated: it is
+# kept for one release only, reachable with
+# ``PICASSO_SPLINE_GPU_BACKEND=gpufit``, so that a result can still be compared
+# against the binary Picasso used to ship. Both the switch and the branch it
+# selects are due to be deleted together with ``picasso/ext/pygpufit``.
+_SPLINE_GPU_BACKEND = os.environ.get("PICASSO_SPLINE_GPU_BACKEND", "numba")
+
+
+def _use_numba_gpu_backend() -> bool:
+    """Whether a GPU fit should use the numba kernels rather than Gpufit."""
+    if _SPLINE_GPU_BACKEND.lower() != "numba":
+        # Only reachable via the deprecated escape hatch above; falling back to
+        # the numba kernels silently would make an explicit A/B comparison
+        # quietly compare the new backend against itself.
+        if not GPUFIT_INSTALLED:
+            raise ImportError(
+                "PICASSO_SPLINE_GPU_BACKEND requested the deprecated Gpufit "
+                "backend, but Gpufit could not be loaded. Unset the variable "
+                "to use the numba CUDA kernels."
+            )
+        return False
+    return True
+
 
 try:
     from .ext.pygpuspline import gpuspline as gs  # noqa: F401
@@ -2034,35 +2069,57 @@ def fit_spots_gpufit(
         ``mle`` (there the chi-square is the likelihood in disguise and
         is reported as ``log_likelihood``).
     """
-    if not GPUFIT_INSTALLED:
-        raise ImportError(
-            "GPUfit could not be found, CUDA-capable GPU is required."
-        )
     if rotated and spherical:
         raise ValueError("'rotated' and 'spherical' are mutually exclusive.")
+    if not (
+        GPU_FITTING_AVAILABLE if _use_numba_gpu_backend() else GPUFIT_INSTALLED
+    ):
+        raise ImportError(
+            "No usable GPU fitting backend, a CUDA-capable GPU is required."
+        )
     if mle:
         spots = np.maximum(spots, 0)
     size = spots.shape[1]
     initial_parameters = _initial_parameters_gpufit(
         spots, size, rotated=rotated, spherical=spherical
     )
-    if spherical:
-        model_id = gf.ModelID.GAUSS_2D
-    elif rotated:
-        model_id = gf.ModelID.GAUSS_2D_ROTATED
+    if _use_numba_gpu_backend():
+        if spherical:
+            model = gaussfit_cuda.SPHERICAL
+        elif rotated:
+            model = gaussfit_cuda.ROTATED
+        else:
+            model = gaussfit_cuda.ELLIPTIC
+        parameters, chi_squares, states, number_iterations = (
+            gaussfit_cuda.fit_spots(
+                model,
+                spots,
+                initial_parameters.astype(np.float64),
+                mle=mle,
+            )
+        )
+        parameters = parameters.astype(np.float32)
+        chi_squares = chi_squares.astype(np.float32)
     else:
-        model_id = gf.ModelID.GAUSS_2D_ELLIPTIC
-    estimator_id = gf.EstimatorID.MLE if mle else gf.EstimatorID.LSE
+        if spherical:
+            model_id = gf.ModelID.GAUSS_2D
+        elif rotated:
+            model_id = gf.ModelID.GAUSS_2D_ROTATED
+        else:
+            model_id = gf.ModelID.GAUSS_2D_ELLIPTIC
+        estimator_id = gf.EstimatorID.MLE if mle else gf.EstimatorID.LSE
 
-    parameters, states, chi_squares, number_iterations, exec_time = gf.fit(
-        spots.reshape((len(spots), (size * size))),
-        None,
-        model_id,
-        initial_parameters,
-        tolerance=1e-2,
-        max_number_iterations=20,
-        estimator_id=estimator_id,
-    )
+        parameters, states, chi_squares, number_iterations, _exec_time = (
+            gf.fit(
+                spots.reshape((len(spots), (size * size))),
+                None,
+                model_id,
+                initial_parameters,
+                tolerance=gaussfit_cuda.TOLERANCE,
+                max_number_iterations=gaussfit_cuda.MAX_ITERATIONS,
+                estimator_id=estimator_id,
+            )
+        )
 
     if spherical:
         # GAUSS_2D returns [amp, x, y, s, bg]. Expand to the standard
@@ -3217,7 +3274,7 @@ def _spline_cpu_schedule(
     return splinefit.resolve_schedule(apply_seeds, tolerance, max_iterations)
 
 
-def _run_splinefit_cpu(
+def _run_splinefit(
     spots: lib.FloatArray3D,
     calibration: dict,
     mle: bool = False,
@@ -3230,21 +3287,31 @@ def _run_splinefit_cpu(
         Callable[[int], None] | Literal["console"] | None
     ) = None,
     abort_callback: Callable[[], bool] | None = None,
+    use_gpu: bool = False,
 ) -> tuple | None:
-    """Low-level CPU spline fit: unpack the calibration and run the kernels.
+    """Low-level spline fit: unpack the calibration and run the kernels.
 
     Returns ``(theta, chi_squares, states, iterations)``, or None if
-    ``abort_callback`` asked to stop. The CPU counterpart of
-    :func:`_run_gpufit_spline` combined with :func:`_fit_spline_z_multistart` -
-    the axial multi-start runs inside the per-spot kernel here, so every seed
-    is tried while that spot's data is still in cache and progress is reported
-    once per spot rather than once per pass.
+    ``abort_callback`` asked to stop. The axial multi-start runs inside the
+    per-spot kernel on both devices, so every seed is tried while that spot's
+    data is still in cache and progress is reported once per spot rather than
+    once per pass.
+
+    ``use_gpu`` selects :mod:`picasso.splinefit_cuda` over
+    :mod:`picasso.splinefit`. The two backends are driven from *this* function
+    rather than from separate translation layers deliberately: everything above
+    the dispatch - the box crop, the channel-major reshape, the coefficient
+    view, the affines, the ROI residuals, the initial parameters and the
+    schedule - is computed once, so both devices are guaranteed to see
+    byte-identical inputs. That is what makes a CPU/GPU comparison meaningful
+    rather than a test of two translation layers agreeing.
 
     ``multiprocess`` keeps ``fit2D``'s argument name, but as for ``gaussmle``
-    it selects a **thread** pool: the kernels are ``nogil``, so the workers run
-    concurrently while sharing the spots and the coefficient table rather than
-    pickling a copy of each into a subprocess. False runs the fit serially in
-    the calling thread, which is what the tests use for reproducibility.
+    it selects a **thread** pool: the CPU kernels are ``nogil``, so the workers
+    run concurrently while sharing the spots and the coefficient table rather
+    than pickling a copy of each into a subprocess. False runs the fit serially
+    in the calling thread, which is what the tests use for reproducibility. It
+    is ignored on the GPU, where one launch fits every spot.
     """
     box = spots.shape[1]
     # Fit a smaller-than-calibration box against a centered crop, exactly as
@@ -3290,6 +3357,23 @@ def _run_splinefit_cpu(
     aborted = callable(abort_callback) and abort_callback()
     if aborted:
         return None
+    if use_gpu:
+        stopped_early = False
+
+        def _abort() -> bool:
+            nonlocal stopped_early
+            if abort_callback():
+                stopped_early = True
+                return True
+            return False
+
+        result = splinefit_cuda.fit_spots(
+            *args,
+            progress_callback=progress_callback,
+            abort_callback=_abort if callable(abort_callback) else None,
+            **kwargs,
+        )
+        return None if stopped_early else result
     if not multiprocess or len(spots) == 0:
         return splinefit.fit_spots(
             *args, progress_callback=progress_callback, **kwargs
@@ -3356,23 +3440,25 @@ def fit_spots_splinefit(
         Callable[[int], None] | Literal["console"] | None
     ) = None,
     abort_callback: Callable[[], bool] | None = None,
+    use_gpu: bool = False,
 ) -> np.ndarray | tuple | None:
-    """Fit multiple spots with a cubic-spline PSF model on the CPU.
+    """Fit multiple spots with a cubic-spline PSF model using the numba kernels.
 
-    The CPU counterpart of :func:`fit_spots_gpufit_spline`, with the same
-    arguments, the same parameter conventions and the same return shape, so
-    the two are interchangeable (see :func:`fit_spots_spline`, which picks
-    between them). It supports every spline model the GPU path does:
-    ``spline-2d``, ``spline-3d``, ``spline-3d-multichannel`` and the
-    photon-decoupled ``spline-3d-multichannel-link-xyz``.
+    Runs on the CPU by default and on the GPU with ``use_gpu``; the two are the
+    same algorithm, so the choice only affects speed. Same arguments, parameter
+    conventions and return shape as :func:`fit_spots_gpufit_spline`, so all
+    three are interchangeable (see :func:`fit_spots_spline`, which picks between
+    them). Every spline model is supported: ``spline-2d``, ``spline-3d``,
+    ``spline-3d-multichannel`` and the photon-decoupled
+    ``spline-3d-multichannel-link-xyz``.
 
-    Unlike the GPU fit, which is one call, this reports progress per spot and
-    can be aborted; see ``tolerance``/``max_iterations`` for the convergence
-    schedule and :func:`_run_splinefit_cpu` for the multi-start.
+    Progress is reported per spot on the CPU and per chunk on the GPU; see
+    ``tolerance``/``max_iterations`` for the convergence schedule and
+    :func:`_run_splinefit` for the multi-start.
 
     Returns None if ``abort_callback`` asked to stop.
     """
-    result = _run_splinefit_cpu(
+    result = _run_splinefit(
         spots,
         calibration,
         mle=mle,
@@ -3383,6 +3469,7 @@ def fit_spots_splinefit(
         multiprocess=multiprocess,
         progress_callback=progress_callback,
         abort_callback=abort_callback,
+        use_gpu=use_gpu,
     )
     if result is None:
         return None
@@ -3400,25 +3487,31 @@ def fit_spots_splinefit(
     return theta
 
 
-def _fit_splinefit_cpu_multistart(
+def _fit_splinefit_multistart(
     spots: lib.FloatArray3D,
     calibration: dict,
     mle: bool = False,
     n_z_starts: int = 1,
     residuals: np.ndarray | None = None,
+    use_gpu: bool = False,
 ) -> tuple:
-    """CPU twin of :func:`_fit_spline_z_multistart`.
+    """Axial multi-start with the numba kernels, on either device.
 
     Returns ``(parameters, chi_squares, converged, n_iterations)``.
     :func:`fit_spline_multichannel_ratiometric` uses this form because it ranks
     photon-ratio hypotheses on the chi-square and needs to know which fits
-    converged."""
-    theta, chi_squares, states, iterations = _run_splinefit_cpu(
+    converged.
+
+    There is no separate seed loop here: both kernels run the multi-start
+    per spot internally and return the winning seed, so this only has to
+    translate the fit state into the ``converged`` mask."""
+    theta, chi_squares, states, iterations = _run_splinefit(
         spots,
         calibration,
         mle=mle,
         n_z_starts=n_z_starts,
         residuals=residuals,
+        use_gpu=use_gpu,
     )
     finite = np.isfinite(theta).all(axis=1) & np.isfinite(chi_squares)
     converged = finite & (
@@ -3427,17 +3520,25 @@ def _fit_splinefit_cpu_multistart(
     return theta.astype(np.float32), chi_squares, converged, iterations
 
 
+def _gpu_spline_available() -> bool:
+    """Whether a GPU spline fit can run with the selected backend."""
+    if _use_numba_gpu_backend():
+        return GPU_FITTING_AVAILABLE
+    return GPUFIT_INSTALLED
+
+
 def _spline_use_gpu(use_gpu: bool | None) -> bool:
     """Resolve a ``use_gpu`` flag: None means "whatever is available".
 
-    Raises if the GPU was explicitly asked for but Gpufit is missing, so an
-    explicit request never silently becomes a (much slower) CPU fit."""
+    Raises if the GPU was explicitly asked for but is unusable, so an explicit
+    request never silently becomes a (much slower) CPU fit."""
     if use_gpu is None:
-        return GPUFIT_INSTALLED
-    if use_gpu and not GPUFIT_INSTALLED:
+        return _gpu_spline_available()
+    if use_gpu and not _gpu_spline_available():
         raise ImportError(
-            "GPUfit could not be found, CUDA-capable GPU is required. Pass "
-            "use_gpu=False to fit the spline PSF on the CPU instead."
+            "No usable GPU spline fitting backend, a CUDA-capable GPU is "
+            "required. Pass use_gpu=False to fit the spline PSF on the CPU "
+            "instead."
         )
     return bool(use_gpu)
 
@@ -3461,9 +3562,10 @@ def fit_spots_spline(
     only affects speed. ``use_gpu`` None (the default) uses the GPU when Gpufit
     is installed.
 
-    ``progress_callback`` is only meaningful on the CPU, where the fit is a
-    per-spot loop; the GPU fit is a single call."""
-    if _spline_use_gpu(use_gpu):
+    ``progress_callback`` is reported per spot on the CPU and per chunk on the
+    GPU; the Gpufit backend is a single call and cannot report at all."""
+    on_gpu = _spline_use_gpu(use_gpu)
+    if on_gpu and not _use_numba_gpu_backend():
         return fit_spots_gpufit_spline(
             spots,
             calibration,
@@ -3480,6 +3582,7 @@ def fit_spots_spline(
         return_stats=return_stats,
         residuals=residuals,
         progress_callback=progress_callback,
+        use_gpu=on_gpu,
     )
 
 
@@ -3492,9 +3595,10 @@ def _fit_spline_multistart(
     use_gpu: bool | None = None,
 ) -> tuple:
     """Axial multi-start on whichever device is available. See
-    :func:`_fit_spline_z_multistart` (GPU) and
-    :func:`_fit_splinefit_cpu_multistart` (CPU)."""
-    if _spline_use_gpu(use_gpu):
+    :func:`_fit_splinefit_multistart` (numba, either device) and
+    :func:`_fit_spline_z_multistart` (Gpufit)."""
+    on_gpu = _spline_use_gpu(use_gpu)
+    if on_gpu and not _use_numba_gpu_backend():
         return _fit_spline_z_multistart(
             spots,
             calibration,
@@ -3502,12 +3606,13 @@ def _fit_spline_multistart(
             n_z_starts=n_z_starts,
             residuals=residuals,
         )
-    return _fit_splinefit_cpu_multistart(
+    return _fit_splinefit_multistart(
         spots,
         calibration,
         mle=mle,
         n_z_starts=n_z_starts,
         residuals=residuals,
+        use_gpu=on_gpu,
     )
 
 
@@ -5939,13 +6044,25 @@ def _fit2d_spline_gpu(
     ``n_z_starts`` is the axial multi-start (see
     :func:`fit_spots_gpufit_spline`); ``None`` picks it from the calibration.
     Pass 1 for the single in-focus start."""
-    theta, log_likelihood, iterations, chi_square = fit_spots_gpufit_spline(
-        spots,
-        calibration,
-        mle=mle,
-        return_stats=True,
-        n_z_starts=n_z_starts,
-    )
+    if _use_numba_gpu_backend():
+        theta, log_likelihood, iterations, chi_square = fit_spots_splinefit(
+            spots,
+            calibration,
+            mle=mle,
+            return_stats=True,
+            n_z_starts=n_z_starts,
+            use_gpu=True,
+        )
+    else:
+        theta, log_likelihood, iterations, chi_square = (
+            fit_spots_gpufit_spline(
+                spots,
+                calibration,
+                mle=mle,
+                return_stats=True,
+                n_z_starts=n_z_starts,
+            )
+        )
     locs = locs_from_fits_spline(
         identifications,
         theta,

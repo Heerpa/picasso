@@ -40,7 +40,7 @@ from .. import (
 from PyQt6 import QtCore, QtGui, QtWidgets
 from playsound3 import playsound
 
-GPUFIT_INSTALLED = localize.GPUFIT_INSTALLED
+GPU_FITTING_AVAILABLE = localize.GPU_FITTING_AVAILABLE
 GPUSPLINE_INSTALLED = localize.GPUSPLINE_INSTALLED
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
@@ -164,7 +164,7 @@ FIT_MODELS = {
 # its MLE optimizer is GPU-only. The cubic-spline PSF has both: the bare codes
 # above run on the CPU (picasso.splinefit) and FitWorker appends "-gpu" when
 # the GPUfit checkbox is ticked, exactly as for the Gaussian models.
-if not GPUFIT_INSTALLED:
+if not GPU_FITTING_AVAILABLE:
     del FIT_MODELS["2D rotated elliptical Gaussian"]["optimizers"]["MLE"]
 
 
@@ -2227,12 +2227,14 @@ class ParametersDialog(lib.Dialog):
         fit_stack.addWidget(lq_widget)
         fit_stack.addWidget(mle_widget)
 
-        # Gpufit implements both least-squares and MLE estimators, so
-        # the checkbox applies to both optimizers and sits below the
-        # optimizer parameter stack.
-        self.gpufit_checkbox = QtWidgets.QCheckBox("Use GPUfit")
+        # Picasso implements both least-squares and MLE estimators on the
+        # GPU, so the checkbox applies to both optimizers and sits below
+        # the optimizer parameter stack.
+        self.gpufit_checkbox = QtWidgets.QCheckBox("Use GPU")
         self.gpufit_checkbox.setToolTip(
-            "Perform fitting on the GPU using Gpufit.\n\n"
+            "Perform fitting on a CUDA-capable GPU.\n\n"
+            "The algorithm is a port of Gpufit; the kernels are compiled "
+            "at run time by Numba.\n\n"
             "Przybylski, A., Thiel, B., Keller-Findeisen, J. et al. "
             "Gpufit: An open-source toolkit for GPU-accelerated curve "
             "fitting. Sci Rep 7, 15722 (2017). "
@@ -2241,7 +2243,7 @@ class ParametersDialog(lib.Dialog):
         self.gpufit_checkbox.setDisabled(True)
         self.gpufit_checkbox.stateChanged.connect(self.on_gpufit_changed)
 
-        if not GPUFIT_INSTALLED:
+        if not GPU_FITTING_AVAILABLE:
             self.gpufit_checkbox.hide()
         else:
             self.gpufit_checkbox.setDisabled(False)
@@ -2624,7 +2626,7 @@ class ParametersDialog(lib.Dialog):
             self.gpufit_checkbox.setDisabled(True)
         elif optimizer in ("Least squares", "MLE"):
             # Gpufit implements both estimators
-            self.gpufit_checkbox.setDisabled(not GPUFIT_INSTALLED)
+            self.gpufit_checkbox.setDisabled(not GPU_FITTING_AVAILABLE)
         else:
             self.gpufit_checkbox.setChecked(False)
             self.gpufit_checkbox.setDisabled(True)

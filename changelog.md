@@ -11,9 +11,10 @@ Last change: 01-AUG-2026 CEST
 - `config.yaml` can now be stored in the `.picasso` directory and the location is easily accessible via Localize
 
 #### Localize
-- New fitting model: **Experimental PSF (cubic spline)** — fits an experimentally measured PSF (a cubic-spline model built from a bead z-stack), via GPUfit's `SPLINE_2D`/`SPLINE_3D`/`SPLINE_3D_MULTICHANNEL` models on the GPU or the new `picasso.splinefit` module on the CPU. The `pygpuspline` binding is vendored under `picasso/ext/pygpuspline`. In single-channel data, the bead alignment follows the workflow from [Li, et al, Nature Methods, 2018](https://www.nature.com/articles/nmeth.4661). See the [experimental PSF (cubic-spline) fitting documentation](https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting) for details. *Note this is an experimental feature, do let us know if you find any bugs/unexpected behavior*
-- Multichannel spline PSF fitting (GPUfit's `SPLINE_3D_MULTICHANNEL`, e.g. biplane); additionally a new model was added for uncoupled photons with up to 6 channels. The global (multichannel) fitting follows globLoc, see [Li, et al, Nature Communications, 2022](https://doi.org/10.1038/s41467-022-30719-4)
-- New fitting algorithms from GPUfit supported: 2D rotated Gaussian, 2D spherical Gaussian
+- **GPU fitting is now implemented in Numba CUDA instead of Gpufit.** All seven models Picasso fits on the GPU — the spherical, elliptical and rotated 2D Gaussians and the cubic splines — now run through kernels written in Python and compiled at run time (`picasso.splinefit_cuda`, `picasso.gaussfit_cuda`, `picasso.lmfit_cuda`). The fitting algorithm itself is unchanged — it remains a port of [Gpufit](https://github.com/gpufit/Gpufit) (Przybylski et al., Scientific Reports 7, 15722, 2017).Z
+- New fitting model: **Experimental PSF (cubic spline)** — fits an experimentally measured PSF (a cubic-spline model built from a bead z-stack), via the new `picasso.splinefit_cuda` module on the GPU or `picasso.splinefit` on the CPU. The `pygpuspline` binding is vendored under `picasso/ext/pygpuspline`. In single-channel data, the bead alignment follows the workflow from [Li, et al, Nature Methods, 2018](https://www.nature.com/articles/nmeth.4661). See the [experimental PSF (cubic-spline) fitting documentation](https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting) for details. *Note this is an experimental feature, do let us know if you find any bugs/unexpected behavior*
+- Multichannel spline PSF fitting (a shared-amplitude 3D spline model, e.g. biplane); additionally a new model was added for uncoupled photons with up to 6 channels. The global (multichannel) fitting follows globLoc, see [Li, et al, Nature Communications, 2022](https://doi.org/10.1038/s41467-022-30719-4)
+- New GPU fitting algorithms supported: 2D rotated Gaussian, 2D spherical Gaussian
 - CPU fitting of the 2D spherical (isotropic) Gaussian (least squares and MLE) and the 2D rotated elliptical Gaussian (least squares)
 - Picasso relies on package `tifffile` for processing `.tif` files and many other grayscale movie formats, see [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html). **Note:** this is an experimental feature, do not hesitate to let us know if you detect bugs/unexpected behavior or would like to see more file formats in Picasso, see our [GitHub page](https://github.com/jungmannlab/picasso/issues) for contact information.
 - Added support for Zeiss `.czi` and Leica `.lif` movies in Localize (open dialog, drag-and-drop and batch CLI). These read via the optional `czifile` and `liffile` libraries (Python ≥ 3.12); install with `pip install picassosr[czi,lif]`. Multi-channel files prompt for a channel, and a `.lif` file with several acquisitions uses the one with the most frames.
@@ -37,12 +38,11 @@ Last change: 01-AUG-2026 CEST
 - Single-channel data loading with smooth progress bar
 - Improved zooming in/out via scroll wheel
 - Contrast spin boxes use logarithmic scaling
-- Gpufit's MLE-fitted localizations save log-likelihood and iterations
-- Gpufit's Gaussian MLE-fitted localizations' precisions corrected/included (`lpx`, `photon_unc`, etc)
+- GPU MLE-fitted localizations save log-likelihood and iterations
+- GPU Gaussian MLE-fitted localizations' precisions corrected/included (`lpx`, `photon_unc`, etc)
 - Fixed a gap of roughly one box size in the identified spots along the borders between adjacent (e.g. overlapping) ROIs
 - Fixed handling abortions during identification
 - Fixed zooming in Localize with scale bar + better appearance on Windows
-- GPU-accelerated fitting (GPUfit) now documented for Linux: the `libGpufit.so` is not shipped (only the Windows `Gpufit.dll` is), so Linux users must build it themselves. Added build/install instructions to the [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html#gpu-fitting-on-linux), the readme and a README in `picasso/ext/pygpufit/`.
 
 #### Render
 - Rendering rotated Gaussians

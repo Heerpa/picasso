@@ -1,5 +1,17 @@
-pyGpufit (vendored)
-===================
+pyGpufit (vendored) - DEPRECATED, SCHEDULED FOR REMOVAL
+=======================================================
+
+Picasso no longer uses this binding. GPU fitting is implemented in Numba CUDA
+kernels (picasso/splinefit_cuda.py, picasso/gaussfit_cuda.py,
+picasso/lmfit_cuda.py), which need no compiled library and work on Linux as
+well as Windows - so nothing below has to be done any more. This folder is kept
+for one release only, so that a result can still be compared against the binary
+Picasso used to ship, by setting PICASSO_SPLINE_GPU_BACKEND=gpufit. It will be
+deleted; do not write new code against it.
+
+Everything that follows describes the old, deprecated arrangement.
+
+---
 
 This folder contains the Python binding (gpufit.py) for Gpufit
 (https://github.com/gpufit/Gpufit), a CUDA Levenberg-Marquardt curve fitting

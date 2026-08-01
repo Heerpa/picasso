@@ -22,13 +22,6 @@ from tqdm import tqdm
 
 from picasso import lib
 
-try:
-    from picasso.ext.pygpufit import gpufit as _gpufit
-
-    GPUFIT_INSTALLED = bool(_gpufit.cuda_available())
-except Exception:
-    GPUFIT_INSTALLED = False
-
 
 @numba.jit(nopython=True, nogil=True)
 def _gaussian(

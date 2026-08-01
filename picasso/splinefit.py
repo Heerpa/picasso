@@ -401,6 +401,12 @@ def _solve_gj(
             tmp = b[irow]
             b[irow] = b[icol]
             b[icol] = tmp
+        # Recorded but never read: Gpufit drops the Numerical-Recipes column
+        # back-permutation because this elimination only interchanges rows.
+        # Kept so the transcription stays line-for-line comparable with
+        # ``LMFitCPP::solve_equation_system_gj``; the CUDA twin
+        # (``lmfit_cuda._solve_gj_device``) omits them, since two unused
+        # per-thread arrays are not free on a register-bound kernel.
         indxr[i] = irow
         indxc[i] = icol
         pivot = a[icol, icol]

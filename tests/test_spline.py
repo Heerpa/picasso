@@ -883,7 +883,7 @@ class TestCalibrateSplineMultichannel:
         assert abs(t1[1, 2] - (h - 1)) < 2.0  # y offset ~ H - 1
 
     @pytest.mark.skipif(
-        not localize.GPUFIT_INSTALLED, reason="Gpufit not available"
+        not localize.GPU_FITTING_AVAILABLE, reason="no CUDA device"
     )
     def test_axial_precision_multichannel_is_joint(self):
         """The multichannel axial-precision diagnostic must fit all channels

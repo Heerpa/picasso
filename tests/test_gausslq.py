@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from picasso import gausslq
+from picasso import gausslq, localize
 
 from tests.conftest import BOX, make_rotated_gaussian_spot
 
@@ -403,7 +403,7 @@ class TestSigmaUncertainty:
 
 
 @pytest.mark.skipif(
-    not gausslq.GPUFIT_INSTALLED, reason="GPUfit/CUDA not available"
+    not localize.GPU_FITTING_AVAILABLE, reason="no CUDA device"
 )
 class TestGpufit:
     """Tests for the backward-compatible GPU codepath. Skipped when the

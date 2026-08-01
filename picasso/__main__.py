@@ -1247,10 +1247,13 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     print("{:<8} {:<15} {:<10}".format("No", "Label", "Value"))
 
     if args.fit_method in ("lq-gpu", "spline-gpu", "spline-mle-gpu"):
-        if localize.GPUFIT_INSTALLED:
-            print("GPUfit installed")
+        if localize.GPU_FITTING_AVAILABLE:
+            print("CUDA GPU found")
         else:
-            raise Exception("GPUfit not installed. Aborting.")
+            raise Exception(
+                "No CUDA-capable GPU found, so the requested GPU fit method "
+                "cannot run. Aborting."
+            )
 
     for index, element in enumerate(vars(args)):
         try:
