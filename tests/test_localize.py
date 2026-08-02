@@ -1040,7 +1040,10 @@ class TestFit2D:
         assert len(locs) == len(real_identifications)
         # MLE-specific metadata
         assert new_info["Fit method"] == "gaussmle"
-        assert new_info["Convergence criterion"] == 0.001
+        # 1e-5, not 0.001: the CPU MLE now runs on Levenberg-Marquardt,
+        # where the criterion is relative in the chi-square rather than a
+        # position shift in pixels. See ``localize._GAUSS_SCHEDULES``.
+        assert new_info["Convergence criterion"] == 1e-5
         assert new_info["Max iterations"] == 100
 
     @pytest.mark.parametrize(
@@ -1657,7 +1660,7 @@ class TestGpufit:
     def test_spherical_end_to_end_omits_ellipticity(
         self, synthetic_spots_isotropic
     ):
-        """The full GPU spherical path (via ``_fit2d_gauss_gpu``) drops the
+        """The full GPU spherical path (via ``_fit2d_gauss``) drops the
         ellipticity column."""
         spots, _ = synthetic_spots_isotropic
         n = len(spots)
@@ -1669,8 +1672,8 @@ class TestGpufit:
                 "net_gradient": np.full(n, 5000.0, dtype=np.float32),
             }
         )
-        locs = localize._fit2d_gauss_gpu(
-            spots, ids, spots.shape[1], em=False, spherical=True
+        locs = localize._fit2d_gauss(
+            spots, ids, spots.shape[1], em=False, spherical=True, use_gpu=True
         )
         assert "ellipticity" not in locs.columns
         assert (locs["sx"].to_numpy() == locs["sy"].to_numpy()).all()
@@ -1761,8 +1764,8 @@ class TestGpufit:
                 "net_gradient": np.full(n, 5000.0, dtype=np.float32),
             }
         )
-        locs = localize._fit2d_gauss_gpu(
-            spots, ids, spots.shape[1], em=False, mle=False
+        locs = localize._fit2d_gauss(
+            spots, ids, spots.shape[1], em=False, mle=False, use_gpu=True
         )
         assert "chi_square" in locs.columns
         assert "log_likelihood" not in locs.columns
@@ -3688,6 +3691,90 @@ class TestSplineGpufit:
         np.testing.assert_allclose(locs["photons"], amp, rtol=1e-3)
 
 
+class TestNoSelfDeprecation:
+    """Picasso must not warn about its own use of the deprecated fitters.
+
+    ``picasso.gausslq`` and ``picasso.gaussmle`` are deprecated as of 0.11
+    and go in 1.0, but ``localize`` and ``spline`` still call them until the
+    method codes are rerouted. They call the *private* implementations for
+    exactly this reason: a deprecation notice a user cannot act on - because
+    it is Picasso's own internals that triggered it - is noise, and it would
+    train people to ignore the ones that do matter."""
+
+    CAMERA_INFO = {**CAMERA_INFO, "Pixelsize": PIXELSIZE}
+
+    @pytest.mark.parametrize(
+        "method",
+        [
+            "gausslq",
+            "gausslq-spherical",
+            "gausslq-rotated",
+            "gaussmle",
+            "gaussmle-spherical",
+            "avg",
+        ],
+    )
+    def test_fit2d_raises_no_deprecation_warning(
+        self, picasso_movie, movie_info, real_identifications, method
+    ):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            localize.fit2D(
+                picasso_movie,
+                movie_info,
+                self.CAMERA_INFO,
+                real_identifications[:20],
+                BOX,
+                fitting_method=method,
+                multiprocess=False,
+            )
+        offenders = [
+            str(w.message)
+            for w in caught
+            if issubclass(w.category, DeprecationWarning)
+            and ("gausslq" in str(w.message) or "gaussmle" in str(w.message))
+        ]
+        assert offenders == []
+
+    def test_multiprocessed_gausslq_is_silent(
+        self, picasso_movie, movie_info, real_identifications
+    ):
+        """The process-pool path goes through ``_fit_spots_parallel``."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            localize.fit2D(
+                picasso_movie,
+                movie_info,
+                self.CAMERA_INFO,
+                real_identifications[:20],
+                BOX,
+                fitting_method="gausslq",
+                multiprocess=True,
+            )
+        offenders = [
+            str(w.message)
+            for w in caught
+            if issubclass(w.category, DeprecationWarning)
+            and "gausslq" in str(w.message)
+        ]
+        assert offenders == []
+
+    def test_internal_callers_use_the_private_names(self):
+        """Belt and braces: reading the source, so a future edit that
+        reintroduces a public call is caught even if the warning filter
+        configuration changes."""
+        for module in (localize, spline):
+            source = inspect.getsource(module)
+            for public in (
+                "gausslq.fit_spot(",
+                "gausslq.fit_spots(",
+                "gausslq.fit_spots_parallel(",
+                "gaussmle.gaussmle(",
+                "gaussmle.gaussmle_async(",
+            ):
+                assert public not in source, (module.__name__, public)
+
+
 class TestConvergenceSchedulePlumbing:
     """The convergence criterion and the iteration cap must reach *every*
     fitting method, on either device, and be recorded as what the fit actually
@@ -3703,8 +3790,8 @@ class TestConvergenceSchedulePlumbing:
             ("gausslq", (gausslq.TOLERANCE, gausslq.MAX_ITERATIONS)),
             ("gausslq-spherical", (gausslq.TOLERANCE, gausslq.MAX_ITERATIONS)),
             ("gausslq-rotated", (gausslq.TOLERANCE, gausslq.MAX_ITERATIONS)),
-            ("gaussmle", (0.001, 100)),
-            ("gaussmle-spherical", (0.001, 100)),
+            ("gaussmle", localize.gauss_schedule(True, False)),
+            ("gaussmle-spherical", localize.gauss_schedule(True, False)),
             (
                 "gausslq-gpu",
                 (gaussfit_cuda.TOLERANCE, gaussfit_cuda.MAX_ITERATIONS),
@@ -3855,6 +3942,92 @@ class TestConvergenceSchedulePlumbing:
         assert seen["max_iterations"] == 3
 
 
+class TestGaussCodeGrammar:
+    """``localize.parse_gauss_code`` is both the parser and the validator for
+    the Gaussian fit codes, so a code cannot be offered somewhere and
+    rejected here."""
+
+    #: The eleven codes that predate 0.11, with the flags they have always
+    #: meant. These are what saved metadata and existing CLI scripts contain,
+    #: so their meaning is frozen.
+    LEGACY = {
+        "gausslq": (False, False, False, False),
+        "gausslq-spherical": (False, True, False, False),
+        "gausslq-rotated": (False, False, True, False),
+        "gausslq-gpu": (False, False, False, True),
+        "gausslq-spherical-gpu": (False, True, False, True),
+        "gausslq-rotated-gpu": (False, False, True, True),
+        "gaussmle": (True, False, False, False),
+        "gaussmle-spherical": (True, True, False, False),
+        "gaussmle-gpu": (True, False, False, True),
+        "gaussmle-spherical-gpu": (True, True, False, True),
+        "gaussmle-rotated-gpu": (True, False, True, True),
+    }
+
+    @pytest.mark.parametrize("code,expected", sorted(LEGACY.items()))
+    def test_legacy_codes_keep_their_meaning(self, code, expected):
+        flags = localize.parse_gauss_code(code)
+        assert flags is not None, code
+        assert (
+            flags["mle"],
+            flags["spherical"],
+            flags["rotated"],
+            flags["use_gpu"],
+        ) == expected
+
+    def test_every_legacy_code_is_still_offered(self):
+        assert set(self.LEGACY) <= set(localize.FIT_METHODS)
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "gausslq-bogus",
+            "gaussmle-gpu-gpu",
+            "gausslq-spherical-rotated",
+            "spline",
+            "avg",
+            "",
+        ],
+    )
+    def test_rejects_what_is_not_a_gaussian_code(self, code):
+        assert localize.parse_gauss_code(code) is None
+
+    def test_rotated_has_no_integrated_form(self):
+        """Not an oversight: the pixel integral of a rotated elliptical
+        Gaussian is not separable in the rotated frame."""
+        assert localize.parse_gauss_code("gausslq-int-rotated") is None
+        assert not any(
+            "int" in c and "rotated" in c for c in localize.FIT_METHODS
+        )
+
+    def test_fit_methods_round_trip(self):
+        """Every generated code parses, and nothing else claims to."""
+        for code in localize.FIT_METHODS:
+            if code.startswith(("gausslq", "gaussmle")):
+                assert localize.parse_gauss_code(code) is not None, code
+            else:
+                assert localize.parse_gauss_code(code) is None, code
+
+    def test_fit2d_rejects_an_unknown_code(self, tmp_path):
+        """The grammar is the validator: anything it does not accept must be
+        refused rather than silently fitted as something else."""
+        raw = tmp_path / "movie.raw"
+        np.zeros((1, 16, 16), np.uint16).tofile(raw)
+        movie = np.memmap(raw, dtype=np.uint16, mode="r", shape=(1, 16, 16))
+        identifications = pd.DataFrame(
+            {"frame": [0], "x": [8.0], "y": [8.0], "net_gradient": [1.0]}
+        )
+        with pytest.raises(AssertionError, match="not one of"):
+            localize.fit2D(
+                movie,
+                [{"Frames": 1}],
+                {"Baseline": 0, "Sensitivity": 1, "Gain": 1, "Pixelsize": 130},
+                identifications,
+                7,
+                fitting_method="gausslq-nonsense",
+            )
+
+
 class TestGuiConvergenceDefaults:
     """The GUI's per-method default table has to agree with the values the
     backends use when asked for None; otherwise the boxes show one schedule
@@ -3874,6 +4047,9 @@ class TestGuiConvergenceDefaults:
         assert codes - localize_gui._CONVERGENCE_CODES == {"avg"}
 
     def test_defaults_match_the_backends(self):
+        """The boxes must show the schedule the fit will actually use, so the
+        table is derived from ``localize.gauss_schedule`` rather than
+        repeated - this pins that it still resolves to the right values."""
         table = localize_gui._CONVERGENCE_DEFAULTS
         assert table["gausslq"] == (
             gausslq.TOLERANCE,
@@ -3883,7 +4059,12 @@ class TestGuiConvergenceDefaults:
             gaussfit_cuda.TOLERANCE,
             gaussfit_cuda.MAX_ITERATIONS,
         )
-        assert table["gaussmle"] == (0.001, 100)
+        # Not 0.001: rerouting the CPU MLE onto Levenberg-Marquardt changed
+        # what the criterion *means* (relative in the chi-square, not a
+        # position shift in pixels), so the default was re-derived rather
+        # than carried across. See ``localize._GAUSS_SCHEDULES``.
+        assert table["gaussmle"] == localize.gauss_schedule(True, False)
+        assert table["gaussmle"] == (1e-5, 100)
         assert table["spline-gpu"] == table["spline"]
         assert table["spline"] == localize._spline_schedule(True, None, None)
 
@@ -3921,7 +4102,7 @@ class TestGuiConvergenceDefaults:
             assert (
                 dialog.convergence_criterion.value(),
                 dialog.max_it.value(),
-            ) == localize_gui._GAUSSLQ_SCHEDULE
+            ) == localize.gauss_schedule(False, False)
 
             if localize.GPU_FITTING_AVAILABLE:
                 dialog.gpu_checkbox.setChecked(True)
@@ -3929,12 +4110,12 @@ class TestGuiConvergenceDefaults:
                 assert (
                     dialog.convergence_criterion.value(),
                     dialog.max_it.value(),
-                ) == localize_gui._GAUSS_GPU_SCHEDULE
+                ) == localize.gauss_schedule(False, True)
                 dialog.gpu_checkbox.setChecked(False)
                 assert (
                     dialog.convergence_criterion.value(),
                     dialog.max_it.value(),
-                ) == localize_gui._GAUSSLQ_SCHEDULE
+                ) == localize.gauss_schedule(False, False)
 
             dialog.fit_optimizer.setCurrentIndex(
                 dialog.fit_optimizer.findText("MLE")
@@ -3943,7 +4124,7 @@ class TestGuiConvergenceDefaults:
             assert (
                 dialog.convergence_criterion.value(),
                 dialog.max_it.value(),
-            ) == localize_gui._GAUSSMLE_SCHEDULE
+            ) == localize.gauss_schedule(True, False)
 
             # An unrelated refresh must not overwrite a typed value.
             dialog.convergence_criterion.setValue(0.05)
@@ -4861,17 +5042,19 @@ def _ref_gauss_crlb(theta, box, rotated, floor=1e-3):
     """Finite-difference Poisson Fisher CRLB reference for _gauss_crlb: builds
     I = sum g gᵀ / mu with numerical gradients g = d mu / d theta and inverts.
     """
+
+    def model(t):
+        return _gauss_model(t, box, rotated)
+
     n_params = len(theta)
-    mu = np.maximum(_gauss_model(theta, box, rotated), floor)
+    mu = np.maximum(model(theta), floor)
     g = np.zeros((n_params,) + mu.shape)
     for k in range(n_params):
         h = 1e-6 * max(abs(theta[k]), 1e-3)
         tp, tm = theta.copy(), theta.copy()
         tp[k] += h
         tm[k] -= h
-        g[k] = (
-            _gauss_model(tp, box, rotated) - _gauss_model(tm, box, rotated)
-        ) / (2 * h)
+        g[k] = (model(tp) - model(tm)) / (2 * h)
     return np.diag(np.linalg.pinv(np.einsum("pij,qij->pq", g / mu, g)))
 
 

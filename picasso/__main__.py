@@ -1078,6 +1078,7 @@ _FIT_METHOD_MAP = {
     "mle": "gaussmle",
     "mle-spherical": "gaussmle-spherical",
     "mle-spherical-gpu": "gaussmle-spherical-gpu",
+    "mle-rotated": "gaussmle-rotated",
     "mle-rotated-gpu": "gaussmle-rotated-gpu",
     "mle-3d": "gaussmle",
     "spline": "spline",
@@ -2665,6 +2666,7 @@ def main():  # noqa: C901
             "mle",
             "mle-spherical",
             "mle-spherical-gpu",
+            "mle-rotated",
             "mle-rotated-gpu",
             "lq",
             "lq-spherical",
@@ -2713,7 +2715,7 @@ def main():  # noqa: C901
             "convergence criterion: the fit stops once the chi-square"
             " changes by less than this, relative to its own magnitude."
             " 0 (the default) uses the selected fit method's own value"
-            " (0.001 for 'mle', 0.01 for 'lq' and the GPU Gaussians, and"
+            " (1e-5 for 'mle', 0.01 for 'lq' and every GPU Gaussian, and"
             " for the splines 1e-4 with the axial multi-start, 1e-2"
             " without)"
         ),
@@ -2726,7 +2728,7 @@ def main():  # noqa: C901
         help=(
             "maximum number of iterations per spot. 0 (the default) uses"
             " the selected fit method's own value (100 for 'mle', 200 for"
-            " 'lq', 20 for the GPU Gaussians, and for the splines 100 with"
+            " 'lq', 20 for every GPU Gaussian, and for the splines 100 with"
             " the axial multi-start, 20 without)"
         ),
     )

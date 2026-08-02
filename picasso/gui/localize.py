@@ -140,7 +140,7 @@ FIT_MODELS = {
     "2D rotated elliptical Gaussian": {
         "optimizers": {
             "Least squares": "gausslq-rotated",
-            "MLE": "gaussmle-rotated-gpu",
+            "MLE": "gaussmle-rotated",
         },
     },
     "2D spherical Gaussian": {
@@ -161,12 +161,6 @@ FIT_MODELS = {
         "code": "avg",
     },
 }
-# The rotated elliptical Gaussian has a CPU least-squares implementation but
-# its MLE optimizer is GPU-only. The cubic-spline PSF has both: the bare codes
-# above run on the CPU (picasso.fitting.splinefit) and FitWorker appends "-gpu"
-# when the GPU checkbox is ticked, exactly as for the Gaussian models.
-if not GPU_FITTING_AVAILABLE:
-    del FIT_MODELS["2D rotated elliptical Gaussian"]["optimizers"]["MLE"]
 
 
 MODEL_TOOLTIP = (
@@ -191,9 +185,7 @@ OPTIMIZER_TOOLTIP = (
     " biased for the Poisson (shot) noise of low-photon spots.\n\n"
     "MLE: maximum likelihood estimation with a Poisson noise model."
     " Statistically optimal (precision close to the Cramer-Rao lower"
-    " bound) and the better choice for dim spots.\n\n"
-    "Available optimizers may depend on the selected model; some are only"
-    " implemented on the GPU."
+    " bound) and the better choice for dim spots."
 )
 
 
@@ -222,7 +214,10 @@ _GPU_CAPABLE_CODES = frozenset(
 
 
 def _effective_fit_code(code: str, use_gpu: bool) -> str:
-    """The ``fit2D`` code a (code, GPU checkbox) pair actually runs."""
+    """The ``fit2D`` code a (code, GPU checkbox) pair actually runs.
+
+    "Use GPU" is a *modifier* on the model and optimizer comboboxes, so the
+    code it produces is assembled here rather than enumerated."""
     if use_gpu and code in _GPU_CAPABLE_CODES:
         return code + "-gpu"
     return code
@@ -231,29 +226,24 @@ def _effective_fit_code(code: str, use_gpu: bool) -> str:
 # Fit codes that iterate, and the default convergence schedule of each. Every
 # method except "avg" is here: all of them run an iterative solver, so all of
 # them honor the convergence criterion and the maximum-iteration count.
-_GAUSSMLE_SCHEDULE = (0.001, 100)
-_GAUSSLQ_SCHEDULE = (gausslq.TOLERANCE, gausslq.MAX_ITERATIONS)
-_GAUSS_GPU_SCHEDULE = (gaussfit_cuda.TOLERANCE, gaussfit_cuda.MAX_ITERATIONS)
+#
+# The Gaussian defaults come from ``localize.gauss_schedule`` rather than
+# being repeated, so the boxes cannot show a schedule the fit does not use.
 _SPLINE_SCHEDULE = (
     splinefit.TOLERANCE_MULTI_START,
     splinefit.MAX_ITERATIONS_MULTI_START,
 )
 _CONVERGENCE_DEFAULTS = {
-    "gausslq": _GAUSSLQ_SCHEDULE,
-    "gausslq-spherical": _GAUSSLQ_SCHEDULE,
-    "gausslq-rotated": _GAUSSLQ_SCHEDULE,
-    "gausslq-gpu": _GAUSS_GPU_SCHEDULE,
-    "gausslq-spherical-gpu": _GAUSS_GPU_SCHEDULE,
-    "gausslq-rotated-gpu": _GAUSS_GPU_SCHEDULE,
-    "gaussmle": _GAUSSMLE_SCHEDULE,
-    "gaussmle-spherical": _GAUSSMLE_SCHEDULE,
-    "gaussmle-gpu": _GAUSS_GPU_SCHEDULE,
-    "gaussmle-spherical-gpu": _GAUSS_GPU_SCHEDULE,
-    "gaussmle-rotated-gpu": _GAUSS_GPU_SCHEDULE,
-    "spline": _SPLINE_SCHEDULE,
-    "spline-mle": _SPLINE_SCHEDULE,
-    "spline-gpu": _SPLINE_SCHEDULE,
-    "spline-mle-gpu": _SPLINE_SCHEDULE,
+    code: (
+        _SPLINE_SCHEDULE
+        if code.startswith("spline")
+        else localize.gauss_schedule(
+            localize.parse_gauss_code(code)["mle"],
+            localize.parse_gauss_code(code)["use_gpu"],
+        )
+    )
+    for code in localize.FIT_METHODS
+    if code != "avg"
 }
 _CONVERGENCE_CODES = frozenset(_CONVERGENCE_DEFAULTS)
 
@@ -5791,10 +5781,7 @@ class Window(QtWidgets.QMainWindow):
         method = _fit_code(model, optimizer)
         # get the convergence criterion and max iterations
         iterates = (
-            _effective_fit_code(
-                method, self.parameters_dialog.gpu_checkbox.isChecked()
-            )
-            in _CONVERGENCE_CODES
+            self.parameters_dialog.current_fit_code() in _CONVERGENCE_CODES
         )
         eps = (
             self.parameters_dialog.convergence_criterion.value()

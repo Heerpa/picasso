@@ -49,6 +49,7 @@ from numba import cuda
 import dask.array as da
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.special import erf
 from tqdm import tqdm
 from sqlalchemy import create_engine
 
@@ -64,7 +65,13 @@ from . import (
     zfit,
     __version__,
 )
-from .fitting import gaussfit_cuda, splinefit, splinefit_cuda
+from .fitting import (
+    gaussfit,
+    gaussfit_cuda,
+    precision,
+    splinefit,
+    splinefit_cuda,
+)
 
 # Check for CUDA availability for spline CRLB calculations. Otherwise,
 # CPU is used
@@ -1667,29 +1674,9 @@ def fit2D(
         identifications, pd.DataFrame
     ), "identifications must be a DataFrame"
     assert isinstance(box, int) and box > 0, "box must be a positive integer"
-    assert fitting_method in [
-        "gausslq",
-        "gausslq-spherical",
-        "gausslq-rotated",
-        "gausslq-gpu",
-        "gausslq-rotated-gpu",
-        "gausslq-spherical-gpu",
-        "gaussmle",
-        "gaussmle-spherical",
-        "gaussmle-gpu",
-        "gaussmle-rotated-gpu",
-        "gaussmle-spherical-gpu",
-        "spline",
-        "spline-mle",
-        "spline-gpu",
-        "spline-mle-gpu",
-        "avg",
-    ], (
-        "fitting_method must be one of 'gausslq', 'gausslq-spherical',"
-        " 'gausslq-rotated', 'gausslq-gpu', 'gausslq-rotated-gpu',"
-        " 'gausslq-spherical-gpu', 'gaussmle', 'gaussmle-spherical',"
-        " 'gaussmle-gpu', 'gaussmle-rotated-gpu', 'gaussmle-spherical-gpu',"
-        " 'spline', 'spline-mle', 'spline-gpu', 'spline-mle-gpu', or 'avg'"
+    assert fitting_method in FIT_METHODS, (
+        f"fitting_method '{fitting_method}' is not one of "
+        f"{', '.join(FIT_METHODS)}"
     )
     if fitting_method.startswith("spline"):
         assert isinstance(spline_calibration, dict), (
@@ -1723,40 +1710,21 @@ def fit2D(
         progress_callback=cut_progress_callback,
     )
     em = camera_info["Gain"] > 1
-    if fitting_method in ("gausslq", "gausslq-spherical", "gausslq-rotated"):
-        locs = _fit2d_gausslq(
-            spots=spots,
-            identifications=identifications,
-            box=box,
-            em=em,
-            multiprocess=multiprocess,
-            progress_callback=progress_callback,
-            abort_callback=abort_callback,
-            spherical=fitting_method == "gausslq-spherical",
-            rotated=fitting_method == "gausslq-rotated",
-            tolerance=eps,
-            max_iterations=max_it,
-        )
-    elif fitting_method in (
-        "gausslq-gpu",
-        "gausslq-rotated-gpu",
-        "gausslq-spherical-gpu",
-        "gaussmle-gpu",
-        "gaussmle-rotated-gpu",
-        "gaussmle-spherical-gpu",
-    ):
-        if callable(progress_callback):
+    gauss_flags = parse_gauss_code(fitting_method)
+    if gauss_flags is not None:
+        if gauss_flags["use_gpu"] and callable(progress_callback):
             progress_callback(1)
-        locs = _fit2d_gauss_gpu(
+        locs = _fit2d_gauss(
             spots=spots,
             identifications=identifications,
             box=box,
             em=em,
-            rotated="-rotated-" in fitting_method,
-            mle=fitting_method.startswith("gaussmle"),
-            spherical="-spherical-" in fitting_method,
             tolerance=eps,
             max_iterations=max_it,
+            progress_callback=(
+                None if gauss_flags["use_gpu"] else progress_callback
+            ),
+            **gauss_flags,
         )
     elif fitting_method in ("spline-gpu", "spline-mle-gpu"):
         if callable(progress_callback):
@@ -1794,26 +1762,6 @@ def fit2D(
             progress_callback=progress_callback,
             abort_callback=abort_callback,
         )
-    elif fitting_method in ("gaussmle", "gaussmle-spherical"):
-        # "gaussmle-spherical" forces the isotropic single-width ("sigma")
-        # MLE path, which already outputs equal sx/sy; the plain "gaussmle"
-        # code respects the separate mle_method argument.
-        locs = _fit2d_gaussmle(
-            spots=spots,
-            identifications=identifications,
-            box=box,
-            eps=0.001 if eps is None else eps,
-            max_it=100 if max_it is None else max_it,
-            mle_method=(
-                "sigma"
-                if fitting_method == "gaussmle-spherical"
-                else mle_method
-            ),
-            multiprocess=multiprocess,
-            progress_callback=progress_callback,
-            abort_callback=abort_callback,
-            spherical=fitting_method == "gaussmle-spherical",
-        )
     elif fitting_method == "avg":
         locs = _fit2d_avg(
             spots,
@@ -1831,28 +1779,12 @@ def fit2D(
     }
     # Record the schedule the fit actually ran with, per method - each
     # backend has its own defaults, and "None" in the caller means "yours".
-    if fitting_method in ("gaussmle", "gaussmle-spherical"):
-        localize_info["Convergence criterion"] = 0.001 if eps is None else eps
-        localize_info["Max iterations"] = 100 if max_it is None else max_it
-    elif fitting_method in (
-        "gausslq",
-        "gausslq-spherical",
-        "gausslq-rotated",
-    ):
-        localize_info["Convergence criterion"] = (
-            gausslq.TOLERANCE if eps is None else eps
+    if gauss_flags is not None:
+        tolerance, max_iterations = gauss_schedule(
+            gauss_flags["mle"], gauss_flags["use_gpu"], eps, max_it
         )
-        localize_info["Max iterations"] = (
-            gausslq.MAX_ITERATIONS if max_it is None else max_it
-        )
-    elif fitting_method.startswith(("gausslq-", "gaussmle-")):
-        # The remaining Gaussian codes are all GPU ones.
-        localize_info["Convergence criterion"] = (
-            gaussfit_cuda.TOLERANCE if eps is None else eps
-        )
-        localize_info["Max iterations"] = (
-            gaussfit_cuda.MAX_ITERATIONS if max_it is None else max_it
-        )
+        localize_info["Convergence criterion"] = tolerance
+        localize_info["Max iterations"] = max_iterations
     if fitting_method.startswith("spline"):
         localize_info["Spline calibration model"] = spline_calibration.get(
             "model"
@@ -1878,75 +1810,13 @@ def fit2D(
     return locs, new_info
 
 
-def _fit2d_gausslq(
-    spots: lib.FloatArray3D,
-    identifications: pd.DataFrame,
-    box: int,
-    em: bool,
-    multiprocess: bool = True,
-    progress_callback: (
-        Callable[[int], None] | Literal["console"] | None
-    ) = None,
-    abort_callback: Callable[[], bool] | None = None,
-    spherical: bool = False,
-    rotated: bool = False,
-    tolerance: float | None = None,
-    max_iterations: int | None = None,
-) -> pd.DataFrame | None:
-    """Fit 2D Gaussians using least-squares fitting (CPU). If
-    ``spherical``, an isotropic Gaussian with a single width is fitted
-    and the resulting ``sx`` and ``sy`` columns are identical. If
-    ``rotated``, a rotated elliptical Gaussian is fitted and the
-    resulting localizations contain the fitted rotation angle (in
-    degrees) in the column ``angle``. See ``fit_2D`` for more details."""
-    N = len(identifications)
-    if multiprocess:
-        fs = gausslq.fit_spots_parallel(
-            spots,
-            asynch=True,
-            spherical=spherical,
-            rotated=rotated,
-            return_chi_square=True,
-            tolerance=tolerance,
-            max_iterations=max_iterations,
-        )
-        theta = _process_fitting_futures(
-            fs, N, progress_callback, abort_callback
-        )
-        if theta is None:
-            return
-    else:
-        theta = gausslq.fit_spots(
-            spots,
-            progress_callback,
-            spherical=spherical,
-            rotated=rotated,
-            return_chi_square=True,
-            tolerance=tolerance,
-            max_iterations=max_iterations,
-        )
-    # The chi-square rides along as the last column of theta (see
-    # gausslq.fit_spot); split it off so locs_from_fits sees the plain
-    # parameter layout it detects the rotated model from.
-    theta, chi_square = theta[:, :-1], theta[:, -1]
-    locs = gausslq.locs_from_fits(
-        identifications,
-        theta,
-        box,
-        em,
-        spherical=spherical,
-        chi_square=chi_square,
-    )
-    return locs
-
-
 def _initial_parameters_gauss(
     spots: lib.FloatArray3D,
     size: int,
     rotated: bool = False,
     spherical: bool = False,
 ) -> lib.FloatArray2D:
-    """Initialize the parameters for the GPU fit - photons, x, y, sx,
+    """Initialize the parameters for a Gaussian fit - photons, x, y, sx,
     sy, bg (plus the rotation angle if ``rotated``). If ``spherical``,
     a single width is used and the layout is photons, x, y, s, bg
     (the isotropic ``GAUSS_2D`` model)."""
@@ -1988,6 +1858,235 @@ def _initial_parameters_gauss(
     return initial_parameters
 
 
+# Per-method convergence schedules. Each backend's own defaults, kept here so
+# the resolved values reach both the fit and the saved metadata, and so that
+# rerouting a method to a new backend cannot silently change where it stops.
+#: Tokens a Gaussian fit code may carry after ``gausslq``/``gaussmle``.
+_GAUSS_TOKENS = frozenset({"spherical", "rotated", "gpu"})
+
+
+def parse_gauss_code(fitting_method: str) -> dict | None:
+    """Flags of a Gaussian fit code, or None if it is not one.
+
+    The grammar is ``gauss{lq,mle}[-spherical|-rotated][-gpu]`` and it returns
+    ``{"mle", "spherical", "rotated", "use_gpu"}``.
+
+    Returns None for anything that is not a valid Gaussian code, so callers
+    can use it as both the parser and the validator.
+    """
+    tokens = fitting_method.split("-")
+    if tokens[0] not in ("gausslq", "gaussmle"):
+        return None
+    if len(set(tokens[1:])) != len(tokens[1:]):
+        return None  # a repeated token, e.g. "gausslq-gpu-gpu"
+    flags = {
+        "mle": tokens[0] == "gaussmle",
+        "spherical": False,
+        "rotated": False,
+        "use_gpu": False,
+    }
+    for token in tokens[1:]:
+        if token not in _GAUSS_TOKENS:
+            return None
+        if token == "spherical":
+            flags["spherical"] = True
+        elif token == "rotated":
+            flags["rotated"] = True
+        else:  # "gpu"
+            flags["use_gpu"] = True
+    if flags["spherical"] and flags["rotated"]:
+        return None
+    return flags
+
+
+def gauss_fit_methods() -> list[str]:
+    """Every Gaussian fit code :func:`parse_gauss_code` accepts.
+
+    Generated from the grammar rather than listed by hand, so a code cannot
+    be offered somewhere and rejected here."""
+    codes = []
+    for estimator in ("gausslq", "gaussmle"):
+        for shape in ("", "-spherical", "-rotated"):
+            for device in ("", "-gpu"):
+                code = f"{estimator}{shape}{device}"
+                if parse_gauss_code(code) is not None:
+                    codes.append(code)
+    return codes
+
+
+#: Every ``fit2D`` method. Generated for the Gaussians (see
+#: :func:`gauss_fit_methods`) and listed for the rest, which have no grammar.
+FIT_METHODS = tuple(
+    gauss_fit_methods()
+    + ["spline", "spline-mle", "spline-gpu", "spline-mle-gpu", "avg"]
+)
+
+
+_GAUSS_SCHEDULES = {
+    # (mle, use_gpu) -> (tolerance, max_iterations)
+    #
+    # On the CPU each estimator gets a schedule that converges it properly;
+    # for least squares that is what ``picasso.gausslq`` always used. On the
+    # GPU both keep Gpufit's, which is looser - deliberate rather than ideal,
+    # since it is what every "-gpu" code has always meant and changing it
+    # would silently move existing results. These are only *defaults*: pass
+    # ``eps``/``max_it``, or use the Localize parameters dialog, to change
+    # them.
+    (False, False): (gausslq.TOLERANCE, gausslq.MAX_ITERATIONS),
+    (True, False): (1e-5, 100),
+    (False, True): (gaussfit_cuda.TOLERANCE, gaussfit_cuda.MAX_ITERATIONS),
+    (True, True): (gaussfit_cuda.TOLERANCE, gaussfit_cuda.MAX_ITERATIONS),
+}
+
+
+def gauss_schedule(
+    mle: bool,
+    use_gpu: bool,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+) -> tuple:
+    """``(tolerance, max_iterations)`` a Gaussian fit uses, explicit values
+    winning. ``None`` picks the default of the method, which differs by
+    estimator and device - see :data:`_GAUSS_SCHEDULES`."""
+    default = _GAUSS_SCHEDULES[(bool(mle), bool(use_gpu))]
+    if tolerance is None:
+        tolerance = default[0]
+    if max_iterations is None:
+        max_iterations = default[1]
+    return float(tolerance), int(max_iterations)
+
+
+def _gauss_model(rotated: bool, spherical: bool) -> int:
+    """The :mod:`picasso.fitting.gaussfit` model of a method's flags."""
+    if spherical:
+        return gaussfit.SPHERICAL
+    if rotated:
+        return gaussfit.ROTATED
+    return gaussfit.ELLIPTIC
+
+
+def fit_spots_gauss(
+    spots: lib.FloatArray3D,
+    rotated: bool = False,
+    mle: bool = False,
+    spherical: bool = False,
+    use_gpu: bool = False,
+    return_stats: bool = False,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> (
+    lib.FloatArray2D
+    | tuple[
+        lib.FloatArray2D,
+        lib.FloatArray1D | None,
+        lib.FloatArray1D,
+        lib.FloatArray1D | None,
+    ]
+):
+    """Fit spots with a 2D Gaussian on the CPU or the GPU.
+
+    The one entry point for every Gaussian method Picasso offers. Both devices
+    run the identical Levenberg-Marquardt algorithm
+    (:mod:`picasso.fitting.gaussfit` and ``gaussfit_cuda``), so ``use_gpu``
+    only affects speed - the arrangement :func:`fit_spots_spline` already uses
+    for the spline models.
+
+    Parameters
+    ----------
+    spots : lib.FloatArray3D
+        ``(n_spots, box, box)`` photon counts.
+    rotated : bool, optional
+        Fit a rotated elliptical Gaussian, whose seventh parameter is the
+        rotation angle in radians. Cannot be combined with ``spherical``.
+    mle : bool, optional
+        Use the Poisson maximum-likelihood estimator instead of least squares.
+    spherical : bool, optional
+        Fit a single shared width. The returned parameters still use the
+        elliptical layout with ``sx == sy``, so the rest of the pipeline is
+        unchanged.
+    use_gpu : bool, optional
+        Run on a CUDA GPU. Default False.
+    return_stats : bool, optional
+        Additionally return ``(log_likelihood, iterations, chi_square)``.
+    tolerance, max_iterations : optional
+        ``None`` uses the method's own schedule, see :func:`gauss_schedule`.
+    progress_callback : callable, "console" or None, optional
+        Reported per spot on the CPU; the GPU fit is one launch per chunk.
+
+    Returns
+    -------
+    parameters : lib.FloatArray2D
+        ``[photons, x, y, sx, sy, bg]``, plus the rotation angle (radians) if
+        ``rotated``. Positions are box-local.
+    log_likelihood, number_iterations, chi_square
+        Only if ``return_stats``. ``log_likelihood`` is None for least
+        squares, ``chi_square`` is None for maximum likelihood - each
+        estimator reports the goodness of fit that means something for it.
+    """
+    if rotated and spherical:
+        raise ValueError("'rotated' and 'spherical' are mutually exclusive.")
+    if use_gpu and not GPU_FITTING_AVAILABLE:
+        raise ImportError(
+            "GPU fitting was requested but no CUDA-capable GPU is available."
+        )
+    model = _gauss_model(rotated, spherical)
+    tolerance, max_iterations = gauss_schedule(
+        mle, use_gpu, tolerance, max_iterations
+    )
+    if mle:
+        spots = np.maximum(spots, 0)
+    size = spots.shape[1]
+    initial_parameters = _initial_parameters_gauss(
+        spots, size, rotated=rotated, spherical=spherical
+    ).astype(np.float64)
+
+    backend = gaussfit_cuda if use_gpu else gaussfit
+    parameters, chi_squares, _states, number_iterations = backend.fit_spots(
+        model,
+        spots,
+        initial_parameters,
+        mle=mle,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        progress_callback=progress_callback,
+    )
+    parameters = parameters.astype(np.float32)
+    chi_squares = chi_squares.astype(np.float32)
+
+    if spherical:
+        # The isotropic models return [amplitude, x, y, s, bg]. Expand to the
+        # standard elliptical layout with sx == sy so the rest of the pipeline
+        # (CRLB, column building) is unchanged.
+        s = parameters[:, 3]
+        expanded = np.empty((len(parameters), 6), dtype=parameters.dtype)
+        expanded[:, 0] = parameters[:, 0]
+        expanded[:, 1] = parameters[:, 1]
+        expanded[:, 2] = parameters[:, 2]
+        expanded[:, 3] = s
+        expanded[:, 4] = s
+        expanded[:, 5] = parameters[:, 4]
+        expanded[:, 0] *= 2.0 * np.pi * s * s
+        parameters = expanded
+    else:
+        # The models fit a peak height; convert to total photons.
+        parameters[:, 0] *= 2.0 * np.pi * parameters[:, 3] * parameters[:, 4]
+
+    if return_stats:
+        # The MLE chi-square equals twice the negative Poisson
+        # log-likelihood, so -0.5 * chi_square reproduces the CPU MLE
+        # fit's log_likelihood (both Stirling-approximated). For least
+        # squares the chi-square is the plain residual sum of squares -
+        # not a likelihood, since least squares assumes no noise model -
+        # and is reported as such, as this fit's goodness-of-fit metric.
+        log_likelihood = -0.5 * chi_squares if mle else None
+        chi_square = None if mle else chi_squares
+        return parameters, log_likelihood, number_iterations, chi_square
+    return parameters
+
+
 def fit_spots_gauss_gpu(
     spots: lib.FloatArray3D,
     rotated: bool = False,
@@ -2005,135 +2104,22 @@ def fit_spots_gauss_gpu(
         lib.FloatArray1D | None,
     ]
 ):
-    """Fit multiple spots using GPU-based Gaussian fitting. Each spot is
-    a 2D array representing the pixel values of the spot image. The
-    function returns a 2D array with the optimized parameters for each
-    spot, where each row corresponds to a spot and the columns are the
-    parameters in the following order: [photons, x, y, sx, sy, bg] or,
-    for the rotated elliptical Gaussian, [photons, x, y, sx, sy, bg,
-    angle], where angle is the rotation angle in radians.
+    """Fit spots with a 2D Gaussian on the GPU.
 
-    The algorithm is a port of Gpufit; its licence is reproduced in
-    LICENSES/Gpufit-LICENSE.txt.
-
-    Runs on any CUDA-capable GPU; the kernels
-    (:mod:`picasso.fitting.gaussfit_cuda`) are compiled at run time by
-    Numba, so no platform-specific binary is involved.
-
-    Cite: Przybylski, et al. Scientific Reports, 2017.
-    DOI: 10.1038/s41598-017-15313-9
-
-    Parameters
-    ----------
-    spots : lib.FloatArray3D
-        A 3D array of shape (n_spots, size, size), where n_spots is the
-        number of spots and size is the length of one side of the square
-        spot image. Each slice along the first axis represents a single
-        spot image.
-    rotated : bool, optional
-        If True, fit a rotated elliptical Gaussian (the
-        GAUSS_2D_ROTATED model) whose seventh parameter is the rotation
-        angle. Default is False.
-    mle : bool, optional
-        If True, use the maximum likelihood estimator (Poisson
-        noise model) instead of least squares. Default is False.
-    spherical : bool, optional
-        If True, fit a spherical (isotropic) Gaussian with a single
-        width using the ``GAUSS_2D`` model. The returned parameters
-        still use the standard elliptical layout with ``sx == sy`` so
-        the rest of the pipeline is unchanged. Cannot be combined with
-        ``rotated``. Default is False.
-    return_stats : bool, optional
-        If True, additionally return the per-spot fit diagnostics
-        (log-likelihood, iteration counts and chi-square) reported by
-        the fit. Default is False.
-    tolerance : float or None, optional
-        Convergence criterion: the fit stops once the chi-square
-        changes by less than this, relative to its own magnitude.
-        None (the default) uses ``gaussfit_cuda.TOLERANCE``.
-    max_iterations : int or None, optional
-        Maximum number of Levenberg-Marquardt iterations per spot.
-        None (the default) uses ``gaussfit_cuda.MAX_ITERATIONS``.
-
-    Returns
-    -------
-    parameters : lib.FloatArray2D
-        A 2D array with the optimized parameters for each spot. The
-        columns correspond to [photons, x, y, sx, sy, bg] or
-        [photons, x, y, sx, sy, bg, angle] if ``rotated``.
-    log_likelihood : lib.FloatArray1D or None
-        Only returned if ``return_stats``. The per-spot Poisson
-        log-likelihood when ``mle`` (derived from the chi-square,
-        whose MLE value equals twice the negative log-likelihood), or
-        None for least squares, which does not assume a noise model and
-        so has no likelihood to report (see ``chi_square`` instead).
-    number_iterations : lib.FloatArray1D
-        Only returned if ``return_stats``. The number of iterations
-        taken to converge for each spot.
-    chi_square : lib.FloatArray1D or None
-        Only returned if ``return_stats``. The per-spot residual sum of
-        squares at the fit optimum for a least-squares fit, or None when
-        ``mle`` (there the chi-square is the likelihood in disguise and
-        is reported as ``log_likelihood``).
+    Thin wrapper over :func:`fit_spots_gauss` with ``use_gpu=True``, kept
+    because it is the established public name. See there for the arguments
+    and the returned layout.
     """
-    if rotated and spherical:
-        raise ValueError("'rotated' and 'spherical' are mutually exclusive.")
-    if not GPU_FITTING_AVAILABLE:
-        raise ImportError(
-            "GPU fitting was requested but no CUDA-capable GPU is available."
-        )
-    if mle:
-        spots = np.maximum(spots, 0)
-    size = spots.shape[1]
-    initial_parameters = _initial_parameters_gauss(
-        spots, size, rotated=rotated, spherical=spherical
+    return fit_spots_gauss(
+        spots,
+        rotated=rotated,
+        mle=mle,
+        spherical=spherical,
+        use_gpu=True,
+        return_stats=return_stats,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
     )
-    if spherical:
-        model = gaussfit_cuda.SPHERICAL
-    elif rotated:
-        model = gaussfit_cuda.ROTATED
-    else:
-        model = gaussfit_cuda.ELLIPTIC
-    parameters, chi_squares, _states, number_iterations = (
-        gaussfit_cuda.fit_spots(
-            model,
-            spots,
-            initial_parameters.astype(np.float64),
-            mle=mle,
-            tolerance=tolerance,
-            max_iterations=max_iterations,
-        )
-    )
-    parameters = parameters.astype(np.float32)
-    chi_squares = chi_squares.astype(np.float32)
-
-    if spherical:
-        # GAUSS_2D returns [amp, x, y, s, bg]. Expand to the standard
-        # elliptical layout [photons, x, y, sx, sy, bg] with sx == sy so
-        # the rest of the pipeline (CRLB, column building) is unchanged.
-        s = parameters[:, 3]
-        expanded = np.empty((len(parameters), 6), dtype=parameters.dtype)
-        expanded[:, 0] = parameters[:, 0] * 2.0 * np.pi * s * s
-        expanded[:, 1] = parameters[:, 1]
-        expanded[:, 2] = parameters[:, 2]
-        expanded[:, 3] = s
-        expanded[:, 4] = s
-        expanded[:, 5] = parameters[:, 4]
-        parameters = expanded
-    else:
-        parameters[:, 0] *= 2.0 * np.pi * parameters[:, 3] * parameters[:, 4]
-
-    if return_stats:
-        # The MLE chi-square equals twice the negative Poisson
-        # log-likelihood, so -0.5 * chi_square reproduces the CPU MLE
-        # fit's log_likelihood (both Stirling-approximated). For least
-        # squares the chi-square is the plain residual sum of squares -
-        # not a likelihood, since least squares assumes no noise model -
-        # and is reported as such, as this fit's goodness-of-fit metric.
-        log_likelihood = -0.5 * chi_squares if mle else None
-        chi_square = None if mle else chi_squares
-        return parameters, log_likelihood, number_iterations, chi_square
-    return parameters
 
 
 def _gauss_crlb(
@@ -2142,16 +2128,13 @@ def _gauss_crlb(
     em: bool,
     rotated: bool = False,
 ) -> lib.FloatArray2D:
-    """Poisson Cramer-Rao lower bound for GPU MLE Gaussian fits.
+    """Poisson Cramer-Rao lower bound for MLE Gaussian fits.
 
     Builds the Fisher information matrix ``I = Σ g gᵀ / μ`` (``g = ∂μ/∂θ``) of
-    the point-sampled Gaussian model the GPU actually optimizes
-    (``GAUSS_2D_ELLIPTIC`` / ``GAUSS_2D_ROTATED``) and returns the diagonal of
+    the Gaussian model that was actually optimized and returns the diagonal of
     its inverse — the variance an efficient maximum-likelihood estimator
     attains. Evaluated at the fitted parameters; the spot data is not needed.
-    Mirrors :func:`_spline_crlb` and ``gaussmle._mlefit_sigmaxy_crlb`` but for
-    the point-sampled Gaussian the GPU fits rather than the erf-integrated CPU
-    model.
+    Mirrors :func:`_spline_crlb` and ``gaussmle._mlefit_sigmaxy_crlb``.
 
     Model (photon units, spots are gain-converted before fitting)::
 
@@ -2161,13 +2144,13 @@ def _gauss_crlb(
     coordinate, and ``E`` is the (optionally rotated) unit-height Gaussian.
     Parametrizing the amplitude directly as the total photon count ``N``
     (Picasso's reported ``photons``) makes the returned variances line up with
-    the reported columns, with the ``N``/``sx``/``sy`` coupling of ``mu`` folded
-    into the derivatives.
+    the reported columns, with the ``N``/``sx``/``sy`` coupling of ``mu``
+    folded into the derivatives.
 
     Parameters
     ----------
     theta : lib.FloatArray2D
-        Fitted parameters in the GPU fit's order ``[photons (total N), x, y,
+        Fitted parameters in the fit's order ``[photons (total N), x, y,
         sx, sy, bg]`` (elliptic) or ``[..., bg, angle (radians)]`` (rotated).
         Positions are box-local (pixel = parameter, matching
         :func:`_initial_parameters_gauss`).
@@ -2278,8 +2261,8 @@ def locs_from_fits_gauss_gpu(
     spherical: bool = False,
     chi_square: lib.FloatArray1D | None = None,
 ) -> pd.DataFrame:
-    """Convert the fit results from GPU-based fitting (Gaussian) into a
-    data frame array of localizations.
+    """Convert the fit results from a Gaussian fit into a data frame of
+    localizations.
 
     Parameters
     ----------
@@ -2349,10 +2332,10 @@ def locs_from_fits_gauss_gpu(
             lpx = np.sqrt(crlb[:, 1])
             lpy = np.sqrt(crlb[:, 2])
     else:
-        lpx = gausslq.localization_precision(
+        lpx = precision.localization_precision(
             theta[:, 0], theta[:, 3], theta[:, 4], theta[:, 5], em=em
         )
-        lpy = gausslq.localization_precision(
+        lpy = precision.localization_precision(
             theta[:, 0], theta[:, 4], theta[:, 3], theta[:, 5], em=em
         )
     columns = {
@@ -2398,11 +2381,18 @@ def locs_from_fits_gauss_gpu(
     if chi_square is not None:
         columns["chi_square"] = np.asarray(chi_square).astype(np.float32)
     locs = pd.DataFrame(columns)
-    locs.sort_values(by="frame", kind="quicksort", inplace=True)
+    if "n_id" in identifications.columns:
+        # The cross-channel link index. Carried through and sorted on, as
+        # the spline path does - a multichannel fit needs every channel's
+        # localizations in the same order to pair them up.
+        locs["n_id"] = np.asarray(identifications["n_id"]).astype(np.uint32)
+        locs.sort_values(by="n_id", kind="quicksort", inplace=True)
+    else:
+        locs.sort_values(by="frame", kind="quicksort", inplace=True)
     return locs
 
 
-def _fit2d_gauss_gpu(
+def _fit2d_gauss(
     spots: lib.FloatArray3D,
     identifications: pd.DataFrame,
     box: int,
@@ -2410,24 +2400,29 @@ def _fit2d_gauss_gpu(
     rotated: bool = False,
     mle: bool = False,
     spherical: bool = False,
+    use_gpu: bool = False,
     tolerance: float | None = None,
     max_iterations: int | None = None,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
 ) -> pd.DataFrame:
-    """Fit 2D Gaussians on the GPU using least squares or, if ``mle``,
-    maximum likelihood estimation. If ``rotated``, a rotated elliptical
-    Gaussian is fitted and the resulting localizations contain the
-    fitted rotation angle (in degrees) in the column ``angle``. If
-    ``spherical``, an isotropic Gaussian with a single width is fitted
-    and the resulting ``sx`` and ``sy`` columns are identical. See
-    ``fit_2D`` for more details."""
-    theta, log_likelihood, iterations, chi_square = fit_spots_gauss_gpu(
+    """Fit 2D Gaussians with least squares or, if ``mle``, maximum
+    likelihood, on the CPU or the GPU. If ``rotated``, a rotated elliptical
+    Gaussian is fitted and the resulting localizations contain the fitted
+    rotation angle (in degrees) in the column ``angle``. If ``spherical``, an
+    isotropic Gaussian with a single width is fitted and the resulting ``sx``
+    and ``sy`` columns are identical. See ``fit2D`` for more details."""
+    theta, log_likelihood, iterations, chi_square = fit_spots_gauss(
         spots,
         rotated=rotated,
         mle=mle,
         spherical=spherical,
+        use_gpu=use_gpu,
         return_stats=True,
         tolerance=tolerance,
         max_iterations=max_iterations,
+        progress_callback=progress_callback,
     )
     locs = locs_from_fits_gauss_gpu(
         identifications,
@@ -6642,68 +6637,6 @@ def fit_spline_split_fov(
         tolerance=tolerance,
         max_iterations=max_iterations,
     )
-
-
-def _fit2d_gaussmle(
-    spots,
-    identifications: pd.DataFrame,
-    box: int,
-    eps: float = 0.001,
-    max_it: int = 100,
-    mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
-    multiprocess: bool = True,
-    progress_callback: (
-        Callable[[int], None] | Literal["console"] | None
-    ) = None,
-    abort_callback: Callable[[], bool] | None = None,
-    spherical: bool = False,
-) -> pd.DataFrame | None:
-    """Fit 2D Gaussians using MLE fitting. If ``spherical``, an isotropic
-    Gaussian with a single width is fitted (``sx == sy``) and the
-    ellipticity column is omitted as it is always 0. See ``fit_2D`` for
-    more details."""
-    N = len(identifications)
-    # MLE API is a bit different (at least for now) so we cannot use
-    # _process_fitting_futures here
-    use_tqdm = progress_callback == "console"
-    if use_tqdm:
-        iter_range = tqdm(total=N, desc="Fitting", unit="spot")
-    if multiprocess:
-        curr, thetas, CRLBs, llhoods, iterations = gaussmle.gaussmle_async(
-            spots, eps, max_it, method=mle_method
-        )
-        last = 0
-        while curr[0] < N:
-            # abort check
-            if callable(abort_callback) and abort_callback():
-                if use_tqdm:
-                    iter_range.close()
-                return
-
-            # progress update
-            if use_tqdm:
-                iter_range.update(curr[0] - last)
-                last = curr[0]
-            elif callable(progress_callback):
-                progress_callback(curr[0])
-            time.sleep(0.2)
-        if use_tqdm:
-            iter_range.update(N - last)
-            iter_range.close()
-    else:
-        thetas, CRLBs, llhoods, iterations = gaussmle.gaussmle(
-            spots, eps, max_it, mle_method, progress_callback
-        )
-    locs = gaussmle.locs_from_fits(
-        identifications,
-        thetas,
-        CRLBs,
-        llhoods,
-        iterations,
-        box,
-        spherical=spherical,
-    )
-    return locs
 
 
 def _fit2d_avg(

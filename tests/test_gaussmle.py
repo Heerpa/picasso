@@ -14,14 +14,16 @@ not 0). ``locs_from_fits`` later subtracts ``box//2``.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from picasso import gausslq, gaussmle
+from picasso.fitting import precision
 
 from tests.conftest import BOX
-
 
 BOX_HALF = BOX // 2
 EPS = 1e-3
@@ -441,3 +443,114 @@ class TestSigmaUncertainty:
         se = gaussmle.sigma_uncertainty(sigma, sigma_orth, photons, bg)
         assert len(se) == 2
         assert (se > 0).all()
+
+
+class TestDeprecation:
+    """``picasso.gaussmle`` is deprecated in 0.11 and goes in 1.0.
+
+    ``picasso.fitting.gaussfit.fit_spots(mle=True)`` replaces it, fitting with
+    Levenberg-Marquardt rather than this module's Newton solver and running on
+    either device."""
+
+    @pytest.mark.parametrize("name", ["gaussmle", "gaussmle_async"])
+    def test_documented_as_deprecated(self, name):
+        doc = getattr(gaussmle, name).__doc__
+        assert ".. deprecated:: 0.11" in doc
+        assert "Picasso 1.0" in doc
+
+    def test_gaussmle_warns_once(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            gaussmle.gaussmle(spots, EPS, MAX_IT, method="sigmaxy")
+        deprecations = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert len(deprecations) == 1
+        assert "picasso.fitting.gaussfit" in str(deprecations[0].message)
+
+    def test_gaussmle_async_warns(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        with pytest.warns(DeprecationWarning, match="Picasso 1.0"):
+            current, *_ = gaussmle.gaussmle_async(spots, EPS, MAX_IT)
+        while current[0] < len(spots):
+            pass
+
+    def test_private_implementation_is_silent(self, synthetic_spots):
+        """What Picasso itself calls."""
+        spots, _ = synthetic_spots
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            gaussmle._gaussmle(spots, EPS, MAX_IT, method="sigmaxy")
+        assert not [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+
+    def test_public_and_private_agree(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            public = gaussmle.gaussmle(spots, EPS, MAX_IT, method="sigmaxy")
+        private = gaussmle._gaussmle(spots, EPS, MAX_IT, method="sigmaxy")
+        for a, b in zip(public, private):
+            np.testing.assert_array_equal(a, b)
+
+    def test_the_message_names_every_replacement(self):
+        """A deprecation of a whole module has to say where each piece went,
+        not just the fitter."""
+        message = gaussmle._DEPRECATION_MESSAGE
+        assert "picasso.fitting.gaussfit.fit_spots" in message
+        assert "locs_from_fits_gauss_gpu" in message
+        assert "sigma_uncertainty_mle" in message
+        assert "_gauss_crlb" in message
+
+    @pytest.mark.parametrize(
+        "name",
+        ["gaussmle", "gaussmle_async", "locs_from_fits", "sigma_uncertainty"],
+    )
+    def test_every_public_name_is_deprecated(self, name):
+        """The *whole module* goes in 1.0."""
+        doc = getattr(gaussmle, name).__doc__ or ""
+        assert ".. deprecated:: 0.11" in doc, name
+        assert "Picasso 1.0" in doc, name
+
+    def test_no_undeprecated_public_names_remain(self):
+        undeprecated = [
+            name
+            for name in dir(gaussmle)
+            if not name.startswith("_")
+            and callable(getattr(gaussmle, name))
+            and getattr(getattr(gaussmle, name), "__module__", "")
+            == "picasso.gaussmle"
+            and ".. deprecated::"
+            not in (getattr(gaussmle, name).__doc__ or "")
+        ]
+        assert undeprecated == []
+
+    def test_sigma_uncertainty_moved_verbatim(self):
+        """Renamed to ``sigma_uncertainty_mle`` because ``gausslq`` defined a
+        different formula under the same name - so the rename is the point,
+        and the numbers must be unchanged."""
+        sigma = np.array([1.2, 1.4, 0.9])
+        sigma_orth = np.array([1.1, 1.5, 1.3])
+        photons = np.array([500.0, 1200.0, 8000.0])
+        bg = np.array([5.0, 12.0, 2.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            np.testing.assert_array_equal(
+                gaussmle.sigma_uncertainty(sigma, sigma_orth, photons, bg),
+                precision.sigma_uncertainty_mle(
+                    sigma, sigma_orth, photons, bg
+                ),
+            )
+
+    def test_the_two_sigma_uncertainties_are_different_formulas(self):
+        """Why they could not keep one name: same signature, different noise
+        model, materially different answers."""
+        sigma = np.array([1.3])
+        sigma_orth = np.array([1.1])
+        photons = np.array([800.0])
+        bg = np.array([10.0])
+        lsq = precision.sigma_uncertainty_lsq(sigma, sigma_orth, photons, bg)
+        mle = precision.sigma_uncertainty_mle(sigma, sigma_orth, photons, bg)
+        assert abs(lsq[0] - mle[0]) / mle[0] > 0.05

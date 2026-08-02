@@ -2,38 +2,25 @@
 picasso.fitting.gaussfit_cuda
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-GPU Gaussian PSF fitting: the three two-dimensional Gaussian models Picasso
-fits on the GPU, over the same Levenberg-Marquardt driver as
-:mod:`picasso.fitting.splinefit_cuda`.
+GPU Gaussian PSF fitting: the GPU twin of :mod:`picasso.fitting.gaussfit`, over
+the same Levenberg-Marquardt driver as :mod:`picasso.fitting.splinefit_cuda`.
 
-Transcribed from Gpufit's ``models/gauss_2d.cuh``, ``gauss_2d_elliptic.cuh``
-and ``gauss_2d_rotated.cuh``, which is what ``picasso/ext/pygpufit`` used to
-call. These are **sampled** Gaussians - the model is evaluated at the pixel
-centre rather than integrated over the pixel - so they are a different estimator
-from :mod:`picasso.gaussmle`, whose model is erf-integrated. That difference is
-pre-existing and deliberate; it is why fitted widths from the two paths are not
-directly comparable.
+Every model identifier, parameter count and schedule constant is imported from
+the CPU module, so the two devices cannot disagree about what a model is; only
+the device code lives here. The models are transcribed from Gpufit's
+``models/gauss_2d.cuh``, ``gauss_2d_elliptic.cuh`` and ``gauss_2d_rotated.cuh``.
 
 ===================  ==========  ==============================================
 model                parameters  layout
 ===================  ==========  ==============================================
-:data:`SPHERICAL`             5  ``[photons, x, y, s, bg]``
-:data:`ELLIPTIC`              6  ``[photons, x, y, sx, sy, bg]``
-:data:`ROTATED`               7  ``[photons, x, y, sx, sy, bg, angle]``
+:data:`SPHERICAL`             5  ``[peak, x, y, s, bg]``
+:data:`ELLIPTIC`              6  ``[peak, x, y, sx, sy, bg]``
+:data:`ROTATED`               7  ``[peak, x, y, sx, sy, bg, angle]``
 ===================  ==========  ==============================================
 
-The amplitude parameter is the Gaussian's *peak height*, not its integral;
-``picasso.localize`` converts it to photons afterwards. There is no axial
-multi-start here - these models have no axial coordinate - so each spot is
-fitted once from its initial parameters.
-
-Unlike the spline models these use
-:func:`picasso.fitting.lmfit_cuda._estimator_terms_strict`, which abandons a
-maximum-likelihood fit whose model value goes non-positive rather than flooring
-it. A Gaussian cannot ring negative the way a cubic spline does: the model only
-drops below zero when the *background* parameter does, and flooring those pixels
-would remove the very gradient that pushes it back up - leaving the fit stalled
-at a badly wrong optimum that the relative convergence test then accepts.
+The amplitude is the Gaussian's *peak height*; ``picasso.localize`` converts it
+to photons afterwards. There is no axial multi-start here - these models have
+no axial coordinate - so each spot is fitted once from its initial parameters.
 
 References
 ----------
@@ -61,6 +48,19 @@ from tqdm import tqdm
 
 from picasso.fitting import lmfit_cuda
 from picasso.fitting.splinefit import _allocate_outputs
+
+# Everything that defines *what model this is* and *where a fit stops* comes
+# from the CPU twin, so the two devices cannot drift apart - the same
+# arrangement as ``lmfit_cuda`` importing its constants from ``splinefit``.
+from picasso.fitting.gaussfit import (  # noqa: F401  (re-exported)
+    ELLIPTIC,
+    MAX_ITERATIONS,
+    ROTATED,
+    SPHERICAL,
+    TOLERANCE,
+    _N_PARAMS,
+    n_parameters,
+)
 from picasso.fitting.lmfit_cuda import (
     CUDA_THREADS,
     _INF,
@@ -68,18 +68,6 @@ from picasso.fitting.lmfit_cuda import (
     make_fit_kernel,
     make_lm_driver,
 )
-
-SPHERICAL = 0
-ELLIPTIC = 1
-ROTATED = 2
-
-_N_PARAMS = {SPHERICAL: 5, ELLIPTIC: 6, ROTATED: 7}
-
-# Convergence schedule, from the arguments the Gpufit path passed for these
-# models. It happens to coincide with the spline single-start schedule, but the
-# two are independent settings and are kept separate deliberately.
-TOLERANCE = 1e-2
-MAX_ITERATIONS = 20
 
 
 def _make_accumulate_spherical(ftype):
@@ -479,11 +467,6 @@ def _get_kernel(model: int, single_precision: bool):
         kernel = make_fit_kernel(driver)
         _KERNEL_CACHE[key] = kernel
     return kernel
-
-
-def n_parameters(model: int) -> int:
-    """Parameter count of a model."""
-    return _N_PARAMS[model]
 
 
 def fit_spots(

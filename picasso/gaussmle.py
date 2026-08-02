@@ -5,6 +5,25 @@ picasso.gaussmle
 Maximum likelihood fits for single particle localization. Based on
 Smith, et al. Nature Methods, 2010.
 
+.. deprecated:: 0.11
+    **This whole module will be removed in Picasso 1.0.** Every public name in
+    it now warns. All fitting lives in :mod:`picasso.fitting`:
+
+    ==========================  =============================================
+    this module                  replacement
+    ==========================  =============================================
+    ``gaussmle``                 ``fitting.gaussfit.fit_spots(mle=True)``
+    ``gaussmle_async``           ``fitting.gaussfit.fit_spots_async``
+    ``locs_from_fits``           ``localize.locs_from_fits_gauss_gpu``
+    ``sigma_uncertainty``        ``fitting.precision.sigma_uncertainty_mle``
+    (the CRLB)                   ``localize._gauss_crlb``
+    ==========================  =============================================
+
+    The replacement fits with Levenberg-Marquardt rather than the Newton
+    solver here, and evaluates the Gaussian at the pixel centre rather than
+    integrating it over the pixel, as every other Picasso Gaussian fit does.
+    This leads only to a negligible difference in the results.
+
 :authors: Joerg Schnitzbauer, Maximilian Thomas Strauss
 :copyright: Copyright (c) 2016-2026 Jungmann Lab, MPI of Biochemistry
 """
@@ -23,6 +42,21 @@ import pandas as pd
 from tqdm import tqdm
 
 from picasso import lib
+from picasso.fitting import precision
+
+# The whole module is deprecated. Every public name is a thin wrapper that
+# warns and delegates to a private implementation (or to the new home of the
+# code); Picasso's own callers use those, because a library warning about its
+# own internals is noise rather than a signal.
+_DEPRECATION_MESSAGE = (
+    "picasso.gaussmle is deprecated and will be removed in Picasso 1.0. All "
+    "fitting now lives in picasso.fitting: use "
+    "picasso.fitting.gaussfit.fit_spots with mle=True, "
+    "picasso.localize.locs_from_fits_gauss_gpu to build the localizations, "
+    "picasso.localize._gauss_crlb for the Cramer-Rao bound, and "
+    "picasso.fitting.precision.sigma_uncertainty_mle for the width "
+    "uncertainty."
+)
 
 
 @numba.jit(nopython=True, nogil=True)
@@ -410,6 +444,31 @@ def gaussmle(
     """Fits Gaussians using Maximum Likelihood Estimation (MLE) to the
     extracted spots.
 
+    .. deprecated:: 0.11
+        This whole module is removed in Picasso 1.0. Use
+        :func:`picasso.fitting.gaussfit.fit_spots` with ``mle=True``, which
+        fits with Levenberg-Marquardt instead of this module's Newton solver
+        and runs on the CPU or the GPU.
+
+    See :func:`_gaussmle` for the full description."""
+    lib.deprecation_warning(_DEPRECATION_MESSAGE)
+    return _gaussmle(spots, eps, max_it, method, progress_callback)
+
+
+def _gaussmle(
+    spots: lib.FloatArray3D,
+    eps: float,
+    max_it: int,
+    method: Literal["sigma", "sigmaxy"] = "sigmaxy",
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> tuple[
+    lib.FloatArray2D, lib.FloatArray2D, lib.FloatArray1D, lib.IntArray1D
+]:
+    """Fits Gaussians using Maximum Likelihood Estimation (MLE) to the
+    extracted spots.
+
     Parameters
     ----------
     spots : lib.FloatArray3D
@@ -466,6 +525,30 @@ def gaussmle(
 
 
 def gaussmle_async(
+    spots: lib.FloatArray3D,
+    eps: float,
+    max_it: int,
+    method: Literal["sigma", "sigmaxy"] = "sigmaxy",
+) -> tuple[
+    list, lib.FloatArray2D, lib.FloatArray2D, lib.FloatArray1D, lib.IntArray1D
+]:
+    """Runs ``gaussmle`` asynchronously on several CPU threads.
+
+    .. deprecated:: 0.11
+        This whole module is removed in Picasso 1.0. Use
+        :func:`picasso.fitting.gaussfit.fit_spots` with ``mle=True``, which
+        fits with Levenberg-Marquardt instead of this module's Newton solver
+        and runs on the CPU or the GPU.
+
+    :func:`picasso.fitting.gaussfit.fit_spots_async` is the direct
+    replacement.
+
+    See :func:`_gaussmle_async` for the full description."""
+    lib.deprecation_warning(_DEPRECATION_MESSAGE)
+    return _gaussmle_async(spots, eps, max_it, method)
+
+
+def _gaussmle_async(
     spots: lib.FloatArray3D,
     eps: float,
     max_it: int,
@@ -953,6 +1036,34 @@ def locs_from_fits(
     box: int,
     spherical: bool = False,
 ) -> pd.DataFrame:
+    """Convert the results of Gaussian fits into a data frame array.
+
+    .. deprecated:: 0.11
+        This whole module is removed in Picasso 1.0. Use
+        ``picasso.localize.locs_from_fits_gauss_gpu``.
+
+    See :func:`_locs_from_fits` for the full description."""
+    lib.deprecation_warning(_DEPRECATION_MESSAGE)
+    return _locs_from_fits(
+        identifications,
+        theta,
+        CRLBs,
+        log_likelihoods,
+        iterations,
+        box,
+        spherical,
+    )
+
+
+def _locs_from_fits(
+    identifications: pd.DataFrame,
+    theta: lib.FloatArray2D,
+    CRLBs: lib.FloatArray2D,
+    log_likelihoods: lib.FloatArray1D,
+    iterations: lib.IntArray1D,
+    box: int,
+    spherical: bool = False,
+) -> pd.DataFrame:
     """Convert the results of Gaussian fits into a data frame array
     suitable for further analysis or visualization.
 
@@ -1045,32 +1156,13 @@ def sigma_uncertainty(
     photons: lib.SeriesOrFloatArray1D,
     bg: lib.SeriesOrFloatArray1D,
 ) -> lib.FloatArray1D:
-    """Calculate standard error of fitted sigma based on the MLE 2D
-    Gaussian/Poisson noise model (picasso.gaussmle).
+    """Standard error of a maximum-likelihood fitted sigma.
 
-    Based on the approximation by Rieger and Stallinga, ChemPhysChem,
-    2014.
-
-    Parameters
-    ----------
-    sigma : lib.SeriesOrFloatArray1D
-        Fitted sigma values in camera pixels.
-    sigma_orth : lib.SeriesOrFloatArray1D
-        Fitted sigma values in the orthogonal direction in camera
-        pixels.
-    photons : lib.SeriesOrFloatArray1D
-        Number of photons.
-    bg : lib.SeriesOrFloatArray1D
-        Background photons per pixel.
-
-    Returns
-    -------
-    se_sigma : lib.FloatArray1D
-        Standard error of fitted sigma values in camera pixels.
+    .. deprecated:: 0.11
+        This whole module is removed in Picasso 1.0. Moved verbatim to
+        :func:`picasso.fitting.precision.sigma_uncertainty_mle` - renamed
+        because ``picasso.gausslq`` defined a different formula under this
+        name.
     """
-    sa2 = sigma**2 + 1 / 12
-    tau = (2 * np.pi * sa2 * bg) / (photons)
-    delta_sigma_sq = (sigma**2 / (4 * photons)) * (
-        1 + 8 * tau + np.sqrt((8 * tau) / (1 + 2 * tau))
-    )
-    return np.sqrt(delta_sigma_sq)
+    lib.deprecation_warning(_DEPRECATION_MESSAGE)
+    return precision.sigma_uncertainty_mle(sigma, sigma_orth, photons, bg)

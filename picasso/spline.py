@@ -391,7 +391,7 @@ def _focus_step(volume: np.ndarray) -> tuple[int, float]:
     n_steps = volume.shape[2]
     sigmas = np.full(n_steps, np.inf, dtype=np.float32)
     for k in range(n_steps):
-        theta = gausslq.fit_spot(np.ascontiguousarray(volume[:, :, k]))
+        theta = gausslq._fit_spot(np.ascontiguousarray(volume[:, :, k]))
         sx, sy = abs(theta[4]), abs(theta[5])
         if np.isfinite(sx) and np.isfinite(sy):
             sigmas[k] = np.sqrt(sx * sy)
@@ -527,7 +527,7 @@ def _focus_center_offset(
     usable, so the caller simply leaves the volume alone."""
     focus = np.ascontiguousarray(volume[:, :, int(z_center)], dtype=np.float32)
     try:
-        theta = gausslq.fit_spot(focus)
+        theta = gausslq._fit_spot(focus)
         # gausslq returns [x, y, ...] as offsets from the box centre, x the
         # column and y the row (see gausslq._sum_and_center_of_mass).
         d_col, d_row = float(theta[0]), float(theta[1])
