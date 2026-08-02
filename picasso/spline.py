@@ -83,9 +83,8 @@ def spline_coefficients(data: np.ndarray) -> np.ndarray:
     Tensor product of 1D natural cubic interpolating splines (zero second
     derivative at the boundaries) along each axis, computed in float64 and
     cast to float32. Drop-in replacement for ``spline_coefficients`` of
-    Gpuspline (https://github.com/gpufit/Gpuspline, formerly vendored under
-    ``picasso/ext/pygpuspline``); it reproduces that library's float32 output
-    to accumulation noise. Licence (MIT): ``LICENSES/Gpuspline-LICENSE.txt``.
+    Gpuspline (https://github.com/gpufit/Gpuspline. Licence (MIT):
+    ``LICENSES/Gpuspline-LICENSE.txt``.
 
     Parameters
     ----------
