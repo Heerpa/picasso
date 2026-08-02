@@ -5,14 +5,16 @@ localize
    :scale: 50 %
    :alt: UML Localize
 
-Localize allows performing super-resolution reconstruction of image stacks. For spot detection, a gradient-based approach is used. For Fitting, the following algorithms are implemented:
+Localize allows performing super-resolution reconstruction of image stacks. For spot detection, a gradient-based approach is used. For fitting, you choose a **PSF model** and, independently, an **optimizer**: least squares (LQ) or maximum likelihood (MLE, Poisson). Every PSF model can be fitted with either optimizer, on the CPU or on the GPU (see `GPU fitting`_ below).
 
-- MLE, Gaussian (Poisson maximum likelihood). Fits an elliptical Gaussian with independent widths ``sx`` and ``sy``.
-- LQ, Gaussian (least squares). Fits an elliptical Gaussian with independent widths ``sx`` and ``sy``.
-- Spherical (isotropic) Gaussian, least squares or MLE. Fits a single shared width, so ``sx`` and ``sy`` are always equal. The ``ellipticity`` column is not saved for this model. Available on both CPU and GPU.
-- Rotated elliptical Gaussian. The fitted in-plane rotation angle is saved in the ``angle`` column, in degrees. Both optimizers run on the CPU and the GPU.
-- Experimental PSF (cubic spline), least squares or MLE. Fits an experimentally measured PSF and a 3D calibration recovers ``z`` directly; see `Experimental PSF (cubic-spline) fitting`_ below.
-- Average of ROI (finds summed intensity of spots)
+The following PSF models are implemented:
+
+- Elliptical Gaussian. Fits independent widths ``sx`` and ``sy``.
+- Spherical (isotropic) Gaussian. Fits a single shared width, so ``sx`` and ``sy`` are always equal. The ``ellipticity`` column is not saved for this model.
+- Rotated elliptical Gaussian. The fitted in-plane rotation angle is saved in the ``angle`` column, in degrees.
+- Experimental PSF (cubic spline). Fits an experimentally measured PSF; a 3D calibration recovers ``z`` directly; see `Experimental PSF (cubic-spline) fitting`_ below.
+
+In addition, ``Average of ROI`` is available as a non-fitting option that simply sums the intensity of each spot.
 
 Fitting can run on a CUDA-capable GPU (see `GPU fitting`_ below). The kernels are compiled at run time by Numba, so there is no library to build or install beyond the CUDA runtime (``pip install picassosr[gpu]``), on Windows and Linux alike. When no CUDA GPU is available, the GPU fitting option simply does not appear and Picasso uses the CPU algorithms.
 
