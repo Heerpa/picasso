@@ -230,30 +230,30 @@ class TestSplineEvaluation:
             )
 
     def test_matches_the_cpu_evaluator(self):
-        """Against ``localize._spline_model_and_grad``, the readable reference.
+        """Against ``splinefit._eval_spline_3d``, the CPU kernel these are
+        transcribed from.
 
-        That function takes the *raw* calibration table rather than
-        ``_spline_coeff_reshaped``'s view, and returns arrays indexed
-        ``[loc, x-pixel, y-pixel]`` - transposed from the ``[y, x]`` layout the
-        spot data and these kernels use. Both conversions are made explicit
-        here; getting either wrong is how an x/y swap slips through.
-        """
+        Both read ``_spline_coeff_reshaped``'s view, but the CPU kernel is
+        scalar (one pixel per call, x and y passed separately) while the device
+        kernel fills a ``[y, x]`` image, so the pixel-to-argument mapping is
+        spelled out per pixel here; getting it wrong is how an x/y swap slips
+        through. Both run in double precision, hence the tight tolerance."""
         calibration, _ = _astigmatic_calibration()
-        got = self._evaluate(
-            localize._spline_coeff_reshaped(calibration), BOX, DX, DY, 6.0
-        )
-        want = localize._spline_model_and_grad(
-            calibration["coefficients"],
-            BOX,
-            np.array([DX]),
-            np.array([DY]),
-            np.array([6.0]),
-        )
-        # The reference evaluates in float32, hence the loose tolerance.
-        for k, name in enumerate(("phi", "dphi_dx", "dphi_dy", "dphi_dz")):
-            np.testing.assert_allclose(
-                got[k], want[k][0].T, rtol=1e-4, atol=1e-6, err_msg=name
-            )
+        coefficients = localize._spline_coeff_reshaped(calibration)
+        z_native = 6.0
+        got = self._evaluate(coefficients, BOX, DX, DY, z_native)
+        for j in range(BOX):
+            for i in range(BOX):
+                want = splinefit._eval_spline_3d(
+                    coefficients, 0, i - DX, j - DY, z_native
+                )
+                np.testing.assert_allclose(
+                    [got[k][j, i] for k in range(4)],
+                    want,
+                    rtol=1e-9,
+                    atol=1e-12,
+                    err_msg=f"pixel (x={i}, y={j})",
+                )
 
 
 class TestFixedIterationEquivalence:

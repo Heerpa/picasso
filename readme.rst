@@ -133,13 +133,13 @@ If you use Picasso in your research, please cite our Nature Protocols publicatio
 | If you use some of the functionalities provided by Picasso, please also cite the respective publications:
 
 - All fitting methods are ports of Gpufit. DOI: `10.1038/s41598-017-15313-9 <https://doi.org/10.1038/s41598-017-15313-9>`__. License can be found `here <https://github.com/jungmannlab/picasso/blob/master/LICENSES/Gpufit-LICENSE.txt>`__.
+- Experimental PSF (cubic-spline) fitting. DOIs: `10.1038/nmeth.4661 <https://doi.org/10.1038/nmeth.4661>`__ (Li et al., experimental-PSF localization and bead alignment) and `10.1038/s41598-017-00622-w <https://doi.org/10.1038/s41598-017-00622-w>`__ (Babcock & Zhuang, cubic-spline PSF model). The spline calibration follows the coefficient scheme of Gpuspline; license can be found `here <https://github.com/jungmannlab/picasso/blob/master/LICENSES/Gpuspline-LICENSE.txt>`__.
+- Multichannel (global) experimental-PSF fitting. DOI: `10.1038/s41467-022-30719-4 <https://doi.org/10.1038/s41467-022-30719-4>`__ (Li et al., globLoc).
+- 3D fitting via astigmatism. DOI: `10.1126/science.1153529 <https://www.science.org/doi/10.1126/science.1153529>`__.
 - NeNA. DOI: `10.1007/s00418-014-1192-3 <https://doi.org/10.1007/s00418-014-1192-3>`__
 - FRC. DOI: `10.1038/nmeth.2448 <https://doi.org/10.1038/nmeth.2448>`__
-- Theoretical lateral localization precision (``lpx``/``lpy`` values) (Gauss LQ). DOI: `10.1038/nmeth.1447 <https://doi.org/10.1038/nmeth.1447>`__
-- Theoretical axial localization precision (``lpx``/``lpy`` values) (Gauss LQ and MLE). DOI: `10.1038/s41467-026-70198-5 <https://doi.org/10.1038/s41467-026-70198-5>`__
-- 3D fitting via astigmatism. DOI: `10.1126/science.1153529 <https://www.science.org/doi/10.1126/science.1153529>`__.
-- Experimental PSF (cubic-spline) fitting. DOIs: `10.1038/nmeth.4661 <https://doi.org/10.1038/nmeth.4661>`__ (Li et al., experimental-PSF localization and bead alignment) and `10.1038/s41598-017-00622-w <https://doi.org/10.1038/s41598-017-00622-w>`__ (Babcock & Zhuang, cubic-spline PSF model).
-- Multichannel (global) experimental-PSF fitting. DOI: `10.1038/s41467-022-30719-4 <https://doi.org/10.1038/s41467-022-30719-4>`__ (Li et al., globLoc).
+- Theoretical lateral localization precision (``lpx`` / ``lpy``, Gaussian least-squares). DOI: `10.1038/nmeth.1447 <https://doi.org/10.1038/nmeth.1447>`__
+- Theoretical axial localization precision (``lpz`` values, Gaussian). DOI: `10.1038/s41467-026-70198-5 <https://doi.org/10.1038/s41467-026-70198-5>`__
 - RCC undrifting: DOI: `10.1364/OE.22.015982 <https://doi.org/10.1364/OE.22.015982>`__
 - AIM undrifting. DOI: `10.1126/sciadv.adm776 <https://www.science.org/doi/10.1126/sciadv.adm7765>`__
 - SMLM clusterer. DOIs: `10.1038/s41467-021-22606-1 <https://doi.org/10.1038/s41467-021-22606-1>`__ and `10.1038/s41586-023-05925-9 <https://doi.org/10.1038/s41586-023-05925-9>`__

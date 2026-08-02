@@ -7,15 +7,10 @@ Generate cubic-spline PSF calibrations from a bead z-stack.
 A calibration bead sample (e.g., fluorescent/gold beads) is imaged while the
 stage is scanned through z. This module averages the beads into a clean,
 3D-registered PSF volume, normalizes it, and computes cubic-spline
-coefficients with Gpuspline. The resulting calibration (coefficients +
-metadata) is saved via ``picasso.io.save_spline_calibration`` and later fitted
-per spot with the cubic-spline PSF models (see
-``picasso.localize.fit_spots_spline``).
-
-Note: Gpuspline is a CPU library (no GPU/CUDA); only the subsequent fitting
-step needs a CUDA GPU. Building a calibration therefore only needs Gpuspline,
-which is exposed as ``picasso.localize.gs`` and gated by
-``picasso.localize.GPUSPLINE_INSTALLED``.
+coefficients (:func:`spline_coefficients`, pure NumPy/SciPy). The resulting
+calibration (coefficients + metadata) is saved via
+``picasso.io.save_spline_calibration`` and later fitted per spot with the
+cubic-spline PSF models (see ``picasso.localize.fit_spots_spline``).
 
 The frame -> z-step binning mirrors ``picasso.zfit.calibrate_z`` so that
 multiple fields of view per z position (``frame_order``, ``frames_per_step``,
@@ -45,6 +40,9 @@ References
   "Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
   Scientific Reports 7, 15722 (2017). Licence (MIT):
   ``LICENSES/Gpufit-LICENSE.txt``.
+- Gpuspline (https://github.com/gpufit/Gpuspline), whose coefficient scheme
+  and buffer layout :func:`spline_coefficients` follows. Licence (MIT):
+  ``LICENSES/Gpuspline-LICENSE.txt``.
 
 :authors: Rafal Kowalewski
 :copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry
@@ -60,12 +58,71 @@ import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
-from scipy.interpolate import make_smoothing_spline
+from scipy.interpolate import CubicSpline, make_smoothing_spline
 from scipy.ndimage import shift as _ndi_shift, zoom as _ndi_zoom
 from scipy.spatial import KDTree
 
 from . import io, lib, localize, __version__
 from .fitting import gaussfit, splinefit
+
+
+def _natural_spline_operator(n: int) -> np.ndarray:
+    """The 1D natural cubic interpolating spline on the unit grid as a linear
+    operator on the data: shape ``(n - 1, 4, n)`` mapping ``n`` data values to
+    per-interval ascending-power coefficients ``c[i, p]``, so that
+    ``f(i + t) = sum_p c[i, p] * t**p`` for ``t`` in [0, 1]."""
+    cs = CubicSpline(
+        np.arange(n, dtype=np.float64), np.eye(n), axis=0, bc_type="natural"
+    )
+    return np.moveaxis(cs.c[::-1], 0, 1)
+
+
+def spline_coefficients(data: np.ndarray) -> np.ndarray:
+    """Cubic-spline coefficients of 1/2/3D data sampled on the integer grid.
+
+    Tensor product of 1D natural cubic interpolating splines (zero second
+    derivative at the boundaries) along each axis, computed in float64 and
+    cast to float32. Drop-in replacement for ``spline_coefficients`` of
+    Gpuspline (https://github.com/gpufit/Gpuspline, formerly vendored under
+    ``picasso/ext/pygpuspline``); it reproduces that library's float32 output
+    to accumulation noise. Licence (MIT): ``LICENSES/Gpuspline-LICENSE.txt``.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        1, 2 or 3-dimensional data on the integer grid.
+
+    Returns
+    -------
+    coefficients : np.ndarray
+        Float32 array of nominal shape ``(4**ndim, *(n - 1 for n in
+        data.shape))``. As with the original binding, the flat C-order buffer
+        is the layout consumed downstream: for 3D input ``(x, y, z)`` it reads
+        ``(niz, niy, nix, zp, yp, xp)`` - interval indices slowest (last axis
+        first), ascending polynomial powers fastest with the x power innermost
+        (see ``localize._spline_coeff_reshaped``).
+    """
+    data = np.asarray(data, dtype=np.float64)
+    ops = [_natural_spline_operator(n) for n in data.shape]
+    if data.ndim == 1:
+        coeff = np.einsum("aAi,i->aA", ops[0], data)
+    elif data.ndim == 2:
+        coeff = np.einsum(
+            "aAi,bBj,ij->baBA", ops[0], ops[1], data, optimize=True
+        )
+    elif data.ndim == 3:
+        coeff = np.einsum(
+            "aAi,bBj,cCk,ijk->cbaCBA",
+            ops[0],
+            ops[1],
+            ops[2],
+            data,
+            optimize=True,
+        )
+    else:
+        raise ValueError("data must be 1, 2 or 3-dimensional.")
+    shape = [4**data.ndim] + [n - 1 for n in data.shape]
+    return coeff.reshape(shape).astype(np.float32)
 
 
 def _step_of_frame(
@@ -898,8 +955,8 @@ def build_psf_template(
 ) -> dict:
     """Build a normalized PSF template volume from a bead z-stack.
 
-    This is the GPU-independent part of the calibration (no Gpuspline needed),
-    factored out so it can be unit-tested. Returns a dict with keys
+    This is the template-building part of the calibration (no coefficient
+    computation), factored out so it can be unit-tested. Returns a dict with keys
     ``template`` (box, box, n_steps), ``z_center``, ``effective_sigma``,
     ``background``, ``amplitude``, ``photon_scale``, ``n_beads``,
     ``z_of_step``, ``gof`` and ``registered`` (the 3D-registered individual
@@ -1079,11 +1136,6 @@ def calibrate_spline(
         The spline PSF calibration (see ``io.save_spline_calibration`` /
         ``io.load_spline_calibration`` and ``localize.fit_spots_spline``).
     """
-    if not localize.GPUSPLINE_INSTALLED:
-        raise ImportError(
-            "Gpuspline is required to build a spline PSF calibration but "
-            "could not be loaded. See picasso/ext/pygpuspline/README.txt."
-        )
     assert model in (
         "spline-2d",
         "spline-3d",
@@ -1131,7 +1183,6 @@ def calibrate_spline(
     if callable(progress_callback):
         progress_callback(1)
 
-    gs = localize.gs
     # The template is (row=y, col=x, z), but at fit time spots are flattened
     # C-order so the Gpufit spline model's fast pixel index (point_index_x) is
     # the movie column (x). The spline's first axis must therefore be x, so we
@@ -1141,20 +1192,13 @@ def calibrate_spline(
     # no-op for a laterally symmetric PSF.
     if model == "spline-2d":
         slab = np.ascontiguousarray(template[:, :, z_center].T)
-        coefficients = gs.spline_coefficients(slab)
-        n_intervals = [int(i) for i in (np.array(slab.shape) - 1)]
-        coefficients = np.reshape(coefficients, [16] + n_intervals).astype(
-            np.float32
-        )
+        coefficients = spline_coefficients(slab)
         n_data = [box, box]
     else:
         template_xyz = np.ascontiguousarray(template.transpose(1, 0, 2))
-        coefficients = gs.spline_coefficients(template_xyz)
-        n_intervals = [int(i) for i in (np.array(template_xyz.shape) - 1)]
-        coefficients = np.reshape(coefficients, [64] + n_intervals).astype(
-            np.float32
-        )
+        coefficients = spline_coefficients(template_xyz)
         n_data = [int(s) for s in template_xyz.shape]
+    n_intervals = [int(s) for s in coefficients.shape[1:]]
 
     if callable(progress_callback):
         progress_callback(2)
@@ -1556,11 +1600,6 @@ def calibrate_spline_multichannel(
     channel stack. Prefer the :func:`calibrate_spline_split_fov` wrapper, which
     builds the repeated per-channel lists for you.
     """
-    if not localize.GPUSPLINE_INSTALLED:
-        raise ImportError(
-            "Gpuspline is required to build a spline PSF calibration but "
-            "could not be loaded. See picasso/ext/pygpuspline/README.txt."
-        )
     n_channels = len(movies)
     if n_channels < 2:
         raise ValueError(
@@ -1670,7 +1709,6 @@ def calibrate_spline_multichannel(
 
     # per-channel PSF templates from the same physical beads
     ref_xy = beads_ref[["x", "y"]].to_numpy(dtype=np.float64)
-    gs = localize.gs
     per_channel = []
     for c in range(n_channels):
         if c == 0:
@@ -1715,8 +1753,7 @@ def calibrate_spline_multichannel(
         [64] + n_intervals + [n_channels], dtype=np.float32
     )
     for c, template in enumerate(templates):
-        coeff_c = gs.spline_coefficients(template)
-        coefficients[..., c] = np.reshape(coeff_c, [64] + n_intervals)
+        coefficients[..., c] = spline_coefficients(template)
 
     ref = per_channel[0]
     # z_init (sharpest slice, fit initialization) vs z_origin (output z = 0
@@ -3090,7 +3127,7 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
         are absent, or when GPU spline fitting is unavailable or fails, so the
         caller can fall back to the model-vs-data RMSE panel.
     """
-    if not localize.GPU_FITTING_AVAILABLE:
+    if not localize.CUDA_AVAILABLE:
         return None
     if calibration["model"] == "spline-2d":
         return None  # no axial coordinate to assess
@@ -3191,7 +3228,7 @@ def _axial_precision_multichannel(
     ``spot_residuals`` (``(n_spots, n_channels, 2)``, see
     :func:`_spot_roi_residuals`) are the sub-pixel ROI offsets of the bead
     spots being refitted."""
-    if not localize.GPU_FITTING_AVAILABLE:
+    if not localize.CUDA_AVAILABLE:
         return None
     # only the plain multichannel spline fitter is used here
     if calibration.get("model") != "spline-3d-multichannel":

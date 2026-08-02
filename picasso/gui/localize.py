@@ -41,8 +41,7 @@ from ..fitting import gaussfit_cuda, splinefit
 from PyQt6 import QtCore, QtGui, QtWidgets
 from playsound3 import playsound
 
-GPU_FITTING_AVAILABLE = localize.GPU_FITTING_AVAILABLE
-GPUSPLINE_INSTALLED = localize.GPUSPLINE_INSTALLED
+CUDA_AVAILABLE = localize.CUDA_AVAILABLE
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
 
@@ -2269,7 +2268,7 @@ class ParametersDialog(lib.Dialog):
         self.gpu_checkbox.setDisabled(True)
         self.gpu_checkbox.stateChanged.connect(self.on_gpu_fitting_changed)
 
-        if not GPU_FITTING_AVAILABLE:
+        if not CUDA_AVAILABLE:
             self.gpu_checkbox.hide()
         else:
             self.gpu_checkbox.setDisabled(False)
@@ -2654,7 +2653,7 @@ class ParametersDialog(lib.Dialog):
             self.gpu_checkbox.setDisabled(True)
         elif optimizer in ("Least squares", "MLE"):
             # Both estimators are implemented on the GPU
-            self.gpu_checkbox.setDisabled(not GPU_FITTING_AVAILABLE)
+            self.gpu_checkbox.setDisabled(not CUDA_AVAILABLE)
         else:
             self.gpu_checkbox.setChecked(False)
             self.gpu_checkbox.setDisabled(True)
@@ -3648,20 +3647,15 @@ class Window(QtWidgets.QMainWindow):
         )
         calibrate_z_action.triggered.connect(self.calibrate_z)
 
-        # The spline actions need the compiled Gpuspline library; offer them
-        # only when it loaded, rather than showing actions that can only fail.
-        if GPUSPLINE_INSTALLED:
-            calibrate_spline_action = threed_menu.addAction(
-                "Calibrate spline PSF"
-            )
-            calibrate_spline_action.triggered.connect(self.calibrate_spline)
+        calibrate_spline_action = threed_menu.addAction("Calibrate spline PSF")
+        calibrate_spline_action.triggered.connect(self.calibrate_spline)
 
-            reregister_signal_action = threed_menu.addAction(
-                "Re-align channels (current signal)"
-            )
-            reregister_signal_action.triggered.connect(
-                self.reregister_channels_from_signal
-            )
+        reregister_signal_action = threed_menu.addAction(
+            "Re-align channels (current signal)"
+        )
+        reregister_signal_action.triggered.connect(
+            self.reregister_channels_from_signal
+        )
 
         self.plugin_menu = menu_bar.addMenu("Plugins")  # do not delete
 
@@ -3696,20 +3690,11 @@ class Window(QtWidgets.QMainWindow):
 
     def calibrate_spline(self) -> None:
         """Build a cubic-spline PSF calibration from the loaded bead z-stack
-        movie (Gpuspline). Detects beads, averages them into a PSF volume and
+        movie. Detects beads, averages them into a PSF volume and
         computes the spline coefficients, saved as an HDF5 calibration."""
         if self.movie is None:
             QtWidgets.QMessageBox.information(
                 self, "Spline PSF Calibration", "No file loaded."
-            )
-            return
-        if not GPUSPLINE_INSTALLED:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Spline PSF Calibration",
-                "Gpuspline could not be loaded. See "
-                "picasso/ext/pygpuspline/README.txt for how to add the "
-                "compiled library. Only Windows and Linux are supported.",
             )
             return
 
@@ -7131,8 +7116,8 @@ class FitZWorker(QtCore.QThread):
 
 class SplineCalibrationWorker(QtCore.QThread):
     """Build a cubic-spline PSF calibration from a bead z-stack movie in a
-    background thread (bead detection + averaging on the CPU, coefficients via
-    Gpuspline)."""
+    background thread (bead detection, averaging and spline coefficients, all
+    on the CPU)."""
 
     finished = QtCore.pyqtSignal(str, int)  # (path, n_beads)
     failed = QtCore.pyqtSignal(str)

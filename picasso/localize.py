@@ -69,27 +69,10 @@ from .fitting import (
 # Check for CUDA availability for spline CRLB calculations. Otherwise,
 # CPU is used
 try:
-    SPLINE_CRLB_CUDA_AVAILABLE = bool(cuda.is_available())
+    CUDA_AVAILABLE = bool(cuda.is_available())
 except Exception:
-    SPLINE_CRLB_CUDA_AVAILABLE = False
+    CUDA_AVAILABLE = False
 
-# Whether fitting can run on the GPU, with the numba CUDA kernels in
-# ``picasso.fitting.splinefit_cuda`` and ``picasso.fitting.gaussfit_cuda``.
-# Same condition as the CRLB kernels - it is a separate name only because the
-# two are separate features.
-GPU_FITTING_AVAILABLE = SPLINE_CRLB_CUDA_AVAILABLE
-
-try:
-    from .ext.pygpuspline import gpuspline as gs  # noqa: F401
-
-    # gpuspline is a plain CPU coefficient library (despite the name, it does
-    # not use CUDA/GPU); the import succeeds only if the compiled splines
-    # library can be loaded. It is required only to *generate* a spline PSF
-    # calibration (spline_coefficients), not to fit an existing one. Exposed as
-    # ``localize.gs`` for the calibration builder.
-    GPUSPLINE_INSTALLED = True
-except Exception:
-    GPUSPLINE_INSTALLED = False
 
 plt.style.use("ggplot")
 
@@ -1788,7 +1771,7 @@ def fit2D(
         on_gpu = fitting_method.endswith("-gpu")
         localize_info["Spline fit device"] = "GPU" if on_gpu else "CPU"
         localize_info["Spline CRLB device"] = (
-            "GPU" if SPLINE_CRLB_CUDA_AVAILABLE else "CPU"
+            "GPU" if CUDA_AVAILABLE else "CPU"
         )
         # Record what the fit actually used, not what was requested: the
         # schedule depends on whether the axial multi-start ran. Identical
@@ -2024,7 +2007,7 @@ def fit_spots_gauss(
     """
     if rotated and spherical:
         raise ValueError("'rotated' and 'spherical' are mutually exclusive.")
-    if use_gpu and not GPU_FITTING_AVAILABLE:
+    if use_gpu and not CUDA_AVAILABLE:
         raise ImportError(
             "GPU fitting was requested but no CUDA-capable GPU is available."
         )
@@ -2438,7 +2421,8 @@ def _fit2d_gauss(
 # Cubic-spline PSF fitting
 #
 # The spline models fit an experimentally measured PSF (a cubic-spline model
-# built from a bead z-stack with Gpuspline). Unlike the Gaussian models they
+# built from a bead z-stack, see ``spline.calibrate_spline``). Unlike the
+# Gaussian models they
 # need a coefficient table, which lives inside the calibration dict (see
 # ``io.load_spline_calibration``) and is handed to the kernels by
 # ``_spline_coeff_reshaped``.
@@ -2949,8 +2933,8 @@ def _spline_use_gpu(use_gpu: bool | None) -> bool:
     Raises if the GPU was explicitly asked for but is unusable, so an explicit
     request never silently becomes a (much slower) CPU fit."""
     if use_gpu is None:
-        return GPU_FITTING_AVAILABLE
-    if use_gpu and not GPU_FITTING_AVAILABLE:
+        return CUDA_AVAILABLE
+    if use_gpu and not CUDA_AVAILABLE:
         raise ImportError(
             "GPU spline fitting was requested but no CUDA-capable GPU is "
             "available. Pass use_gpu=False to fit the spline PSF on the CPU "
@@ -3021,94 +3005,6 @@ def _fit_spline_multistart(
     )
 
 
-def _spline_model_and_grad(
-    coeff: np.ndarray,
-    box: int,
-    x_shift: np.ndarray,
-    y_shift: np.ndarray,
-    z_eval: np.ndarray | None,
-) -> tuple:
-    """Vectorized cubic-spline model image and its analytic spatial derivatives.
-
-    Reimplements ``gpuspline.spline_values`` in NumPy for a batch of ``M``
-    localizations and, because a tricubic/bicubic is a polynomial in the local
-    fractional coordinate, also returns its exact spatial derivatives by
-    differentiating that polynomial term-by-term (the closed form the fitting
-    kernels use). This is the readable reference for the tricubic evaluation; the
-    production CRLB uses the equivalent parallel numba kernels
-    (:func:`_spline_infomats_3d` / :func:`_spline_infomats_2d`). It is kept for tests
-    and to validate the coefficient layout against ``gpuspline.spline_values``.
-
-    ``coeff`` is one channel's raw calibration coefficient table, ``(16, nix,
-    niy)`` (2D) or ``(64, nix, niy, niz)`` (3D). Its flat C-order buffer is the
-    Gpuspline-binding layout - it reshapes to ``(niy, nix, yp, xp)`` /
-    ``(niz, niy, nix, zp, yp, xp)`` (see
-    ``_spline_coeff_reshaped``). The model pixel ``(i, j)``
-    (column ``i`` = x, row ``j`` = y) samples the template at ``x = i -
-    x_shift`` and ``y = j - y_shift`` ("position = pixel - parameter", see
-    ``_initial_parameters_spline``); ``z_eval`` is the native z coordinate.
-
-    Returns ``(phi, dphi_dx, dphi_dy, dphi_dz)``, each ``(M, box, box)`` indexed
-    ``[loc, x-pixel, y-pixel]`` (``dphi_dz`` is None for 2D). Derivatives are
-    w.r.t. the native coordinate; the shift derivative is their negative
-    (irrelevant to the sign-invariant CRLB diagonal).
-    """
-    x_shift = np.asarray(x_shift, dtype=np.float32)
-    y_shift = np.asarray(y_shift, dtype=np.float32)
-    grid = np.arange(box, dtype=np.float32)
-    xc = grid[None, :] - x_shift[:, None]  # (M, box) native x per pixel
-    yc = grid[None, :] - y_shift[:, None]
-
-    def _axis_basis(coords, n_int):
-        # interval index (clamped, so out-of-range extrapolates like Gpuspline)
-        # + value/derivative power bases [1,f,f^2,f^3] / [0,1,2f,3f^2].
-        idx = np.clip(np.floor(coords), 0, n_int - 1).astype(np.intp)
-        f = coords - idx
-        ones, zeros = np.ones_like(f), np.zeros_like(f)
-        p = np.stack([ones, f, f * f, f * f * f], axis=-1)
-        dp = np.stack([zeros, ones, 2.0 * f, 3.0 * f * f], axis=-1)
-        return idx, p, dp
-
-    coeff = np.ascontiguousarray(coeff, dtype=np.float32)
-    if z_eval is None:  # 2D bicubic
-        _, nix, niy = coeff.shape
-        c = coeff.reshape(-1).reshape(niy, nix, 4, 4)  # (yi, xi, yp, xp)
-        xi, px, dpx = _axis_basis(xc, nix)
-        yi, py, dpy = _axis_basis(yc, niy)
-        cg = c[yi[:, None, :], xi[:, :, None]]  # (M, box_x, box_y, yp, xp)
-        phi = np.einsum("mijyx,mjy,mix->mij", cg, py, px)
-        dphi_dx = np.einsum("mijyx,mjy,mix->mij", cg, py, dpx)
-        dphi_dy = np.einsum("mijyx,mjy,mix->mij", cg, dpy, px)
-        return phi, dphi_dx, dphi_dy, None
-
-    # 3D tricubic
-    _, nix, niy, niz = coeff.shape
-    c = coeff.reshape(-1).reshape(
-        niz, niy, nix, 4, 4, 4
-    )  # (zi,yi,xi,zp,yp,xp)
-    xi, px, dpx = _axis_basis(xc, nix)
-    yi, py, dpy = _axis_basis(yc, niy)
-    zc = np.asarray(z_eval, dtype=np.float32)
-    zidx = np.clip(np.floor(zc), 0, niz - 1).astype(np.intp)
-    fz = zc - zidx
-    pz = np.stack([np.ones_like(fz), fz, fz * fz, fz * fz * fz], axis=-1)
-    dpz = np.stack(
-        [np.zeros_like(fz), np.ones_like(fz), 2.0 * fz, 3.0 * fz * fz], axis=-1
-    )
-    # z is one slice per loc: contract the z power first, then gather per pixel.
-    cz = c[zidx]  # (M, niy, nix, 4, 4, 4)
-    c_val = np.einsum("mYXzyx,mz->mYXyx", cz, pz)  # (M, niy, nix, yp, xp)
-    c_dz = np.einsum("mYXzyx,mz->mYXyx", cz, dpz)
-    mm = np.arange(len(x_shift))[:, None, None]
-    cg = c_val[mm, yi[:, None, :], xi[:, :, None]]  # (M, box_x, box_y, yp, xp)
-    cg_dz = c_dz[mm, yi[:, None, :], xi[:, :, None]]
-    phi = np.einsum("mijyx,mjy,mix->mij", cg, py, px)
-    dphi_dx = np.einsum("mijyx,mjy,mix->mij", cg, py, dpx)
-    dphi_dy = np.einsum("mijyx,mjy,mix->mij", cg, dpy, px)
-    dphi_dz = np.einsum("mijyx,mjy,mix->mij", cg_dz, py, px)
-    return phi, dphi_dx, dphi_dy, dphi_dz
-
-
 @numba.njit(parallel=True, cache=True, fastmath=True)
 def _spline_infomats_3d(
     coeff,
@@ -3127,9 +3023,7 @@ def _spline_infomats_3d(
     meat,
 ):
     """Fill the per-localization information matrices of the 3D cubic-spline
-    model. Parallel per-spot numba kernel; the readable reference is
-    :func:`_spline_model_and_grad`. ``coeff`` is
-    ``(n_channels, niz, niy, nix, 4, 4, 4)``. Non-converged rows are skipped
+    model. Parallel per-spot numba kernel. Non-converged rows are skipped
     (left as preset by the caller). Parameter order [x, y, z, amplitude, offset].
 
     ``aff`` is ``(n_channels, 4)`` ``[a00, a01, a10, a11]`` and ``res`` is
@@ -4396,7 +4290,7 @@ def _spline_crlb_link_xyz_kernel(
 
 
 def _require_crlb_cuda() -> None:
-    if not SPLINE_CRLB_CUDA_AVAILABLE:
+    if not CUDA_AVAILABLE:
         raise RuntimeError(
             "GPU spline CRLB requested but no CUDA-capable GPU is available."
         )
@@ -4747,7 +4641,7 @@ def _spline_link_xyz_crlb(
     res = _spline_crlb_residuals(residuals, n_locs, n_channels)
 
     crlb = None
-    if SPLINE_CRLB_CUDA_AVAILABLE:
+    if CUDA_AVAILABLE:
         try:
             crlb, failed = _spline_link_xyz_crlb_cuda(
                 _spline_coeff_reshaped(
@@ -4853,9 +4747,8 @@ def _spline_coeff_reshaped(
     calibration: dict, dtype: type = np.float64
 ) -> np.ndarray:
     """Raw calibration coefficients as ``(n_channels, niz, niy, nix, 4, 4, 4)``
-    (3D) or ``(n_channels, niy, nix, 4, 4)`` (2D), float64 for the numba kernels.
-    The flat C-order buffer is the Gpuspline-binding layout (see
-    :func:`_spline_model_and_grad`).
+    (3D) or ``(n_channels, niy, nix, 4, 4)`` (2D), float64 for the numba
+    kernels.
 
     ``dtype`` narrows the output; the CUDA kernels ask for float32 when the
     calibration itself is float32 (see :func:`_spline_crlb_coeff_dtype`), which
@@ -5124,7 +5017,7 @@ def _spline_crlb(
     res = _spline_crlb_residuals(residuals, n_locs, n_channels)
 
     crlb = None
-    if SPLINE_CRLB_CUDA_AVAILABLE:
+    if CUDA_AVAILABLE:
         try:
             crlb, failed = _spline_crlb_cuda(
                 _spline_coeff_reshaped(

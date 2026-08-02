@@ -4,7 +4,7 @@ test_splinefit
 
 Tests for ``picasso.fitting.splinefit``, the CPU cubic-spline PSF fitter.
 
-Everything here runs without a GPU, without Gpufit and without Gpuspline:
+Everything here runs without a GPU:
 the calibrations are built analytically from tensor products of 1D cubic
 splines, so the model, its derivatives and the parameters a fit must
 recover are all known in closed form.
@@ -72,8 +72,9 @@ def _astigmatic_calibration(box=BOX, nz=NZ, n_channels=1, model="spline-3d"):
         coefficients += np.einsum(
             "zZ,yY,xX->zyxZYX", gz.c[::-1].T, gy.c[::-1].T, gx.c[::-1].T
         )
-    # (niz, niy, nix, zp, yp, xp) is the raw Gpuspline-binding buffer, which
-    # NumPy labels (64, nix, niy, niz).
+    # (niz, niy, nix, zp, yp, xp) is the raw flat coefficient buffer (the
+    # spline.spline_coefficients layout), which NumPy labels
+    # (64, nix, niy, niz).
     raw = coefficients.reshape(64, nix, niy, niz).astype(np.float32)
     if model == "spline-3d-multichannel":
         raw = np.repeat(raw[..., None], n_channels, axis=-1)
@@ -269,31 +270,26 @@ class TestSplineEvaluation:
                     rtol=0,
                 )
 
-    def test_matches_localize_reference(self):
-        """Agree with ``localize._spline_model_and_grad``, the NumPy reference
-        the CRLB path is validated against. That function evaluates in float32
-        to mirror the single-precision Gpufit build, so this only holds at
-        float32 level - and it is what pins the coefficient layout: the kernels
-        read the raw Gpuspline-binding buffer, not the reordered blob."""
-        calibration, _ = _astigmatic_calibration()
+    def test_matches_closed_form_off_grid_batch(self):
+        """The closed form again at several asymmetric, off-grid positions,
+        including shifts beyond a pixel. ``test_matches_closed_form_3d`` pins
+        one position; this widens the sampling so a layout error that happens
+        to be benign at a single point cannot survive."""
+        calibration, terms = _astigmatic_calibration()
         coefficients = localize._spline_coeff_reshaped(calibration)
-        xs = np.array([0.3, -0.7])
-        ys = np.array([-0.2, 1.1])
-        zs = np.array([9.0, 12.4])
-        ref = localize._spline_model_and_grad(
-            calibration["coefficients"], BOX, xs, ys, zs
-        )
-        for m in range(len(xs)):
+        for x, y, z in ((0.3, -0.2, 9.0), (-0.7, 1.1, 12.4)):
+            phi, gx, gy, gz = _reference_model(terms, BOX, x, y, z)
+            scale = max(np.max(np.abs(phi)), 1e-12)
             for j in range(BOX):
                 for i in range(BOX):
                     got = splinefit._eval_spline_3d(
-                        coefficients, 0, i - xs[m], j - ys[m], zs[m]
+                        coefficients, 0, i - x, j - y, z
                     )
-                    # ref is indexed [loc, x-pixel, y-pixel]
-                    expected = tuple(float(r[m, i, j]) for r in ref)
-                    scale = max(np.max(np.abs(ref[0])), 1e-12)
                     np.testing.assert_allclose(
-                        got, expected, atol=2e-6 * scale, rtol=0
+                        got,
+                        (phi[j, i], gx[j, i], gy[j, i], gz[j, i]),
+                        atol=5e-7 * scale,
+                        rtol=0,
                     )
 
 
@@ -1276,7 +1272,7 @@ class TestMultichannelIntegration:
 
     def test_explicit_gpu_request_without_gpufit_raises(self, scene):
         calibration, movies, camera_infos, identifications, _ = scene
-        if localize.GPU_FITTING_AVAILABLE:
+        if localize.CUDA_AVAILABLE:
             pytest.skip("a CUDA device is available")
         with pytest.raises(ImportError, match="use_gpu=False"):
             localize.fit_spline_multichannel(

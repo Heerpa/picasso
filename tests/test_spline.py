@@ -1,8 +1,7 @@
 """Tests for picasso.spline (cubic-spline PSF calibration generation).
 
-The GPU-independent parts (frame binning, PSF-template building, registration,
-normalization) run everywhere. The final coefficient step needs Gpuspline (a
-CPU library) and is gated on ``localize.GPUSPLINE_INSTALLED``.
+The whole calibration (frame binning, PSF-template building, registration,
+normalization and the spline-coefficient step) runs on the CPU everywhere.
 """
 
 from __future__ import annotations
@@ -560,11 +559,8 @@ class TestMultiFov:
             assert tpl.min() == pytest.approx(0.0, abs=0.1)
 
 
-@pytest.mark.skipif(
-    not localize.GPUSPLINE_INSTALLED, reason="Gpuspline not available"
-)
 class TestCalibrateSpline:
-    """Full calibration including the Gpuspline coefficient step (CPU)."""
+    """Full calibration including the spline-coefficient step (CPU)."""
 
     def test_calibrate_spline_3d_roundtrip(self, tmp_path):
         from picasso import io
@@ -603,23 +599,6 @@ class TestCalibrateSpline:
         assert calib["model"] == "spline-2d"
         assert calib["coefficients"].shape[0] == 16
         assert list(calib["n_data"]) == [BOX, BOX]
-
-
-@pytest.mark.skipif(
-    localize.GPUSPLINE_INSTALLED,
-    reason="only relevant when Gpuspline is missing",
-)
-def test_calibrate_spline_requires_gpuspline():
-    movie, _, _ = _synthetic_bead_movie()
-    with pytest.raises(ImportError):
-        spline.calibrate_spline(
-            movie,
-            info=[{"Frames": int(movie.shape[0])}],
-            camera_info=CAMERA_INFO,
-            box=BOX,
-            minimum_ng=2000.0,
-            d=20.0,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -783,12 +762,9 @@ class TestRansacMatch:
         )
 
 
-@pytest.mark.skipif(
-    not localize.GPUSPLINE_INSTALLED, reason="Gpuspline not available"
-)
 class TestCalibrateSplineMultichannel:
-    """Full multichannel calibration including the Gpuspline coefficient
-    step (CPU). Skipped unless Gpuspline is installed."""
+    """Full multichannel calibration including the spline-coefficient
+    step (CPU)."""
 
     def test_calibrate_multichannel(self, tmp_path):
         from picasso import io
@@ -882,9 +858,7 @@ class TestCalibrateSplineMultichannel:
         assert abs(t1[1, 1] + 1.0) < 0.1  # y scale ~ -1
         assert abs(t1[1, 2] - (h - 1)) < 2.0  # y offset ~ H - 1
 
-    @pytest.mark.skipif(
-        not localize.GPU_FITTING_AVAILABLE, reason="no CUDA device"
-    )
+    @pytest.mark.skipif(not localize.CUDA_AVAILABLE, reason="no CUDA device")
     def test_axial_precision_multichannel_is_joint(self):
         """The multichannel axial-precision diagnostic must fit all channels
         *jointly* (the real pipeline) rather than each plane alone. This checks
@@ -991,7 +965,7 @@ def _synthetic_split_fov_movie_flipped(axis="y"):
 
 
 class TestSplitFovTransform:
-    """Region-aware channel-transform estimation (no Gpuspline needed)."""
+    """Region-aware channel-transform estimation."""
 
     def test_estimate_region_transform_recovers_shift(self):
         dx, dy = 2, -1
@@ -1083,9 +1057,6 @@ class TestSplitFovTransform:
             np.testing.assert_allclose(mapped[:, 1], ref_xy[:, 1], atol=1.0)
 
 
-@pytest.mark.skipif(
-    not localize.GPUSPLINE_INSTALLED, reason="Gpuspline not available"
-)
 class TestCalibrateSplitFov:
     """Full split-FOV calibration from one movie with two FOV regions."""
 

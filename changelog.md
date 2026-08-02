@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 01-AUG-2026 CEST
+Last change: 02-AUG-2026 CEST
 
 ## 0.11.0
 
@@ -12,7 +12,7 @@ Last change: 01-AUG-2026 CEST
 
 #### Localize
 - **GPU fitting is now implemented in Numba CUDA instead of Gpufit.** All seven models Picasso fits on the GPU — the spherical, elliptical and rotated 2D Gaussians and the cubic splines — now run through kernels written in Python and compiled at run time (`picasso.fitting.splinefit_cuda`, `picasso.fitting.gaussfit_cuda`, `picasso.fitting.lmfit_cuda`). The fitting algorithm itself is unchanged — it remains a port of [Gpufit](https://github.com/gpufit/Gpufit) (Przybylski et al., Scientific Reports 7, 15722, 2017)
-- New fitting model: **Experimental PSF (cubic spline)** — fits an experimentally measured PSF (a cubic-spline model built from a bead z-stack), via the new `picasso.fitting.splinefit_cuda` module on the GPU or `picasso.fitting.splinefit` on the CPU. The `pygpuspline` binding is vendored under `picasso/ext/pygpuspline`. In single-channel data, the bead alignment follows the workflow from [Li, et al, Nature Methods, 2018](https://www.nature.com/articles/nmeth.4661). See the [experimental PSF (cubic-spline) fitting documentation](https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting) for details. *Note this is an experimental feature, do let us know if you find any bugs/unexpected behavior*
+- New fitting model: **Experimental PSF (cubic spline)** — fits an experimentally measured PSF (a cubic-spline model built from a bead z-stack), via the new `picasso.fitting.splinefit_cuda` module on the GPU or `picasso.fitting.splinefit` on the CPU. The spline coefficients of the calibration are computed in pure Python (NumPy/SciPy) on the CPU. In single-channel data, the bead alignment follows the workflow from [Li, et al, Nature Methods, 2018](https://www.nature.com/articles/nmeth.4661). See the [experimental PSF (cubic-spline) fitting documentation](https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting) for details. *Note this is an experimental feature, do let us know if you find any bugs/unexpected behavior*
 - Multichannel spline PSF fitting (a shared-amplitude 3D spline model, e.g. biplane); additionally a new model was added for uncoupled photons with up to 6 channels. The global (multichannel) fitting follows globLoc, see [Li, et al, Nature Communications, 2022](https://doi.org/10.1038/s41467-022-30719-4)
 - New fitting algorithms supported: 2D rotated Gaussian, 2D spherical Gaussian
 - **`picasso.gausslq` and `picasso.gaussmle` are deprecated and the whole modules will be removed in Picasso 1.0**, so that all fitting lives in the `picasso.fitting` subpackage. Every public name in them now raises a `DeprecationWarning` naming its replacement:

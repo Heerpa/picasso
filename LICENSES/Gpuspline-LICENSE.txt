@@ -1,7 +1,16 @@
-Gpuspline is distributed under the MIT License by the Gpufit / Gpuspline
-authors (https://github.com/gpufit/Gpuspline). The MIT license text under which
-it is released is reproduced below. If you replace this file, use the exact
-LICENSE shipped with the Gpuspline source you build the binary from.
+Picasso's spline PSF calibration computes its cubic-spline coefficients with
+an implementation derived from Gpuspline (https://github.com/gpufit/Gpuspline).
+Its coefficient scheme - a tensor product of 1D natural cubic interpolating
+splines - and the flat coefficient-buffer layout Picasso's fitters read were
+reimplemented in Python/NumPy/SciPy in
+
+    picasso/spline.py                  spline_coefficients()
+
+Picasso no longer links against or redistributes the Gpuspline binary, but that
+implementation follows its scheme and layout, so its licence is reproduced
+below in full.
+
+---
 
 MIT License
 

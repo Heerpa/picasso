@@ -189,9 +189,7 @@ def _interval(pos: float, n_intervals: int) -> int:
     Only the *index* is clamped. The caller keeps the true fractional
     coordinate ``pos - i``, which may fall outside ``[0, 1)``, so a position
     off the edge of the box **extrapolates** the boundary cubic rather than
-    saturating at it. This is exactly what the Gpufit models do
-    (``spline_3d.cuh``) and what ``localize._spline_model_and_grad`` reproduces
-    in NumPy."""
+    saturating at it."""
     i = int(np.floor(pos))
     if i < 0:
         i = 0

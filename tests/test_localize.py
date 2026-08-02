@@ -24,7 +24,7 @@ from scipy.interpolate import CubicSpline
 from PyQt6 import QtWidgets
 
 from picasso import gaussmle, gausslq, io, localize, spline
-from picasso.fitting import gaussfit_cuda
+from picasso.fitting import gaussfit_cuda, splinefit
 from picasso.gui import localize as localize_gui
 
 from tests.conftest import BOX, CALIB_3D, CAMERA_INFO, MIN_NG, PIXELSIZE
@@ -39,7 +39,7 @@ SPLINE_CRLB_DEVICES = [
     pytest.param(
         True,
         marks=pytest.mark.skipif(
-            not localize.SPLINE_CRLB_CUDA_AVAILABLE,
+            not localize.CUDA_AVAILABLE,
             reason="no CUDA device for the spline CRLB kernels",
         ),
     ),
@@ -1552,9 +1552,7 @@ def _make_rotated_spot(box, x0, y0, sx, sy, photons, bg, angle):
     return (photons / (2 * np.pi * sx * sy) * e + bg).astype(np.float32)
 
 
-@pytest.mark.skipif(
-    not localize.GPU_FITTING_AVAILABLE, reason="no CUDA device"
-)
+@pytest.mark.skipif(not localize.CUDA_AVAILABLE, reason="no CUDA device")
 class TestGpufit:
     """Thorough tests for the Gpufit Gaussian codepath (``fit_spots_gauss_gpu``).
     Requires a CUDA-capable GPU, so skipped in the typical test environment.
@@ -2122,10 +2120,10 @@ def _fake_spline_calibration(model="spline-3d", box=BOX, n_channels=2):
 # ---------------------------------------------------------------------------
 # Known separable Gaussian spline for CRLB tests. Built with scipy CubicSpline
 # so the exact model Phi = gx(x) gy(y) [gz(z)] and its analytic derivatives are
-# known, giving a closed-form reference for _spline_crlb / _spline_model_and_grad
-# WITHOUT the compiled Gpuspline library. sx != sy makes it astigmatic
+# known, giving a closed-form reference for _spline_crlb
+# independently of spline.spline_coefficients. sx != sy makes it astigmatic
 # (lpx != lpy); gz encodes axial information (finite lpz). The coefficient table
-# is written in the raw Gpuspline-binding layout the evaluator/kernels expect.
+# is written in the raw flat-buffer layout the evaluator/kernels expect.
 # ---------------------------------------------------------------------------
 def _gauss_spline_1d(sigma, center, n):
     x = np.arange(n, dtype=np.float64)
@@ -2473,7 +2471,7 @@ class TestSplineHelpers:
             assert np.all(np.isfinite(locs[col])) and np.all(locs[col] > 0)
 
     @pytest.mark.skipif(
-        localize.GPU_FITTING_AVAILABLE,
+        localize.CUDA_AVAILABLE,
         reason="ImportError only raised when no CUDA device is present",
     )
     def test_fit_spots_spline_without_gpu_raises(self, synthetic_spots):
@@ -2575,7 +2573,7 @@ class TestSplineHelpers:
             (splinefit, False),
             (splinefit_cuda, True),
         ):
-            if use_gpu and not localize.GPU_FITTING_AVAILABLE:
+            if use_gpu and not localize.CUDA_AVAILABLE:
                 continue
             seen = {}
 
@@ -2601,9 +2599,9 @@ class TestSplineHelpers:
 
     def test_spline_use_gpu_resolution(self):
         # no GPU on this machine unless Gpufit is installed
-        assert localize._spline_use_gpu(None) is localize.GPU_FITTING_AVAILABLE
+        assert localize._spline_use_gpu(None) is localize.CUDA_AVAILABLE
         assert localize._spline_use_gpu(False) is False
-        if not localize.GPU_FITTING_AVAILABLE:
+        if not localize.CUDA_AVAILABLE:
             with pytest.raises(ImportError, match="use_gpu=False"):
                 localize._spline_use_gpu(True)
 
@@ -3342,10 +3340,8 @@ class TestCrossRegionLinkingSplitFov:
 
 def _synthetic_spline_3d_calibration(box=BOX, nz=41):
     """Build a 3D spline calibration from a synthetic astigmatic PSF,
-    mirroring the reference pyGpufit splinefit_3d example. Requires Gpuspline
-    (CPU) to compute the coefficients; returns (calibration, template,
-    amplitude, offset)."""
-    gs = localize.gs
+    mirroring the reference pyGpufit splinefit_3d example; returns
+    (calibration, template, amplitude, offset)."""
     x = np.arange(box, dtype=np.float32)
     y = np.arange(box, dtype=np.float32)
     amplitude, offset = 100.0, 10.0
@@ -3357,15 +3353,11 @@ def _synthetic_spline_3d_calibration(box=BOX, nz=41):
         gx = np.exp(-0.5 * ((x - (box - 1) / 2) / sx) ** 2)
         gy = np.exp(-0.5 * ((y - (box - 1) / 2) / sy) ** 2)
         template[:, :, k] = np.outer(gx, gy)
-    coefficients = gs.spline_coefficients(template)
+    coefficients = spline.spline_coefficients(template)
     n_intervals = np.array(template.shape) - 1
-    coefficients = np.reshape(
-        coefficients,
-        (64, n_intervals[0], n_intervals[1], n_intervals[2]),
-    )
     calib = {
         "model": "spline-3d",
-        "coefficients": coefficients.astype(np.float32),
+        "coefficients": coefficients,
         "n_data": [box, box, nz],
         "n_intervals": [int(i) for i in n_intervals],
         "oversampling": 1.0,
@@ -3380,34 +3372,51 @@ def _synthetic_spline_3d_calibration(box=BOX, nz=41):
     return calib, template, amplitude, offset
 
 
-@pytest.mark.skipif(
-    not localize.GPUSPLINE_INSTALLED,
-    reason="Gpuspline not available",
-)
+def _eval_spline_psf(calib, x_shift, y_shift, z_eval=None):
+    """The calibration PSF on the box grid, via the production CPU evaluator
+    (``splinefit._eval_spline_3d`` / ``_eval_spline_2d`` on
+    ``localize._spline_coeff_reshaped``'s view).
+
+    Returns a ``(box, box)`` image indexed ``[x-pixel, y-pixel]`` - the
+    orientation of the templates these synthetic calibrations are built from
+    (``template[:, :, k] = np.outer(gx, gy)``), not the ``[y, x]`` layout of
+    real spot data."""
+    box = calib["n_data"][0]
+    coeff = localize._spline_coeff_reshaped(calib)
+    out = np.empty((box, box))
+    for i in range(box):  # i = x-pixel
+        for j in range(box):  # j = y-pixel
+            if z_eval is None:
+                out[i, j] = splinefit._eval_spline_2d(
+                    coeff, 0, i - x_shift, j - y_shift
+                )[0]
+            else:
+                out[i, j] = splinefit._eval_spline_3d(
+                    coeff, 0, i - x_shift, j - y_shift, z_eval
+                )[0]
+    return out
+
+
 class TestSplineCoefficients:
-    """Coefficient computation/evaluation with Gpuspline. This is a plain CPU
-    library (no GPU/CUDA), so these run wherever the compiled splines library
-    is present - independently of Gpufit."""
+    """Coefficient computation (``spline.spline_coefficients``) and its
+    evaluation (plain CPU, no GPU/CUDA)."""
 
     def test_spline_coefficients_roundtrip(self):
-        """spline_values on the computed coefficients must reproduce the
-        source template (validates coefficient layout / flatten order)."""
-        gs = localize.gs
+        """Evaluating the computed coefficients at the grid nodes must
+        reproduce the source template (validates coefficient layout /
+        flatten order)."""
         calib, template, _, _ = _synthetic_spline_3d_calibration()
-        box, _, nz = calib["n_data"]
-        x = np.arange(box, dtype=np.float32)
-        y = np.arange(box, dtype=np.float32)
-        z = np.arange(nz, dtype=np.float32)
-        # spline_values reads coefficients.shape[3], [2], [1]; it needs the full
-        # (64, nix, niy, niz) table - a reshape to (64, -1) raises IndexError.
-        # This is exactly what _spline_crlb passes.
-        values = gs.spline_values(calib["coefficients"], x, y, z)
+        nz = calib["n_data"][2]
+        values = np.stack(
+            [_eval_spline_psf(calib, 0.0, 0.0, float(k)) for k in range(nz)],
+            axis=-1,
+        )
         np.testing.assert_allclose(values, template, atol=1e-3)
 
     def test_spline_crlb_real_coefficients(self):
-        """_spline_crlb runs on a real Gpuspline calibration and yields finite,
-        positive precisions (exercises the actual spline_values path, not the
-        analytic fake used by TestSplineCRLB)."""
+        """_spline_crlb runs on a real calibration and yields finite,
+        positive precisions (exercises the actual spline-evaluation path, not
+        the analytic fake used by TestSplineCRLB)."""
         calib, _, amplitude, offset = _synthetic_spline_3d_calibration()
         box = calib["n_data"][0]
         z_focus = calib["z_center"]
@@ -3418,47 +3427,52 @@ class TestSplineCoefficients:
         crlb = localize._spline_crlb(theta, calib, box)[0]
         assert np.all(np.isfinite(crlb)) and np.all(crlb > 0)
 
-    def test_model_and_grad_matches_gpuspline(self):
-        """Authoritative layout check: _spline_model_and_grad's value (which the
-        numba kernel mirrors) must equal gpuspline.spline_values at sub-pixel
-        shifts on a real calibration. The local tests use a self-built spline,
-        so they cannot catch a coefficient-layout mismatch - this one can."""
-        calib, _, _, _ = _synthetic_spline_3d_calibration()
+    def test_evaluation_matches_scipy(self):
+        """Authoritative layout check: the fitting kernels' view of a real
+        ``spline.spline_coefficients`` table must equal an independent scipy
+        evaluation of the tensor-product natural spline at sub-pixel shifts.
+
+        The analytic calibrations in test_splinefit.py build their coefficient
+        buffer by hand, so they pin the kernels against that hand-written
+        layout; only this test feeds the kernels a genuine
+        ``spline_coefficients`` output and so can catch the two disagreeing."""
+        calib, template, _, _ = _synthetic_spline_3d_calibration()
         box, _, nz = calib["n_data"]
         rng = np.random.default_rng(1)
         m = 12
         xs = rng.uniform(-0.5, 0.5, m)
         ys = rng.uniform(-0.5, 0.5, m)
         ze = rng.uniform(5, nz - 6, m)
-        phi, _, _, _ = localize._spline_model_and_grad(
-            calib["coefficients"], box, xs, ys, ze
+        # Independent reference: the tensor-product natural spline evaluated
+        # axis by axis with scipy (a natural interpolant is separable, so
+        # interpolating in z first and then laterally is the same function).
+        grid = np.arange(box, dtype=np.float64)
+        cs_z = CubicSpline(
+            np.arange(nz),
+            template.astype(np.float64),
+            axis=2,
+            bc_type="natural",
         )
-        grid = np.arange(box, dtype=np.float32)
         for k in range(m):
-            # gs.spline_values is indexed [x-pixel, y-pixel] like phi[k]
-            gsv = localize.gs.spline_values(
-                calib["coefficients"],
-                grid - np.float32(xs[k]),
-                grid - np.float32(ys[k]),
-                np.array([ze[k]], np.float32),
-            )[:, :, 0]
-            np.testing.assert_allclose(phi[k], gsv, atol=1e-3)
+            slab = cs_z(ze[k])  # (box, box) at native z
+            cs_x = CubicSpline(grid, slab, axis=0, bc_type="natural")
+            cols = cs_x(grid - xs[k])  # (box, box), rows = x pixels
+            cs_y = CubicSpline(grid, cols, axis=1, bc_type="natural")
+            ref = cs_y(grid - ys[k])  # (box, box) indexed [x, y]
+            got = _eval_spline_psf(calib, xs[k], ys[k], ze[k])
+            np.testing.assert_allclose(got, ref, atol=1e-3)
 
 
 def _synthetic_spline_2d_calibration(box=13, sigma=1.4):
     """Build a 2D (16-coefficient) spline calibration from a single isotropic
-    Gaussian slice, using Gpuspline (CPU). Isotropic -> swap-invariant in x/y,
-    so recovery assertions are convention-agnostic. Returns
+    Gaussian slice. Isotropic -> swap-invariant in x/y, so recovery
+    assertions are convention-agnostic. Returns
     ``(calibration, amplitude, offset)``."""
-    gs = localize.gs
     x = np.arange(box, dtype=np.float32)
     g = np.exp(-0.5 * ((x - (box - 1) / 2) / sigma) ** 2)
     template = np.outer(g, g).astype(np.float32)
     n_intervals = np.array(template.shape) - 1
-    coefficients = np.reshape(
-        gs.spline_coefficients(template),
-        (16, n_intervals[0], n_intervals[1]),
-    ).astype(np.float32)
+    coefficients = spline.spline_coefficients(template)
     calib = {
         "model": "spline-2d",
         "coefficients": coefficients,
@@ -3477,13 +3491,13 @@ def _synthetic_spline_2d_calibration(box=13, sigma=1.4):
 
 
 @pytest.mark.skipif(
-    not (localize.GPU_FITTING_AVAILABLE and localize.GPUSPLINE_INSTALLED),
-    reason="CUDA GPU + Gpuspline not available",
+    not localize.CUDA_AVAILABLE,
+    reason="CUDA GPU not available",
 )
 class TestSplineGpufit:
-    """End-to-end spline fitting. The fit itself runs on Gpufit (CUDA GPU);
-    the calibration is built with Gpuspline (CPU). Skipped in the typical
-    (GPU-less) test environment.
+    """End-to-end spline fitting. The fit itself runs on the CUDA GPU; the
+    calibration is built on the CPU. Skipped in the typical (GPU-less) test
+    environment.
 
     Spline theta is ``[amplitude, x_shift, y_shift, z_shift, offset]`` for 3D
     and ``[amplitude, x_shift, y_shift, offset]`` for 2D. The exact x/y and z
@@ -3522,16 +3536,10 @@ class TestSplineGpufit:
             np.stack([spot]), calib
         )[0]
         box, _, nz = calib["n_data"]
-        grid = np.arange(box, dtype=np.float32)
 
         def model(native_z):
-            zc = np.array([np.clip(native_z, 0.0, nz - 1)], np.float32)
-            phi = localize.gs.spline_values(
-                calib["coefficients"],
-                grid - np.float32(xs),
-                grid - np.float32(ys),
-                zc,
-            )[:, :, 0]
+            zc = np.clip(native_z, 0.0, nz - 1)
+            phi = _eval_spline_psf(calib, xs, ys, zc)
             return off + amp * phi
 
         res_minus = float(np.mean((model(-zs) - spot) ** 2))
@@ -3564,16 +3572,10 @@ class TestSplineGpufit:
         calib, _, amp, off = _synthetic_spline_3d_calibration()
         box, _, nz = calib["n_data"]
         z_focus = np.float32(calib["z_center"])
-        grid = np.arange(box, dtype=np.float32)
         shifts = [0.0, 0.3, -0.4, 0.45]
         spots = []
         for d in shifts:
-            phi = localize.gs.spline_values(
-                calib["coefficients"],
-                grid - np.float32(d),
-                grid - np.float32(d),
-                np.array([z_focus], np.float32),
-            )[:, :, 0]
+            phi = _eval_spline_psf(calib, d, d, z_focus)
             spots.append((off + amp * phi).astype(np.float32))
         theta = localize.fit_spots_spline(np.stack(spots), calib)
         np.testing.assert_allclose(theta[:, 1], shifts, atol=5e-3)
@@ -3627,13 +3629,7 @@ class TestSplineGpufit:
         a, xs, ys, zs, o = localize.fit_spots_spline(np.stack([spot]), calib)[
             0
         ]
-        grid = np.arange(box, dtype=np.float32)
-        phi = localize.gs.spline_values(
-            calib["coefficients"],
-            grid - np.float32(xs),
-            grid - np.float32(ys),
-            np.array([np.clip(-zs, 0, nz - 1)], np.float32),
-        )[:, :, 0]
+        phi = _eval_spline_psf(calib, xs, ys, np.clip(-zs, 0, nz - 1))
         model = o + a * phi
         rms = np.sqrt(np.mean((model - spot) ** 2))
         assert rms < 0.5  # amplitude is 100 -> < 0.5% of peak
@@ -3643,18 +3639,10 @@ class TestSplineGpufit:
         offset and symmetric sub-pixel shift."""
         calib, amp, off = _synthetic_spline_2d_calibration()
         box = calib["n_data"][0]
-        grid = np.arange(box, dtype=np.float32)
         shifts = [0.0, 0.3, -0.35]
         spots = []
         for d in shifts:
-            phi = localize.gs.spline_values(
-                calib["coefficients"],
-                grid - np.float32(d),
-                grid - np.float32(d),
-            )
-            phi = np.asarray(phi)
-            if phi.ndim == 3:
-                phi = phi[:, :, 0]
+            phi = _eval_spline_psf(calib, d, d)
             spots.append((off + amp * phi).astype(np.float32))
         theta = localize.fit_spots_spline(np.stack(spots), calib)
         assert theta.shape == (len(shifts), 4)  # [amp, x_shift, y_shift, off]
@@ -3807,7 +3795,7 @@ class TestConvergenceSchedulePlumbing:
     ):
         """Asked for None, the metadata reports that method's own default;
         asked for a value, it reports the value."""
-        if method.endswith("-gpu") and not localize.GPU_FITTING_AVAILABLE:
+        if method.endswith("-gpu") and not localize.CUDA_AVAILABLE:
             pytest.skip("no CUDA device")
 
         def run(eps, max_it):
@@ -3846,7 +3834,7 @@ class TestConvergenceSchedulePlumbing:
     @pytest.mark.parametrize("mle", [False, True])
     def test_gpu_gauss_iteration_cap_bites(self, mle):
         """The cap has to reach the kernel, not just the metadata."""
-        if not localize.GPU_FITTING_AVAILABLE:
+        if not localize.CUDA_AVAILABLE:
             pytest.skip("no CUDA device")
         rng = np.random.default_rng(0)
         yy, xx = np.mgrid[0:BOX, 0:BOX].astype(float)
@@ -3878,7 +3866,7 @@ class TestConvergenceSchedulePlumbing:
 
     def test_gpu_gauss_tolerance_bites(self):
         """A looser stop must take strictly fewer iterations."""
-        if not localize.GPU_FITTING_AVAILABLE:
+        if not localize.CUDA_AVAILABLE:
             pytest.skip("no CUDA device")
         rng = np.random.default_rng(1)
         yy, xx = np.mgrid[0:BOX, 0:BOX].astype(float)
@@ -4104,7 +4092,7 @@ class TestGuiConvergenceDefaults:
                 dialog.max_it.value(),
             ) == localize.gauss_schedule(False, False)
 
-            if localize.GPU_FITTING_AVAILABLE:
+            if localize.CUDA_AVAILABLE:
                 dialog.gpu_checkbox.setChecked(True)
                 assert dialog.current_fit_code() == "gausslq-gpu"
                 assert (
@@ -4159,9 +4147,7 @@ class TestGuiConvergenceDefaults:
             dialog.deleteLater()
 
 
-@pytest.mark.skipif(
-    not localize.GPU_FITTING_AVAILABLE, reason="no CUDA device"
-)
+@pytest.mark.skipif(not localize.CUDA_AVAILABLE, reason="no CUDA device")
 class TestFit2DGpu:
     """End-to-end ``localize.fit2D`` through every GPU fitting method, driven by
     the bundled movie and its real identifications. Verifies the high-level
@@ -4224,8 +4210,6 @@ class TestFit2DGpu:
     def test_spline_gpu_methods(
         self, picasso_movie, movie_info, real_identifications, method
     ):
-        if not localize.GPUSPLINE_INSTALLED:
-            pytest.skip("Gpuspline needed to build the calibration")
         calib, _, _, _ = _synthetic_spline_3d_calibration(box=BOX)
         locs, info = localize.fit2D(
             picasso_movie,
@@ -4279,12 +4263,9 @@ class TestFit2DGpu:
         )
 
 
-@pytest.mark.skipif(
-    not localize.GPUSPLINE_INSTALLED,
-    reason="Gpuspline not available",
-)
 class TestSplineCRLBReal:
-    """The CRLB path on a real Gpuspline-built calibration (CPU, no GPU fit)."""
+    """The CRLB path on a real (non-separable) calibration (CPU, no GPU
+    fit)."""
 
     def test_crlb_finite_across_z(self):
         calib, _, amplitude, offset = _synthetic_spline_3d_calibration()
@@ -4301,12 +4282,12 @@ class TestSplineCRLBReal:
         assert np.all(np.isfinite(crlb)) and np.all(crlb > 0)
 
     @pytest.mark.skipif(
-        not localize.SPLINE_CRLB_CUDA_AVAILABLE,
+        not localize.CUDA_AVAILABLE,
         reason="requires a CUDA-capable GPU (numba-cuda)",
     )
     def test_gpu_matches_cpu_on_real_coefficients(self):
-        """Parity on a genuinely non-separable, Gpuspline-generated coefficient
-        table - the analytic test spline cannot exercise that layout."""
+        """Parity on a genuinely non-separable coefficient table - the
+        analytic test spline cannot exercise that layout."""
         calib, _, amplitude, offset = _synthetic_spline_3d_calibration()
         box, _, nz = calib["n_data"]
         rng = np.random.default_rng(0)
@@ -4328,28 +4309,40 @@ class TestSplineCRLBReal:
 class TestSplineCRLB:
     """Cramer-Rao lower bounds for spline-fitted localizations. Uses a known
     separable Gaussian spline built with scipy (see _gauss_spline_calibration),
-    so the exact CRLB reference is available without the compiled Gpuspline
-    library or a GPU. The numba kernel is validated against the closed-form
-    reference; the layout-vs-Gpuspline check is in TestSplineCoefficients."""
+    so the exact CRLB reference is available in closed form without a GPU.
+    The numba kernel is validated against the closed-form reference; the
+    layout check is in TestSplineCoefficients."""
 
     def test_evaluator_matches_scipy_3d(self):
-        # _spline_model_and_grad (the NumPy reference the numba kernel mirrors)
-        # must reproduce the scipy spline value and its x/y/z derivatives.
+        # The evaluator the CRLB kernels are built on must reproduce the scipy
+        # spline value and its x/y/z derivatives on the very fixture the CRLB
+        # assertions below take as ground truth.
         calib, splines = _gauss_spline_calibration(model="spline-3d")
         nz = calib["n_data"][2]
+        coeff = localize._spline_coeff_reshaped(calib)
         rng = np.random.default_rng(0)
-        m = 50
+        # The evaluator is scalar (one call per pixel), so this samples fewer
+        # positions than a vectorized reference could afford.
+        m = 12
         xs = rng.uniform(-0.7, 0.7, m)
         ys = rng.uniform(-0.7, 0.7, m)
         ze = rng.uniform(5, nz - 6, m)
-        phi, dx, dy, dz = localize._spline_model_and_grad(
-            calib["coefficients"], BOX, xs, ys, ze
-        )
-        rphi, rdx, rdy, rdz = _ref_model_grad(splines, BOX, xs, ys, ze)
-        assert np.abs(phi - rphi).max() < 1e-4
-        assert np.abs(dx - rdx).max() < 1e-3
-        assert np.abs(dy - rdy).max() < 1e-3
-        assert np.abs(dz - rdz).max() < 1e-3
+        ref = _ref_model_grad(splines, BOX, xs, ys, ze)
+        # ref is indexed [loc, x-pixel, y-pixel]
+        for k in range(m):
+            for i in range(BOX):
+                for j in range(BOX):
+                    got = splinefit._eval_spline_3d(
+                        coeff, 0, i - xs[k], j - ys[k], ze[k]
+                    )
+                    want = tuple(float(r[k, i, j]) for r in ref)
+                    np.testing.assert_allclose(
+                        got,
+                        want,
+                        atol=1e-3,
+                        rtol=0,
+                        err_msg=f"loc {k}, pixel (x={i}, y={j})",
+                    )
 
     def test_crlb_matches_reference_3d(self):
         # sx < sy (astigmatic) so lpx < lpy - also guards the x/y association.
@@ -4467,7 +4460,7 @@ def _crlb(theta, calibration, box, *, gpu, **kwargs):
     hiding the GPU is the only way to exercise the CPU path deliberately - and
     the only way to compare the two against each other."""
     with pytest.MonkeyPatch.context() as m:
-        m.setattr(localize, "SPLINE_CRLB_CUDA_AVAILABLE", gpu)
+        m.setattr(localize, "CUDA_AVAILABLE", gpu)
         return localize._spline_crlb(theta, calibration, box, **kwargs)
 
 
@@ -4675,7 +4668,7 @@ class TestSplineCRLBEMCCD:
 
 
 requires_crlb_gpu = pytest.mark.skipif(
-    not localize.SPLINE_CRLB_CUDA_AVAILABLE,
+    not localize.CUDA_AVAILABLE,
     reason="requires a CUDA-capable GPU (numba-cuda)",
 )
 
@@ -4699,7 +4692,7 @@ class TestSplineCRLBGPU:
     def test_no_cuda_uses_the_cpu_silently(self, monkeypatch):
         """Without a CUDA device the CPU kernels are used, with no warning and
         no way (or need) for the caller to ask for anything else."""
-        monkeypatch.setattr(localize, "SPLINE_CRLB_CUDA_AVAILABLE", False)
+        monkeypatch.setattr(localize, "CUDA_AVAILABLE", False)
         calib, _ = _gauss_spline_calibration(model="spline-2d")
         theta = np.array([[3000.0, 0.1, -0.1, 15.0]])
         with warnings.catch_warnings():
@@ -4715,7 +4708,7 @@ class TestSplineCRLBGPU:
         pinv numbers, not whatever the kernel left behind. Driven through a stub
         device driver so it runs without a GPU - this fallback is the only
         structural difference between the two paths, so it needs a test."""
-        monkeypatch.setattr(localize, "SPLINE_CRLB_CUDA_AVAILABLE", True)
+        monkeypatch.setattr(localize, "CUDA_AVAILABLE", True)
         calib, _ = _gauss_spline_calibration(model=model)
         rng = np.random.default_rng(5)
         n_params = 4 if model == "spline-2d" else 5
@@ -4765,7 +4758,7 @@ class TestSplineCRLBGPU:
         but must not do it silently - a permanently broken GPU path would
         otherwise never be noticed. (Having no device at all is not an error
         and stays quiet; see test_no_cuda_uses_the_cpu_silently.)"""
-        monkeypatch.setattr(localize, "SPLINE_CRLB_CUDA_AVAILABLE", True)
+        monkeypatch.setattr(localize, "CUDA_AVAILABLE", True)
         monkeypatch.setattr(localize, "_crlb_gpu_fallback_warned", False)
 
         def boom(*args, **kwargs):
@@ -4986,7 +4979,7 @@ class TestSplineCRLBGPU:
             "from tests.test_localize import ("
             "_gauss_spline_calibration, _shared_theta, _crlb, BOX,"
             " _link_xyz_calib_and_theta, _with_channel_geometry)\n"
-            "assert localize.SPLINE_CRLB_CUDA_AVAILABLE, 'simulator off'\n"
+            "assert localize.CUDA_AVAILABLE, 'simulator off'\n"
             "rng = np.random.default_rng(0)\n"
             "for model in ('spline-2d', 'spline-3d'):\n"
             "    calib, _ = _gauss_spline_calibration(model=model)\n"
@@ -5511,11 +5504,11 @@ class TestSplinePerChannelPhotonScale:
 
 
 @pytest.mark.skipif(
-    not (localize.GPU_FITTING_AVAILABLE and localize.GPUSPLINE_INSTALLED),
-    reason="CUDA GPU + Gpuspline not available",
+    not localize.CUDA_AVAILABLE,
+    reason="CUDA GPU not available",
 )
 class TestSplineRatiometric:
-    """End-to-end ratiometric color assignment on a real (Gpuspline) PSF,
+    """End-to-end ratiometric color assignment on a real PSF,
     stacked into two identical channels. The two channels differ only by a
     known photon split; the fitter must recover it as the winning ratio."""
 
@@ -5731,8 +5724,8 @@ class TestFitSplineSplitFovValidation:
 
 
 @pytest.mark.skipif(
-    not (localize.GPU_FITTING_AVAILABLE and localize.GPUSPLINE_INSTALLED),
-    reason="CUDA GPU + Gpuspline not available",
+    not localize.CUDA_AVAILABLE,
+    reason="CUDA GPU not available",
 )
 class TestFitSplineSplitFov:
     """End-to-end split-FOV fit on a single movie built + calibrated from the

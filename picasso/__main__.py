@@ -1248,7 +1248,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     print("{:<8} {:<15} {:<10}".format("No", "Label", "Value"))
 
     if args.fit_method in ("lq-gpu", "spline-gpu", "spline-mle-gpu"):
-        if localize.GPU_FITTING_AVAILABLE:
+        if localize.CUDA_AVAILABLE:
             print("CUDA GPU found")
         else:
             raise Exception(
@@ -1361,12 +1361,6 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
     picasso_logo()
     print("Spline PSF calibration")
     print("------------------------------------------")
-
-    if not localize.GPUSPLINE_INSTALLED:
-        raise Exception(
-            "Gpuspline is required to build a spline PSF calibration but "
-            "could not be loaded. See picasso/ext/pygpuspline/README.txt."
-        )
 
     camera_info = {
         "Baseline": args.baseline,
@@ -2822,8 +2816,7 @@ def main():  # noqa: C901
     )
 
     # spline-calibrate: build a cubic-spline PSF calibration from a bead
-    # z-stack movie (Gpuspline; CPU) for later use with the 'spline' fit
-    # methods.
+    # z-stack movie for later use with the 'spline' fit methods.
     spline_calib_parser = subparsers.add_parser(
         "spline-calibrate",
         help="build a cubic-spline PSF calibration from a bead z-stack",
