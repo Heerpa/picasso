@@ -7,10 +7,9 @@ sequence.
 
 Spot detection and the localization table live here; the fits themselves are
 run by :mod:`picasso.fitting` (Gaussian and cubic-spline PSF models on the CPU
-and on CUDA GPUs), :mod:`picasso.gausslq` and :mod:`picasso.gaussmle`. This
-module owns the translation between them: calibration dicts, initial
-parameters, the device choice, and the Cramer-Rao lower bounds that become the
-reported localization precisions.
+and on CUDA GPUs). This module owns the translation between them:
+calibration dicts, initial parameters, the device choice, and the
+Cramer-Rao lower bounds that become the reported localization precisions.
 
 References
 ----------
@@ -19,10 +18,6 @@ Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
 Scientific Reports 7, 15722 (2017).
 https://doi.org/10.1038/s41598-017-15313-9
 Licence (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
-
-Smith, C., Joseph, N., Rieger, B. & Lidke, K. "Fast, single-molecule
-localization that achieves theoretically minimum uncertainty."
-Nature Methods 7, 373-375 (2010). https://doi.org/10.1038/nmeth.1449
 
 :authors: Joerg Schnitzbauer, Maximilian Thomas Strauss,
     Rafal Kowalewski
@@ -58,8 +53,6 @@ from .ext import bitplane
 from . import (
     io,
     lib,
-    gausslq,
-    gaussmle,
     avgroi,
     postprocess,
     zfit,
@@ -111,7 +104,7 @@ _GAUSS_CRLB_MU_FLOOR = (
 )
 # EMCCD stochastic multiplication doubles every pixel's variance (excess noise
 # factor F^2 = 2), so every variance derived from a Poisson pixel model has to
-# be scaled by it. Same factor as in gausslq.localization_precision.
+# be scaled by it. Same factor as in precision.localization_precision.
 _EM_EXCESS_NOISE_FACTOR = 2.0
 
 # Largest channel count the photon-decoupled (link-XYZ) spline fit supports.
@@ -1926,13 +1919,16 @@ _GAUSS_SCHEDULES = {
     # (mle, use_gpu) -> (tolerance, max_iterations)
     #
     # On the CPU each estimator gets a schedule that converges it properly;
-    # for least squares that is what ``picasso.gausslq`` always used. On the
-    # GPU both keep Gpufit's, which is looser - deliberate rather than ideal,
-    # since it is what every "-gpu" code has always meant and changing it
-    # would silently move existing results. These are only *defaults*: pass
-    # ``eps``/``max_it``, or use the Localize parameters dialog, to change
-    # them.
-    (False, False): (gausslq.TOLERANCE, gausslq.MAX_ITERATIONS),
+    # for least squares that is the historical MINPACK schedule, kept in
+    # ``gaussfit`` as ``*_LSQ_CPU``. On the GPU both keep Gpufit's, which is
+    # looser - deliberate rather than ideal, since it is what every "-gpu"
+    # code has always meant and changing it would silently move existing
+    # results. These are only *defaults*: pass ``eps``/``max_it``, or use the
+    # Localize parameters dialog, to change them.
+    (False, False): (
+        gaussfit.TOLERANCE_LSQ_CPU,
+        gaussfit.MAX_ITERATIONS_LSQ_CPU,
+    ),
     (True, False): (1e-5, 100),
     (False, True): (gaussfit_cuda.TOLERANCE, gaussfit_cuda.MAX_ITERATIONS),
     (True, True): (gaussfit_cuda.TOLERANCE, gaussfit_cuda.MAX_ITERATIONS),
@@ -2158,7 +2154,7 @@ def _gauss_crlb(
         Fit box side length (pixels).
     em : bool
         EMCCD excess noise: doubles every parameter's variance (halves the
-        Fisher weight), as in :func:`gausslq.localization_precision`.
+        Fisher weight), as in :func:`precision.localization_precision`.
     rotated : bool, optional
         If True, ``theta`` carries the seventh (angle) column and the CRLB
         includes it. Default False.
@@ -2244,7 +2240,7 @@ def _gauss_crlb(
 
     if em:
         # EMCCD excess noise doubles every pixel's variance, hence the CRLB
-        # (matches the factor-2 in gausslq.localization_precision).
+        # (matches the factor-2 in precision.localization_precision).
         crlb *= _EM_EXCESS_NOISE_FACTOR
     crlb = np.where(crlb > 0.0, crlb, np.nan)
     return crlb
@@ -6680,7 +6676,7 @@ def _process_fitting_futures(
     abort_callback: Callable[[], bool] | None = None,
 ) -> lib.FloatArray2D | None:
     """Convenience function for processing progress of fitting using
-    multiprocessing. See ``_fit2d_gausslq``, ``_fit2d_avg``."""
+    multiprocessing. See ``_fit2d_gauss``, ``_fit2d_avg``."""
     n_tasks = len(fs)
     use_tqdm = progress_callback == "console"
     if use_tqdm:

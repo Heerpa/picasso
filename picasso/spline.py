@@ -64,7 +64,8 @@ from scipy.interpolate import make_smoothing_spline
 from scipy.ndimage import shift as _ndi_shift, zoom as _ndi_zoom
 from scipy.spatial import KDTree
 
-from . import io, lib, gausslq, localize, __version__
+from . import io, lib, localize, __version__
+from .fitting import gaussfit, splinefit
 
 
 def _step_of_frame(
@@ -384,17 +385,36 @@ def _bead_volumes(
     return volumes
 
 
+def _fit_gauss_spots(spots: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Least-squares elliptical Gaussian fit of ``(n_spots, box, box)`` spots.
+
+    Returns ``(thetas, states)``, the parameters
+    ``[photons, x, y, sx, sy, bg]`` - with ``x``/``y`` in box-local pixels,
+    ``x`` the column and ``y`` the row - and Gpufit's state codes (see
+    :data:`picasso.fitting.splinefit.FIT_STATE_CONVERGED`). The convergence
+    schedule is the least-squares one, so the calibration is unaffected by the
+    CPU Gaussian fitter's own (looser) defaults."""
+    spots = np.ascontiguousarray(spots, dtype=np.float32)
+    box = spots.shape[1]
+    thetas, _, states, _ = gaussfit.fit_spots(
+        gaussfit.ELLIPTIC,
+        spots,
+        localize._initial_parameters_gauss(spots, box),
+        tolerance=gaussfit.TOLERANCE_LSQ_CPU,
+        max_iterations=gaussfit.MAX_ITERATIONS_LSQ_CPU,
+    )
+    return thetas, states
+
+
 def _focus_step(volume: np.ndarray) -> tuple[int, float]:
     """Return ``(z_center, effective_sigma)``: the sharpest z-slice of a
     ``(box, box, n_steps)`` PSF volume (smallest fitted Gaussian sigma) and
-    the mean sigma there, using the least-squares single-spot fitter."""
-    n_steps = volume.shape[2]
-    sigmas = np.full(n_steps, np.inf, dtype=np.float32)
-    for k in range(n_steps):
-        theta = gausslq._fit_spot(np.ascontiguousarray(volume[:, :, k]))
-        sx, sy = abs(theta[4]), abs(theta[5])
-        if np.isfinite(sx) and np.isfinite(sy):
-            sigmas[k] = np.sqrt(sx * sy)
+    the mean sigma there, using the least-squares Gaussian fitter."""
+    thetas, _ = _fit_gauss_spots(volume.transpose(2, 0, 1))
+    sx, sy = np.abs(thetas[:, 3]), np.abs(thetas[:, 4])
+    sigmas = np.full(volume.shape[2], np.inf, dtype=np.float32)
+    ok = np.isfinite(sx) & np.isfinite(sy)
+    sigmas[ok] = np.sqrt(sx[ok] * sy[ok])
     z_center = int(np.argmin(sigmas))
     return z_center, float(sigmas[z_center])
 
@@ -526,15 +546,29 @@ def _focus_center_offset(
     a well-defined centroid. Returns ``(0.0, 0.0)`` if neither estimate is
     usable, so the caller simply leaves the volume alone."""
     focus = np.ascontiguousarray(volume[:, :, int(z_center)], dtype=np.float32)
-    try:
-        theta = gausslq._fit_spot(focus)
-        # gausslq returns [x, y, ...] as offsets from the box centre, x the
-        # column and y the row (see gausslq._sum_and_center_of_mass).
-        d_col, d_row = float(theta[0]), float(theta[1])
-    except Exception:
-        # a degenerate slice can divide by zero inside the least-squares
-        # model; that is a reason to fall back, not to fail the calibration
+    box = focus.shape[0]
+    thetas, states = _fit_gauss_spots(focus[None])
+    # theta is [photons, x, y, sx, sy, bg] in box-local pixels, x the column
+    # and y the row (see localize._initial_parameters_gauss). A slice no
+    # Gaussian can describe either aborts the fit or "converges" to one with
+    # no photons or a width beyond the box - neither is a centre estimate, and
+    # both are a reason to fall back rather than to fail the calibration.
+    photons, x, y, sx, sy = (float(_) for _ in thetas[0, :5])
+    aborted = states[0] in (
+        splinefit.FIT_STATE_SINGULAR_HESSIAN,
+        splinefit.FIT_STATE_NEG_CURVATURE_MLE,
+    )
+    usable = (
+        not aborted
+        and photons > 0.0
+        and 0.0 < abs(sx) <= box
+        and 0.0 < abs(sy) <= box
+    )
+    if not usable:
         d_col = d_row = np.nan
+    else:
+        center = (box / 2.0) - 0.5
+        d_col, d_row = x - center, y - center
     if not (np.isfinite(d_row) and np.isfinite(d_col)):
         weights = np.clip(focus - focus.min(), 0.0, None).astype(np.float64)
         total = float(weights.sum())

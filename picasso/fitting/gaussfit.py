@@ -81,6 +81,15 @@ _N_PARAMS = {SPHERICAL: 5, ELLIPTIC: 6, ROTATED: 7}
 TOLERANCE = 1e-2
 MAX_ITERATIONS = 20
 
+# Convergence schedule of the CPU least-squares path, inherited from the
+# retired ``picasso.gausslq``: ``TOLERANCE_LSQ_CPU`` was MINPACK's relative
+# reduction in both the sum of squares (``ftol``) and the parameter vector
+# (``xtol``). Kept separate from the schedule above so that least-squares
+# results do not move now that the fit runs here. Used by
+# ``picasso.localize.gauss_schedule``.
+TOLERANCE_LSQ_CPU = 1e-2
+MAX_ITERATIONS_LSQ_CPU = 200
+
 
 @numba.njit(nogil=True, cache=True, fastmath=_FASTMATH)
 def _estimator_terms(mle: bool, value: float, data: float) -> tuple:
