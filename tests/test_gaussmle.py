@@ -500,7 +500,7 @@ class TestDeprecation:
         not just the fitter."""
         message = gaussmle._DEPRECATION_MESSAGE
         assert "picasso.fitting.gaussfit.fit_spots" in message
-        assert "locs_from_fits_gauss_gpu" in message
+        assert "locs_from_fits_gauss" in message
         assert "sigma_uncertainty_mle" in message
         assert "_gauss_crlb" in message
 

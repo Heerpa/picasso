@@ -1772,7 +1772,7 @@ class TestGpufit:
     # -- end-to-end: fit -> localizations ---------------------------------
 
     def test_end_to_end_locs_absolute_position(self, synthetic_spots):
-        """fit_spots_gauss_gpu + locs_from_fits_gauss_gpu place each spot at its true
+        """fit_spots_gauss_gpu + locs_from_fits_gauss place each spot at its true
         absolute position (identification pixel + sub-pixel fit offset)."""
         spots, gt = synthetic_spots
         n = len(spots)
@@ -1786,7 +1786,7 @@ class TestGpufit:
             }
         )
         theta = localize.fit_spots_gauss_gpu(spots, mle=False)
-        locs = localize.locs_from_fits_gauss_gpu(ids, theta, box, em=False)
+        locs = localize.locs_from_fits_gauss(ids, theta, box, em=False)
         box_offset = int(box / 2)
         # x_abs = x_id + (x_fit - box_offset); x_fit - box//2 == gt.x
         np.testing.assert_allclose(locs["x"], 50 + gt.x.values, atol=3e-3)
@@ -1879,7 +1879,7 @@ class TestInitialParametersGpufit:
 
 
 class TestLocsFromFitsGpufit:
-    """``localize.locs_from_fits_gauss_gpu`` maps gpufit theta
+    """``localize.locs_from_fits_gauss`` maps gpufit theta
     ``[photons, x, y, sx, sy, bg, (angle)]`` to a localizations frame. Pure
     pandas/NumPy - no GPU needed."""
 
@@ -1908,7 +1908,7 @@ class TestLocsFromFitsGpufit:
             dtype=np.float32,
         )
         ids = self._ids(2)
-        locs = localize.locs_from_fits_gauss_gpu(ids, theta, BOX, em=False)
+        locs = localize.locs_from_fits_gauss(ids, theta, BOX, em=False)
         box_offset = int(BOX / 2)
         np.testing.assert_allclose(
             locs["x"], theta[:, 1] + ids["x"].to_numpy() - box_offset
@@ -1923,7 +1923,7 @@ class TestLocsFromFitsGpufit:
 
     def test_ellipticity_formula(self):
         theta = np.array([[500.0, 3.0, 3.0, 1.4, 1.0, 5.0]], dtype=np.float32)
-        locs = localize.locs_from_fits_gauss_gpu(
+        locs = localize.locs_from_fits_gauss(
             theta=theta, box=BOX, em=False, identifications=self._ids(1)
         )
         # (max - min) / max = (1.4 - 1.0) / 1.4
@@ -1935,7 +1935,7 @@ class TestLocsFromFitsGpufit:
         # A spherical fit has sx == sy, so ellipticity is always 0 and is
         # dropped entirely. The rest of the columns are unaffected.
         theta = np.array([[500.0, 3.0, 3.0, 1.2, 1.2, 5.0]], dtype=np.float32)
-        locs = localize.locs_from_fits_gauss_gpu(
+        locs = localize.locs_from_fits_gauss(
             self._ids(1), theta, BOX, em=False, spherical=True
         )
         assert "ellipticity" not in locs.columns
@@ -1955,10 +1955,10 @@ class TestLocsFromFitsGpufit:
 
     def test_spherical_flag_only_drops_ellipticity(self):
         theta = np.array([[500.0, 3.2, 3.7, 1.2, 1.2, 5.0]], dtype=np.float32)
-        full = localize.locs_from_fits_gauss_gpu(
+        full = localize.locs_from_fits_gauss(
             self._ids(1), theta, BOX, em=False, mle=True, spherical=False
         )
-        sph = localize.locs_from_fits_gauss_gpu(
+        sph = localize.locs_from_fits_gauss(
             self._ids(1), theta, BOX, em=False, mle=True, spherical=True
         )
         assert set(full.columns) - set(sph.columns) == {"ellipticity"}
@@ -1969,7 +1969,7 @@ class TestLocsFromFitsGpufit:
 
     def test_lse_precision_is_mortensen_no_unc_columns(self):
         theta = np.array([[500.0, 3.2, 3.7, 1.3, 1.1, 5.0]], dtype=np.float32)
-        locs = localize.locs_from_fits_gauss_gpu(
+        locs = localize.locs_from_fits_gauss(
             self._ids(1), theta, BOX, em=False, mle=False
         )
         expected_lpx = gausslq.localization_precision(
@@ -1986,7 +1986,7 @@ class TestLocsFromFitsGpufit:
 
     def test_mle_precision_is_crlb_with_unc_columns(self):
         theta = np.array([[500.0, 3.2, 3.7, 1.3, 1.1, 5.0]], dtype=np.float32)
-        locs = localize.locs_from_fits_gauss_gpu(
+        locs = localize.locs_from_fits_gauss(
             self._ids(1), theta, BOX, em=False, mle=True
         )
         crlb = localize._gauss_crlb(theta, BOX, em=False)
@@ -2013,7 +2013,7 @@ class TestLocsFromFitsGpufit:
             [[500.0, 3.0, 3.0, 1.4, 1.0, 5.0, np.deg2rad(100.0)]],
             dtype=np.float32,
         )
-        locs = localize.locs_from_fits_gauss_gpu(
+        locs = localize.locs_from_fits_gauss(
             self._ids(1), theta, BOX, em=False, mle=True
         )
         assert "angle" in locs.columns
@@ -2027,19 +2027,19 @@ class TestLocsFromFitsGpufit:
             (3, 1),
         )
         ids = self._ids(3, frames=[2, 0, 1])
-        locs = localize.locs_from_fits_gauss_gpu(ids, theta, BOX, em=False)
+        locs = localize.locs_from_fits_gauss(ids, theta, BOX, em=False)
         assert list(locs["frame"]) == [0, 1, 2]
 
     def test_stats_columns_optional(self):
         theta = np.array([[500.0, 3.0, 3.0, 1.2, 1.2, 5.0]], dtype=np.float32)
         # without stats, no log_likelihood / iterations
-        locs = localize.locs_from_fits_gauss_gpu(
+        locs = localize.locs_from_fits_gauss(
             self._ids(1), theta, BOX, em=False
         )
         assert "log_likelihood" not in locs.columns
         assert "iterations" not in locs.columns
         # with stats they appear, correctly typed
-        locs = localize.locs_from_fits_gauss_gpu(
+        locs = localize.locs_from_fits_gauss(
             self._ids(1),
             theta,
             BOX,
@@ -2054,15 +2054,38 @@ class TestLocsFromFitsGpufit:
 
     def test_em_scales_lse_precision_by_sqrt2(self):
         theta = np.array([[500.0, 3.2, 3.7, 1.3, 1.1, 5.0]], dtype=np.float32)
-        no_em = localize.locs_from_fits_gauss_gpu(
+        no_em = localize.locs_from_fits_gauss(
             self._ids(1), theta, BOX, em=False, mle=False
         )
-        em = localize.locs_from_fits_gauss_gpu(
+        em = localize.locs_from_fits_gauss(
             self._ids(1), theta, BOX, em=True, mle=False
         )
         np.testing.assert_allclose(
             em["lpx"] / no_em["lpx"], np.sqrt(2.0), rtol=1e-5
         )
+
+    def test_gpu_suffixed_alias_warns_and_forwards(self):
+        """The old ``_gpu``-suffixed name was a misnomer (the converter is
+        backend-agnostic), so it warns but must still return the same frame."""
+        theta = np.array([[500.0, 3.2, 3.7, 1.3, 1.1, 5.0]], dtype=np.float32)
+        ids = self._ids(1)
+        with pytest.warns(DeprecationWarning, match="locs_from_fits_gauss"):
+            old = localize.locs_from_fits_gauss_gpu(ids, theta, BOX, em=False)
+        new = localize.locs_from_fits_gauss(ids, theta, BOX, em=False)
+        pd.testing.assert_frame_equal(old, new)
+
+    def test_legacy_locs_from_fits_is_deprecated(self):
+        """The leftover ``gaussmle``-GPU converter goes in 1.0."""
+        theta = np.zeros((1, 6), dtype=np.float32)
+        with pytest.warns(DeprecationWarning, match="locs_from_fits_gauss"):
+            localize.locs_from_fits(
+                self._ids(1),
+                theta,
+                np.ones((1, 6), dtype=np.float32),
+                np.zeros(1, dtype=np.float32),
+                np.ones(1, dtype=np.int32),
+                BOX,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -4252,7 +4275,7 @@ class TestFit2DGpu:
             picasso_movie, real_identifications, BOX, self.CAMERA_INFO
         )
         theta = localize.fit_spots_gauss_gpu(spots, mle=False)
-        direct = localize.locs_from_fits_gauss_gpu(
+        direct = localize.locs_from_fits_gauss(
             real_identifications, theta, BOX, em=False
         )
         np.testing.assert_allclose(
@@ -5260,16 +5283,16 @@ class TestSaveableColumns:
             ],
             dtype=np.float32,
         )
-        frames["gpufit-mle"] = localize.locs_from_fits_gauss_gpu(
+        frames["gpufit-mle"] = localize.locs_from_fits_gauss(
             ids, theta_e, BOX, em=False, mle=True, **stats
         )
-        frames["gpufit-mle-rotated"] = localize.locs_from_fits_gauss_gpu(
+        frames["gpufit-mle-rotated"] = localize.locs_from_fits_gauss(
             ids, theta_r, BOX, em=False, mle=True, **stats
         )
-        frames["gpufit-lse"] = localize.locs_from_fits_gauss_gpu(
+        frames["gpufit-lse"] = localize.locs_from_fits_gauss(
             ids, theta_e, BOX, em=False, mle=False, **lsq_stats
         )
-        frames["gpufit-lse-rotated"] = localize.locs_from_fits_gauss_gpu(
+        frames["gpufit-lse-rotated"] = localize.locs_from_fits_gauss(
             ids, theta_r, BOX, em=False, mle=False, **lsq_stats
         )
 

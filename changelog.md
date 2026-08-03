@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 02-AUG-2026 CEST
+Last change: 03-AUG-2026 CEST
 
 ## 0.11.0
 
@@ -18,7 +18,7 @@ Last change: 02-AUG-2026 CEST
 - **`picasso.gausslq` and `picasso.gaussmle` are deprecated and the whole modules will be removed in Picasso 1.0**, so that all fitting lives in the `picasso.fitting` subpackage. Every public name in them now raises a `DeprecationWarning` naming its replacement:
   - the fitters (`fit_spot`, `fit_spots`, `fit_spots_parallel`, `gaussmle`, `gaussmle_async`) → `picasso.fitting.gaussfit.fit_spots` / `fit_spots_async`
   - `fit_spots_gauss_gpu` → `picasso.fitting.gaussfit_cuda.fit_spots`
-  - `locs_from_fits` → `picasso.localize.locs_from_fits_gauss_gpu`
+  - `locs_from_fits` → `picasso.localize.locs_from_fits_gauss`
   - `localization_precision` and the two `sigma_uncertainty` functions → the new `picasso.fitting.precision` module, as `localization_precision`, `sigma_uncertainty_lsq` and `sigma_uncertainty_mle`
   - Implementation of elliptical Gaussian MLE fitting on CPU changed slightly, now matching the results from Gpufit
 - New CPU fitting backend `picasso.fitting.gaussfit`: all three 2D Gaussian models (spherical, elliptical and rotated) over the same Levenberg-Marquardt driver as the GPU (Gpufit). Multithreading is used instead of multiprocessing.

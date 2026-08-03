@@ -14,7 +14,7 @@ Smith, et al. Nature Methods, 2010.
     ==========================  =============================================
     ``gaussmle``                 ``fitting.gaussfit.fit_spots(mle=True)``
     ``gaussmle_async``           ``fitting.gaussfit.fit_spots_async``
-    ``locs_from_fits``           ``localize.locs_from_fits_gauss_gpu``
+    ``locs_from_fits``           ``localize.locs_from_fits_gauss``
     ``sigma_uncertainty``        ``fitting.precision.sigma_uncertainty_mle``
     (the CRLB)                   ``localize._gauss_crlb``
     ==========================  =============================================
@@ -52,7 +52,7 @@ _DEPRECATION_MESSAGE = (
     "picasso.gaussmle is deprecated and will be removed in Picasso 1.0. All "
     "fitting now lives in picasso.fitting: use "
     "picasso.fitting.gaussfit.fit_spots with mle=True, "
-    "picasso.localize.locs_from_fits_gauss_gpu to build the localizations, "
+    "picasso.localize.locs_from_fits_gauss to build the localizations, "
     "picasso.localize._gauss_crlb for the Cramer-Rao bound, and "
     "picasso.fitting.precision.sigma_uncertainty_mle for the width "
     "uncertainty."
@@ -1040,7 +1040,7 @@ def locs_from_fits(
 
     .. deprecated:: 0.11
         This whole module is removed in Picasso 1.0. Use
-        ``picasso.localize.locs_from_fits_gauss_gpu``.
+        ``picasso.localize.locs_from_fits_gauss``.
 
     See :func:`_locs_from_fits` for the full description."""
     lib.deprecation_warning(_DEPRECATION_MESSAGE)

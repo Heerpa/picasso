@@ -14,7 +14,7 @@ Fit spots (single-molecule images) with 2D Gaussian least squares.
     ``fit_spot`` / ``fit_spots``    ``fitting.gaussfit.fit_spots``
     ``fit_spots_parallel``          ``fitting.gaussfit.fit_spots_async``
     ``fit_spots_gauss_gpu``         ``fitting.gaussfit_cuda.fit_spots``
-    ``locs_from_fits``              ``localize.locs_from_fits_gauss_gpu``
+    ``locs_from_fits``              ``localize.locs_from_fits_gauss``
     ``localization_precision``      ``fitting.precision.localization_precision``
     ``sigma_uncertainty``           ``fitting.precision.sigma_uncertainty_lsq``
     ==============================  ===============================
@@ -61,7 +61,7 @@ _DEPRECATION_MESSAGE = (
     "picasso.gausslq is deprecated and will be removed in Picasso 1.0. All "
     "fitting now lives in picasso.fitting: use "
     "picasso.fitting.gaussfit.fit_spots (or fit_spots_async) for the fit, "
-    "picasso.localize.locs_from_fits_gauss_gpu to build the localizations, "
+    "picasso.localize.locs_from_fits_gauss to build the localizations, "
     "and picasso.fitting.precision.localization_precision / "
     "sigma_uncertainty_lsq for the analytic precisions."
 )
@@ -805,7 +805,7 @@ def locs_from_fits(
 
     .. deprecated:: 0.11
         This whole module is removed in Picasso 1.0. Use
-        ``picasso.localize.locs_from_fits_gauss_gpu``, which builds the same
+        ``picasso.localize.locs_from_fits_gauss``, which builds the same
         table from the parameter layout ``picasso.fitting.gaussfit`` returns.
 
     See :func:`_locs_from_fits` for the full description."""
@@ -892,7 +892,8 @@ def _locs_from_fits(
         np.float32
     )
     if rotated:
-        # Match the GPU convention (see localize.locs_from_fits_gauss_gpu):
+        # Match the fitting subpackage's convention (see
+        # localize.locs_from_fits_gauss):
         # negate, convert to degrees and normalize to [-90, 90) since the
         # ellipse repeats every half turn.
         angle = -np.rad2deg(theta[:, 6])
@@ -922,7 +923,7 @@ def locs_from_fits_gauss_gpu(
 
     .. deprecated:: 0.11
         This whole module is removed in Picasso 1.0. Use
-        ``picasso.localize.locs_from_fits_gauss_gpu``, which this already
+        ``picasso.localize.locs_from_fits_gauss``, which this already
         forwards to.
 
     Parameters
@@ -948,7 +949,7 @@ def locs_from_fits_gauss_gpu(
     from picasso import localize
 
     lib.deprecation_warning(_DEPRECATION_MESSAGE)
-    return localize.locs_from_fits_gauss_gpu(identifications, theta, box, em)
+    return localize.locs_from_fits_gauss(identifications, theta, box, em)
 
 
 def localization_precision(

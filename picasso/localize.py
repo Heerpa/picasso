@@ -1458,6 +1458,11 @@ def locs_from_fits(
     """Convert the resulting localizations from the list of Futures
     into a data frame.
 
+    .. deprecated:: 0.11
+        Removed in Picasso 1.0. Left over from the old ``gaussmle`` GPU
+        pipeline and unused since; use :func:`locs_from_fits_gauss`,
+        which takes the fitters' ``theta`` layout directly.
+
     Parameters
     ----------
     identifications : pd.DataFrame
@@ -1483,6 +1488,10 @@ def locs_from_fits(
         `frame`, `x`, `y`, `photons`, `sx`, `sy`, `bg`, `lpx`, `lpy`,
         `net_gradient`, `log_likelihood`, and `iterations`.
     """
+    lib.deprecation_warning(
+        "picasso.localize.locs_from_fits is deprecated and will be removed "
+        "in Picasso 1.0. Use picasso.localize.locs_from_fits_gauss."
+    )
     # box_offset = int(box / 2)
     y = theta[:, 0] + identifications["y"]  # - box_offset
     x = theta[:, 1] + identifications["x"]  # - box_offset
@@ -2229,7 +2238,7 @@ def _gauss_crlb(
     return crlb
 
 
-def locs_from_fits_gauss_gpu(
+def locs_from_fits_gauss(
     identifications: pd.DataFrame,
     theta: lib.FloatArray2D,
     box: int,
@@ -2242,6 +2251,10 @@ def locs_from_fits_gauss_gpu(
 ) -> pd.DataFrame:
     """Convert the fit results from a Gaussian fit into a data frame of
     localizations.
+
+    Backend-agnostic: ``picasso.fitting.gaussfit`` (CPU) and
+    ``picasso.fitting.gaussfit_cuda`` (GPU) return the same ``theta``
+    layout, so both are converted here.
 
     Parameters
     ----------
@@ -2304,7 +2317,7 @@ def locs_from_fits_gauss_gpu(
     y = theta[:, 2] + identifications["y"] - box_offset
     if mle:
         # Poisson Cramer-Rao bound from the Fisher information of the
-        # point-sampled Gaussian model the GPU optimizes. Columns of ``crlb``
+        # point-sampled Gaussian model the fitters optimize. Columns of ``crlb``
         # follow ``theta``: [photons, x, y, sx, sy, bg, (angle)].
         crlb = _gauss_crlb(theta, box, em, rotated=rotated)
         with np.errstate(invalid="ignore"):
@@ -2371,6 +2384,23 @@ def locs_from_fits_gauss_gpu(
     return locs
 
 
+def locs_from_fits_gauss_gpu(*args, **kwargs) -> pd.DataFrame:
+    """Convert the fit results from a Gaussian fit into a data frame of
+    localizations.
+
+    .. deprecated:: 0.11
+        Renamed to :func:`locs_from_fits_gauss` and removed under this
+        name in Picasso 1.0. The function never was GPU-specific: it
+        converts CPU and GPU Gaussian fits alike.
+    """
+    lib.deprecation_warning(
+        "picasso.localize.locs_from_fits_gauss_gpu is deprecated and will "
+        "be removed in Picasso 1.0. It handles CPU and GPU fits alike and "
+        "was renamed to picasso.localize.locs_from_fits_gauss."
+    )
+    return locs_from_fits_gauss(*args, **kwargs)
+
+
 def _fit2d_gauss(
     spots: lib.FloatArray3D,
     identifications: pd.DataFrame,
@@ -2403,7 +2433,7 @@ def _fit2d_gauss(
         max_iterations=max_iterations,
         progress_callback=progress_callback,
     )
-    locs = locs_from_fits_gauss_gpu(
+    locs = locs_from_fits_gauss(
         identifications,
         theta,
         box,
@@ -5223,7 +5253,7 @@ def locs_from_fits_spline(
     ``log_likelihood`` (MLE) and ``chi_square`` (the least-squares residual
     sum of squares at the optimum) are the per-estimator goodness-of-fit
     metrics; each becomes a column when given. See
-    :func:`locs_from_fits_gauss_gpu` for how to read ``chi_square``."""
+    :func:`locs_from_fits_gauss` for how to read ``chi_square``."""
     calibration = crop_spline_calibration(calibration, box)
     model = calibration["model"]
     if model == _LINK_XYZ_MODEL:

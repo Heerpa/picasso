@@ -653,7 +653,7 @@ def _fit_gauss_spot(
         iterations[index] = n_iterations
     else:
         # The fit diverged. Report NaN parameters with an infinite chi-square;
-        # ``localize.locs_from_fits_gauss_gpu`` turns those into NaN precisions.
+        # ``localize.locs_from_fits_gauss`` turns those into NaN precisions.
         for p in range(n_params):
             thetas[index, p] = np.nan
         chi_squares[index] = np.inf
