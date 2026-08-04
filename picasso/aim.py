@@ -685,15 +685,9 @@ def aim(
     drift : pd.DataFrame
         Drift in x and y directions (and z if applicable).
     """
-    assert (
-        progress is None
-        or progress == "console"
-        or isinstance(progress, lib.ProgressDialog)
-    ), "progress must be None, 'console', or a ProgressDialog instance."
-    if progress is None:
-        progress = lib.MockProgress()
-    elif progress == "console":
-        progress = lib.TqdmProgress(description="Undrifting by AIM (1/2)")
+    progress = lib.normalize_progress(
+        progress, description="Undrifting by AIM (1/2)"
+    )
 
     locs = locs.copy()
     # extract metadata

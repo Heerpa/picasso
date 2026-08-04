@@ -21,10 +21,13 @@ from typing import Literal
 import numpy as np
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+# must come after the PyQt6 import so that matplotlib's qt_compat
+# selects the PyQt6 binding (picasso core no longer imports PyQt6)
 from matplotlib.backends.backend_qt5agg import FigureCanvas
 from scipy.optimize import curve_fit
 from scipy.stats import norm
-from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .. import io, lib, simulate, __version__
 

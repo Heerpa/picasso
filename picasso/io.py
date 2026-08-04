@@ -19,7 +19,7 @@ import json
 import os
 import threading
 import warnings
-from typing import Callable, Literal
+from typing import Callable, Literal, TYPE_CHECKING
 
 import tifffile
 import yaml
@@ -27,7 +27,9 @@ import h5py
 import nd2
 import numpy as np
 import pandas as pd
-from PyQt6 import QtWidgets
+
+if TYPE_CHECKING:
+    from PyQt6 import QtWidgets
 
 from . import lib, __version__
 
@@ -1010,6 +1012,8 @@ def load_info(
     # Neither the sidecar file nor embedded metadata was found.
     print(f"\nAn error occured. Could not find metadata file:\n{filename}")
     if qt_parent is not None:
+        from PyQt6 import QtWidgets
+
         QtWidgets.QMessageBox.critical(
             qt_parent,
             "An error occured",
@@ -3544,6 +3548,8 @@ def load_locs(
             "'locs' dataset."
         )
         if qt_parent is not None:
+            from PyQt6 import QtWidgets
+
             QtWidgets.QMessageBox.critical(
                 qt_parent,
                 "An error occured",
@@ -3613,6 +3619,8 @@ def load_identifications(
             "'identifications' dataset."
         )
         if qt_parent is not None:
+            from PyQt6 import QtWidgets
+
             QtWidgets.QMessageBox.critical(
                 qt_parent,
                 "An error occured",

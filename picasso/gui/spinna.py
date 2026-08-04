@@ -30,9 +30,12 @@ import pandas as pd
 import matplotlib
 import matplotlib.font_manager
 import matplotlib.pyplot as plt
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+# must come after the PyQt6 import so that matplotlib's qt_compat
+# selects the PyQt6 binding (picasso core no longer imports PyQt6)
 from matplotlib.backends.backend_qt5agg import FigureCanvas
 from scipy.spatial.transform import Rotation
-from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .. import io, lib, render, spinna, __version__
 

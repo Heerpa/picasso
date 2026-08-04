@@ -409,23 +409,12 @@ def _resolve_progress(
 
     Returns
     -------
-    callable or None
-        Called with the cumulative number of processed items, or None if
-        no progress should be reported.
+    callable
+        Called with the cumulative number of processed items.
     """
-    assert (
-        progress is None
-        or progress == "console"
-        or isinstance(progress, lib.ProgressDialog)
-    ), "progress must be None, 'console', or a ProgressDialog instance."
-    if progress is None:
-        return lib.MockProgress().set_value
-    if progress == "console":
-        tqdm_progress = lib.TqdmProgress(description=description)
-        tqdm_progress.get_iterator(0, total, unit=unit)  # arm the tqdm bar
-        return tqdm_progress.set_value
-    # lib.ProgressDialog: set its range here so callers need not know the
-    # internal item count (e.g. number of KDTree batches or clusters)
+    progress = lib.normalize_progress(progress, description, unit=unit)
+    # set the range here so callers need not know the internal item
+    # count (e.g. number of KDTree batches or clusters)
     progress.setMaximum(total)
     return progress.set_value
 
