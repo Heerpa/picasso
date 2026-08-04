@@ -2223,13 +2223,18 @@ def _save_multichannel_diagnostics(
             title_prefix=f"{label} - ",
         )
         # <base>_ch{c}_beads.png: the beads that were averaged into this
-        # channel's PSF and those rejected as outliers
-        _save_bead_gallery_plot(
-            per_channel[c],
-            calib_c,
-            f"{base}_ch{c}.hdf5",
-            label=f"{label} - ",
-        )
+        # channel's PSF and those rejected as outliers. Guarded on its own so
+        # a failure here cannot cost us the summary and registration figures
+        # that are written after this loop.
+        try:
+            _save_bead_gallery_plot(
+                per_channel[c],
+                calib_c,
+                f"{base}_ch{c}.hdf5",
+                label=f"{label} - ",
+            )
+        except Exception:
+            pass
     # cross-channel summary: overlaid axial profiles and joint z accuracy
     # (see _save_multichannel_summary_plot)
     _save_multichannel_summary_plot(
@@ -3714,6 +3719,21 @@ def _save_diagnostic_plot(
 # ----------------------------------------------------------------------
 # Bead inspection: which beads went into the PSF and which were filtered out
 # ----------------------------------------------------------------------
+
+
+def n_beads_used(calibration: dict) -> int:
+    """How many beads actually went into the calibration's PSF.
+
+    A multichannel calibration stores one count per channel; the reference
+    channel's is the meaningful single number, since it is the channel the
+    beads were detected on. Falls back to the detected bead count for a
+    calibration built before the filtering was recorded, so a caller can
+    always compare it against ``n_beads``."""
+    detected = int(calibration.get("n_beads", 0))
+    used = calibration.get("n_beads_used", detected)
+    if isinstance(used, (list, tuple, np.ndarray)):
+        used = used[0] if len(used) else detected
+    return int(used)
 
 
 def bead_inspection_data(

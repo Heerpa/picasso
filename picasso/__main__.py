@@ -1466,11 +1466,7 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
         )
     print("------------------------------------------")
     n_beads = calibration["n_beads"]
-    # multichannel reports one count per channel; the reference channel is the
-    # one the beads were detected on
-    n_used = calibration.get("n_beads_used", n_beads)
-    if isinstance(n_used, (list, tuple)):
-        n_used = n_used[0] if len(n_used) else n_beads
+    n_used = spline.n_beads_used(calibration)
     built_from = f"{n_beads} beads"
     if n_used < n_beads:
         # the rejected beads are not in the PSF; the gallery next to the

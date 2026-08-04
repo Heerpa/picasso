@@ -7540,13 +7540,10 @@ class SplineCalibrationWorker(QtCore.QThread):
         # PSF, which were rejected) are read off the worker by the window when
         # it opens the bead inspector; they are too large for a signal payload
         self.bead_diagnostics = [d for d in diagnostics if d]
-        n_used = calibration.get("n_beads_used", calibration.get("n_beads", 0))
-        # multichannel reports one count per channel; the reference channel's
-        # beads are the ones the user detected on
-        if isinstance(n_used, (list, tuple)):
-            n_used = n_used[0] if len(n_used) else 0
         self.finished.emit(
-            self.path, int(calibration.get("n_beads", 0)), int(n_used)
+            self.path,
+            int(calibration.get("n_beads", 0)),
+            spline.n_beads_used(calibration),
         )
 
 

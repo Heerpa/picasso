@@ -484,6 +484,52 @@ class TestBeadFiltering:
         spline.plot_bead_gallery(data, fig, max_beads=1)
         assert len(fig.axes) == 3 * (1 + n_rejected) + 1
 
+    def test_n_beads_used_reads_either_calibration_layout(self):
+        # a multichannel calibration counts per channel; the reference
+        # channel's count is the one to report
+        assert spline.n_beads_used({"n_beads": 20, "n_beads_used": 17}) == 17
+        assert (
+            spline.n_beads_used({"n_beads": 20, "n_beads_used": [17, 15]})
+            == 17
+        )
+        # a calibration built before the filtering was recorded
+        assert spline.n_beads_used({"n_beads": 20}) == 20
+
+    def test_calibrate_multichannel_records_every_channel(self, tmp_path):
+        """Every channel builds its own PSF from its own beads, so each one
+        gets its own filtering record and gallery - the reference channel's
+        rejections say nothing about the others."""
+        movie_ref, _, _ = _synthetic_bead_movie()
+        movie_c = np.roll(movie_ref, shift=(2, -1), axis=(1, 2))
+        info = [{"Frames": int(movie_ref.shape[0])}]
+        path = str(tmp_path / "mc_spline_calib.hdf5")
+        calib, diagnostics = spline.calibrate_spline_multichannel(
+            [movie_ref, movie_c],
+            infos=[info, info],
+            camera_infos=[CAMERA_INFO, CAMERA_INFO],
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            path=path,
+            return_diagnostics=True,
+        )
+        assert len(calib["n_beads_used"]) == 2
+        assert spline.n_beads_used(calib) == calib["n_beads_used"][0]
+        assert len(diagnostics) == 2
+        assert diagnostics[0]["label"].startswith("reference channel")
+        assert diagnostics[1]["label"].startswith("channel 1")
+        for data in diagnostics:
+            assert len(data["keep"]) == calib["n_beads"]
+        for channel in (0, 1):
+            assert os.path.exists(
+                str(tmp_path / f"mc_spline_calib_ch{channel}_beads.png")
+            )
+        # the galleries must not have cost us the cross-channel diagnostics
+        assert os.path.exists(str(tmp_path / "mc_spline_calib_summary.png"))
+        assert os.path.exists(
+            str(tmp_path / "mc_spline_calib_registration.png")
+        )
+
     def test_calibrate_spline_writes_the_bead_gallery(self, tmp_path):
         movie, _, _ = _synthetic_bead_movie()
         path = str(tmp_path / "bead_spline_calib.hdf5")
@@ -1652,6 +1698,30 @@ class TestCliWiring:
         from picasso import __main__ as cli
 
         assert callable(cli._spline_calibrate)
+
+    def test_spline_calibrate_reports_the_filtered_beads(self, tmp_path):
+        """The command line has no inspector, so its summary must say how many
+        beads were actually used and point at the gallery that was written."""
+        import inspect
+        from picasso import __main__ as cli
+
+        src = inspect.getsource(cli._spline_calibrate)
+        assert "spline.n_beads_used(calibration)" in src
+        assert "_beads.png" in src
+
+        # and the gallery really is written next to the calibration
+        movie, _, _ = _synthetic_bead_movie()
+        path = str(tmp_path / "cli_spline_calib.hdf5")
+        spline.calibrate_spline(
+            movie,
+            info=[{"Frames": int(movie.shape[0])}],
+            camera_info=CAMERA_INFO,
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            path=path,
+        )
+        assert os.path.exists(str(tmp_path / "cli_spline_calib_beads.png"))
 
     def test_backend_accepts_both_spline_codes(self):
         # both spline codes must be recognised model ids by the backend
