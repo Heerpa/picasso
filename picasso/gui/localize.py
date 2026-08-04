@@ -2759,6 +2759,7 @@ class ParametersDialog(lib.Dialog):
             quality_grid.addWidget(_, idx + 1, 2)
 
         self.reset_quality_check()
+        vbox.addStretch(1)
 
         # adjust the size of the dialog to fit its contents
         hint = container.sizeHint()
