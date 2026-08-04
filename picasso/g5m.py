@@ -2506,11 +2506,13 @@ def g5m(
         prior to G5M. Use "group_input" when the "group" column has been
         overwritten but the original cluster ids are preserved in
         "group_input". Default is "group".
-    callback_parent : {QtWidgets.QMainWindow, "console", None}, optional
-        Callback function's parent object for displaying progress bar.
-        If "console" tqdm is used to display the progress bar in the
-        console. If None, no progress is displayed. Default is
-        "console".
+    callback_parent : QMainWindow, ProgressType, "console" or None, optional
+        Where progress is reported. A parent widget builds a
+        ``lib.ProgressDialog`` for it; "console" uses tqdm; None
+        displays nothing. A ready-made progress tracker (anything with
+        the ``ProgressDialog`` interface, see
+        ``lib.normalize_progress``) can also be passed and is driven
+        directly. Default is "console".
 
     Returns
     -------
@@ -2568,14 +2570,19 @@ def g5m(
     # determine how many steps are displayed in the progress bar
     n_steps = N_TASKS if asynch else len(np.unique(locs["group"]))
 
-    # initialize the progress bar (uniform ProgressDialog-like
-    # interface, see lib.normalize_progress)
+    # initialize the progress bar. Everything below drives the same
+    # ProgressDialog-like interface (see lib.normalize_progress), so a
+    # ready-made tracker can be passed instead of a parent window.
     if callback_parent is None or callback_parent == "console":
         progress = lib.normalize_progress(
             callback_parent, description="Running G5M..."
         )
         progress.setMaximum(n_steps)
-    else:
+    elif callable(getattr(callback_parent, "set_value", None)):
+        progress = callback_parent
+        progress.zero_progress("Running G5M...")
+        progress.setMaximum(n_steps)
+    else:  # a parent widget: build the dialog for it
         progress = lib.ProgressDialog(
             "Running G5M...", 0, n_steps, callback_parent
         )

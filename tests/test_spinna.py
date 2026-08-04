@@ -1609,3 +1609,119 @@ def test_fit_le_smoke(mols_real):
     assert len(best_props) == 3
     assert isinstance(best_mixer, StructureMixer)
     assert len(best_mixer.structures) == 3
+
+
+# ---------------------------------------------------------------------
+# Section H — Progress reporting
+#
+# Progress is driven through a uniform duck-typed interface (see
+# lib.normalize_progress), so every fitting mode must work with None,
+# "console" and any object implementing that interface.
+# ---------------------------------------------------------------------
+
+
+class _RecordingProgress:
+    """Duck-typed progress tracker recording the calls it receives."""
+
+    def __init__(self):
+        self.values = []
+        self.maxima = []
+        self.titles = []
+        self.description_base = ""
+        self.closed = False
+
+    def set_value(self, value):
+        self.values.append(value)
+
+    def setMaximum(self, maximum):
+        self.maxima.append(maximum)
+
+    def maximum(self):
+        return self.maxima[-1] if self.maxima else 0
+
+    def zero_progress(self, description=None, *args, **kwargs):
+        self.titles.append(description)
+
+    def close(self, *args, **kwargs):
+        self.closed = True
+
+
+@pytest.fixture
+def small_spinner(mols_real, monomer_dimer_structures):
+    """A SPINNA instance plus a small search space, cheap to fit."""
+    coords = mols_real[["x", "y"]].to_numpy()
+    n = int(len(coords) / LE)
+    mixer = StructureMixer(
+        structures=monomer_dimer_structures,
+        label_unc={"target": LABEL_UNC},
+        le={"target": LE},
+        width=ROI,
+        height=ROI,
+    )
+    ss = spinna.generate_N_structures(
+        monomer_dimer_structures, {"target": n}, granularity=3
+    )
+    spinner = SPINNA(mixer=mixer, gt_coords={"target": coords}, N_sim=1)
+    return spinner, ss
+
+
+@pytest.mark.parametrize(
+    "fitting_mode", ["brute-force", "coarse-to-fine", "bayesian"]
+)
+@pytest.mark.parametrize("callback", [None, "console"])
+def test_fit_progress_modes(small_spinner, fitting_mode, callback):
+    spinner, ss = small_spinner
+    np.random.seed(0)
+    props, score = spinner.fit_stoichiometry(
+        N_structures=ss,
+        fitting_mode=fitting_mode,
+        asynch=False,
+        callback=callback,
+    )
+    assert np.isfinite(score)
+    assert props.shape == (2,)
+
+
+@pytest.mark.parametrize(
+    "fitting_mode", ["brute-force", "coarse-to-fine", "bayesian"]
+)
+def test_fit_reports_progress_to_duck_typed_tracker(
+    small_spinner, fitting_mode
+):
+    spinner, ss = small_spinner
+    tracker = _RecordingProgress()
+    np.random.seed(0)
+    spinner.fit_stoichiometry(
+        N_structures=ss,
+        fitting_mode=fitting_mode,
+        asynch=False,
+        callback=tracker,
+    )
+    assert tracker.values, "no progress was reported"
+    assert tracker.maxima, "progress range was never set"
+    assert all(m > 0 for m in tracker.maxima)
+    # progress never exceeds the range declared at the time
+    assert max(tracker.values) <= max(tracker.maxima)
+
+
+def test_invalid_callback_raises(small_spinner):
+    spinner, ss = small_spinner
+    with pytest.raises((TypeError, ValueError)):
+        spinner.fit_stoichiometry(
+            N_structures=ss, fitting_mode="brute-force", callback="bogus"
+        )
+
+
+def test_coarse_to_fine_labels_both_passes(small_spinner):
+    spinner, ss = small_spinner
+    tracker = _RecordingProgress()
+    np.random.seed(0)
+    spinner.fit_stoichiometry(
+        N_structures=ss,
+        fitting_mode="coarse-to-fine",
+        asynch=False,
+        callback=tracker,
+    )
+    titles = " | ".join(t for t in tracker.titles if t)
+    assert "Coarse pass" in titles
+    assert "Fine pass" in titles

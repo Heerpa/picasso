@@ -3510,19 +3510,22 @@ class SPINNA:
         )
 
         # --- Phase 2: GP-guided acquisition ---
-        callback.zero_progress(gp_title)
-        callback.setMaximum(n_iterations)
-        evaluated, scores, _ = self._bayesian_gp_phase(
-            proportions=proportions,
-            N_structures=N_structures,
-            evaluated=evaluated,
-            scores=scores,
-            n_iterations=n_iterations,
-            callback=callback,
-            eval_count=0,
-        )
-        # fill the bar (the maximum was shrunk on early stopping)
-        callback.set_value(callback.maximum())
+        # skipped when the initial design already covered the whole
+        # search space (a zero range would show as a busy indicator)
+        if n_iterations > 0:
+            callback.zero_progress(gp_title)
+            callback.setMaximum(n_iterations)
+            evaluated, scores, _ = self._bayesian_gp_phase(
+                proportions=proportions,
+                N_structures=N_structures,
+                evaluated=evaluated,
+                scores=scores,
+                n_iterations=n_iterations,
+                callback=callback,
+                eval_count=0,
+            )
+            # fill the bar (the maximum was shrunk on early stopping)
+            callback.set_value(callback.maximum())
 
         # collect results for evaluated candidates only
         N_evaluated = N_structures[evaluated]

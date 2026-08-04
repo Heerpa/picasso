@@ -11,6 +11,8 @@ rectangle containment, drift-shift inversion, and group syncing.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import warnings
 
 import matplotlib
@@ -587,3 +589,149 @@ class TestSyncGroups:
         a = pd.DataFrame({"x": [1.0]})
         with pytest.raises(AssertionError):
             lib.sync_groups([a])
+
+
+# ---------------------------------------------------------------------------
+# Progress trackers (MockProgress / TqdmProgress / normalize_progress)
+# ---------------------------------------------------------------------------
+
+
+class TestMockProgress:
+    def test_implements_full_interface_silently(self):
+        p = lib.MockProgress()
+        p.init()
+        p.set_value(3)
+        p.zero_progress()
+        p.zero_progress("new phase")
+        p.setLabelText("text")
+        p.play_sound_notification()
+        p.close()
+        assert list(p.get_iterator(0, 5)) == [0, 1, 2, 3, 4]
+
+    def test_maximum_roundtrip(self):
+        p = lib.MockProgress()
+        assert p.maximum() == 0
+        p.setMaximum(42)
+        assert p.maximum() == 42
+
+
+class TestTqdmProgress:
+    def test_bar_armed_lazily_on_first_set_value(self):
+        p = lib.TqdmProgress(description="phase 1")
+        p.setMaximum(10)
+        assert p.iterator is None  # not armed yet
+        p.set_value(3)
+        assert p.iterator is not None
+        assert p.iterator.total == 10
+        assert p.iterator.n == 3
+        assert p.iterator.desc == "phase 1"
+        p.close()
+        assert p.iterator is None
+
+    def test_set_maximum_updates_active_bar_in_place(self):
+        # the early-stopping case: shrink the target of a running bar
+        p = lib.TqdmProgress(description="gp phase")
+        p.setMaximum(100)
+        p.set_value(30)
+        bar = p.iterator
+        p.setMaximum(30)
+        assert p.iterator is bar  # same bar, not re-armed
+        assert p.iterator.total == 30
+        assert p.maximum() == 30
+        p.close()
+
+    def test_zero_progress_starts_fresh_bar_with_new_title(self):
+        p = lib.TqdmProgress(description="phase 1")
+        p.setMaximum(5)
+        p.set_value(5)
+        first_bar = p.iterator
+        p.zero_progress("phase 2")
+        assert p.iterator is None  # old bar closed
+        p.setMaximum(7)
+        p.set_value(1)
+        assert p.iterator is not first_bar
+        assert p.iterator.desc == "phase 2"
+        assert p.iterator.total == 7
+        p.close()
+
+    def test_get_iterator_closes_previous_bar(self):
+        p = lib.TqdmProgress(description="loop")
+        p.setMaximum(3)
+        p.set_value(1)
+        first_bar = p.iterator
+        iterator = p.get_iterator(0, 4)
+        assert p.iterator is not first_bar
+        assert list(iterator) == [0, 1, 2, 3]
+        p.close()
+
+
+class TestNormalizeProgress:
+    def test_none_returns_mock(self):
+        assert isinstance(lib.normalize_progress(None), lib.MockProgress)
+
+    def test_console_returns_tqdm(self):
+        p = lib.normalize_progress("console", "my task", unit="loc")
+        assert isinstance(p, lib.TqdmProgress)
+        assert p.description_base == "my task"
+        assert p.unit == "loc"
+
+    def test_existing_tracker_passed_through(self):
+        for tracker in (lib.MockProgress(), lib.TqdmProgress()):
+            assert lib.normalize_progress(tracker) is tracker
+
+    def test_duck_typed_tracker_passed_through(self):
+        # any object with the ProgressDialog interface is accepted
+        class Recorder:
+            def set_value(self, value):
+                pass
+
+            def setMaximum(self, maximum):
+                pass
+
+            def zero_progress(self, description=None):
+                pass
+
+        tracker = Recorder()
+        assert lib.normalize_progress(tracker) is tracker
+
+    def test_invalid_string_raises(self):
+        with pytest.raises(ValueError):
+            lib.normalize_progress("bogus")
+
+    def test_non_protocol_object_raises(self):
+        with pytest.raises(TypeError):
+            lib.normalize_progress(42)
+
+
+# ---------------------------------------------------------------------------
+# Lazy Qt imports (PyQt6 must not load with the core library; the Qt
+# names moved to picasso.lib_qt stay reachable as lib.<name>)
+# ---------------------------------------------------------------------------
+
+
+class TestLazyQtImports:
+    def test_core_imports_do_not_load_pyqt6(self):
+        # fresh interpreter: importing the core library (including the
+        # progress machinery) must not pull in PyQt6
+        code = (
+            "import sys\n"
+            "from picasso import lib, io, render, g5m, clusterer, aim\n"
+            "lib.normalize_progress('console').set_value(0)\n"
+            "assert 'PyQt6' not in sys.modules, 'PyQt6 imported eagerly'\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_lib_forwards_qt_names_to_lib_qt(self):
+        pytest.importorskip("PyQt6")
+        assert lib.ProgressDialog.__module__ == "picasso.lib_qt"
+        from picasso import lib_qt
+
+        assert lib.Dialog is lib_qt.Dialog
+        assert lib.ProgressType is lib_qt.ProgressType
+
+    def test_unknown_attribute_raises(self):
+        with pytest.raises(AttributeError):
+            lib.no_such_attribute
