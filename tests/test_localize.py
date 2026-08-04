@@ -6002,3 +6002,483 @@ class TestMultichannelWorkerRouting:
         assert float(seen["ids"]["x"].iloc[0]) == 6.0
         # progress totals follow the linked subset, not the original count
         assert worker.N == 1
+
+
+# ---------------------------------------------------------------------------
+# Temporal median filter (identification-only background subtraction)
+# ---------------------------------------------------------------------------
+
+
+def _notebook_temporal_median_filter(
+    stack: np.ndarray, temporal_length: int
+) -> np.ndarray:
+    """Reference implementation, transcribed from the teaching notebook
+    this feature is based on (Endesfelder Lab, SMLMComputational module 1).
+
+    Deliberately kept as the original triple loop so that it is obvious it
+    has not been "helpfully" rewritten alongside the code it validates.
+    """
+    filtered = np.zeros(stack.shape)
+    for tt in range(stack.shape[0]):
+        for xx in range(stack.shape[1]):
+            for yy in range(stack.shape[2]):
+                start_t = tt - (temporal_length - 1) / 2
+                end_t = tt + (temporal_length - 1) / 2 + 1
+                if start_t < 0:
+                    end_t = end_t - start_t
+                    start_t = 0
+                if end_t > stack.shape[0]:
+                    start_t = start_t - (end_t - stack.shape[0])
+                    end_t = stack.shape[0]
+                median = np.median(stack[int(start_t) : int(end_t), xx, yy])
+                if stack[tt, xx, yy] >= median:
+                    filtered[tt, xx, yy] = stack[tt, xx, yy] - median
+                else:
+                    filtered[tt, xx, yy] = 0
+    return filtered
+
+
+class _CountingMovie:
+    """Movie wrapper that counts how often a frame is read."""
+
+    def __init__(self, data: np.ndarray) -> None:
+        self.data = data
+        self.reads = 0
+
+    def __getitem__(self, it):
+        self.reads += 1
+        return self.data[it]
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+
+class TestTemporalMedian:
+    """``localize.TemporalMedianMovie`` and its use from ``identify``."""
+
+    @staticmethod
+    def _movie(n_frames=24, height=8, width=6, seed=0):
+        rng = np.random.default_rng(seed)
+        return rng.integers(
+            0, 4000, size=(n_frames, height, width), dtype=np.uint16
+        )
+
+    @pytest.mark.parametrize("n_frames", [5, 6])
+    def test_temporal_median_matches_numpy(self, n_frames):
+        stack = self._movie(n_frames=n_frames)
+        median = localize._temporal_median(stack)
+        assert median.dtype == np.float32
+        np.testing.assert_allclose(
+            median, np.median(stack, axis=0), rtol=0, atol=1e-3
+        )
+
+    def test_stripes_do_not_change_the_result(self):
+        stack = self._movie(n_frames=9, height=17, width=5)
+        one_stripe = localize._temporal_median(stack)
+        many_stripes = localize._temporal_median(stack, max_stripe_bytes=1)
+        np.testing.assert_array_equal(one_stripe, many_stripes)
+
+    def test_stride_one_matches_the_notebook(self):
+        """``stride=1`` must reproduce the reference filter exactly."""
+        stack = self._movie(n_frames=12, height=8, width=8, seed=3)
+        filtered = localize.TemporalMedianMovie(stack, 5, stride=1)
+        expected = _notebook_temporal_median_filter(stack, 5)
+        for frame_number in range(len(stack)):
+            np.testing.assert_allclose(
+                filtered[frame_number], expected[frame_number], atol=1e-3
+            )
+
+    def test_window_is_shifted_not_truncated_at_the_edges(self):
+        stack = self._movie(n_frames=20)
+        filtered = localize.TemporalMedianMovie(stack, 7, stride=1)
+        for frame_number in range(len(stack)):
+            start, stop = filtered._bounds(filtered._block_index(frame_number))
+            assert stop - start == 7
+            assert 0 <= start < stop <= len(stack)
+            # the frame being filtered always lies inside its own window
+            assert start <= frame_number < stop
+
+    def test_window_longer_than_movie_uses_whole_movie(self):
+        stack = self._movie(n_frames=5)
+        filtered = localize.TemporalMedianMovie(stack, 51)
+        assert filtered.window == 5
+        expected = np.maximum(
+            stack.astype(np.float32) - np.median(stack, axis=0), 0
+        )
+        for frame_number in range(len(stack)):
+            np.testing.assert_allclose(
+                filtered[frame_number], expected[frame_number], atol=1e-3
+            )
+
+    def test_every_frame_lies_inside_its_block_window(self):
+        """Holds for any stride, and is what lets the block serve raw
+        frames straight out of its cached window."""
+        stack = self._movie(n_frames=37)
+        for window in (3, 8, 11):
+            for stride in (1, 2, window):
+                filtered = localize.TemporalMedianMovie(
+                    stack, window, stride=stride
+                )
+                for frame_number in range(len(stack)):
+                    start, stop = filtered._bounds(
+                        filtered._block_index(frame_number)
+                    )
+                    assert start <= frame_number < stop
+
+    def test_movie_protocol(self):
+        stack = self._movie()
+        filtered = localize.TemporalMedianMovie(stack, 5)
+        assert len(filtered) == len(stack)
+        assert filtered.shape == stack.shape
+        assert filtered.dtype == np.float32
+        assert filtered[-1].shape == stack.shape[1:]
+        np.testing.assert_array_equal(filtered[-1], filtered[len(stack) - 1])
+        np.testing.assert_array_equal(
+            filtered[2:5], np.stack([filtered[i] for i in (2, 3, 4)])
+        )
+        np.testing.assert_array_equal(
+            np.stack(list(iter(filtered))),
+            np.stack([filtered[i] for i in range(len(stack))]),
+        )
+        with pytest.raises(IndexError):
+            filtered[len(stack)]
+
+    def test_output_is_non_negative_float32(self):
+        filtered = localize.TemporalMedianMovie(self._movie(), 5)
+        for frame_number in range(len(filtered)):
+            frame = filtered[frame_number]
+            assert frame.dtype == np.float32
+            assert (frame >= 0).all()
+
+    def test_cache_does_not_change_the_result(self):
+        stack = self._movie(n_frames=30)
+        cached = localize.TemporalMedianMovie(stack, 7)
+        uncached = localize.TemporalMedianMovie(stack, 7, cache_bytes=0)
+        first_pass = [cached[i] for i in range(len(stack))]
+        second_pass = [cached[i] for i in range(len(stack))]
+        for i in range(len(stack)):
+            np.testing.assert_array_equal(first_pass[i], second_pass[i])
+            np.testing.assert_array_equal(first_pass[i], uncached[i])
+
+    def test_eviction_stays_within_budget_and_keeps_results(self):
+        """A tight budget must drop cached frames (and then whole blocks)
+        without changing what the filter returns."""
+        stack = self._movie(n_frames=60)
+        reference = localize.TemporalMedianMovie(stack, 5, stride=1)
+        one_median = reference[0].nbytes
+        # room for a handful of medians but not for any raw window
+        budget = 6 * one_median
+        tight = localize.TemporalMedianMovie(
+            stack, 5, stride=1, cache_bytes=budget
+        )
+        for frame_number in range(len(stack)):
+            np.testing.assert_array_equal(
+                tight[frame_number], reference[frame_number]
+            )
+            resident = sum(block.nbytes for block in tight._cache.values())
+            assert resident <= budget or len(tight._cache) <= 2
+
+    def test_each_frame_is_read_once(self):
+        """With the default stride the cached window serves every frame it
+        covers, so the movie is read exactly once end to end."""
+        stack = self._movie(n_frames=30)
+        counting = _CountingMovie(stack)
+        filtered = localize.TemporalMedianMovie(counting, 10)
+        counting.reads = 0  # ignore the geometry probe read in __init__
+        for frame_number in range(len(stack)):
+            filtered[frame_number]
+        assert counting.reads == len(stack)
+
+    def test_roi_restricts_the_median_but_not_the_geometry(self):
+        stack = self._movie(n_frames=20, height=40, width=40)
+        roi = ((0, 0), (8, 8))
+        filtered = localize.TemporalMedianMovie(stack, 5, roi=roi, roi_pad=1)
+        full = localize.TemporalMedianMovie(stack, 5)
+        for frame_number in (0, 7, 19):
+            frame = filtered[frame_number]
+            assert frame.shape == stack.shape[1:]
+            # inside the ROI the result is identical to filtering everything
+            np.testing.assert_allclose(
+                frame[:8, :8], full[frame_number][:8, :8], atol=1e-3
+            )
+            # outside the padded bounding box nothing is reported
+            assert (frame[10:, 10:] == 0).all()
+
+    def test_threaded_matches_serial(self, movie):
+        ids_t = localize.identify(
+            movie,
+            MIN_NG,
+            BOX,
+            threaded=True,
+            temporal_median_window=11,
+            return_info=False,
+        )
+        ids_s = localize.identify(
+            movie,
+            MIN_NG,
+            BOX,
+            threaded=False,
+            temporal_median_window=11,
+            return_info=False,
+        )
+        as_set = lambda ids: set(  # noqa: E731
+            map(tuple, ids[["frame", "y", "x"]].to_numpy())
+        )
+        assert as_set(ids_t) == as_set(ids_s)
+
+    def test_identify_argument_matches_explicit_wrapper(self, movie):
+        ids_arg, info = localize.identify(
+            movie, MIN_NG, BOX, threaded=False, temporal_median_window=11
+        )
+        ids_wrapped = localize.identify(
+            localize.TemporalMedianMovie(movie, 11, roi_pad=int(BOX / 2) + 1),
+            MIN_NG,
+            BOX,
+            threaded=False,
+            return_info=False,
+        )
+        pd.testing.assert_frame_equal(ids_arg, ids_wrapped)
+        assert info["Temporal Median Window"] == 11
+
+    def test_info_records_zero_when_disabled(self, movie):
+        _, info = localize.identify(movie, MIN_NG, BOX, threaded=False)
+        assert info["Temporal Median Window"] == 0
+
+    def test_static_structure_is_removed_but_blinking_spots_survive(self):
+        """A bright but constant structure must stop being identified,
+        while a spot that is only on in a few frames must not."""
+        n_frames, size = 40, 32
+        movie = np.full((n_frames, size, size), 100, dtype=np.uint16)
+        yy, xx = np.mgrid[0:size, 0:size]
+
+        def gaussian(y0, x0, amplitude):
+            return amplitude * np.exp(
+                -((yy - y0) ** 2 + (xx - x0) ** 2) / (2 * 1.2**2)
+            )
+
+        movie += gaussian(8, 8, 3000).astype(np.uint16)  # static structure
+        blinking = [5, 6, 20, 21]
+        for frame_number in blinking:
+            movie[frame_number] += gaussian(24, 24, 3000).astype(np.uint16)
+
+        found = lambda ids, y, x: (  # noqa: E731
+            (ids["y"] - y).abs().le(1) & (ids["x"] - x).abs().le(1)
+        ).any()
+
+        raw_ids = localize.identify(
+            movie, 500, BOX, threaded=False, return_info=False
+        )
+        assert found(raw_ids, 8, 8)
+        assert found(raw_ids, 24, 24)
+
+        filtered_ids = localize.identify(
+            movie,
+            500,
+            BOX,
+            threaded=False,
+            temporal_median_window=11,
+            return_info=False,
+        )
+        assert not found(filtered_ids, 8, 8)
+        assert found(filtered_ids, 24, 24)
+        assert set(filtered_ids["frame"]) == set(blinking)
+
+    def test_out_of_bounds_frames_are_not_read(self):
+        """``identify_by_frame_number`` must not touch the movie for a
+        frame it is going to skip - reading one would make a temporally
+        filtered movie compute a whole window for nothing."""
+        counting = _CountingMovie(self._movie(n_frames=10))
+        ids = localize.identify_by_frame_number(
+            counting, MIN_NG, BOX, 0, frame_bounds=(5, 8)
+        )
+        assert len(ids) == 0
+        assert counting.reads == 0
+
+
+class TestTemporalMedianGui:
+    """Wiring of the temporal median filter into Picasso: Localize.
+
+    The risk this guards is stale state: every place that records or
+    compares identification settings has to know about the new one, or
+    identifications are silently reused (or never reused) after toggling
+    the filter.
+    """
+
+    @staticmethod
+    def _dialog():
+        class _StubWindow(QtWidgets.QMainWindow):
+            movie = None
+
+            def draw_frame(self):
+                pass
+
+            def on_parameters_changed(self):
+                pass
+
+        return localize_gui.ParametersDialog(_StubWindow())
+
+    def test_spinbox_follows_the_checkbox(self):
+        dialog = self._dialog()
+        try:
+            assert not dialog.temporal_median_checkbox.isChecked()
+            assert not dialog.temporal_median_spinbox.isEnabled()
+            dialog.temporal_median_checkbox.setChecked(True)
+            assert dialog.temporal_median_spinbox.isEnabled()
+            dialog.temporal_median_checkbox.setChecked(False)
+            assert not dialog.temporal_median_spinbox.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_parameters_reports_zero_when_unchecked(self):
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        window.parameters_dialog = self._dialog()
+        try:
+            assert window.parameters["Temporal Median Window"] == 0
+            window.parameters_dialog.temporal_median_checkbox.setChecked(True)
+            window.parameters_dialog.temporal_median_spinbox.setValue(33)
+            assert window.parameters["Temporal Median Window"] == 33
+        finally:
+            window.parameters_dialog.close()
+
+    def test_toggling_the_filter_invalidates_identifications(self):
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        window.parameters_dialog = self._dialog()
+        try:
+            window.view = type("_View", (), {"rois": []})()
+            window.frame_range = None
+            window.last_identification_info = {
+                **window.parameters,
+                "ROI": [],
+                "Frame bounds": None,
+            }
+            assert not window.identifications_outdated()
+            window.parameters_dialog.temporal_median_checkbox.setChecked(True)
+            assert window.identifications_outdated()
+        finally:
+            window.parameters_dialog.close()
+
+    def test_identification_movie_is_cached_and_invalidated(self):
+        rng = np.random.default_rng(0)
+        movie = rng.integers(0, 4000, size=(20, 8, 8), dtype=np.uint16)
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        window.parameters_dialog = self._dialog()
+        try:
+            window.view = type("_View", (), {"rois": []})()
+            window.movie = movie
+            window._temporal_movie = None
+
+            # disabled: the raw movie is handed out untouched
+            assert window.identification_movie() is movie
+
+            window.parameters_dialog.temporal_median_checkbox.setChecked(True)
+            window.parameters_dialog.temporal_median_spinbox.setValue(5)
+            filtered = window.identification_movie()
+            assert isinstance(filtered, localize.TemporalMedianMovie)
+            assert filtered.raw is movie
+            # cached across calls, so scrubbing frames does not rebuild it
+            assert window.identification_movie() is filtered
+
+            # changing the window rebuilds it
+            window.parameters_dialog.temporal_median_spinbox.setValue(7)
+            assert window.identification_movie() is not filtered
+
+            # so does loading another movie, by identity
+            other = movie.copy()
+            window.movie = other
+            assert window.identification_movie().raw is other
+        finally:
+            window.parameters_dialog.close()
+
+    def test_bead_calibration_runs_ignore_the_filter(self, movie):
+        """Beads are static, so a temporal median would subtract them."""
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        window.parameters_dialog = self._dialog()
+        try:
+            window.parameters_dialog.temporal_median_checkbox.setChecked(True)
+            window.parameters_dialog.temporal_median_spinbox.setValue(21)
+            window.movie = movie
+            window.view = type("_View", (), {"rois": []})()
+            window.frame_range = None
+
+            def window_length(calibrate_z, calibrate_spline):
+                worker = localize_gui.IdentificationWorker(
+                    window,
+                    fit_afterwards=False,
+                    calibrate_z=calibrate_z,
+                    calibrate_spline=calibrate_spline,
+                )
+                return worker.parameters["Temporal Median Window"]
+
+            assert window_length(False, False) == 21
+            assert window_length(True, False) == 0
+            assert window_length(False, True) == 0
+            # the window's own settings must not have been mutated
+            assert window.parameters["Temporal Median Window"] == 21
+        finally:
+            window.parameters_dialog.close()
+
+    def test_contrast_follows_the_filter(self, movie):
+        """Filtered frames sit on a completely different intensity scale,
+        so a contrast set for the raw camera counts must not survive the
+        toggle - it would render the frame solid black."""
+        window = gui_window = localize_gui.Window()
+        try:
+            window.movie = movie
+            window.curr_frame_number = 40
+            dialog = window.parameters_dialog
+            contrast = window.contrast_dialog
+            # start from a known state: the dialog restores the last-used
+            # setting from the user's settings file
+            dialog.temporal_median_checkbox.setChecked(False)
+            dialog.temporal_median_spinbox.setValue(11)
+
+            # black must be reachable: filtered frames are clipped at zero
+            assert contrast.black_spinbox.minimum() == 0
+            # white divides in _draw_frame, so it must stay positive
+            assert contrast.white_spinbox.minimum() >= 1
+
+            contrast.auto_checkbox.setChecked(False)
+            contrast.change_contrast_silently(210, 300)
+
+            def displayed_range():
+                frame = window.identification_movie()[40]
+                return float(frame.min()), float(frame.max())
+
+            def contrast_range():
+                return (
+                    contrast.black_spinbox.value(),
+                    contrast.white_spinbox.value(),
+                )
+
+            for checked in (True, False, True):
+                dialog.temporal_median_checkbox.setChecked(checked)
+                assert contrast_range() == displayed_range()
+
+            # 'Auto' must re-read the displayed movie, not the raw one
+            contrast.auto_checkbox.setChecked(True)
+            assert contrast_range() == displayed_range()
+        finally:
+            gui_window.close()
+
+    def test_channel_params_round_trip(self):
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        dialog = self._dialog()
+        window.parameters_dialog = dialog
+        try:
+            dialog.temporal_median_checkbox.setChecked(True)
+            dialog.temporal_median_spinbox.setValue(77)
+            params = window._capture_params()
+            dialog.temporal_median_checkbox.setChecked(False)
+            window._apply_params(params)
+            assert dialog.temporal_median_checkbox.isChecked()
+            assert dialog.temporal_median_spinbox.value() == 77
+            # a parameter set from before this feature existed still loads
+            legacy = {
+                key: value
+                for key, value in params.items()
+                if not key.startswith("temporal_median")
+            }
+            window._apply_params(legacy)
+            assert not dialog.temporal_median_checkbox.isChecked()
+        finally:
+            dialog.close()

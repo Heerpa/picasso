@@ -259,6 +259,9 @@ def _detect_bead_positions(
     """
     if min_separation is None:
         min_separation = box
+    # No temporal median filter here: beads in a calibration
+    # stack are static and do not blink, so their own signal would end up
+    # in the temporal median and be subtracted away.
     ids, _ = localize.identify(
         movie,
         minimum_ng,

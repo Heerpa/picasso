@@ -27,7 +27,6 @@ import imageio
 from .. import (
     aim,
     CONFIG,
-    gausslq,
     imageprocess,
     io,
     localize,
@@ -37,13 +36,17 @@ from .. import (
     __version__,
     zfit,
 )
-from ..fitting import gaussfit_cuda, splinefit
+from ..fitting import splinefit
 from PyQt6 import QtCore, QtGui, QtWidgets
 from playsound3 import playsound
 
 CUDA_AVAILABLE = localize.CUDA_AVAILABLE
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
-DEFAULT_PARAMETERS = {"Box Size": 7, "Min. Net Gradient": 5000}
+DEFAULT_PARAMETERS = {
+    "Box Size": 7,
+    "Min. Net Gradient": 5000,
+    "Temporal Median Window": 51,
+}
 
 # Distinct box colours for the cross-channel link overlay (grey is kept
 # out of the palette so it reads as "unmatched"). tab20-style hues.
@@ -1907,6 +1910,42 @@ class ParametersDialog(lib.Dialog):
         self.mng_max_spinbox.valueChanged.connect(self.on_mng_max_changed)
         hbox.addWidget(self.mng_max_spinbox)
 
+        # temporal median background subtraction (identification only)
+        tm_row = QtWidgets.QHBoxLayout()
+        self.temporal_median_checkbox = QtWidgets.QCheckBox(
+            "Temporal median filter"
+        )
+        self.temporal_median_checkbox.setToolTip(
+            "Subtract a running per-pixel temporal median before spot\n"
+            "identification, which removes inhomogeneous background and\n"
+            "static structures.\n\n"
+            "Only the identification uses the filtered frames: fitting, spot\n"
+            "cutting and photon conversion always use the raw movie.\n\n"
+            "Net gradient values change when this is on, so re-tune 'Min.\n"
+            "net gradient' with 'Preview' enabled after switching it on or"
+            "off.\n\nNot applied to bead stacks (3D / spline calibration)."
+        )
+        self.temporal_median_checkbox.setTristate(False)
+        self.temporal_median_checkbox.stateChanged.connect(
+            self.on_temporal_median_changed
+        )
+        tm_row.addWidget(self.temporal_median_checkbox)
+        self.temporal_median_spinbox = QtWidgets.QSpinBox()
+        self.temporal_median_spinbox.setRange(3, 100_000)
+        self.temporal_median_spinbox.setSingleStep(10)
+        self.temporal_median_spinbox.setValue(
+            DEFAULT_PARAMETERS["Temporal Median Window"]
+        )
+        self.temporal_median_spinbox.setKeyboardTracking(False)
+        self.temporal_median_spinbox.setEnabled(False)
+        self.temporal_median_spinbox.setToolTip(
+            "Number of frames in the temporal window used for the median."
+        )
+        self.temporal_median_spinbox.valueChanged.connect(self.on_box_changed)
+        tm_row.addWidget(self.temporal_median_spinbox)
+        tm_row.addStretch(1)
+        identification_grid.addLayout(tm_row, 4, 0, 1, 2)
+
         # preview identifications + cross-channel link colour overlay
         preview_row = QtWidgets.QHBoxLayout()
         self.preview_checkbox = QtWidgets.QCheckBox("Preview")
@@ -1932,7 +1971,7 @@ class ParametersDialog(lib.Dialog):
         )
         preview_row.addWidget(self.link_colors_checkbox)
         preview_row.addStretch(1)
-        identification_grid.addLayout(preview_row, 4, 0)
+        identification_grid.addLayout(preview_row, 5, 0)
 
         # ROIs
         label = QtWidgets.QLabel("ROIs:")
@@ -1962,7 +2001,7 @@ class ParametersDialog(lib.Dialog):
         self.split_fov_checkbox.setTristate(False)
         self.split_fov_checkbox.stateChanged.connect(self.on_split_fov_changed)
         roi_label_layout.addWidget(self.split_fov_checkbox)
-        identification_grid.addLayout(roi_label_layout, 5, 0)
+        identification_grid.addLayout(roi_label_layout, 6, 0)
 
         self._updating_roi_field = False
         self.roi_dialog = None
@@ -1980,7 +2019,7 @@ class ParametersDialog(lib.Dialog):
         self.roi_edit_button = QtWidgets.QPushButton("Edit ROIs...")
         self.roi_edit_button.clicked.connect(self.on_edit_rois)
         roi_layout.addWidget(self.roi_edit_button)
-        identification_grid.addLayout(roi_layout, 5, 1)
+        identification_grid.addLayout(roi_layout, 6, 1)
 
         # min/max frames
         label = QtWidgets.QLabel("Frames (min,max):")
@@ -1990,7 +2029,7 @@ class ParametersDialog(lib.Dialog):
             "Several disjoint segments can be given as min,max pairs\n"
             "separated by semicolons, e.g. '1,100; 200,300'."
         )
-        identification_grid.addWidget(label, 6, 0)
+        identification_grid.addWidget(label, 7, 0)
         self.frames_edit = QtWidgets.QLineEdit()
         # one or more "min,max" pairs separated by semicolons, with
         # optional surrounding whitespace
@@ -2001,7 +2040,7 @@ class ParametersDialog(lib.Dialog):
         self.frames_edit.setValidator(validator)
         self.frames_edit.editingFinished.connect(self.on_frames_edit_finished)
         self.frames_edit.textChanged.connect(self.on_frames_edit_changed)
-        identification_grid.addWidget(self.frames_edit, 6, 1)
+        identification_grid.addWidget(self.frames_edit, 7, 1)
 
         # Multichannel: optionally use the same key settings for every channel.
         # Shown only when more than one channel is loaded (see the Window's
@@ -2902,6 +2941,21 @@ class ParametersDialog(lib.Dialog):
         else:  # checked
             self.aim_segmentation.setEnabled(True)
 
+    def on_temporal_median_changed(self, state: int) -> None:
+        """Enable/disable the temporal window spinbox and refresh the
+        display, which shows the filtered frames while this is on.
+
+        Toggling the filter moves the image onto a different intensity
+        scale, so the contrast has to be re-derived or the frame would
+        come out solid black (filter on) or solid white (filter off).
+        """
+        self.temporal_median_spinbox.setEnabled(state != 0)
+        # this dialog is built before the contrast dialog
+        contrast_dialog = getattr(self.window, "contrast_dialog", None)
+        if contrast_dialog is not None:
+            contrast_dialog.reset_to_frame()
+        self.window.on_parameters_changed()
+
     def on_link_params_changed(self, _state: int = 0) -> None:
         """A cross-channel link toggle changed: converge every channel to the
         current (shared) settings so it takes effect immediately, not only on
@@ -3100,7 +3154,11 @@ class ContrastDialog(lib.Dialog):
         self.black_spinbox = lib.LogDoubleSpinBox()
         self.black_spinbox.setDecimals(0)
         self.black_spinbox.setKeyboardTracking(False)
-        self.black_spinbox.setRange(1, 999999)
+        # 0 must be reachable: a temporal median filtered frame has its
+        # background subtracted and clipped at zero, so its black point
+        # genuinely is 0. (White stays >= 1, it is a divisor in
+        # ``_draw_frame``.)
+        self.black_spinbox.setRange(0, 999999)
         self.black_spinbox.valueChanged.connect(self.on_contrast_changed)
         grid.addWidget(self.black_spinbox, 0, 1)
         white_label = QtWidgets.QLabel("White:")
@@ -3129,6 +3187,21 @@ class ContrastDialog(lib.Dialog):
         self.white_spinbox.setValue(white)
         self.silent_contrast_change = False
 
+    def reset_to_frame(self) -> None:
+        """Re-derive the range from the frame currently on screen.
+
+        Called when the intensity scale changes underneath the display:
+        switching the temporal median filter on subtracts the background
+        and clips at zero, so a contrast set for the raw camera counts
+        would render the filtered frame as an empty black image.
+        """
+        if getattr(self.window, "movie", None) is None:
+            return
+        frame = self.window.identification_movie()[
+            getattr(self.window, "curr_frame_number", 0)
+        ]
+        self.change_contrast_silently(frame.min(), frame.max())
+
     def on_contrast_changed(self, value: int) -> None:
         if not self.silent_contrast_change:
             self.auto_checkbox.setChecked(False)
@@ -3136,10 +3209,9 @@ class ContrastDialog(lib.Dialog):
 
     def on_auto_changed(self, state: int) -> None:
         if state:
-            movie = self.window.movie
-            frame_number = self.window.curr_frame_number
-            frame = movie[frame_number]
-            self.change_contrast_silently(frame.min(), frame.max())
+            # the displayed movie, which is the temporal median filtered
+            # view when that filter is on - not the raw camera counts
+            self.reset_to_frame()
             self.window.draw_frame()
 
 
@@ -3313,6 +3385,9 @@ class Window(QtWidgets.QMainWindow):
         # Holds the curr movie as a numpy memmap in the format
         # (frame, y, x)
         self.movie = None
+        # Cached temporal median filtered view of ``self.movie``, see
+        # ``identification_movie``. Never used for fitting.
+        self._temporal_movie = None
         # Dictionary of analysis parameters used for the last operation
         self.last_identification_info = None
         # Dataframe of identifcations with fields frame, x and y
@@ -3382,6 +3457,15 @@ class Window(QtWidgets.QMainWindow):
         if type(gradient) is int:
             self.parameters_dialog.mng_slider.setValue(gradient)
 
+        temporal_median = settings["Localize"].get("temporal_median", None)
+        if type(temporal_median) is int and temporal_median > 0:
+            self.parameters_dialog.temporal_median_spinbox.setValue(
+                temporal_median
+            )
+        self.parameters_dialog.temporal_median_checkbox.setChecked(
+            bool(settings["Localize"].get("temporal_median_on", False))
+        )
+
         # Restore the last-used fitting model and optimizer. The model must
         # be set first, since it repopulates the optimizer combobox.
         fit_model = settings["Localize"].get("fit_model", None)
@@ -3411,6 +3495,12 @@ class Window(QtWidgets.QMainWindow):
             settings["Localize"][
                 "gradient"
             ] = self.parameters_dialog.mng_slider.value()
+        settings["Localize"][
+            "temporal_median"
+        ] = self.parameters_dialog.temporal_median_spinbox.value()
+        settings["Localize"][
+            "temporal_median_on"
+        ] = self.parameters_dialog.temporal_median_checkbox.isChecked()
         settings["Localize"][
             "fit_model"
         ] = self.parameters_dialog.fit_model.currentText()
@@ -4388,6 +4478,8 @@ class Window(QtWidgets.QMainWindow):
             "z_calibration_path": pd.z_calibration_path,
             "z_calib_label": pd.z_calib_label.text(),
             "use_gpu": pd.gpu_checkbox.isChecked(),
+            "temporal_median_on": pd.temporal_median_checkbox.isChecked(),
+            "temporal_median": pd.temporal_median_spinbox.value(),
         }
         if hasattr(pd, "camera"):
             params["camera"] = pd.camera.currentIndex()
@@ -4427,6 +4519,16 @@ class Window(QtWidgets.QMainWindow):
             pd.pixelsize.setValue(params["pixelsize"])
         pd.convergence_criterion.setValue(params["convergence"])
         pd.max_it.setValue(params["max_it"])
+        # .get() with defaults: parameter sets captured before the temporal
+        # median filter existed must still restore
+        pd.temporal_median_spinbox.setValue(
+            params.get(
+                "temporal_median", DEFAULT_PARAMETERS["Temporal Median Window"]
+            )
+        )
+        pd.temporal_median_checkbox.setChecked(
+            params.get("temporal_median_on", False)
+        )
         pd.magnification_factor.setValue(params["magnification"])
         pd.z_calibration = params["z_calibration"]
         pd.z_calibration_path = params["z_calibration_path"]
@@ -4599,6 +4701,7 @@ class Window(QtWidgets.QMainWindow):
         self.identifications = identifications
         box = lib.get_from_metadata(info, "Box Size")
         min_ng = lib.get_from_metadata(info, "Min. Net Gradient")
+        temporal_median = lib.get_from_metadata(info, "Temporal Median Window")
         if box or min_ng:
             self.last_identification_info = {}
             if box is not None:
@@ -4607,6 +4710,15 @@ class Window(QtWidgets.QMainWindow):
             if min_ng is not None:
                 self.last_identification_info["Min. Net Gradient"] = min_ng
                 self.parameters_dialog.mng_slider.setValue(min_ng)
+        # restore the temporal median setting too, otherwise the loaded
+        # identifications would immediately count as outdated
+        self.parameters_dialog.temporal_median_checkbox.setChecked(
+            bool(temporal_median)
+        )
+        if temporal_median:
+            self.parameters_dialog.temporal_median_spinbox.setValue(
+                temporal_median
+            )
         self._clean_up_external_ids()
 
     def _clean_up_external_ids(self) -> None:
@@ -4627,8 +4739,7 @@ class Window(QtWidgets.QMainWindow):
         self.locs_display = None
         self.loaded_picks = True
         self.last_identification_info = {
-            "Box Size": self.parameters_dialog.box_spinbox.value(),
-            "Min. Net Gradient": self.parameters_dialog.mng_slider.value(),
+            **self.parameters,
             "ROI": self.view.rois,
             "Frame bounds": self.frame_range,
         }
@@ -4707,9 +4818,12 @@ class Window(QtWidgets.QMainWindow):
         """Set the current frame to the specified number."""
         self.curr_frame_number = number
         if self.contrast_dialog.auto_checkbox.isChecked():
-            black = self.movie[number].min()
-            white = self.movie[number].max()
-            self.contrast_dialog.change_contrast_silently(black, white)
+            # the same frame the view shows, so the auto contrast matches
+            # what is displayed when the temporal median filter is on
+            frame = self.identification_movie()[number]
+            self.contrast_dialog.change_contrast_silently(
+                frame.min(), frame.max()
+            )
         self.draw_frame()
         self.status_bar_frame_indicator.setText(
             "{:,}/{:,}".format(
@@ -4746,7 +4860,9 @@ class Window(QtWidgets.QMainWindow):
         """Actual frame-drawing implementation, wrapped by ``draw_frame``
         with a re-entrancy guard."""
         if self.movie is not None:
-            frame = self.movie[self.curr_frame_number]
+            # show what the identification sees, so that the contrast and
+            # the preview boxes agree with the min. net gradient being set
+            frame = self.identification_movie()[self.curr_frame_number]
             frame = frame.astype("float32")
             if self.contrast_dialog.auto_checkbox.isChecked():
                 frame -= frame.min()
@@ -4820,14 +4936,24 @@ class Window(QtWidgets.QMainWindow):
                     )
             else:
                 if self.parameters_dialog.preview_checkbox.isChecked():
-                    identifications_frame = localize.identify_by_frame_number(
-                        self.movie,
-                        self.parameters["Min. Net Gradient"],
-                        self.parameters["Box Size"],
-                        self.curr_frame_number,
-                        roi=self.view.rois,
-                        frame_bounds=self.frame_range,
+                    # scrubbing into a new temporal window costs one median
+                    # (~0.1 s at 512x512, more for larger frames)
+                    QtWidgets.QApplication.setOverrideCursor(
+                        QtCore.Qt.CursorShape.WaitCursor
                     )
+                    try:
+                        identifications_frame = (
+                            localize.identify_by_frame_number(
+                                self.identification_movie(),
+                                self.parameters["Min. Net Gradient"],
+                                self.parameters["Box Size"],
+                                self.curr_frame_number,
+                                roi=self.view.rois,
+                                frame_bounds=self.frame_range,
+                            )
+                        )
+                    finally:
+                        QtWidgets.QApplication.restoreOverrideCursor()
                     box = self.parameters["Box Size"]
                     self.status_bar.showMessage(
                         f"Found {len(identifications_frame):,} spots in "
@@ -5365,11 +5491,53 @@ class Window(QtWidgets.QMainWindow):
 
     @property
     def parameters(self) -> dict:
-        """Dictionary with box size and min. net gradient."""
+        """Dictionary with the identification settings: box size, min.
+        net gradient and the temporal median window (0 when disabled).
+
+        Every key is compared in ``identifications_outdated`` and stored
+        in ``last_identification_info``, so adding one here is enough for
+        it to invalidate stale identifications and reach the metadata.
+        """
+        dialog = self.parameters_dialog
         return {
-            "Box Size": self.parameters_dialog.box_spinbox.value(),
-            "Min. Net Gradient": self.parameters_dialog.mng_slider.value(),
+            "Box Size": dialog.box_spinbox.value(),
+            "Min. Net Gradient": dialog.mng_slider.value(),
+            "Temporal Median Window": (
+                dialog.temporal_median_spinbox.value()
+                if dialog.temporal_median_checkbox.isChecked()
+                else 0
+            ),
         }
+
+    def identification_movie(self) -> lib.IntArray3D:
+        """The movie the display and the identification preview run on:
+        either the raw movie or a cached temporal median filtered view of
+        it.
+
+        Never used for fitting - ``FitWorker`` and ``save_spots`` always
+        cut spots out of ``self.movie``.
+        """
+        window = self.parameters["Temporal Median Window"]
+        if not window or self.movie is None:
+            self._temporal_movie = None
+            return self.movie
+        rois = self.view.rois or None
+        roi_pad = int(self.parameters["Box Size"] / 2) + 1
+        cached = self._temporal_movie
+        if (
+            cached is None
+            or cached.raw is not self.movie
+            or cached.window != min(window, len(self.movie))
+            or cached.roi != rois
+            or cached.roi_pad != roi_pad
+        ):
+            # comparing against self.movie by identity means loading a
+            # movie or switching channel invalidates this for free
+            cached = localize.TemporalMedianMovie(
+                self.movie, window, roi=rois, roi_pad=roi_pad
+            )
+            self._temporal_movie = cached
+        return cached
 
     def on_parameters_changed(self) -> None:
         """Reset ``self.locs`` and draw frame."""
@@ -5558,10 +5726,16 @@ class Window(QtWidgets.QMainWindow):
                 self._linked_count_phrase(n_identifications)
                 or f"{n_identifications:,} spots"
             )
+            temporal_median = parameters.get("Temporal Median Window", 0)
+            filtered = (
+                f"; Temporal median: {temporal_median}"
+                if temporal_median
+                else ""
+            )
             message = (
                 f"Identified {counted} in {elapsed_time:.2f}"
-                f" seconds. (Box Size: {box}; Min. Net Gradient: {mng}). "
-                "Ready for fit."
+                f" seconds. (Box Size: {box}; Min. Net Gradient: {mng}"
+                f"{filtered}). Ready for fit."
             )
             self.status_bar.showMessage(message)
             self.draw_frame()
@@ -6510,6 +6684,8 @@ class Window(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "No identifications", message)
             return
         box = self.parameters["Box Size"]
+        # raw movie on purpose: spots must carry real photon counts, so
+        # the temporal median filter (an identification aid) never applies
         spots = localize.get_spots(
             self.movie, self.identifications, box, self.camera_info
         )
@@ -6624,6 +6800,9 @@ class Window(QtWidgets.QMainWindow):
             "Generated by": f"Picasso v{__version__} Localize",
             "Box Size": self.parameters_dialog.box_spinbox.value(),
             "Min. Net Gradient": (self.parameters_dialog.mng_slider.value()),
+            "Temporal Median Window": (
+                self.parameters["Temporal Median Window"]
+            ),
         }
         info = self.info + [ids_info]
         io.save_identifications(path, self.identifications, info)
@@ -6722,7 +6901,11 @@ class IdentificationWorker(QtCore.QThread):
         self.movie = window.movie
         self.rois = window.view.rois
         self.frame_range = window.frame_range
-        self.parameters = window.parameters
+        self.parameters = dict(window.parameters)
+        if calibrate_z or calibrate_spline:
+            # bead calibration stacks: the beads are static and do not
+            # blink, so a temporal median would subtract them away
+            self.parameters["Temporal Median Window"] = 0
         self.fit_afterwards = fit_afterwards
         self.calibrate_z = calibrate_z
         self.calibrate_spline = calibrate_spline
@@ -6741,6 +6924,7 @@ class IdentificationWorker(QtCore.QThread):
             roi=self.rois,
             frame_bounds=self.frame_range,
             threaded=True,
+            temporal_median_window=self.parameters["Temporal Median Window"],
             progress_callback=self.on_progress,
             abort_callback=self.isInterruptionRequested,
         )

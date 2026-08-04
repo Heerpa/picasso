@@ -1131,6 +1131,7 @@ def _localize_process_file(
     parameters = {
         "Min. Net Gradient": min_net_gradient,
         "Box Size": box,
+        "Temporal Median Window": args.temporal_median,
     }
 
     locs, info = localize(
@@ -2699,6 +2700,20 @@ def main():  # noqa: C901
     )
     localize_parser.add_argument(
         "-g", "--gradient", type=int, default=5000, help="minimum net gradient"
+    )
+    localize_parser.add_argument(
+        "-tm",
+        "--temporal-median",
+        type=int,
+        default=0,
+        help=(
+            "window length (in frames) of the temporal median filter applied"
+            " before spot identification; it subtracts a per-pixel rolling"
+            " median background, which suppresses inhomogeneous background"
+            " and static structures. 0 (the default) disables it. Fitting"
+            " always uses the raw movie, so the minimum net gradient needs"
+            " re-tuning when this is switched on"
+        ),
     )
     localize_parser.add_argument(
         "-cc",

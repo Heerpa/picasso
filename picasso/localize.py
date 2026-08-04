@@ -32,6 +32,7 @@ import multiprocessing
 import threading
 import time
 import warnings
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future
 from itertools import chain
 from typing import Literal
@@ -158,6 +159,8 @@ SET_COLS = [
     "Min. Net Gradient",
     "Pixelsize",
 ]
+# Memory budget for the cached temporal windows of TemporalMedianMovie.
+TEMPORAL_MEDIAN_CACHE_BYTES = 512 * 1024**2
 
 
 @numba.jit(nopython=True, nogil=True, cache=False)
@@ -434,6 +437,401 @@ def _as_roi_list(
     return rois if len(rois) else None
 
 
+def _temporal_median(
+    frames: np.ndarray, max_stripe_bytes: int = 64 * 1024**2
+) -> lib.FloatArray2D:
+    """Per-pixel median of a stack of frames, i.e. the median along
+    axis 0.
+
+    ``np.partition`` is used instead of ``np.median`` because only the
+    middle order statistic is needed and because it keeps the data in its
+    native (usually integer) dtype - ``np.median`` promotes to float64,
+    which doubles the memory traffic. The stack is processed in stripes of
+    rows so that the copy ``np.partition`` makes internally stays bounded
+    regardless of the window length and the frame size.
+
+    Parameters
+    ----------
+    frames : np.ndarray
+        Stack of frames of shape (N, Y, X).
+    max_stripe_bytes : int, optional
+        Approximate memory budget for one stripe. Default is 64 MB.
+
+    Returns
+    -------
+    lib.FloatArray2D
+        Per-pixel median, 2D array of shape (Y, X) and dtype float32.
+    """
+    n_frames, height, width = frames.shape
+    median = np.empty((height, width), dtype=np.float32)
+    lower = (n_frames - 1) // 2
+    upper = n_frames // 2  # == lower for an odd number of frames
+    kth = lower if lower == upper else (lower, upper)
+    stripe_rows = max(
+        1, int(max_stripe_bytes // max(n_frames * width * frames.itemsize, 1))
+    )
+    for y0 in range(0, height, stripe_rows):
+        y1 = min(y0 + stripe_rows, height)
+        stripe = np.partition(frames[:, y0:y1], kth, axis=0)
+        if lower == upper:
+            median[y0:y1] = stripe[lower]
+        else:  # cast before adding, the sum can overflow the input dtype
+            median[y0:y1] = 0.5 * (
+                stripe[lower].astype(np.float32)
+                + stripe[upper].astype(np.float32)
+            )
+    return median
+
+
+class _TemporalMedianBlock:
+    """One cached temporal window of a ``TemporalMedianMovie``.
+
+    ``ready`` is set once ``median`` (and possibly ``frames``) has been
+    filled in, or once the attempt has failed and ``error`` holds the
+    exception. Threads that did not win the race to compute the block wait
+    on it.
+    """
+
+    __slots__ = ("start", "stop", "median", "frames", "ready", "error")
+
+    def __init__(self, start: int, stop: int) -> None:
+        self.start = start
+        self.stop = stop
+        self.median: lib.FloatArray2D | None = None
+        self.frames: np.ndarray | None = None
+        self.ready = threading.Event()
+        self.error: BaseException | None = None
+
+    @property
+    def nbytes(self) -> int:
+        """Memory held by this block."""
+        total = 0 if self.median is None else self.median.nbytes
+        if self.frames is not None:
+            total += self.frames.nbytes
+        return total
+
+
+class TemporalMedianMovie:
+    """Lazily evaluated, read-only temporal median filtered view of a
+    movie.
+
+    Frame ``t`` is ``max(movie[t] - median(movie[window(t)]), 0)`` as
+    float32, where ``window(t)`` is a window of ``window`` frames centered
+    on ``t``. At the edges of the movie the window is shifted inwards
+    rather than truncated, so it always covers ``window`` frames.
+
+    Computing that median for every single frame is far too slow for real
+    movies, so the median is only evaluated at *anchor* frames spaced
+    ``stride`` apart and shared by the frames in between. The default
+    ``stride=window`` gives ``n_frames / window`` medians; ``stride=1``
+    reproduces the exact per-frame filter.
+
+    This class is meant for spot identification only - fitting, spot
+    cutting and photon conversion must always use the raw movie, since
+    the subtracted background would otherwise corrupt the photon counts.
+    It deliberately does not implement the ``io.AbstractPicassoMovie``
+    interface so that accidentally handing it to ``fit2D`` trips that
+    function's input assertion instead of silently returning wrong
+    photon numbers.
+
+    Note that subtracting a per-pixel background changes the scale of the
+    net gradient, so the minimum net gradient has to be re-tuned when the
+    filter is switched on or off.
+
+    References
+    ----------
+    Martens, K. J. A., Turkowyd, B. & Endesfelder, U.
+    "Raw Data to Results: A Hands-On Introduction and Overview of
+    Computational Analysis for Single-Molecule Localization Microscopy."
+    Frontiers in Bioinformatics 1, 817254 (2022).
+    https://doi.org/10.3389/fbinf.2021.817254
+
+    Parameters
+    ----------
+    movie : lib.IntArray3D
+        The raw movie, i.e. any object supporting ``len()`` and integer
+        indexing that returns 2D frames.
+    window : int, optional
+        Number of frames in the temporal window used for the median.
+        Clipped to the length of the movie. Default is 51.
+    stride : int or None, optional
+        Spacing (in frames) between the anchors at which the median is
+        evaluated. Clipped to ``[1, window]``. None (the default) uses
+        ``window``, which is the fastest setting; 1 evaluates the median
+        for every frame.
+    roi : tuple, list of tuples or None, optional
+        Region(s) of interest that will be identified in, in the same
+        format as ``identify``. When given, the median is only computed
+        inside their (padded) bounding box and the returned frames are
+        zero outside it. Default is None (whole frame).
+    roi_pad : int, optional
+        Number of pixels the ROI bounding box is grown by, so that the
+        gradients of maxima sitting on the ROI border are still computed
+        from filtered pixels. Pass ``int(box / 2) + 1``. Default is 0.
+    cache_bytes : int, optional
+        Memory budget for the cached temporal windows. Default is
+        ``TEMPORAL_MEDIAN_CACHE_BYTES``.
+
+    Attributes
+    ----------
+    raw : lib.IntArray3D
+        The underlying unfiltered movie.
+    window, stride, roi : as above
+    """
+
+    # The wrapper is internally thread safe (see _read_lock), so it tells
+    # identify_by_frame_number not to serialize reads on the identification
+    # lock - that lock is also what _identify_worker hands out frame
+    # numbers with, so holding it across a median would stall every worker.
+    supports_concurrent_reads = True
+
+    def __init__(
+        self,
+        movie: lib.IntArray3D,
+        window: int = 51,
+        *,
+        stride: int | None = None,
+        roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
+        roi_pad: int = 0,
+        cache_bytes: int = TEMPORAL_MEDIAN_CACHE_BYTES,
+    ) -> None:
+        self.raw = movie
+        self.n_frames = len(movie)
+        if self.n_frames == 0:
+            raise ValueError("Cannot temporally filter an empty movie.")
+        self.window = max(1, min(int(window), self.n_frames))
+        stride = self.window if stride is None else int(stride)
+        self.stride = max(1, min(stride, self.window))
+        self.roi = roi
+        self.roi_pad = int(roi_pad)
+        self.cache_bytes = int(cache_bytes)
+        # one read to learn the frame geometry; movies do not agree on
+        # whether they expose .shape (TiffMap does not) or a usable .dtype
+        probe = np.asarray(movie[0])
+        self.frame_shape = probe.shape
+        self._raw_dtype = probe.dtype
+        self._bbox = self._roi_bbox(roi, self.roi_pad)
+        self._cache: OrderedDict[int, _TemporalMedianBlock] = OrderedDict()
+        self._lock = threading.Lock()  # guards _cache only, never held long
+        concurrent = getattr(
+            movie, "supports_concurrent_reads", False
+        ) or isinstance(movie, np.memmap)
+        self._read_lock = None if concurrent else threading.Lock()
+
+    def _roi_bbox(
+        self,
+        roi: tuple[tuple[int, int], tuple[int, int]] | list | None,
+        pad: int,
+    ) -> tuple[slice, slice] | None:
+        """Bounding box of the ROIs, grown by ``pad`` and clipped to the
+        frame, or None to use the whole frame."""
+        rois = _as_roi_list(roi)
+        if rois is None:
+            return None
+        height, width = self.frame_shape
+        y0 = max(0, min(int(r[0][0]) for r in rois) - pad)
+        x0 = max(0, min(int(r[0][1]) for r in rois) - pad)
+        y1 = min(height, max(int(r[1][0]) for r in rois) + pad)
+        x1 = min(width, max(int(r[1][1]) for r in rois) + pad)
+        if y1 <= y0 or x1 <= x0:
+            return None
+        # the median costs O(window * area), so restricting it only pays
+        # off when the bounding box is substantially smaller than the frame
+        if (y1 - y0) * (x1 - x0) > 0.5 * height * width:
+            return None
+        return slice(y0, y1), slice(x0, x1)
+
+    def _block_index(self, frame_number: int) -> int:
+        """Index of the temporal window used to filter ``frame_number``.
+        Frames are tiled into groups of ``stride``, each sharing one
+        median."""
+        return frame_number // self.stride
+
+    def _bounds(self, block_index: int) -> tuple[int, int]:
+        """Start (inclusive) and stop (exclusive) frame of a block's
+        temporal window.
+
+        The window covers the block's own ``stride`` frames and is grown
+        symmetrically around them up to ``window`` frames; at the edges of
+        the movie it is shifted inwards rather than truncated, so it
+        always spans ``window`` frames. Every frame of the block therefore
+        lies inside its own window, which is what lets the block serve raw
+        frames straight out of its cached window.
+
+        The two extremes are exactly the ones we care about:
+        ``stride == window`` tiles the movie into non-overlapping blocks,
+        and ``stride == 1`` reduces to a window centered on the frame,
+        i.e. the exact per-frame filter.
+        """
+        start = block_index * self.stride - (self.window - self.stride) // 2
+        stop = start + self.window
+        if start < 0:
+            stop -= start
+            start = 0
+        if stop > self.n_frames:
+            start -= stop - self.n_frames
+            stop = self.n_frames
+        return max(start, 0), min(stop, self.n_frames)
+
+    def _read_frame(self, index: int) -> np.ndarray:
+        if self._read_lock is None:
+            return np.asarray(self.raw[index])
+        with self._read_lock:
+            return np.asarray(self.raw[index])
+
+    def _read(self, start: int, stop: int) -> np.ndarray:
+        """Read frames ``[start, stop)`` into one array. Frames are read
+        one by one because not every movie class supports slice
+        indexing."""
+        frames = np.empty(
+            (stop - start, *self.frame_shape), dtype=self._raw_dtype
+        )
+        if self._read_lock is None:
+            for i in range(start, stop):
+                frames[i - start] = self.raw[i]
+        else:
+            with self._read_lock:
+                for i in range(start, stop):
+                    frames[i - start] = self.raw[i]
+        return frames
+
+    def _fill(self, block: _TemporalMedianBlock) -> None:
+        """Compute a block's median (and keep its frames if they fit in
+        the cache budget)."""
+        frames = self._read(block.start, block.stop)
+        if self._bbox is None:
+            block.median = _temporal_median(frames)
+        else:
+            sy, sx = self._bbox
+            block.median = _temporal_median(frames[:, sy, sx])
+        # every frame this block serves lies inside its own window (since
+        # stride <= window), so keeping the frames means each frame of the
+        # movie is read exactly once overall. Two blocks stay resident, so
+        # only keep the frames if two windows still fit in the budget.
+        if 2 * frames.nbytes <= self.cache_bytes:
+            block.frames = frames
+
+    def _evict(self) -> None:
+        """Keep the cache within its memory budget. Must be called with
+        ``_lock`` held.
+
+        Raw frames are dropped before whole blocks: a block's median is
+        tiny (one float32 image) and re-reading a frame is far cheaper
+        than recomputing a median. The two most recent blocks are always
+        kept intact, since the worker pool straddles at most two of them.
+        """
+        if len(self._cache) <= 2:
+            return
+        total = sum(block.nbytes for block in self._cache.values())
+        if total <= self.cache_bytes:
+            return
+        for block in list(self._cache.values())[:-2]:  # oldest first
+            if block.frames is not None:
+                total -= block.frames.nbytes
+                block.frames = None
+                if total <= self.cache_bytes:
+                    return
+        while len(self._cache) > 2 and total > self.cache_bytes:
+            total -= self._cache.popitem(last=False)[1].nbytes
+
+    def _block(self, frame_number: int) -> _TemporalMedianBlock:
+        """The cached block used to filter ``frame_number``, computing it
+        if necessary. Exactly one thread computes a given block; the
+        others wait for it without holding the cache lock."""
+        index = self._block_index(frame_number)
+        with self._lock:
+            block = self._cache.get(index)
+            owner = block is None
+            if owner:
+                block = _TemporalMedianBlock(*self._bounds(index))
+                self._cache[index] = block
+            else:
+                self._cache.move_to_end(index)
+        if not owner:
+            block.ready.wait()
+            if block.error is not None:
+                raise block.error
+            return block
+        try:
+            self._fill(block)
+        except BaseException as error:
+            block.error = error
+            with self._lock:
+                self._cache.pop(index, None)
+            raise
+        finally:
+            block.ready.set()
+        with self._lock:
+            self._evict()
+        return block
+
+    def clear_cache(self) -> None:
+        """Drop all cached temporal windows."""
+        with self._lock:
+            self._cache.clear()
+
+    def __getitem__(self, it):
+        if isinstance(it, tuple):
+            if len(it) == 1:
+                return self[it[0]]
+            return self[it[0]][tuple(it[1:])]
+        if isinstance(it, slice):
+            return np.stack(
+                [self[i] for i in range(*it.indices(self.n_frames))]
+            )
+        index = int(it)
+        if index < 0:
+            index += self.n_frames
+        if not 0 <= index < self.n_frames:
+            raise IndexError(
+                f"Frame {it} is out of range for a movie with "
+                f"{self.n_frames} frames."
+            )
+        block = self._block(index)
+        # bind once: another thread's eviction may clear block.frames
+        # between the check and the lookup
+        frames = block.frames
+        if frames is not None:
+            raw = frames[index - block.start]
+        else:
+            raw = self._read_frame(index)
+        if self._bbox is None:
+            return np.maximum(raw.astype(np.float32) - block.median, 0)
+        sy, sx = self._bbox
+        filtered = np.zeros(self.frame_shape, dtype=np.float32)
+        filtered[sy, sx] = np.maximum(
+            raw[sy, sx].astype(np.float32) - block.median, 0
+        )
+        return filtered
+
+    def __iter__(self):
+        for i in range(self.n_frames):
+            yield self[i]
+
+    def __len__(self) -> int:
+        return self.n_frames
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self.n_frames, *self.frame_shape)
+
+    @property
+    def dtype(self) -> np.dtype:
+        return np.dtype(np.float32)
+
+    def close(self) -> None:
+        self.clear_cache()
+        close = getattr(self.raw, "close", None)
+        if close is not None:
+            close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
 def identify_in_frame(
     frame: lib.IntArray2D,
     minimum_ng: float,
@@ -549,6 +947,18 @@ def identify_by_frame_number(
         DataFrame containing the frame number, x and y coordinates of
         the identified maxima, and their net gradient.
     """
+    # check frame bounds before reading, so that frames that are skipped
+    # anyway cost nothing (a TemporalMedianMovie would otherwise compute a
+    # whole temporal window for them)
+    if not lib.frame_in_bounds(frame_number, frame_bounds, len(movie)):
+        return pd.DataFrame(
+            {
+                "frame": pd.Series(dtype=int),
+                "x": pd.Series(dtype=int),
+                "y": pd.Series(dtype=int),
+                "net_gradient": pd.Series(dtype=np.float32),
+            }
+        )
     # Movies that read each frame through their own per-thread file
     # handle (TiffMap, STKMovie and the multi-file maps) or a memory map
     # are safe to read concurrently, so they skip the shared lock. This
@@ -563,16 +973,6 @@ def identify_by_frame_number(
             frame = movie[frame_number]
     else:
         frame = movie[frame_number]
-    # check frame bounds
-    if not lib.frame_in_bounds(frame_number, frame_bounds, len(movie)):
-        return pd.DataFrame(
-            {
-                "frame": pd.Series(dtype=int),
-                "x": pd.Series(dtype=int),
-                "y": pd.Series(dtype=int),
-                "net_gradient": pd.Series(dtype=np.float32),
-            }
-        )
     # identify
     y, x, net_gradient = identify_in_frame(frame, minimum_ng, box, roi)
     frame = frame_number * np.ones(len(x))
@@ -818,6 +1218,8 @@ def identify(
     roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
     frame_bounds: tuple[int, int] | list | None = None,
     threaded: bool = True,
+    temporal_median_window: int | None = None,
+    temporal_median_stride: int | None = None,
     progress_callback: (
         Callable[[list[int]], None] | Literal["console"] | None
     ) = None,
@@ -856,6 +1258,19 @@ def identify(
     threaded : bool, optional
         Whether to use threading for the identification process. Default
         is True.
+    temporal_median_window : int or None, optional
+        If given (and non-zero), a temporal median background is
+        subtracted from every frame before identifying, using a window of
+        this many frames, see ``TemporalMedianMovie``. The filter applies
+        to the identification only - the returned coordinates refer to
+        the raw movie, which is what the spots must be fitted on. Note
+        that ``minimum_ng`` has to be re-tuned when this is switched on
+        or off, since subtracting a background changes the scale of the
+        net gradient. Default is None (no filtering).
+    temporal_median_stride : int or None, optional
+        Spacing between the frames at which the temporal median is
+        evaluated, see ``TemporalMedianMovie``. None (the default) uses
+        ``temporal_median_window``, which is the fastest setting.
     progress_callback : callable, "console" or None, optional
         A callback function to report the progress of the identification
         process. If "console", progress will be printed to the console.
@@ -888,6 +1303,16 @@ def identify(
             "that picasso.localize.localize() will always return both "
             "the localizations and the metadata dictionary."
         )
+    if temporal_median_window:
+        # note that identify_async() is not wrapped: callers driving the
+        # thread pool themselves build a TemporalMedianMovie explicitly
+        movie = TemporalMedianMovie(
+            movie,
+            temporal_median_window,
+            stride=temporal_median_stride,
+            roi=roi,
+            roi_pad=int(box / 2) + 1,
+        )
     if threaded:
         ids = _identify_threaded(
             movie,
@@ -916,6 +1341,7 @@ def identify(
             "Box Size": box,
             "ROI": roi,
             "Frame Bounds": frame_bounds,
+            "Temporal Median Window": int(temporal_median_window or 0),
         }
         return ids, info
     else:
@@ -6685,6 +7111,9 @@ def localize(
         - `Min. Net Gradient`: Minimum net gradient for spot
           identification.
         - `Box Size`: Size of the box to cut out around each spot.
+        - `Temporal Median Window`: optional, window length (in frames)
+          of the temporal median filter applied before identification;
+          0 or missing disables it. Fitting always uses the raw movie.
     threaded : bool, optional
         Whether to use multithreading/multiprocessing. Default is True.
     movie_info : list[dict], optional
@@ -6756,6 +7185,7 @@ def localize(
         roi=roi,
         frame_bounds=frame_bounds,
         threaded=threaded,
+        temporal_median_window=parameters.get("Temporal Median Window", 0),
         progress_callback=identification_progress_callback,
     )
 
@@ -6812,6 +7242,7 @@ def localize_3D(
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
     multiprocess: bool = True,
+    temporal_median_window: int | None = None,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
@@ -6980,6 +7411,7 @@ def localize_3D(
         mle_method=mle_method,
         spline_calibration=spline_calibration,
         multiprocess=multiprocess,
+        temporal_median_window=temporal_median_window,
         identification_progress_callback=identification_progress_callback,
         fit_progress_callback=fit_progress_callback,
         fit_z_progress_callback=fit_z_progress_callback,
@@ -7018,6 +7450,7 @@ def _localize_3D(
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
     multiprocess: bool = True,
+    temporal_median_window: int | None = None,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
@@ -7035,6 +7468,7 @@ def _localize_3D(
         parameters={
             "Min. Net Gradient": minimum_ng,
             "Box Size": box,
+            "Temporal Median Window": temporal_median_window,
         },
         roi=roi,
         frame_bounds=frame_bounds,
