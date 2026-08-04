@@ -1807,6 +1807,7 @@ class ParametersDialog(lib.Dialog):
     IDENT_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#identification-and-fitting-of-single-molecule-spots"  # noqa: E501
     ROI_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#regions-of-interest-rois"  # noqa: E501
     SPLINE_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting"  # noqa: E501
+    TEMPORAL_MEDIAN_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#temporal-median-filter"  # noqa: E501
 
     def __init__(  # noqa: C901
         self, parent: QtWidgets.QMainWindow | None = None
@@ -1912,6 +1913,7 @@ class ParametersDialog(lib.Dialog):
 
         # temporal median background subtraction (identification only)
         tm_row = QtWidgets.QHBoxLayout()
+        tm_row.addWidget(lib.HelpButton(self.TEMPORAL_MEDIAN_URL))
         self.temporal_median_checkbox = QtWidgets.QCheckBox(
             "Temporal median filter"
         )
