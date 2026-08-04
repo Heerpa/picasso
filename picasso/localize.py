@@ -7773,8 +7773,7 @@ def _affine_refine_bead_positions(
     image: np.ndarray, coarse: np.ndarray, box: int
 ) -> np.ndarray:
     """Refine coarse bead positions to sub-pixel accuracy using the
-    standard ``gausslq`` 2D Gaussian least-squares spot fitting (the same
-    routine used by ``fit2D``).
+    standard 2D Gaussian least-squares spot fitting.
 
     Parameters
     ----------
@@ -7807,8 +7806,8 @@ def _affine_refine_bead_positions(
     # intensities to localize each bead).
     camera_info = {"Baseline": 0, "Sensitivity": 1.0, "Gain": 1}
     spots = get_spots(image[np.newaxis], ids, box, camera_info)
-    theta = gausslq.fit_spots(spots)
-    locs = gausslq.locs_from_fits(ids, theta, box, em=False)
+    theta = fit_spots_gauss(spots.astype(np.float32))
+    locs = locs_from_fits_gauss(ids, theta, box, em=False)
     refined = np.column_stack((locs["y"].to_numpy(), locs["x"].to_numpy()))
     return refined[np.isfinite(refined).all(axis=1)]
 
