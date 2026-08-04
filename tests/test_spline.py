@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from picasso import localize, spline
@@ -305,6 +306,201 @@ class TestTemplateHelpers:
         volume = np.zeros((box, box, nz), dtype=np.float32)
         volume[0, 0, :] = 1.0  # all the signal jammed into one corner
         assert spline._focus_center_offset(volume, z_center=1) == (0.0, 0.0)
+
+
+def _volumes_with_one_outlier(box=BOX, nz=5, n_good=5, seed=0):
+    """A stack of near-identical Gaussian beads plus one obvious outlier (a
+    doublet), with a little noise so the robust spread is non-zero."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:box, 0:box]
+    c = box // 2
+    volumes = np.zeros((n_good + 1, box, box, nz), dtype=np.float32)
+    for k in range(nz):
+        s = 1.1 * (1.0 + 0.3 * abs(k - nz // 2))
+        good = np.exp(-((xx - c) ** 2 + (yy - c) ** 2) / (2 * s**2))
+        for b in range(n_good):
+            volumes[b, :, :, k] = 1000.0 * good + rng.normal(
+                0.0, 3.0, (box, box)
+            )
+        doublet = np.exp(
+            -((xx - c - 2) ** 2 + (yy - c) ** 2) / (2 * s**2)
+        ) + np.exp(-((xx - c + 2) ** 2 + (yy - c) ** 2) / (2 * s**2))
+        volumes[n_good, :, :, k] = 500.0 * doublet + rng.normal(
+            0.0, 3.0, (box, box)
+        )
+    return volumes
+
+
+class TestBeadFiltering:
+    """The outlier filtering that decides which beads enter the PSF, and the
+    per-bead record that makes that decision visible in the GUI."""
+
+    def test_keep_inliers_reports_the_thresholds_it_applied(self):
+        ncc = np.array([0.98, 0.97, 0.98, 0.99, 0.60])
+        mse = np.array([1.0, 1.1, 0.9, 1.0, 50.0])
+        keep, limits = spline._keep_inliers(ncc, mse)
+        assert keep.tolist() == [True, True, True, True, False]
+        # the thresholds are reported so the inspector can show the user
+        # where the cut was made
+        assert 0.6 < limits["ncc_min"] < 0.97
+        assert 1.1 < limits["mse_max"] < 50.0
+        assert limits["fallback"] is False
+
+    def test_keep_inliers_flags_the_fallback(self):
+        # both criteria together would reject nearly everything, so the
+        # lowest-MSE half is kept instead - which is worth telling the user,
+        # since the thresholds then say nothing about a rejected bead
+        # two beads fail on correlation, two others on the residual: four of
+        # six would go, so the lowest-MSE half is kept instead
+        ncc = np.array([0.990, 0.991, 0.989, 0.992, 0.50, 0.51])
+        mse = np.array([1.0, 1.01, 500.0, 600.0, 1.02, 1.03])
+        keep, limits = spline._keep_inliers(ncc, mse)
+        assert limits["fallback"] is True
+        assert keep.tolist() == [True, True, False, False, True, False]
+
+    def test_register_and_average_reports_every_bead(self):
+        volumes = _volumes_with_one_outlier()
+        mean_volume, registered, quality = spline._register_and_average(
+            volumes, z_center=2, return_registered=True
+        )
+        # the doublet is dropped from the average ...
+        assert quality["keep"][:-1].all()
+        assert not quality["keep"][-1]
+        assert registered.shape[0] == int(quality["keep"].sum())
+        # ... but is still reported, with the measures behind the decision
+        assert quality["registered_all"].shape[0] == len(volumes)
+        assert quality["ncc"][-1] < quality["ncc"][:-1].min()
+        assert quality["mse"][-1] > quality["mse"][:-1].max()
+
+    def test_bead_quality_summary_keeps_the_central_views(self):
+        volumes = _volumes_with_one_outlier()
+        _, _, quality = spline._register_and_average(
+            volumes, z_center=2, return_registered=True
+        )
+        beads = pd.DataFrame(
+            {"x": np.arange(len(volumes)), "y": np.arange(len(volumes)) + 5}
+        )
+        summary = spline._bead_quality_summary(quality, beads, z_center=2)
+        n_beads, box, _, nz = volumes.shape
+        assert summary["xy"].shape == (n_beads, box, box)
+        assert summary["xz"].shape == (n_beads, nz, box)
+        assert summary["yz"].shape == (n_beads, nz, box)
+        # each bead is normalized to its own focus peak, so beads are compared
+        # by shape rather than by brightness
+        assert summary["xy"].max() == pytest.approx(1.0, abs=0.05)
+        assert summary["x"].tolist() == beads["x"].tolist()
+        # the full volumes are dropped - only the views are kept around
+        assert "registered_all" not in summary
+
+    def test_build_template_records_the_filtering(self):
+        movie, _, _ = _synthetic_bead_movie()
+        built = spline.build_psf_template(
+            movie, CAMERA_INFO, box=BOX, minimum_ng=2000.0, d=20.0
+        )
+        quality = built["bead_quality"]
+        assert len(quality["keep"]) == built["n_beads"]
+        assert built["n_beads_used"] == int(quality["keep"].sum())
+        assert len(quality["x"]) == built["n_beads"]
+
+    def test_inspection_data_and_rejection_reasons(self):
+        movie, _, _ = _synthetic_bead_movie()
+        built = spline.build_psf_template(
+            movie, CAMERA_INFO, box=BOX, minimum_ng=2000.0, d=20.0
+        )
+        # pretend the last bead was rejected for both reasons
+        quality = built["bead_quality"]
+        quality["keep"][-1] = False
+        quality["ncc"][-1] = 0.1
+        quality["mse"][-1] = 1e9
+        quality["ncc_min"], quality["mse_max"] = 0.9, 1.0
+        data = spline.bead_inspection_data(
+            built, {"z_center": float(built["z_center"]), "pixelsize": 130.0}
+        )
+        assert data["template_xy"].shape == (BOX, BOX)
+        assert len(data["z_nm"]) == movie.shape[0]
+        reasons = spline._rejection_reasons(data)
+        assert reasons[:-1] == [""] * (len(reasons) - 1)
+        assert reasons[-1] == "low correlation, high residual"
+
+    def test_inspection_data_is_none_without_the_record(self):
+        # a template built by an older version has no per-bead record; the
+        # inspector must degrade rather than raise
+        assert spline.bead_inspection_data({}, {}) is None
+
+    def test_plot_bead_gallery_draws_every_bead(self):
+        from matplotlib.figure import Figure
+
+        movie, _, _ = _synthetic_bead_movie()
+        built = spline.build_psf_template(
+            movie, CAMERA_INFO, box=BOX, minimum_ng=2000.0, d=20.0
+        )
+        built["bead_quality"]["keep"][-1] = False
+        data = spline.bead_inspection_data(
+            built, {"z_center": float(built["z_center"]), "pixelsize": 130.0}
+        )
+        n_beads = len(data["keep"])
+        fig = Figure()
+        spline.plot_bead_gallery(data, fig)
+        # three panels per bead plus the averaged-PSF cell, plus the scatter
+        assert len(fig.axes) == 3 * (n_beads + 1) + 1
+        # only the rejected bead (and the averaged PSF) when filtered
+        fig = Figure()
+        spline.plot_bead_gallery(data, fig, only_rejected=True)
+        assert len(fig.axes) == 3 * 2 + 1
+
+    def test_plot_bead_gallery_never_caps_the_rejected_beads(self):
+        """The cap keeps a bead-rich z-stack readable, but must only drop
+        beads that were kept - hiding a rejection would defeat the point."""
+        from matplotlib.figure import Figure
+
+        n, n_rejected, nz = 12, 4, 5
+        keep = np.ones(n, dtype=bool)
+        keep[:n_rejected] = False
+        data = {
+            "label": "",
+            "keep": keep,
+            "ncc": np.linspace(0.5, 1.0, n),
+            "mse": np.linspace(10.0, 1.0, n),
+            "ncc_min": 0.8,
+            "mse_max": 5.0,
+            "fallback": False,
+            "x": np.arange(n, dtype=float),
+            "y": np.arange(n, dtype=float),
+            "xy": np.zeros((n, BOX, BOX), dtype=np.float32),
+            "xz": np.zeros((n, nz, BOX), dtype=np.float32),
+            "yz": np.zeros((n, nz, BOX), dtype=np.float32),
+            "template_xy": np.zeros((BOX, BOX), dtype=np.float32),
+            "template_xz": np.zeros((nz, BOX), dtype=np.float32),
+            "template_yz": np.zeros((nz, BOX), dtype=np.float32),
+            "z_nm": np.linspace(200.0, -200.0, nz),
+            "pixelsize": 130.0,
+        }
+        fig = Figure()
+        spline.plot_bead_gallery(data, fig, max_beads=6)
+        # the averaged PSF, all 4 rejected beads and 2 kept ones
+        assert len(fig.axes) == 3 * (1 + n_rejected + 2) + 1
+        # a cap below the number of rejected beads still shows all of them
+        fig = Figure()
+        spline.plot_bead_gallery(data, fig, max_beads=1)
+        assert len(fig.axes) == 3 * (1 + n_rejected) + 1
+
+    def test_calibrate_spline_writes_the_bead_gallery(self, tmp_path):
+        movie, _, _ = _synthetic_bead_movie()
+        path = str(tmp_path / "bead_spline_calib.hdf5")
+        calib, diagnostics = spline.calibrate_spline(
+            movie,
+            info=[{"Frames": int(movie.shape[0])}],
+            camera_info=CAMERA_INFO,
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            path=path,
+            return_diagnostics=True,
+        )
+        assert os.path.exists(str(tmp_path / "bead_spline_calib_beads.png"))
+        assert calib["n_beads_used"] <= calib["n_beads"]
+        assert len(diagnostics) == 1
+        assert len(diagnostics[0]["keep"]) == calib["n_beads"]
 
 
 class TestBuildPsfTemplate:
@@ -1553,3 +1749,102 @@ class TestGuiWiring:
         as it does for the Gaussian ones."""
         worker = self._fit_worker(method, use_gpufit, {"model": "spline-3d"})
         assert worker.method == expected
+
+    def test_bead_inspection_dialog_shows_the_filtering(self):
+        """The bead inspector must render the calibration's per-bead record,
+        so the user can check the outlier filtering instead of trusting it."""
+        import sys
+        from PyQt6 import QtWidgets
+        from picasso.gui import localize as glocalize
+
+        movie, _, _ = _synthetic_bead_movie()
+        built = spline.build_psf_template(
+            movie, CAMERA_INFO, box=BOX, minimum_ng=2000.0, d=20.0
+        )
+        built["bead_quality"]["keep"][-1] = False
+        data = spline.bead_inspection_data(
+            built, {"z_center": float(built["z_center"]), "pixelsize": 130.0}
+        )
+        n_beads = len(data["keep"])
+
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            app = QtWidgets.QApplication(sys.argv)
+        dialog = glocalize.BeadInspectionDialog([data, data])
+        assert f"of {n_beads} beads" in dialog.summary.text()
+        assert "1 rejected" in dialog.summary.text()
+        # one entry per channel, and the gallery is drawn on the canvas
+        assert dialog.channel.count() == 2
+        assert len(dialog.figure.axes) == 3 * (n_beads + 1) + 1
+        dialog.only_rejected.setChecked(True)
+        assert len(dialog.figure.axes) == 3 * 2 + 1
+        dialog.close()
+
+    def test_bead_inspection_dialog_scrolls_the_gallery(self):
+        """The gallery is taller than any window, so it must scroll - and a
+        matplotlib canvas swallows wheel events unless they are forwarded."""
+        import sys
+        from PyQt6 import QtCore, QtGui, QtWidgets
+        from picasso.gui import localize as glocalize
+
+        movie, _, _ = _synthetic_bead_movie()
+        built = spline.build_psf_template(
+            movie, CAMERA_INFO, box=BOX, minimum_ng=2000.0, d=20.0
+        )
+        data = spline.bead_inspection_data(
+            built, {"z_center": float(built["z_center"]), "pixelsize": 130.0}
+        )
+
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            app = QtWidgets.QApplication(sys.argv)
+        dialog = glocalize.BeadInspectionDialog([data])
+        dialog.show()
+        app.processEvents()
+
+        viewport = dialog.scroll.viewport()
+        # "Fit width" leaves nothing to scroll horizontally ...
+        assert dialog.zoom.currentData() is None
+        assert dialog.canvas.width() <= viewport.width()
+        assert dialog.scroll.horizontalScrollBar().maximum() == 0
+        # ... while the gallery itself runs past the bottom of the window
+        vbar = dialog.scroll.verticalScrollBar()
+        assert dialog.canvas.height() > viewport.height()
+        assert vbar.maximum() > 0
+
+        wheel = QtGui.QWheelEvent(
+            QtCore.QPointF(50, 50),
+            dialog.canvas.mapToGlobal(QtCore.QPointF(50, 50)),
+            QtCore.QPoint(0, 0),
+            QtCore.QPoint(0, -240),  # two notches down
+            QtCore.Qt.MouseButton.NoButton,
+            QtCore.Qt.KeyboardModifier.NoModifier,
+            QtCore.Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+        QtWidgets.QApplication.sendEvent(dialog.canvas, wheel)
+        app.processEvents()
+        assert vbar.value() > 0
+
+        # a fixed zoom enlarges the gallery (and then scrolls both ways)
+        fit_width = dialog.canvas.width()
+        dialog.zoom.setCurrentIndex(dialog.zoom.findText("200 %"))
+        app.processEvents()
+        assert dialog.canvas.width() > fit_width
+        assert dialog.scroll.horizontalScrollBar().maximum() > 0
+        dialog.close()
+
+    def test_spline_calibration_worker_collects_the_bead_record(self):
+        """The worker must hand the per-bead record to the window; without it
+        the inspector has nothing to show after a calibration."""
+        import inspect
+        from picasso.gui import localize as glocalize
+
+        src = inspect.getsource(glocalize.SplineCalibrationWorker.run)
+        assert src.count("return_diagnostics=True") == 3  # every entry point
+        assert "self.bead_diagnostics" in src
+        finished = inspect.getsource(
+            glocalize.Window.on_spline_calibration_finished
+        )
+        assert "bead_diagnostics" in finished
+        assert "inspect_beads_action" in finished

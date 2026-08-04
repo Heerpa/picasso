@@ -1469,6 +1469,236 @@ class CalibrateSplineDialog(lib.Dialog):
         )
 
 
+class BeadInspectionDialog(lib.Dialog):
+    """Gallery of the individual beads a spline PSF calibration was built
+    from, showing which ones were averaged into the PSF and which were
+    rejected as outliers.
+
+    The calibration only averages beads whose shape agrees with the running
+    average and discards the rest (see :func:`picasso.spline._keep_inliers`),
+    which is a decision worth looking at: a bead can be dropped because it is
+    a doublet, an aggregate or out of focus - or because the sample really
+    does have a field-dependent PSF, in which case the calibration is being
+    built from a biased subset. Each bead is drawn as its xy slice at focus
+    plus the two cross-sections, next to the averaged PSF it was compared
+    against, and rejected beads are framed in red and annotated with the
+    criterion they failed and their position in the movie.
+    """
+
+    def __init__(
+        self,
+        diagnostics: list[dict],
+        parent: QtWidgets.QWidget | None = None,
+        title: str = "",
+    ) -> None:
+        super().__init__(parent)
+        # Imported here (not at module import time) so the GUI only pays for
+        # the Qt matplotlib backend when the inspector is actually opened.
+        from matplotlib.backends.backend_qt5agg import (
+            FigureCanvasQTAgg,
+            NavigationToolbar2QT,
+        )
+        from matplotlib.figure import Figure
+
+        self.diagnostics = [d for d in diagnostics if d]
+        self.setWindowTitle(
+            "Calibration beads" + (f" - {title}" if title else "")
+        )
+        self.setModal(False)
+        vbox = QtWidgets.QVBoxLayout(self)
+
+        controls = QtWidgets.QHBoxLayout()
+        vbox.addLayout(controls)
+        self.channel = QtWidgets.QComboBox()
+        for c in range(len(self.diagnostics)):
+            self.channel.addItem(
+                "Reference channel" if c == 0 else f"Channel {c}"
+            )
+        self.channel.setCurrentIndex(0)
+        self.channel.currentIndexChanged.connect(self.draw)
+        if len(self.diagnostics) > 1:
+            controls.addWidget(QtWidgets.QLabel("Channel:"))
+            controls.addWidget(self.channel)
+        self.only_rejected = QtWidgets.QCheckBox("Show only rejected beads")
+        self.only_rejected.setToolTip(
+            "Hide the beads that were averaged into the PSF, keeping only\n"
+            "the ones the calibration discarded as outliers."
+        )
+        self.only_rejected.stateChanged.connect(self.draw)
+        controls.addWidget(self.only_rejected)
+        controls.addWidget(QtWidgets.QLabel("Max. beads shown:"))
+        # a z-stack can hold hundreds of beads; drawing them all is slow and
+        # unreadable, so only the kept ones are capped (every rejected bead is
+        # always drawn, since those are what is being checked)
+        self.max_beads = QtWidgets.QSpinBox()
+        self.max_beads.setRange(1, 1000)
+        self.max_beads.setValue(60)
+        self.max_beads.setToolTip(
+            "How many beads to draw. Rejected beads are always shown; the\n"
+            "limit only caps how many of the kept beads are drawn alongside."
+        )
+        self.max_beads.valueChanged.connect(self.draw)
+        controls.addWidget(self.max_beads)
+        controls.addWidget(QtWidgets.QLabel("Zoom:"))
+        # The gallery is taller than any window, so it is scrolled rather than
+        # squeezed. "Fit" scales it to the window width, which keeps the
+        # scrolling one-dimensional; the percentages are there to enlarge a
+        # cell that is too small to judge.
+        self.zoom = QtWidgets.QComboBox()
+        self.zoom.addItem("Fit width", userData=None)
+        for percent in (75, 100, 150, 200, 300):
+            self.zoom.addItem(f"{percent} %", userData=percent)
+        self.zoom.setToolTip(
+            "Size of the gallery. 'Fit width' scales it to the window, so\n"
+            "only vertical scrolling is needed; a fixed zoom lets you look\n"
+            "at a bead more closely and scroll in both directions."
+        )
+        self.zoom.currentIndexChanged.connect(self._fit_canvas)
+        controls.addWidget(self.zoom)
+        controls.addStretch(1)
+        self.summary = QtWidgets.QLabel("")
+        controls.addWidget(self.summary)
+
+        self.figure = Figure()
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        # a matplotlib canvas consumes wheel events (it turns them into its own
+        # scroll_event), so without this filter the gallery cannot be scrolled
+        # with the wheel or a trackpad at all - only by dragging the scrollbar
+        self.canvas.installEventFilter(self)
+        # keep the keyboard on the scroll area (Page Up/Down, arrows) instead
+        # of letting the canvas take focus for matplotlib's own key bindings,
+        # which are of no use in a static gallery
+        self.canvas.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidget(self.canvas)
+        self.scroll.setWidgetResizable(False)
+        self.scroll.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
+        # the gallery is always taller than the window, so keeping the
+        # vertical scrollbar on stops the width from jumping as it appears
+        self.scroll.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+        )
+        self.scroll.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self.scroll.setFocus()
+        vbox.addWidget(self.scroll, stretch=1)
+        vbox.addWidget(NavigationToolbar2QT(self.canvas, self))
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Close,
+            QtCore.Qt.Orientation.Horizontal,
+            self,
+        )
+        buttons.rejected.connect(self.reject)
+        vbox.addWidget(buttons)
+
+        self.resize(1000, 800)
+        # guards _fit_canvas against re-entering itself: resizing the canvas
+        # can add or remove a scrollbar, which resizes the viewport again
+        self._fitting = False
+        self._figure_inches = ()
+        self.draw()
+
+    def draw(self) -> None:
+        """(Re)draw the gallery of the selected channel."""
+        if not self.diagnostics:
+            return
+        data = self.diagnostics[
+            min(self.channel.currentIndex(), len(self.diagnostics) - 1)
+        ]
+        self.figure.clear()
+        spline.plot_bead_gallery(
+            data,
+            self.figure,
+            only_rejected=self.only_rejected.isChecked(),
+            max_beads=self.max_beads.value(),
+        )
+        # the size the gallery was laid out at. Kept here rather than read
+        # back from the figure on every fit: the canvas is sized in whole
+        # pixels, so reading it back would shave a fraction off each time and
+        # the gallery would creep smaller with every window resize.
+        self._figure_inches = tuple(self.figure.get_size_inches())
+        self._fit_canvas()
+        n_beads = len(data["keep"])
+        n_used = int(data["keep"].sum())
+        self.summary.setText(
+            f"{n_used} of {n_beads} beads averaged into the PSF, "
+            f"{n_beads - n_used} rejected"
+        )
+
+    def _fit_canvas(self) -> None:
+        """Size the canvas to the figure at the selected zoom.
+
+        The figure sizes itself (in inches) to the number of beads shown, so
+        the canvas is given that size in pixels and the scroll area scrolls
+        through it. At "Fit width" the pixels-per-inch is chosen so the
+        gallery is exactly as wide as the viewport.
+        """
+        if self._fitting or not self._figure_inches:
+            return
+        self._fitting = True
+        try:
+            width_in, height_in = self._figure_inches
+            percent = self.zoom.currentData()
+            if percent is None:
+                # the viewport already excludes the (always-on) vertical
+                # scrollbar, so fitting to it never adds a horizontal one
+                usable = max(self.scroll.viewport().width() - 2, 100)
+                dpi = usable / max(width_in, 1e-6)
+            else:
+                dpi = percent  # 100 % is 100 pixels per figure inch
+            # The canvas is sized in logical pixels while the figure renders
+            # at the screen's pixel ratio (2 on a Retina display), so the two
+            # are related by dpi / ratio - matplotlib's own resize handler
+            # then reads back exactly the inch size the gallery was drawn at.
+            ratio = self.canvas.device_pixel_ratio or 1
+            self.figure.set_dpi(dpi * ratio)
+            self.canvas.setFixedSize(
+                max(int(width_in * dpi), 1), max(int(height_in * dpi), 1)
+            )
+            self.canvas.draw_idle()
+        finally:
+            self._fitting = False
+
+    def resizeEvent(self, event) -> None:
+        """Re-fit the gallery when the window is resized (only the canvas is
+        rescaled - the figure itself does not have to be redrawn)."""
+        super().resizeEvent(event)
+        self._fit_canvas()
+
+    def showEvent(self, event) -> None:
+        """Fit the gallery once the dialog has its real size - the first draw
+        happens before it is shown, when the viewport is still tiny."""
+        super().showEvent(event)
+        self._fit_canvas()
+        # so Page Up/Down and the arrows scroll the gallery straight away
+        self.scroll.setFocus()
+
+    def eventFilter(self, obj, event) -> bool:
+        """Scroll the gallery on wheel/trackpad input over the canvas.
+
+        The matplotlib canvas handles wheel events itself and does not pass
+        them on, so they are translated into scrollbar movement here; without
+        this the gallery could only be scrolled by dragging the scrollbar.
+        """
+        wheel = QtCore.QEvent.Type.Wheel
+        if obj is self.canvas and event.type() == wheel:
+            pixels, angle = event.pixelDelta(), event.angleDelta()
+            if not pixels.isNull():  # trackpads report pixel-exact deltas
+                dx, dy = pixels.x(), pixels.y()
+            else:  # a wheel notch is 120 eighths of a degree
+                step = self.scroll.verticalScrollBar().singleStep() * 3
+                dx = int(angle.x() / 120 * step)
+                dy = int(angle.y() / 120 * step)
+            for bar, delta in (
+                (self.scroll.verticalScrollBar(), dy),
+                (self.scroll.horizontalScrollBar(), dx),
+            ):
+                if delta:
+                    bar.setValue(bar.value() - delta)
+            return True
+        return super().eventFilter(obj, event)
+
+
 class RefineRegistrationDialog(lib.Dialog):
     """Dialog for choosing which frames the signal-based channel re-alignment
     considers.
@@ -3329,6 +3559,10 @@ class Window(QtWidgets.QMainWindow):
         self.frame_range = None
         self.info = []
         self.extra_info = []
+        # Per-bead records of the last spline PSF calibration built in this
+        # session (one per channel), shown by the bead inspector.
+        self.bead_diagnostics = []
+        self.bead_calibration_path = None
         self._active_worker = None
         # Bookkeeping for a multichannel "Identify" (Ctrl+I) batch that runs
         # identification on every channel in turn; None when not running.
@@ -3650,6 +3884,18 @@ class Window(QtWidgets.QMainWindow):
         calibrate_spline_action = threed_menu.addAction("Calibrate spline PSF")
         calibrate_spline_action.triggered.connect(self.calibrate_spline)
 
+        self.inspect_beads_action = threed_menu.addAction(
+            "Inspect spline calibration beads"
+        )
+        self.inspect_beads_action.setToolTip(
+            "Show the individual beads the last spline PSF calibration was\n"
+            "built from, and which of them were rejected as outliers."
+        )
+        self.inspect_beads_action.setEnabled(False)
+        self.inspect_beads_action.triggered.connect(
+            self.inspect_calibration_beads
+        )
+
         reregister_signal_action = threed_menu.addAction(
             "Re-align channels (current signal)"
         )
@@ -3843,23 +4089,80 @@ class Window(QtWidgets.QMainWindow):
         self.status_bar.showMessage(msg)
         self.spline_calibration_worker.start()
 
-    def on_spline_calibration_finished(self, path: str, n_beads: int) -> None:
+    def on_spline_calibration_finished(
+        self, path: str, n_beads: int, n_used: int
+    ) -> None:
         """Report a successful spline PSF calibration, listing the diagnostic
-        images that were written next to it (so a missing one is obvious)."""
+        images that were written next to it (so a missing one is obvious) and
+        offering the bead inspector when beads were filtered out."""
         self.status_bar.showMessage("")
+        worker = self.spline_calibration_worker
+        self.bead_diagnostics = list(
+            getattr(worker, "bead_diagnostics", []) or []
+        )
+        self.bead_calibration_path = path
+        self.inspect_beads_action.setEnabled(bool(self.bead_diagnostics))
         base = os.path.splitext(path)[0]
         written = [
             os.path.basename(p) for p in sorted(glob.glob(base + "_*.png"))
         ]
+        n_rejected = max(0, n_beads - n_used)
+        built_from = f"{n_beads} beads"
+        if n_rejected:
+            # do not let the bead count imply that every detected bead is in
+            # the PSF - point the user at the inspector to check the ones that
+            # were dropped
+            built_from = (
+                f"{n_used} of {n_beads} detected beads ({n_rejected} rejected "
+                "as outliers)"
+            )
         lines = [
-            f"Spline PSF calibration built from {n_beads} beads and saved to:",
+            f"Spline PSF calibration built from {built_from} and saved to:",
             path,
         ]
         if written:
             lines += ["", "Diagnostics written:"] + [f"  {w}" for w in written]
-        QtWidgets.QMessageBox.information(
-            self, "Spline PSF Calibration", "\n".join(lines)
+        message = QtWidgets.QMessageBox(self)
+        message.setIcon(QtWidgets.QMessageBox.Icon.Information)
+        message.setWindowTitle("Spline PSF Calibration")
+        message.setText("\n".join(lines))
+        message.addButton(QtWidgets.QMessageBox.StandardButton.Ok)
+        if self.bead_diagnostics:
+            inspect = message.addButton(
+                "Inspect beads...",
+                QtWidgets.QMessageBox.ButtonRole.ActionRole,
+            )
+        else:
+            inspect = None
+        message.exec()
+        if inspect is not None and message.clickedButton() is inspect:
+            self.inspect_calibration_beads()
+
+    def inspect_calibration_beads(self) -> None:
+        """Show the beads of the last spline PSF calibration built in this
+        session, marking those that were rejected as outliers."""
+        if not self.bead_diagnostics:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Calibration beads",
+                "No spline PSF calibration has been built in this session. "
+                "Build one (Calibration > Calibrate spline PSF) to inspect "
+                "the beads it averaged; the same gallery is also saved next "
+                "to every calibration as <name>_beads.png.",
+            )
+            return
+        # the dialog is parented to the window, so an earlier one would linger
+        # as a hidden child; drop it before opening the new one
+        previous = getattr(self, "bead_inspection_dialog", None)
+        if previous is not None:
+            previous.close()
+            previous.deleteLater()
+        self.bead_inspection_dialog = BeadInspectionDialog(
+            self.bead_diagnostics,
+            self,
+            title=os.path.basename(self.bead_calibration_path or ""),
         )
+        self.bead_inspection_dialog.show()
 
     def on_spline_calibration_failed(self, message: str) -> None:
         """Report a failed spline PSF calibration."""
@@ -7119,7 +7422,7 @@ class SplineCalibrationWorker(QtCore.QThread):
     background thread (bead detection, averaging and spline coefficients, all
     on the CPU)."""
 
-    finished = QtCore.pyqtSignal(str, int)  # (path, n_beads)
+    finished = QtCore.pyqtSignal(str, int, int)  # (path, n_beads, n_used)
     failed = QtCore.pyqtSignal(str)
     statusChanged = QtCore.pyqtSignal(str)
 
@@ -7146,6 +7449,7 @@ class SplineCalibrationWorker(QtCore.QThread):
         camera_infos=None,
     ) -> None:
         super().__init__()
+        self.bead_diagnostics: list[dict] = []
         self.movie = movie
         self.info = info
         self.camera_info = camera_info
@@ -7174,24 +7478,27 @@ class SplineCalibrationWorker(QtCore.QThread):
     def run(self) -> None:
         try:
             if self.movies:
-                calibration = spline.calibrate_spline_multichannel(
-                    self.movies,
-                    infos=self.infos,
-                    camera_infos=self.camera_infos,
-                    box=self.box,
-                    minimum_ng=self.minimum_ng,
-                    d=self.step,
-                    frames_per_step=self.frames_per_step,
-                    frame_bounds=self.frame_bounds,
-                    frame_order=self.frame_order,
-                    magnification_factor=self.magnification_factor,
-                    correct_z_bias=self.correct_z_bias,
-                    link_photons=self.link_photons,
-                    reference=0,
-                    path=self.path,
+                calibration, diagnostics = (
+                    spline.calibrate_spline_multichannel(
+                        self.movies,
+                        infos=self.infos,
+                        camera_infos=self.camera_infos,
+                        box=self.box,
+                        minimum_ng=self.minimum_ng,
+                        d=self.step,
+                        frames_per_step=self.frames_per_step,
+                        frame_bounds=self.frame_bounds,
+                        frame_order=self.frame_order,
+                        magnification_factor=self.magnification_factor,
+                        correct_z_bias=self.correct_z_bias,
+                        link_photons=self.link_photons,
+                        reference=0,
+                        path=self.path,
+                        return_diagnostics=True,
+                    )
                 )
             elif self.regions:
-                calibration = spline.calibrate_spline_split_fov(
+                calibration, diagnostics = spline.calibrate_spline_split_fov(
                     self.movie,
                     info=self.info,
                     camera_info=self.camera_info,
@@ -7206,9 +7513,10 @@ class SplineCalibrationWorker(QtCore.QThread):
                     correct_z_bias=self.correct_z_bias,
                     link_photons=self.link_photons,
                     path=self.path,
+                    return_diagnostics=True,
                 )
             else:
-                calibration = spline.calibrate_spline(
+                calibration, diagnostics = spline.calibrate_spline(
                     self.movie,
                     info=self.info,
                     camera_info=self.camera_info,
@@ -7223,11 +7531,23 @@ class SplineCalibrationWorker(QtCore.QThread):
                     correct_z_bias=self.correct_z_bias,
                     roi=self.roi,
                     path=self.path,
+                    return_diagnostics=True,
                 )
         except Exception as e:  # surface any failure to the GUI
             self.failed.emit(str(e))
             return
-        self.finished.emit(self.path, int(calibration.get("n_beads", 0)))
+        # the per-bead inspection records (which beads were averaged into the
+        # PSF, which were rejected) are read off the worker by the window when
+        # it opens the bead inspector; they are too large for a signal payload
+        self.bead_diagnostics = [d for d in diagnostics if d]
+        n_used = calibration.get("n_beads_used", calibration.get("n_beads", 0))
+        # multichannel reports one count per channel; the reference channel's
+        # beads are the ones the user detected on
+        if isinstance(n_used, (list, tuple)):
+            n_used = n_used[0] if len(n_used) else 0
+        self.finished.emit(
+            self.path, int(calibration.get("n_beads", 0)), int(n_used)
+        )
 
 
 class QualityWorker(QtCore.QThread):

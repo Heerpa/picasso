@@ -1465,8 +1465,23 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
             progress_callback=lambda i: print(f"  step {i}/3"),
         )
     print("------------------------------------------")
+    n_beads = calibration["n_beads"]
+    # multichannel reports one count per channel; the reference channel is the
+    # one the beads were detected on
+    n_used = calibration.get("n_beads_used", n_beads)
+    if isinstance(n_used, (list, tuple)):
+        n_used = n_used[0] if len(n_used) else n_beads
+    built_from = f"{n_beads} beads"
+    if n_used < n_beads:
+        # the rejected beads are not in the PSF; the gallery next to the
+        # calibration shows which ones were dropped and why
+        built_from = (
+            f"{n_used} of {n_beads} detected beads "
+            f"({n_beads - n_used} rejected as outliers, see the "
+            "*_beads.png diagnostic)"
+        )
     print(
-        f"Spline PSF calibration built from {calibration['n_beads']} beads "
+        f"Spline PSF calibration built from {built_from} "
         f"and saved to {out_path}"
     )
 
