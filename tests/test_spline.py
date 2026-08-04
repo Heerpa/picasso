@@ -1,8 +1,7 @@
 """Tests for picasso.spline (cubic-spline PSF calibration generation).
 
-The GPU-independent parts (frame binning, PSF-template building, registration,
-normalization) run everywhere. The final coefficient step needs Gpuspline (a
-CPU library) and is gated on ``localize.GPUSPLINE_INSTALLED``.
+The whole calibration (frame binning, PSF-template building, registration,
+normalization and the spline-coefficient step) runs on the CPU everywhere.
 """
 
 from __future__ import annotations
@@ -10,6 +9,7 @@ from __future__ import annotations
 import os
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from picasso import localize, spline
@@ -308,6 +308,247 @@ class TestTemplateHelpers:
         assert spline._focus_center_offset(volume, z_center=1) == (0.0, 0.0)
 
 
+def _volumes_with_one_outlier(box=BOX, nz=5, n_good=5, seed=0):
+    """A stack of near-identical Gaussian beads plus one obvious outlier (a
+    doublet), with a little noise so the robust spread is non-zero."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:box, 0:box]
+    c = box // 2
+    volumes = np.zeros((n_good + 1, box, box, nz), dtype=np.float32)
+    for k in range(nz):
+        s = 1.1 * (1.0 + 0.3 * abs(k - nz // 2))
+        good = np.exp(-((xx - c) ** 2 + (yy - c) ** 2) / (2 * s**2))
+        for b in range(n_good):
+            volumes[b, :, :, k] = 1000.0 * good + rng.normal(
+                0.0, 3.0, (box, box)
+            )
+        doublet = np.exp(
+            -((xx - c - 2) ** 2 + (yy - c) ** 2) / (2 * s**2)
+        ) + np.exp(-((xx - c + 2) ** 2 + (yy - c) ** 2) / (2 * s**2))
+        volumes[n_good, :, :, k] = 500.0 * doublet + rng.normal(
+            0.0, 3.0, (box, box)
+        )
+    return volumes
+
+
+class TestBeadFiltering:
+    """The outlier filtering that decides which beads enter the PSF, and the
+    per-bead record that makes that decision visible in the GUI."""
+
+    def test_keep_inliers_reports_the_thresholds_it_applied(self):
+        ncc = np.array([0.98, 0.97, 0.98, 0.99, 0.60])
+        mse = np.array([1.0, 1.1, 0.9, 1.0, 50.0])
+        keep, limits = spline._keep_inliers(ncc, mse)
+        assert keep.tolist() == [True, True, True, True, False]
+        # the thresholds are reported so the inspector can show the user
+        # where the cut was made
+        assert 0.6 < limits["ncc_min"] < 0.97
+        assert 1.1 < limits["mse_max"] < 50.0
+        assert limits["fallback"] is False
+
+    def test_keep_inliers_flags_the_fallback(self):
+        # both criteria together would reject nearly everything, so the
+        # lowest-MSE half is kept instead - which is worth telling the user,
+        # since the thresholds then say nothing about a rejected bead
+        # two beads fail on correlation, two others on the residual: four of
+        # six would go, so the lowest-MSE half is kept instead
+        ncc = np.array([0.990, 0.991, 0.989, 0.992, 0.50, 0.51])
+        mse = np.array([1.0, 1.01, 500.0, 600.0, 1.02, 1.03])
+        keep, limits = spline._keep_inliers(ncc, mse)
+        assert limits["fallback"] is True
+        assert keep.tolist() == [True, True, False, False, True, False]
+
+    def test_register_and_average_reports_every_bead(self):
+        volumes = _volumes_with_one_outlier()
+        mean_volume, registered, quality = spline._register_and_average(
+            volumes, z_center=2, return_registered=True
+        )
+        # the doublet is dropped from the average ...
+        assert quality["keep"][:-1].all()
+        assert not quality["keep"][-1]
+        assert registered.shape[0] == int(quality["keep"].sum())
+        # ... but is still reported, with the measures behind the decision
+        assert quality["registered_all"].shape[0] == len(volumes)
+        assert quality["ncc"][-1] < quality["ncc"][:-1].min()
+        assert quality["mse"][-1] > quality["mse"][:-1].max()
+
+    def test_bead_quality_summary_keeps_the_central_views(self):
+        volumes = _volumes_with_one_outlier()
+        _, _, quality = spline._register_and_average(
+            volumes, z_center=2, return_registered=True
+        )
+        beads = pd.DataFrame(
+            {"x": np.arange(len(volumes)), "y": np.arange(len(volumes)) + 5}
+        )
+        summary = spline._bead_quality_summary(quality, beads, z_center=2)
+        n_beads, box, _, nz = volumes.shape
+        assert summary["xy"].shape == (n_beads, box, box)
+        assert summary["xz"].shape == (n_beads, nz, box)
+        assert summary["yz"].shape == (n_beads, nz, box)
+        # each bead is normalized to its own focus peak, so beads are compared
+        # by shape rather than by brightness
+        assert summary["xy"].max() == pytest.approx(1.0, abs=0.05)
+        assert summary["x"].tolist() == beads["x"].tolist()
+        # the full volumes are dropped - only the views are kept around
+        assert "registered_all" not in summary
+
+    def test_build_template_records_the_filtering(self):
+        movie, _, _ = _synthetic_bead_movie()
+        built = spline.build_psf_template(
+            movie, CAMERA_INFO, box=BOX, minimum_ng=2000.0, d=20.0
+        )
+        quality = built["bead_quality"]
+        assert len(quality["keep"]) == built["n_beads"]
+        assert built["n_beads_used"] == int(quality["keep"].sum())
+        assert len(quality["x"]) == built["n_beads"]
+
+    def test_inspection_data_and_rejection_reasons(self):
+        movie, _, _ = _synthetic_bead_movie()
+        built = spline.build_psf_template(
+            movie, CAMERA_INFO, box=BOX, minimum_ng=2000.0, d=20.0
+        )
+        # pretend the last bead was rejected for both reasons
+        quality = built["bead_quality"]
+        quality["keep"][-1] = False
+        quality["ncc"][-1] = 0.1
+        quality["mse"][-1] = 1e9
+        quality["ncc_min"], quality["mse_max"] = 0.9, 1.0
+        data = spline.bead_inspection_data(
+            built, {"z_center": float(built["z_center"]), "pixelsize": 130.0}
+        )
+        assert data["template_xy"].shape == (BOX, BOX)
+        assert len(data["z_nm"]) == movie.shape[0]
+        reasons = spline._rejection_reasons(data)
+        assert reasons[:-1] == [""] * (len(reasons) - 1)
+        assert reasons[-1] == "low correlation, high residual"
+
+    def test_inspection_data_is_none_without_the_record(self):
+        # a template built by an older version has no per-bead record; the
+        # inspector must degrade rather than raise
+        assert spline.bead_inspection_data({}, {}) is None
+
+    def test_plot_bead_gallery_draws_every_bead(self):
+        from matplotlib.figure import Figure
+
+        movie, _, _ = _synthetic_bead_movie()
+        built = spline.build_psf_template(
+            movie, CAMERA_INFO, box=BOX, minimum_ng=2000.0, d=20.0
+        )
+        built["bead_quality"]["keep"][-1] = False
+        data = spline.bead_inspection_data(
+            built, {"z_center": float(built["z_center"]), "pixelsize": 130.0}
+        )
+        n_beads = len(data["keep"])
+        fig = Figure()
+        spline.plot_bead_gallery(data, fig)
+        # three panels per bead plus the averaged-PSF cell, plus the scatter
+        assert len(fig.axes) == 3 * (n_beads + 1) + 1
+        # only the rejected bead (and the averaged PSF) when filtered
+        fig = Figure()
+        spline.plot_bead_gallery(data, fig, only_rejected=True)
+        assert len(fig.axes) == 3 * 2 + 1
+
+    def test_plot_bead_gallery_never_caps_the_rejected_beads(self):
+        """The cap keeps a bead-rich z-stack readable, but must only drop
+        beads that were kept - hiding a rejection would defeat the point."""
+        from matplotlib.figure import Figure
+
+        n, n_rejected, nz = 12, 4, 5
+        keep = np.ones(n, dtype=bool)
+        keep[:n_rejected] = False
+        data = {
+            "label": "",
+            "keep": keep,
+            "ncc": np.linspace(0.5, 1.0, n),
+            "mse": np.linspace(10.0, 1.0, n),
+            "ncc_min": 0.8,
+            "mse_max": 5.0,
+            "fallback": False,
+            "x": np.arange(n, dtype=float),
+            "y": np.arange(n, dtype=float),
+            "xy": np.zeros((n, BOX, BOX), dtype=np.float32),
+            "xz": np.zeros((n, nz, BOX), dtype=np.float32),
+            "yz": np.zeros((n, nz, BOX), dtype=np.float32),
+            "template_xy": np.zeros((BOX, BOX), dtype=np.float32),
+            "template_xz": np.zeros((nz, BOX), dtype=np.float32),
+            "template_yz": np.zeros((nz, BOX), dtype=np.float32),
+            "z_nm": np.linspace(200.0, -200.0, nz),
+            "pixelsize": 130.0,
+        }
+        fig = Figure()
+        spline.plot_bead_gallery(data, fig, max_beads=6)
+        # the averaged PSF, all 4 rejected beads and 2 kept ones
+        assert len(fig.axes) == 3 * (1 + n_rejected + 2) + 1
+        # a cap below the number of rejected beads still shows all of them
+        fig = Figure()
+        spline.plot_bead_gallery(data, fig, max_beads=1)
+        assert len(fig.axes) == 3 * (1 + n_rejected) + 1
+
+    def test_n_beads_used_reads_either_calibration_layout(self):
+        # a multichannel calibration counts per channel; the reference
+        # channel's count is the one to report
+        assert spline.n_beads_used({"n_beads": 20, "n_beads_used": 17}) == 17
+        assert (
+            spline.n_beads_used({"n_beads": 20, "n_beads_used": [17, 15]})
+            == 17
+        )
+        # a calibration built before the filtering was recorded
+        assert spline.n_beads_used({"n_beads": 20}) == 20
+
+    def test_calibrate_multichannel_records_every_channel(self, tmp_path):
+        """Every channel builds its own PSF from its own beads, so each one
+        gets its own filtering record and gallery - the reference channel's
+        rejections say nothing about the others."""
+        movie_ref, _, _ = _synthetic_bead_movie()
+        movie_c = np.roll(movie_ref, shift=(2, -1), axis=(1, 2))
+        info = [{"Frames": int(movie_ref.shape[0])}]
+        path = str(tmp_path / "mc_spline_calib.hdf5")
+        calib, diagnostics = spline.calibrate_spline_multichannel(
+            [movie_ref, movie_c],
+            infos=[info, info],
+            camera_infos=[CAMERA_INFO, CAMERA_INFO],
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            path=path,
+            return_diagnostics=True,
+        )
+        assert len(calib["n_beads_used"]) == 2
+        assert spline.n_beads_used(calib) == calib["n_beads_used"][0]
+        assert len(diagnostics) == 2
+        assert diagnostics[0]["label"].startswith("reference channel")
+        assert diagnostics[1]["label"].startswith("channel 1")
+        for data in diagnostics:
+            assert len(data["keep"]) == calib["n_beads"]
+        for channel in (0, 1):
+            assert os.path.exists(
+                str(tmp_path / f"mc_spline_calib_ch{channel}_beads.png")
+            )
+        # the galleries must not have cost us the cross-channel diagnostics
+        assert os.path.exists(str(tmp_path / "mc_spline_calib_summary.png"))
+        assert os.path.exists(
+            str(tmp_path / "mc_spline_calib_registration.png")
+        )
+
+    def test_calibrate_spline_writes_the_bead_gallery(self, tmp_path):
+        movie, _, _ = _synthetic_bead_movie()
+        path = str(tmp_path / "bead_spline_calib.hdf5")
+        calib, diagnostics = spline.calibrate_spline(
+            movie,
+            info=[{"Frames": int(movie.shape[0])}],
+            camera_info=CAMERA_INFO,
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            path=path,
+            return_diagnostics=True,
+        )
+        assert os.path.exists(str(tmp_path / "bead_spline_calib_beads.png"))
+        assert calib["n_beads_used"] <= calib["n_beads"]
+        assert len(diagnostics) == 1
+        assert len(diagnostics[0]["keep"]) == calib["n_beads"]
+
+
 class TestBuildPsfTemplate:
     """End-to-end PSF template building on a synthetic bead movie (no GPU)."""
 
@@ -560,11 +801,8 @@ class TestMultiFov:
             assert tpl.min() == pytest.approx(0.0, abs=0.1)
 
 
-@pytest.mark.skipif(
-    not localize.GPUSPLINE_INSTALLED, reason="Gpuspline not available"
-)
 class TestCalibrateSpline:
-    """Full calibration including the Gpuspline coefficient step (CPU)."""
+    """Full calibration including the spline-coefficient step (CPU)."""
 
     def test_calibrate_spline_3d_roundtrip(self, tmp_path):
         from picasso import io
@@ -584,10 +822,10 @@ class TestCalibrateSpline:
         assert calib["model"] == "spline-3d"
         assert calib["coefficients"].shape[0] == 64
         assert list(calib["n_data"]) == [BOX, BOX, movie.shape[0]]
-        # the saved calibration loads and can drive the fitter's packer
+        # the saved calibration loads and can drive the fitter
         loaded = io.load_spline_calibration(path)
-        user_info = localize._pack_spline_user_info(loaded)
-        assert user_info.dtype == np.float32
+        coefficients = localize._spline_coeff_reshaped(loaded)
+        assert coefficients.ndim == 7  # (C, niz, niy, nix, 4, 4, 4)
 
     def test_calibrate_spline_2d(self):
         movie, _, _ = _synthetic_bead_movie()
@@ -603,23 +841,6 @@ class TestCalibrateSpline:
         assert calib["model"] == "spline-2d"
         assert calib["coefficients"].shape[0] == 16
         assert list(calib["n_data"]) == [BOX, BOX]
-
-
-@pytest.mark.skipif(
-    localize.GPUSPLINE_INSTALLED,
-    reason="only relevant when Gpuspline is missing",
-)
-def test_calibrate_spline_requires_gpuspline():
-    movie, _, _ = _synthetic_bead_movie()
-    with pytest.raises(ImportError):
-        spline.calibrate_spline(
-            movie,
-            info=[{"Frames": int(movie.shape[0])}],
-            camera_info=CAMERA_INFO,
-            box=BOX,
-            minimum_ng=2000.0,
-            d=20.0,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -783,12 +1004,9 @@ class TestRansacMatch:
         )
 
 
-@pytest.mark.skipif(
-    not localize.GPUSPLINE_INSTALLED, reason="Gpuspline not available"
-)
 class TestCalibrateSplineMultichannel:
-    """Full multichannel calibration including the Gpuspline coefficient
-    step (CPU). Skipped unless Gpuspline is installed."""
+    """Full multichannel calibration including the spline-coefficient
+    step (CPU)."""
 
     def test_calibrate_multichannel(self, tmp_path):
         from picasso import io
@@ -818,10 +1036,10 @@ class TestCalibrateSplineMultichannel:
         assert calib["coefficients"].shape[0] == 64
         assert calib["coefficients"].shape[-1] == 2
         assert len(calib["channel_transforms"]) == 2
-        # round-trips and drives the multichannel user_info packer
+        # round-trips and drives the multichannel fitter
         loaded = io.load_spline_calibration(path)
-        user_info = localize._pack_spline_user_info(loaded)
-        assert user_info.dtype == np.float32
+        coefficients = localize._spline_coeff_reshaped(loaded)
+        assert coefficients.shape[0] == 2  # one coefficient block per channel
         # co-focal channels: both planes at the same focus
         np.testing.assert_allclose(
             calib["plane_offsets"], [0.0, 0.0], atol=25.0
@@ -882,9 +1100,7 @@ class TestCalibrateSplineMultichannel:
         assert abs(t1[1, 1] + 1.0) < 0.1  # y scale ~ -1
         assert abs(t1[1, 2] - (h - 1)) < 2.0  # y offset ~ H - 1
 
-    @pytest.mark.skipif(
-        not localize.GPUFIT_INSTALLED, reason="Gpufit not available"
-    )
+    @pytest.mark.skipif(not localize.CUDA_AVAILABLE, reason="no CUDA device")
     def test_axial_precision_multichannel_is_joint(self):
         """The multichannel axial-precision diagnostic must fit all channels
         *jointly* (the real pipeline) rather than each plane alone. This checks
@@ -991,7 +1207,7 @@ def _synthetic_split_fov_movie_flipped(axis="y"):
 
 
 class TestSplitFovTransform:
-    """Region-aware channel-transform estimation (no Gpuspline needed)."""
+    """Region-aware channel-transform estimation."""
 
     def test_estimate_region_transform_recovers_shift(self):
         dx, dy = 2, -1
@@ -1083,9 +1299,6 @@ class TestSplitFovTransform:
             np.testing.assert_allclose(mapped[:, 1], ref_xy[:, 1], atol=1.0)
 
 
-@pytest.mark.skipif(
-    not localize.GPUSPLINE_INSTALLED, reason="Gpuspline not available"
-)
 class TestCalibrateSplitFov:
     """Full split-FOV calibration from one movie with two FOV regions."""
 
@@ -1466,13 +1679,49 @@ class TestCliWiring:
     def test_fit_method_map(self):
         from picasso import __main__ as cli
 
-        assert cli._FIT_METHOD_MAP["spline"] == "spline-gpu"
-        assert cli._FIT_METHOD_MAP["spline-mle"] == "spline-mle-gpu"
+        # bare names are the CPU fit, "-gpu" the Gpufit one - the convention
+        # the Gaussian methods already follow
+        assert cli._FIT_METHOD_MAP["spline"] == "spline"
+        assert cli._FIT_METHOD_MAP["spline-mle"] == "spline-mle"
+        assert cli._FIT_METHOD_MAP["spline-gpu"] == "spline-gpu"
+        assert cli._FIT_METHOD_MAP["spline-mle-gpu"] == "spline-mle-gpu"
+
+    def test_only_the_gpu_codes_require_gpufit(self):
+        """The CPU spline codes must not trip the GPUfit precheck."""
+        import inspect
+        from picasso import __main__ as cli
+
+        src = inspect.getsource(cli._localize)
+        assert '("lq-gpu", "spline-gpu", "spline-mle-gpu")' in src
 
     def test_spline_calibrate_handler_exists(self):
         from picasso import __main__ as cli
 
         assert callable(cli._spline_calibrate)
+
+    def test_spline_calibrate_reports_the_filtered_beads(self, tmp_path):
+        """The command line has no inspector, so its summary must say how many
+        beads were actually used and point at the gallery that was written."""
+        import inspect
+        from picasso import __main__ as cli
+
+        src = inspect.getsource(cli._spline_calibrate)
+        assert "spline.n_beads_used(calibration)" in src
+        assert "_beads.png" in src
+
+        # and the gallery really is written next to the calibration
+        movie, _, _ = _synthetic_bead_movie()
+        path = str(tmp_path / "cli_spline_calib.hdf5")
+        spline.calibrate_spline(
+            movie,
+            info=[{"Frames": int(movie.shape[0])}],
+            camera_info=CAMERA_INFO,
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            path=path,
+        )
+        assert os.path.exists(str(tmp_path / "cli_spline_calib_beads.png"))
 
     def test_backend_accepts_both_spline_codes(self):
         # both spline codes must be recognised model ids by the backend
@@ -1480,34 +1729,50 @@ class TestCliWiring:
         import inspect
 
         src = inspect.getsource(localize.fit2D)
-        assert "spline-gpu" in src and "spline-mle-gpu" in src
+        for code in ("spline", "spline-mle", "spline-gpu", "spline-mle-gpu"):
+            assert f'"{code}"' in src
 
 
 class TestGuiWiring:
-    def test_fit_code_resolves_spline(self, monkeypatch):
+    def test_spline_model_is_offered_without_gpufit(self):
+        """The spline model must be in the menu on every machine: it now has a
+        CPU backend, so it is no longer deleted when Gpufit is missing."""
         from picasso.gui import localize as glocalize
 
-        models = dict(glocalize.FIT_MODELS)
-        models["Experimental PSF (cubic spline)"] = {
-            "optimizers": {
-                "Least squares": "spline-gpu",
-                "MLE": "spline-mle-gpu",
-            },
-            "needs_spline_calibration": True,
-        }
-        monkeypatch.setattr(glocalize, "FIT_MODELS", models)
+        assert "Experimental PSF (cubic spline)" in glocalize.FIT_MODELS
+
+    def test_fit_code_resolves_spline(self):
+        from picasso.gui import localize as glocalize
+
+        # bare (CPU) codes; FitWorker appends "-gpu" when the GPUfit
+        # checkbox is ticked, as for the Gaussian models
         assert (
             glocalize._fit_code(
                 "Experimental PSF (cubic spline)", "Least squares"
             )
-            == "spline-gpu"
+            == "spline"
         )
         assert (
             glocalize._fit_code("Experimental PSF (cubic spline)", "MLE")
-            == "spline-mle-gpu"
+            == "spline-mle"
         )
 
-    def test_fit_worker_preserves_spline_method_and_calibration(self):
+    def test_spline_honours_the_convergence_controls(self):
+        """The CPU spline iterates under both estimators, so both must show
+        the convergence page - and with the spline's own schedule, not the
+        Gaussian MLE's."""
+        from picasso.gui import localize as glocalize
+        from picasso.fitting import splinefit
+
+        assert "spline" in glocalize._CONVERGENCE_CODES
+        assert "spline-mle" in glocalize._CONVERGENCE_CODES
+        assert glocalize._CONVERGENCE_DEFAULTS["spline"] == (
+            splinefit.TOLERANCE_MULTI_START,
+            splinefit.MAX_ITERATIONS_MULTI_START,
+        )
+
+    @staticmethod
+    def _fit_worker(method, use_gpufit, calib):
         import sys
         import pandas as pd
         from PyQt6 import QtWidgets
@@ -1516,22 +1781,140 @@ class TestGuiWiring:
         app = QtWidgets.QApplication.instance()
         if app is None:
             app = QtWidgets.QApplication(sys.argv)
-
-        calib = {"model": "spline-3d"}
-        worker = glocalize.FitWorker(
+        return glocalize.FitWorker(
             None,
             [],
             {},
             pd.DataFrame({"x": [], "y": [], "frame": []}),
             BOX,
-            "spline-mle-gpu",
+            method,
             0.001,
             100,
             False,
             False,
-            True,  # use_gpufit
+            use_gpufit,
             spline_calibration=calib,
         )
+
+    def test_fit_worker_preserves_spline_method_and_calibration(self):
+        calib = {"model": "spline-3d"}
+        worker = self._fit_worker("spline-mle-gpu", True, calib)
         # the "-gpu" suffix must not be appended to an already-gpu spline code
         assert worker.method == "spline-mle-gpu"
         assert worker.spline_calibration is calib
+
+    @pytest.mark.parametrize(
+        "method, use_gpufit, expected",
+        [
+            ("spline", False, "spline"),
+            ("spline-mle", False, "spline-mle"),
+            ("spline", True, "spline-gpu"),
+            ("spline-mle", True, "spline-mle-gpu"),
+        ],
+    )
+    def test_fit_worker_routes_spline_by_gpufit_checkbox(
+        self, method, use_gpufit, expected
+    ):
+        """The GPUfit checkbox selects the device for the spline model exactly
+        as it does for the Gaussian ones."""
+        worker = self._fit_worker(method, use_gpufit, {"model": "spline-3d"})
+        assert worker.method == expected
+
+    def test_bead_inspection_dialog_shows_the_filtering(self):
+        """The bead inspector must render the calibration's per-bead record,
+        so the user can check the outlier filtering instead of trusting it."""
+        import sys
+        from PyQt6 import QtWidgets
+        from picasso.gui import localize as glocalize
+
+        movie, _, _ = _synthetic_bead_movie()
+        built = spline.build_psf_template(
+            movie, CAMERA_INFO, box=BOX, minimum_ng=2000.0, d=20.0
+        )
+        built["bead_quality"]["keep"][-1] = False
+        data = spline.bead_inspection_data(
+            built, {"z_center": float(built["z_center"]), "pixelsize": 130.0}
+        )
+        n_beads = len(data["keep"])
+
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            app = QtWidgets.QApplication(sys.argv)
+        dialog = glocalize.BeadInspectionDialog([data, data])
+        assert f"of {n_beads} beads" in dialog.summary.text()
+        assert "1 rejected" in dialog.summary.text()
+        # one entry per channel, and the gallery is drawn on the canvas
+        assert dialog.channel.count() == 2
+        assert len(dialog.figure.axes) == 3 * (n_beads + 1) + 1
+        dialog.only_rejected.setChecked(True)
+        assert len(dialog.figure.axes) == 3 * 2 + 1
+        dialog.close()
+
+    def test_bead_inspection_dialog_scrolls_the_gallery(self):
+        """The gallery is taller than any window, so it must scroll - and a
+        matplotlib canvas swallows wheel events unless they are forwarded."""
+        import sys
+        from PyQt6 import QtCore, QtGui, QtWidgets
+        from picasso.gui import localize as glocalize
+
+        movie, _, _ = _synthetic_bead_movie()
+        built = spline.build_psf_template(
+            movie, CAMERA_INFO, box=BOX, minimum_ng=2000.0, d=20.0
+        )
+        data = spline.bead_inspection_data(
+            built, {"z_center": float(built["z_center"]), "pixelsize": 130.0}
+        )
+
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            app = QtWidgets.QApplication(sys.argv)
+        dialog = glocalize.BeadInspectionDialog([data])
+        dialog.show()
+        app.processEvents()
+
+        viewport = dialog.scroll.viewport()
+        # "Fit width" leaves nothing to scroll horizontally ...
+        assert dialog.zoom.currentData() is None
+        assert dialog.canvas.width() <= viewport.width()
+        assert dialog.scroll.horizontalScrollBar().maximum() == 0
+        # ... while the gallery itself runs past the bottom of the window
+        vbar = dialog.scroll.verticalScrollBar()
+        assert dialog.canvas.height() > viewport.height()
+        assert vbar.maximum() > 0
+
+        wheel = QtGui.QWheelEvent(
+            QtCore.QPointF(50, 50),
+            dialog.canvas.mapToGlobal(QtCore.QPointF(50, 50)),
+            QtCore.QPoint(0, 0),
+            QtCore.QPoint(0, -240),  # two notches down
+            QtCore.Qt.MouseButton.NoButton,
+            QtCore.Qt.KeyboardModifier.NoModifier,
+            QtCore.Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+        QtWidgets.QApplication.sendEvent(dialog.canvas, wheel)
+        app.processEvents()
+        assert vbar.value() > 0
+
+        # a fixed zoom enlarges the gallery (and then scrolls both ways)
+        fit_width = dialog.canvas.width()
+        dialog.zoom.setCurrentIndex(dialog.zoom.findText("200 %"))
+        app.processEvents()
+        assert dialog.canvas.width() > fit_width
+        assert dialog.scroll.horizontalScrollBar().maximum() > 0
+        dialog.close()
+
+    def test_spline_calibration_worker_collects_the_bead_record(self):
+        """The worker must hand the per-bead record to the window; without it
+        the inspector has nothing to show after a calibration."""
+        import inspect
+        from picasso.gui import localize as glocalize
+
+        src = inspect.getsource(glocalize.SplineCalibrationWorker.run)
+        assert src.count("return_diagnostics=True") == 3  # every entry point
+        assert "self.bead_diagnostics" in src
+        finished = inspect.getsource(
+            glocalize.Window.on_spline_calibration_finished
+        )
+        assert "bead_diagnostics" in finished
+        assert "inspect_beads_action" in finished

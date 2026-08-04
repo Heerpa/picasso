@@ -7,15 +7,10 @@ Generate cubic-spline PSF calibrations from a bead z-stack.
 A calibration bead sample (e.g., fluorescent/gold beads) is imaged while the
 stage is scanned through z. This module averages the beads into a clean,
 3D-registered PSF volume, normalizes it, and computes cubic-spline
-coefficients with Gpuspline. The resulting calibration (coefficients +
-metadata) is saved via ``picasso.io.save_spline_calibration`` and later fitted
-per spot with Gpufit's SPLINE_2D / SPLINE_3D models (see
-``picasso.localize.fit_spots_gpufit_spline``).
-
-Note: Gpuspline is a CPU library (no GPU/CUDA); only the subsequent fitting
-step needs a CUDA GPU. Building a calibration therefore only needs Gpuspline,
-which is exposed as ``picasso.localize.gs`` and gated by
-``picasso.localize.GPUSPLINE_INSTALLED``.
+coefficients (:func:`spline_coefficients`, pure NumPy/SciPy). The resulting
+calibration (coefficients + metadata) is saved via
+``picasso.io.save_spline_calibration`` and later fitted per spot with the
+cubic-spline PSF models (see ``picasso.localize.fit_spots_spline``).
 
 The frame -> z-step binning mirrors ``picasso.zfit.calibrate_z`` so that
 multiple fields of view per z position (``frame_order``, ``frames_per_step``,
@@ -43,10 +38,14 @@ References
   DOI: 10.1038/s41467-022-30719-4. (globLoc)
 - Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
   "Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
-  Scientific Reports 7, 15722 (2017).
+  Scientific Reports 7, 15722 (2017). Licence (MIT):
+  ``LICENSES/Gpufit-LICENSE.txt``.
+- Gpuspline (https://github.com/gpufit/Gpuspline), whose coefficient scheme
+  and buffer layout :func:`spline_coefficients` follows. Licence (MIT):
+  ``LICENSES/Gpuspline-LICENSE.txt``.
 
 :authors: Rafal Kowalewski
-:copyright: Copyright (c) 2016-2026 Jungmann Lab, MPI of Biochemistry
+:copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry
 """
 
 from __future__ import annotations
@@ -59,11 +58,70 @@ import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
-from scipy.interpolate import make_smoothing_spline
+from scipy.interpolate import CubicSpline, make_smoothing_spline
 from scipy.ndimage import shift as _ndi_shift, zoom as _ndi_zoom
 from scipy.spatial import KDTree
 
-from . import io, lib, gausslq, localize, __version__
+from . import io, lib, localize, __version__
+from .fitting import gaussfit, splinefit
+
+
+def _natural_spline_operator(n: int) -> np.ndarray:
+    """The 1D natural cubic interpolating spline on the unit grid as a linear
+    operator on the data: shape ``(n - 1, 4, n)`` mapping ``n`` data values to
+    per-interval ascending-power coefficients ``c[i, p]``, so that
+    ``f(i + t) = sum_p c[i, p] * t**p`` for ``t`` in [0, 1]."""
+    cs = CubicSpline(
+        np.arange(n, dtype=np.float64), np.eye(n), axis=0, bc_type="natural"
+    )
+    return np.moveaxis(cs.c[::-1], 0, 1)
+
+
+def spline_coefficients(data: np.ndarray) -> np.ndarray:
+    """Cubic-spline coefficients of 1/2/3D data sampled on the integer grid.
+
+    Tensor product of 1D natural cubic interpolating splines (zero second
+    derivative at the boundaries) along each axis, computed in float64 and
+    cast to float32. Drop-in replacement for ``spline_coefficients`` of
+    Gpuspline (https://github.com/gpufit/Gpuspline. Licence (MIT):
+    ``LICENSES/Gpuspline-LICENSE.txt``.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        1, 2 or 3-dimensional data on the integer grid.
+
+    Returns
+    -------
+    coefficients : np.ndarray
+        Float32 array of nominal shape ``(4**ndim, *(n - 1 for n in
+        data.shape))``. As with the original binding, the flat C-order buffer
+        is the layout consumed downstream: for 3D input ``(x, y, z)`` it reads
+        ``(niz, niy, nix, zp, yp, xp)`` - interval indices slowest (last axis
+        first), ascending polynomial powers fastest with the x power innermost
+        (see ``localize._spline_coeff_reshaped``).
+    """
+    data = np.asarray(data, dtype=np.float64)
+    ops = [_natural_spline_operator(n) for n in data.shape]
+    if data.ndim == 1:
+        coeff = np.einsum("aAi,i->aA", ops[0], data)
+    elif data.ndim == 2:
+        coeff = np.einsum(
+            "aAi,bBj,ij->baBA", ops[0], ops[1], data, optimize=True
+        )
+    elif data.ndim == 3:
+        coeff = np.einsum(
+            "aAi,bBj,cCk,ijk->cbaCBA",
+            ops[0],
+            ops[1],
+            ops[2],
+            data,
+            optimize=True,
+        )
+    else:
+        raise ValueError("data must be 1, 2 or 3-dimensional.")
+    shape = [4**data.ndim] + [n - 1 for n in data.shape]
+    return coeff.reshape(shape).astype(np.float32)
 
 
 def _step_of_frame(
@@ -201,6 +259,9 @@ def _detect_bead_positions(
     """
     if min_separation is None:
         min_separation = box
+    # No temporal median filter here: beads in a calibration
+    # stack are static and do not blink, so their own signal would end up
+    # in the temporal median and be subtracted away.
     ids, _ = localize.identify(
         movie,
         minimum_ng,
@@ -383,17 +444,36 @@ def _bead_volumes(
     return volumes
 
 
+def _fit_gauss_spots(spots: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Least-squares elliptical Gaussian fit of ``(n_spots, box, box)`` spots.
+
+    Returns ``(thetas, states)``, the parameters
+    ``[photons, x, y, sx, sy, bg]`` - with ``x``/``y`` in box-local pixels,
+    ``x`` the column and ``y`` the row - and Gpufit's state codes (see
+    :data:`picasso.fitting.splinefit.FIT_STATE_CONVERGED`). The convergence
+    schedule is the least-squares one, so the calibration is unaffected by the
+    CPU Gaussian fitter's own (looser) defaults."""
+    spots = np.ascontiguousarray(spots, dtype=np.float32)
+    box = spots.shape[1]
+    thetas, _, states, _ = gaussfit.fit_spots(
+        gaussfit.ELLIPTIC,
+        spots,
+        localize._initial_parameters_gauss(spots, box),
+        tolerance=gaussfit.TOLERANCE_LSQ_CPU,
+        max_iterations=gaussfit.MAX_ITERATIONS_LSQ_CPU,
+    )
+    return thetas, states
+
+
 def _focus_step(volume: np.ndarray) -> tuple[int, float]:
     """Return ``(z_center, effective_sigma)``: the sharpest z-slice of a
     ``(box, box, n_steps)`` PSF volume (smallest fitted Gaussian sigma) and
-    the mean sigma there, using the least-squares single-spot fitter."""
-    n_steps = volume.shape[2]
-    sigmas = np.full(n_steps, np.inf, dtype=np.float32)
-    for k in range(n_steps):
-        theta = gausslq.fit_spot(np.ascontiguousarray(volume[:, :, k]))
-        sx, sy = abs(theta[4]), abs(theta[5])
-        if np.isfinite(sx) and np.isfinite(sy):
-            sigmas[k] = np.sqrt(sx * sy)
+    the mean sigma there, using the least-squares Gaussian fitter."""
+    thetas, _ = _fit_gauss_spots(volume.transpose(2, 0, 1))
+    sx, sy = np.abs(thetas[:, 3]), np.abs(thetas[:, 4])
+    sigmas = np.full(volume.shape[2], np.inf, dtype=np.float32)
+    ok = np.isfinite(sx) & np.isfinite(sy)
+    sigmas[ok] = np.sqrt(sx[ok] * sy[ok])
     z_center = int(np.argmin(sigmas))
     return z_center, float(sigmas[z_center])
 
@@ -466,7 +546,7 @@ def _subpixel_shift(
 
 def _keep_inliers(
     ncc: np.ndarray, mse: np.ndarray, k: float = 2.5
-) -> np.ndarray:
+) -> tuple[np.ndarray, dict]:
     """Boolean mask of beads to keep during iterative averaging.
 
     A bead is dropped when it is dissimilar from the running average - either
@@ -475,12 +555,23 @@ def _keep_inliers(
     scaled MADs) of the population. At least half of the beads (and never fewer
     than three) are always kept, falling back to the lowest-MSE beads if the
     two criteria together would reject too many.
+
+    Returns ``(keep, limits)``, where ``limits`` holds the two acceptance
+    thresholds actually applied (``ncc_min`` / ``mse_max``, NaN when the
+    criterion could not be evaluated) and whether the ``fallback`` (keep the
+    ``min_keep`` lowest-MSE beads) was used. They are reported so the GUI /
+    diagnostic plot can show the user why a bead was dropped.
     """
     ncc = np.asarray(ncc, dtype=np.float64)
     mse = np.asarray(mse, dtype=np.float64)
     n = len(mse)
+    limits = {
+        "ncc_min": float("nan"),
+        "mse_max": float("nan"),
+        "fallback": False,
+    }
     if n <= 3:
-        return np.ones(n, dtype=bool)
+        return np.ones(n, dtype=bool), limits
     keep = np.ones(n, dtype=bool)
     for values, high_is_bad in ((ncc, False), (mse, True)):
         med = np.median(values)
@@ -488,12 +579,18 @@ def _keep_inliers(
         if mad <= 0:
             continue
         t = 1.4826 * k * mad
-        keep &= values <= med + t if high_is_bad else values >= med - t
+        if high_is_bad:
+            limits["mse_max"] = float(med + t)
+            keep &= values <= med + t
+        else:
+            limits["ncc_min"] = float(med - t)
+            keep &= values >= med - t
     min_keep = max(3, n // 2)
     if keep.sum() < min_keep:
         keep = np.zeros(n, dtype=bool)
         keep[np.argsort(mse)[:min_keep]] = True
-    return keep
+        limits["fallback"] = True
+    return keep, limits
 
 
 # Sub-pixel lateral offsets below this are left alone rather than paying for an
@@ -525,15 +622,29 @@ def _focus_center_offset(
     a well-defined centroid. Returns ``(0.0, 0.0)`` if neither estimate is
     usable, so the caller simply leaves the volume alone."""
     focus = np.ascontiguousarray(volume[:, :, int(z_center)], dtype=np.float32)
-    try:
-        theta = gausslq.fit_spot(focus)
-        # gausslq returns [x, y, ...] as offsets from the box centre, x the
-        # column and y the row (see gausslq._sum_and_center_of_mass).
-        d_col, d_row = float(theta[0]), float(theta[1])
-    except Exception:
-        # a degenerate slice can divide by zero inside the least-squares
-        # model; that is a reason to fall back, not to fail the calibration
+    box = focus.shape[0]
+    thetas, states = _fit_gauss_spots(focus[None])
+    # theta is [photons, x, y, sx, sy, bg] in box-local pixels, x the column
+    # and y the row (see localize._initial_parameters_gauss). A slice no
+    # Gaussian can describe either aborts the fit or "converges" to one with
+    # no photons or a width beyond the box - neither is a centre estimate, and
+    # both are a reason to fall back rather than to fail the calibration.
+    photons, x, y, sx, sy = (float(_) for _ in thetas[0, :5])
+    aborted = states[0] in (
+        splinefit.FIT_STATE_SINGULAR_HESSIAN,
+        splinefit.FIT_STATE_NEG_CURVATURE_MLE,
+    )
+    usable = (
+        not aborted
+        and photons > 0.0
+        and 0.0 < abs(sx) <= box
+        and 0.0 < abs(sy) <= box
+    )
+    if not usable:
         d_col = d_row = np.nan
+    else:
+        center = (box / 2.0) - 0.5
+        d_col, d_row = x - center, y - center
     if not (np.isfinite(d_row) and np.isfinite(d_col)):
         weights = np.clip(focus - focus.min(), 0.0, None).astype(np.float64)
         total = float(weights.sum())
@@ -584,7 +695,12 @@ def _register_and_average(
     ``return_registered`` is True, also returns the stack of the retained
     individual registered bead volumes (photon units, shape
     ``(n_used, box, box, n_steps)``) so the averaged model can be compared
-    against the individual beads (goodness of fit)."""
+    against the individual beads (goodness of fit), plus a ``quality`` dict
+    describing the inlier decision for *every* bead - ``keep`` (bool mask),
+    the two dissimilarity measures ``ncc`` / ``mse``, the thresholds applied
+    (see ``_keep_inliers``) and ``registered_all``, the registered volumes of
+    all beads including the rejected ones, so the rejection can be inspected
+    visually."""
     n_beads, box, _, n_steps = volumes.shape
     vols = volumes.astype(np.float64)
     z_center = int(z_center)
@@ -609,6 +725,9 @@ def _register_and_average(
     ref = vols[int(np.argmax(vols[:, :, :, z_center].max(axis=(1, 2))))]
 
     keep = np.ones(n_beads, dtype=bool)
+    ncc = np.full(n_beads, np.nan)
+    mse = np.full(n_beads, np.nan)
+    limits = {"ncc_min": np.nan, "mse_max": np.nan, "fallback": False}
     aligned = vols
     for _ in range(n_iter):
         ref_c = central(ref)
@@ -638,7 +757,7 @@ def _register_and_average(
             scale = float((bead_c * avg_c).sum()) / avg_energy
             mse[b] = float(((bead_c - scale * avg_c) ** 2).mean())
 
-        keep = _keep_inliers(ncc, mse)
+        keep, limits = _keep_inliers(ncc, mse)
         ref = aligned[keep].mean(axis=0)
 
     if not keep.any():
@@ -668,8 +787,53 @@ def _register_and_average(
             )
     mean_volume = ref.astype(np.float32)
     if return_registered:
-        return mean_volume, aligned[keep].astype(np.float32)
+        quality = {
+            "keep": keep,
+            "ncc": ncc,
+            "mse": mse,
+            "registered_all": aligned.astype(np.float32),
+            **limits,
+        }
+        return mean_volume, aligned[keep].astype(np.float32), quality
     return mean_volume
+
+
+def _bead_quality_summary(
+    quality: dict, beads: pd.DataFrame, z_center: int
+) -> dict:
+    """Compact, per-bead record of the outlier filtering, ready to display.
+
+    Reduces the registered volumes of every bead (kept and rejected alike, see
+    ``_register_and_average``) to the three central views the diagnostics draw
+    - xy at focus, xz and yz through the box centre - each background-shifted
+    and peak-normalized so beads are compared by *shape* rather than by
+    brightness, and attaches each bead's position in the movie.
+    """
+    registered = quality.pop("registered_all")
+    n_beads, box, _, n_steps = registered.shape
+    c = box // 2
+    k = int(np.clip(z_center, 0, n_steps - 1))
+    xy = np.empty((n_beads, box, box), dtype=np.float32)
+    xz = np.empty((n_beads, n_steps, box), dtype=np.float32)
+    yz = np.empty((n_beads, n_steps, box), dtype=np.float32)
+    for b in range(n_beads):
+        volume = registered[b].astype(np.float64)
+        volume = volume - volume.min()
+        amplitude = float(volume[:, :, k].max())
+        if amplitude > 0:
+            volume /= amplitude
+        xy[b] = volume[:, :, k]
+        # same orientation as the diagnostic plot's cross-sections: z down the
+        # rows, the remaining lateral axis across the columns
+        xz[b] = volume[c, :, :].T
+        yz[b] = volume[:, c, :].T
+    summary = dict(quality)
+    summary.update({"xy": xy, "xz": xz, "yz": yz})
+    summary["x"] = np.asarray(beads["x"], dtype=float)
+    summary["y"] = np.asarray(beads["y"], dtype=float)
+    if "fov" in beads.columns:
+        summary["fov"] = np.asarray(beads["fov"], dtype=int)
+    return summary
 
 
 def _smooth_z(volume: np.ndarray) -> np.ndarray:
@@ -863,13 +1027,16 @@ def build_psf_template(
 ) -> dict:
     """Build a normalized PSF template volume from a bead z-stack.
 
-    This is the GPU-independent part of the calibration (no Gpuspline needed),
-    factored out so it can be unit-tested. Returns a dict with keys
+    This is the template-building part of the calibration (no coefficient
+    computation), factored out so it can be unit-tested. Returns a dict with keys
     ``template`` (box, box, n_steps), ``z_center``, ``effective_sigma``,
     ``background``, ``amplitude``, ``photon_scale``, ``n_beads``,
-    ``z_of_step``, ``gof`` and ``registered`` (the 3D-registered individual
+    ``n_beads_used`` (beads that survived the outlier filtering),
+    ``z_of_step``, ``gof``, ``registered`` (the 3D-registered individual
     bead volumes, ``(n_used, box, box, n_steps)``, photon units, used for the
-    goodness-of-fit).
+    goodness-of-fit) and ``bead_quality`` (the per-bead accept/reject record
+    of that filtering with the central views of every bead, see
+    ``_bead_quality_summary``).
 
     If ``return_spots`` is True, the dict also carries ``spots`` (every
     individual per-frame bead spot, ``(n_spots, box, box)``, photon units),
@@ -927,7 +1094,7 @@ def build_psf_template(
         )
     # first pass on the raw bead-average to locate focus, then register
     z_center, _ = _focus_step(volumes.mean(axis=0))
-    mean_volume, registered = _register_and_average(
+    mean_volume, registered, quality = _register_and_average(
         volumes, z_center, return_registered=True
     )
     # regularize the averaged PSF by smoothing along z (paper's smoothing
@@ -939,6 +1106,9 @@ def build_psf_template(
     )
     # how well the averaged PSF model represents the individual beads
     gof = _goodness_of_fit(registered, template)
+    # per-bead accept/reject record of the outlier filtering, reduced to the
+    # central views (the full registered volumes are dropped here)
+    bead_quality = _bead_quality_summary(quality, beads, z_center)
     # fractional z-slice of the axial intensity peak; used (optionally) to
     # define z = 0 at the intensity focus (see ``calibrate_spline``'s
     # ``correct_z_bias``)
@@ -952,9 +1122,11 @@ def build_psf_template(
         "amplitude": amplitude,
         "photon_scale": photon_scale,
         "n_beads": int(len(beads)),
+        "n_beads_used": int(bead_quality["keep"].sum()),
         "z_of_step": z_of_step[step_range],
         "gof": gof,
         "registered": registered,
+        "bead_quality": bead_quality,
     }
     if return_spots:
         # every individual per-frame bead spot, flattened to (n_spots, box,
@@ -986,7 +1158,8 @@ def calibrate_spline(
     roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
     path: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
-) -> dict:
+    return_diagnostics: bool = False,
+) -> dict | tuple[dict, list]:
     """Generate a cubic-spline PSF calibration from a bead z-stack movie.
 
     Parameters
@@ -1037,18 +1210,19 @@ def calibrate_spline(
         nothing is written. Default is None.
     progress_callback : callable, optional
         Called with an integer step count (0..3) as the calibration proceeds.
+    return_diagnostics : bool, optional
+        If True, return ``(calibration, diagnostics)``, where ``diagnostics``
+        is a one-element list holding the bead inspection record (see
+        :func:`bead_inspection_data`) so a caller such as the GUI can show
+        which beads were averaged into the PSF and which were rejected.
+        Default is False.
 
     Returns
     -------
     calibration : dict
         The spline PSF calibration (see ``io.save_spline_calibration`` /
-        ``io.load_spline_calibration`` and ``localize.fit_spots_gpufit_spline``).
+        ``io.load_spline_calibration`` and ``localize.fit_spots_spline``).
     """
-    if not localize.GPUSPLINE_INSTALLED:
-        raise ImportError(
-            "Gpuspline is required to build a spline PSF calibration but "
-            "could not be loaded. See picasso/ext/pygpuspline/README.txt."
-        )
     assert model in (
         "spline-2d",
         "spline-3d",
@@ -1096,7 +1270,6 @@ def calibrate_spline(
     if callable(progress_callback):
         progress_callback(1)
 
-    gs = localize.gs
     # The template is (row=y, col=x, z), but at fit time spots are flattened
     # C-order so the Gpufit spline model's fast pixel index (point_index_x) is
     # the movie column (x). The spline's first axis must therefore be x, so we
@@ -1106,20 +1279,13 @@ def calibrate_spline(
     # no-op for a laterally symmetric PSF.
     if model == "spline-2d":
         slab = np.ascontiguousarray(template[:, :, z_center].T)
-        coefficients = gs.spline_coefficients(slab)
-        n_intervals = [int(i) for i in (np.array(slab.shape) - 1)]
-        coefficients = np.reshape(coefficients, [16] + n_intervals).astype(
-            np.float32
-        )
+        coefficients = spline_coefficients(slab)
         n_data = [box, box]
     else:
         template_xyz = np.ascontiguousarray(template.transpose(1, 0, 2))
-        coefficients = gs.spline_coefficients(template_xyz)
-        n_intervals = [int(i) for i in (np.array(template_xyz.shape) - 1)]
-        coefficients = np.reshape(coefficients, [64] + n_intervals).astype(
-            np.float32
-        )
+        coefficients = spline_coefficients(template_xyz)
         n_data = [int(s) for s in template_xyz.shape]
+    n_intervals = [int(s) for s in coefficients.shape[1:]]
 
     if callable(progress_callback):
         progress_callback(2)
@@ -1147,6 +1313,9 @@ def calibrate_spline(
         "pixelsize": float(pixelsize),
         "n_channels": 1,
         "n_beads": int(built["n_beads"]),
+        # beads that survived the outlier filtering and were actually averaged
+        # into the PSF (see _keep_inliers); the rest live in the diagnostics
+        "n_beads_used": int(built["n_beads_used"]),
         "Frames per step": int(frames_per_step),
         "Frame order": frame_order,
         "Frame bounds": frame_bounds,
@@ -1162,9 +1331,17 @@ def calibrate_spline(
         # 2D calibration (the plot then falls back to the model-vs-data RMSE)
         precision = _axial_precision(built, calibration)
         _save_diagnostic_plot(built, calibration, path, precision=precision)
+        # gallery of the individual beads, showing which were averaged into the
+        # PSF and which were rejected as outliers. Never fatal.
+        try:
+            _save_bead_gallery_plot(built, calibration, path)
+        except Exception:
+            pass
 
     if callable(progress_callback):
         progress_callback(3)
+    if return_diagnostics:
+        return calibration, [bead_inspection_data(built, calibration)]
     return calibration
 
 
@@ -1485,7 +1662,8 @@ def calibrate_spline_multichannel(
     reference: int = 0,
     path: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
-) -> dict:
+    return_diagnostics: bool = False,
+) -> dict | tuple[dict, list]:
     """Generate a multichannel cubic-spline PSF calibration from registered
     bead z-stacks (one movie per channel).
 
@@ -1507,7 +1685,9 @@ def calibrate_spline_multichannel(
     must share the same frame layout (z scan). ``roi`` (in reference-channel
     coordinates) restricts which reference-channel beads are calibrated on; the
     channel-to-channel transform is still estimated from all detected beads.
-    Returns a ``"spline-3d-multichannel"`` calibration dict.
+    Returns a ``"spline-3d-multichannel"`` calibration dict - or, with
+    ``return_diagnostics``, ``(calibration, diagnostics)`` with one bead
+    inspection record per channel (see :func:`bead_inspection_data`).
 
     **Split-FOV mode** (``regions`` given): the channels are rectangular
     sub-regions of a *single* movie (all ``movies`` entries are the same movie).
@@ -1521,11 +1701,6 @@ def calibrate_spline_multichannel(
     channel stack. Prefer the :func:`calibrate_spline_split_fov` wrapper, which
     builds the repeated per-channel lists for you.
     """
-    if not localize.GPUSPLINE_INSTALLED:
-        raise ImportError(
-            "Gpuspline is required to build a spline PSF calibration but "
-            "could not be loaded. See picasso/ext/pygpuspline/README.txt."
-        )
     n_channels = len(movies)
     if n_channels < 2:
         raise ValueError(
@@ -1635,7 +1810,6 @@ def calibrate_spline_multichannel(
 
     # per-channel PSF templates from the same physical beads
     ref_xy = beads_ref[["x", "y"]].to_numpy(dtype=np.float64)
-    gs = localize.gs
     per_channel = []
     for c in range(n_channels):
         if c == 0:
@@ -1680,8 +1854,7 @@ def calibrate_spline_multichannel(
         [64] + n_intervals + [n_channels], dtype=np.float32
     )
     for c, template in enumerate(templates):
-        coeff_c = gs.spline_coefficients(template)
-        coefficients[..., c] = np.reshape(coeff_c, [64] + n_intervals)
+        coefficients[..., c] = spline_coefficients(template)
 
     ref = per_channel[0]
     # z_init (sharpest slice, fit initialization) vs z_origin (output z = 0
@@ -1722,6 +1895,9 @@ def calibrate_spline_multichannel(
         "box": int(box),
         "pixelsize": float(pixelsize),
         "n_beads": int(ref["n_beads"]),
+        # per channel: the beads that survived that channel's outlier filtering
+        # and were averaged into its PSF (see _keep_inliers)
+        "n_beads_used": [int(p["n_beads_used"]) for p in per_channel],
         "Frames per step": int(frames_per_step),
         "Frame order": frame_order,
         "Frame bounds": frame_bounds,
@@ -1782,6 +1958,18 @@ def calibrate_spline_multichannel(
 
     if callable(progress_callback):
         progress_callback(3)
+    if return_diagnostics:
+        diagnostics = [
+            bead_inspection_data(
+                built,
+                calibration,
+                label=(
+                    "reference channel - " if c == 0 else f"channel {c} - "
+                ),
+            )
+            for c, built in enumerate(per_channel)
+        ]
+        return calibration, diagnostics
     return calibration
 
 
@@ -1983,6 +2171,9 @@ def _save_multichannel_diagnostics(
       axial intensity and per-channel model-vs-data agreement) via
       :func:`_save_diagnostic_plot`. The axial z-accuracy panels are *not* shown
       here: a single plane is z-degenerate, so that is a cross-channel property.
+    * ``<base>_ch{c}_beads.png`` - that channel's bead gallery
+      (:func:`_save_bead_gallery_plot`): which individual beads were averaged
+      into its PSF and which were rejected as outliers.
     * ``<base>_summary.png`` - the cross-channel summary
       (:func:`_save_multichannel_summary_plot`): overlaid axial intensity
       profiles with the per-channel focus (plane offsets) and the joint
@@ -2034,6 +2225,19 @@ def _save_multichannel_diagnostics(
             precision=None,
             title_prefix=f"{label} - ",
         )
+        # <base>_ch{c}_beads.png: the beads that were averaged into this
+        # channel's PSF and those rejected as outliers. Guarded on its own so
+        # a failure here cannot cost us the summary and registration figures
+        # that are written after this loop.
+        try:
+            _save_bead_gallery_plot(
+                per_channel[c],
+                calib_c,
+                f"{base}_ch{c}.hdf5",
+                label=f"{label} - ",
+            )
+        except Exception:
+            pass
     # cross-channel summary: overlaid axial profiles and joint z accuracy
     # (see _save_multichannel_summary_plot)
     _save_multichannel_summary_plot(
@@ -2231,7 +2435,8 @@ def calibrate_spline_split_fov(
     link_photons: bool = True,
     path: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
-) -> dict:
+    return_diagnostics: bool = False,
+) -> dict | tuple[dict, list]:
     """Build a multichannel spline calibration from a *single* bead z-stack in
     which several rectangular field-of-view regions are the channels (split-FOV
     optics: spectral/ratiometric splitters, biplane relays).
@@ -2286,6 +2491,7 @@ def calibrate_spline_split_fov(
         reference=reference,
         path=path,
         progress_callback=progress_callback,
+        return_diagnostics=return_diagnostics,
     )
 
 
@@ -3055,7 +3261,7 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
         are absent, or when GPU spline fitting is unavailable or fails, so the
         caller can fall back to the model-vs-data RMSE panel.
     """
-    if not localize.GPUFIT_INSTALLED:
+    if not localize.CUDA_AVAILABLE:
         return None
     if calibration["model"] == "spline-2d":
         return None  # no axial coordinate to assess
@@ -3075,7 +3281,9 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
         # spots and stays closer to the CRLB than least squares, especially for
         # the dim, defocused spots in the tails. The axial multi-start is left
         # at its default so this measures what the fitting path delivers.
-        theta = localize.fit_spots_gpufit_spline(spots, calibration, mle=True)
+        theta = localize.fit_spots_spline(
+            spots, calibration, mle=True, use_gpu=True
+        )
     except Exception:
         return None
     return _axial_precision_from_theta(
@@ -3154,7 +3362,7 @@ def _axial_precision_multichannel(
     ``spot_residuals`` (``(n_spots, n_channels, 2)``, see
     :func:`_spot_roi_residuals`) are the sub-pixel ROI offsets of the bead
     spots being refitted."""
-    if not localize.GPUFIT_INSTALLED:
+    if not localize.CUDA_AVAILABLE:
         return None
     # only the plain multichannel spline fitter is used here
     if calibration.get("model") != "spline-3d-multichannel":
@@ -3188,10 +3396,11 @@ def _axial_precision_multichannel(
     ):
         spot_residuals = None
     try:
-        theta = localize.fit_spots_gpufit_spline(
+        theta = localize.fit_spots_spline(
             spots,
             fit_cal,
             mle=True,
+            use_gpu=True,
             residuals=spot_residuals,
         )
     except Exception:
@@ -3372,8 +3581,16 @@ def _save_diagnostic_plot(
     # manage and would warn too.
     fig = Figure(figsize=(fig_w, fig_h))
     FigureCanvasAgg(fig)
+    n_beads_txt = f"{built['n_beads']} beads"
+    n_used = built.get("n_beads_used")
+    if n_used is not None and n_used < built["n_beads"]:
+        # the rejected beads are not in the PSF; say so here rather than
+        # letting the bead count suggest they all contributed
+        n_beads_txt += (
+            f" ({n_used} used, {built['n_beads'] - n_used} rejected)"
+        )
     fig.suptitle(
-        f"{title_prefix}{built['n_beads']} beads | z range {z_lo:.0f} to "
+        f"{title_prefix}{n_beads_txt} | z range {z_lo:.0f} to "
         f"{z_hi:.0f} nm | box {box} px | 1 px = 1 camera pixel ({ps:.0f} nm)"
         + gof_txt,
         fontsize=12,
@@ -3500,3 +3717,332 @@ def _save_diagnostic_plot(
 
     base, _ = os.path.splitext(path)
     fig.savefig(base + ".png", format="png", dpi=200)
+
+
+# ----------------------------------------------------------------------
+# Bead inspection: which beads went into the PSF and which were filtered out
+# ----------------------------------------------------------------------
+
+
+def n_beads_used(calibration: dict) -> int:
+    """How many beads actually went into the calibration's PSF.
+
+    A multichannel calibration stores one count per channel; the reference
+    channel's is the meaningful single number, since it is the channel the
+    beads were detected on. Falls back to the detected bead count for a
+    calibration built before the filtering was recorded, so a caller can
+    always compare it against ``n_beads``."""
+    detected = int(calibration.get("n_beads", 0))
+    used = calibration.get("n_beads_used", detected)
+    if isinstance(used, (list, tuple, np.ndarray)):
+        used = used[0] if len(used) else detected
+    return int(used)
+
+
+def bead_inspection_data(
+    built: dict, calibration: dict, label: str = ""
+) -> dict | None:
+    """Self-contained record of the per-bead outlier filtering, for display.
+
+    The calibration averages many beads into one PSF and drops those whose
+    shape is dissimilar from the average (see :func:`_keep_inliers`). This
+    packs everything needed to *see* that decision - each bead's central views,
+    its two dissimilarity measures and the thresholds applied, plus the
+    averaged PSF to compare against - into one dict that is small enough to
+    hand to the GUI (see the localize GUI's bead inspector) and to plot with
+    :func:`plot_bead_gallery`.
+
+    Returns None for a ``built`` dict without the per-bead record (e.g. one
+    produced by an older version).
+    """
+    quality = built.get("bead_quality")
+    if not quality:
+        return None
+    template = np.asarray(built["template"])
+    box, _, n_steps = template.shape
+    c = box // 2
+    k = int(np.clip(int(built["z_center"]), 0, n_steps - 1))
+    z_of_step = np.asarray(built["z_of_step"], dtype=float)
+    # z axis of the cross-sections, in nm relative to the fitter's z = 0 (the
+    # same reference the main diagnostic plot uses)
+    if n_steps > 1:
+        dz = (float(z_of_step[-1]) - float(z_of_step[0])) / (n_steps - 1)
+        z_ref = float(z_of_step[0]) + float(calibration["z_center"]) * dz
+    else:
+        z_ref = 0.0
+    return {
+        "label": label,
+        "keep": np.asarray(quality["keep"], dtype=bool),
+        "ncc": np.asarray(quality["ncc"], dtype=float),
+        "mse": np.asarray(quality["mse"], dtype=float),
+        "ncc_min": float(quality["ncc_min"]),
+        "mse_max": float(quality["mse_max"]),
+        "fallback": bool(quality["fallback"]),
+        "x": np.asarray(quality["x"], dtype=float),
+        "y": np.asarray(quality["y"], dtype=float),
+        "xy": quality["xy"],
+        "xz": quality["xz"],
+        "yz": quality["yz"],
+        # the averaged PSF in the same three views, to compare each bead
+        # against (already unit-peak normalized by _normalize_template)
+        "template_xy": np.ascontiguousarray(template[:, :, k]),
+        "template_xz": np.ascontiguousarray(template[c, :, :].T),
+        "template_yz": np.ascontiguousarray(template[:, c, :].T),
+        "z_nm": z_of_step - z_ref,
+        "pixelsize": float(calibration.get("pixelsize", 130) or 130),
+    }
+
+
+def _rejection_reasons(data: dict) -> list[str]:
+    """Why each bead was dropped (empty string for the beads that were kept).
+
+    Reconstructed from the stored measures and thresholds, so the inspector can
+    tell the user which criterion a rejected bead failed rather than only that
+    it failed."""
+    ncc = data["ncc"]
+    mse = data["mse"]
+    ncc_min = data["ncc_min"]
+    mse_max = data["mse_max"]
+    reasons = []
+    for b, kept in enumerate(data["keep"]):
+        if kept:
+            reasons.append("")
+            continue
+        failed = []
+        if np.isfinite(ncc_min) and ncc[b] < ncc_min:
+            failed.append("low correlation")
+        if np.isfinite(mse_max) and mse[b] > mse_max:
+            failed.append("high residual")
+        if not failed:
+            # the fallback kept the lowest-MSE half instead of the thresholds
+            failed.append("outside the best half")
+        reasons.append(", ".join(failed))
+    return reasons
+
+
+def plot_bead_gallery(
+    data: dict,
+    fig,
+    columns: int = 6,
+    only_rejected: bool = False,
+    max_beads: int | None = None,
+) -> None:
+    """Draw the bead gallery of one calibration channel into ``fig``.
+
+    One cell per bead - xy at focus, xz and yz cross-sections, all normalized
+    to their own peak so beads are compared by shape - preceded by the averaged
+    PSF the beads were compared against. Rejected beads are framed in red and
+    annotated with the criterion they failed; below the gallery, a scatter of
+    the two dissimilarity measures shows every bead against the thresholds that
+    were applied.
+
+    Rejected beads are laid out first and are never dropped by ``max_beads``
+    (which only caps how many *kept* beads are drawn), since they are what the
+    user is checking; each cell is labelled with the bead's index and its
+    position in the movie, so a suspicious one can be found in the raw
+    z-stack.
+    """
+    keep = data["keep"]
+    reasons = _rejection_reasons(data)
+    n_beads = len(keep)
+    n_used = int(keep.sum())
+    n_rejected = n_beads - n_used
+    # rejected first: they are the point of the figure, and the cap only ever
+    # drops beads that were kept, so a rejection is never hidden
+    rejected = list(np.flatnonzero(~keep))
+    accepted = [] if only_rejected else list(np.flatnonzero(keep))
+    order = rejected + accepted
+    if max_beads is None:
+        shown = order
+    else:
+        room = max(0, int(max_beads) - len(rejected))
+        shown = rejected + accepted[:room]
+
+    ps = data["pixelsize"]
+    z_nm = np.asarray(data["z_nm"], dtype=float)
+    n_steps = len(z_nm)
+    box = data["template_xy"].shape[0]
+    # cross-sections share the xy panel's lateral axis; z is drawn in camera
+    # pixels so one camera pixel is the same physical size on both axes
+    lat_lo, lat_hi = -(box // 2) - 0.5, box - (box // 2) - 0.5
+    z_lo, z_hi = float(z_nm[-1]) / ps, float(z_nm[0]) / ps
+    xy_kw = dict(
+        cmap="hot",
+        vmin=0.0,
+        vmax=1.0,
+        extent=[lat_lo, lat_hi, lat_hi, lat_lo],
+        origin="upper",
+    )
+    cs_kw = dict(
+        cmap="hot",
+        vmin=0.0,
+        vmax=1.0,
+        extent=[lat_lo, lat_hi, min(z_lo, z_hi), max(z_lo, z_hi)],
+        origin="upper",
+        aspect="auto",
+    )
+
+    # (title, sublabel, reason, views, color)
+    cells = [
+        (
+            "averaged PSF",
+            f"from {n_used} beads",
+            "",
+            (data["template_xy"], data["template_xz"], data["template_yz"]),
+            "tab:blue",
+        )
+    ]
+    for b in shown:
+        cells.append(
+            (
+                # the position lets the user find a suspicious bead in the
+                # raw z-stack, so it is spelled out rather than left as a
+                # bare pair of numbers
+                f"#{b}  x={data['x'][b]:.0f} y={data['y'][b]:.0f}",
+                f"NCC {data['ncc'][b]:.3f} | MSE {data['mse'][b]:.3g}",
+                reasons[b],
+                (data["xy"][b], data["xz"][b], data["yz"][b]),
+                "0.5" if keep[b] else "tab:red",
+            )
+        )
+
+    # never leave a trailing empty column (e.g. when only a couple of rejected
+    # beads are shown)
+    columns = max(1, min(int(columns), len(cells)))
+    rows = int(np.ceil(len(cells) / columns))
+    # a cell is three stacked panels plus two lines of text underneath
+    cell_w, cell_h = 1.3, 2.6
+    margin, top_margin, bottom_margin = 0.45, 0.8, 0.5
+    scatter_h, scatter_gap = 2.1, 0.5
+    fig_w = max(columns * cell_w + 2 * margin, 6.5)
+    fig_h = (
+        top_margin + rows * cell_h + scatter_gap + scatter_h + bottom_margin
+    )
+    fig.set_size_inches(fig_w, fig_h)
+
+    thresholds = []
+    if np.isfinite(data["ncc_min"]):
+        thresholds.append(f"NCC ≥ {data['ncc_min']:.3f}")
+    if np.isfinite(data["mse_max"]):
+        thresholds.append(f"MSE ≤ {data['mse_max']:.3g}")
+    if data["fallback"]:
+        thresholds.append("fallback: kept the lowest-MSE half")
+    title = (
+        f"{data['label']}{n_beads} beads: {n_used} averaged into the PSF, "
+        f"{n_rejected} rejected as outliers"
+    )
+    if thresholds:
+        title += "  |  " + ", ".join(thresholds)
+    n_hidden = len(order) - len(shown)
+    if n_hidden > 0:
+        title += f"  |  showing {len(shown)} of {len(order)} beads"
+    fig.suptitle(title, fontsize=11, y=1.0 - 0.25 / fig_h)
+
+    grid = fig.add_gridspec(
+        rows,
+        columns,
+        left=margin / fig_w,
+        right=1.0 - margin / fig_w,
+        top=1.0 - top_margin / fig_h,
+        bottom=(bottom_margin + scatter_h + scatter_gap) / fig_h,
+        wspace=0.25,
+        hspace=0.25,
+    )
+    for i, (title_i, sublabel, reason, views, color) in enumerate(cells):
+        inner = grid[i // columns, i % columns].subgridspec(
+            3, 1, hspace=0.08, height_ratios=[1.0, 1.0, 1.0]
+        )
+        for j, (view, kw) in enumerate(zip(views, (xy_kw, cs_kw, cs_kw))):
+            ax = fig.add_subplot(inner[j])
+            ax.imshow(view, **kw)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_color(color)
+                spine.set_linewidth(1.6 if color == "tab:red" else 0.8)
+            if i == 0:
+                # label the reference cell's panels once, as a key for the
+                # bead cells that follow
+                ax.set_ylabel(
+                    ("xy (focus)", "xz", "yz")[j], fontsize=6, labelpad=2
+                )
+            if j == 0:
+                ax.set_title(title_i, fontsize=7, color=color, pad=3)
+            elif j == 2:
+                label = sublabel if not reason else f"{sublabel}\n{reason}"
+                ax.set_xlabel(
+                    label,
+                    fontsize=6,
+                    color="tab:red" if reason else "0.3",
+                    labelpad=2,
+                )
+
+    # left offset leaves room for the (two-line) y label and its ticks
+    scatter_left = margin + 0.95
+    ax = fig.add_axes(
+        [
+            scatter_left / fig_w,
+            bottom_margin / fig_h,
+            min(3.6, fig_w - scatter_left - margin) / fig_w,
+            (scatter_h - 0.45) / fig_h,
+        ]
+    )
+    ax.plot(
+        data["mse"][keep],
+        data["ncc"][keep],
+        "o",
+        color="0.4",
+        markersize=4,
+        label=f"kept ({n_used})",
+    )
+    ax.plot(
+        data["mse"][~keep],
+        data["ncc"][~keep],
+        "x",
+        color="tab:red",
+        markersize=6,
+        label=f"rejected ({n_rejected})",
+    )
+    for b in np.flatnonzero(~keep):
+        ax.annotate(
+            f"#{b}",
+            (data["mse"][b], data["ncc"][b]),
+            textcoords="offset points",
+            xytext=(4, 3),
+            fontsize=6,
+            color="tab:red",
+        )
+    if np.isfinite(data["mse_max"]):
+        ax.axvline(data["mse_max"], color="tab:red", lw=1.0, ls="--")
+    if np.isfinite(data["ncc_min"]):
+        ax.axhline(data["ncc_min"], color="tab:red", lw=1.0, ls="--")
+    ax.set_xlabel("Mean-square error vs the average (photons²)", fontsize=8)
+    ax.set_ylabel("Correlation with\nthe average (NCC)", fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.set_title(
+        "Bead dissimilarity (dashed: rejection thresholds)", fontsize=9
+    )
+    ax.legend(loc="best", fontsize=7)
+
+
+def _save_bead_gallery_plot(
+    built: dict,
+    calibration: dict,
+    path: str,
+    label: str = "",
+    max_beads: int = 47,
+) -> None:
+    """Save the bead gallery (``<base>_beads.png``) next to the calibration.
+
+    The same figure the GUI's bead inspector shows, written out so the
+    filtering can be reviewed later (and by whoever did not run the
+    calibration). Capped at ``max_beads`` cells so a z-stack with hundreds of
+    beads still produces a readable PNG; rejected beads are never cut."""
+    data = bead_inspection_data(built, calibration, label=label)
+    if data is None:
+        return
+    fig = Figure()
+    FigureCanvasAgg(fig)
+    plot_bead_gallery(data, fig, max_beads=max_beads)
+    base, _ = os.path.splitext(path)
+    fig.savefig(base + "_beads.png", format="png", dpi=200)

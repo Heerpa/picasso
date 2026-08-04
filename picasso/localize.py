@@ -5,6 +5,20 @@ picasso.localize
 Identify and localize fluorescent single molecules in a frame
 sequence.
 
+Spot detection and the localization table live here; the fits themselves are
+run by :mod:`picasso.fitting` (Gaussian and cubic-spline PSF models on the CPU
+and on CUDA GPUs). This module owns the translation between them:
+calibration dicts, initial parameters, the device choice, and the
+Cramer-Rao lower bounds that become the reported localization precisions.
+
+References
+----------
+Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
+"Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
+Scientific Reports 7, 15722 (2017).
+https://doi.org/10.1038/s41598-017-15313-9
+Licence (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
+
 :authors: Joerg Schnitzbauer, Maximilian Thomas Strauss,
     Rafal Kowalewski
 :copyright: Copyright (c) 2016-2026 Jungmann Lab, MPI of Biochemistry
@@ -18,6 +32,7 @@ import multiprocessing
 import threading
 import time
 import warnings
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future
 from itertools import chain
 from typing import Literal
@@ -30,6 +45,7 @@ from numba import cuda
 import dask.array as da
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.special import erf
 from tqdm import tqdm
 from sqlalchemy import create_engine
 import matplotlib.gridspec as gridspec
@@ -43,40 +59,26 @@ from .ext import bitplane
 from . import (
     io,
     lib,
-    gausslq,
-    gaussmle,
     avgroi,
     postprocess,
     zfit,
     __version__,
 )
+from .fitting import (
+    gaussfit,
+    gaussfit_cuda,
+    precision,
+    splinefit,
+    splinefit_cuda,
+)
 
 # Check for CUDA availability for spline CRLB calculations. Otherwise,
 # CPU is used
 try:
-    SPLINE_CRLB_CUDA_AVAILABLE = bool(cuda.is_available())
+    CUDA_AVAILABLE = bool(cuda.is_available())
 except Exception:
-    SPLINE_CRLB_CUDA_AVAILABLE = False
+    CUDA_AVAILABLE = False
 
-try:
-    from .ext.pygpufit import gpufit as gf
-
-    GPUFIT_INSTALLED = bool(gf.cuda_available())
-except Exception:
-    GPUFIT_INSTALLED = False
-
-try:
-    from .ext.pygpuspline import gpuspline as gs  # noqa: F401
-
-    # gpuspline is a plain CPU coefficient library (despite the name, it does
-    # not use CUDA/GPU); the import succeeds only if the compiled splines
-    # library can be loaded. It is required only to *generate* a spline PSF
-    # calibration (spline_coefficients), not to fit an existing one - fitting
-    # needs only Gpufit. Exposed as ``localize.gs`` for the calibration
-    # builder.
-    GPUSPLINE_INSTALLED = True
-except Exception:
-    GPUSPLINE_INSTALLED = False
 
 plt.style.use("ggplot")
 
@@ -91,27 +93,11 @@ _GAUSS_CRLB_MU_FLOOR = (
 )
 # EMCCD stochastic multiplication doubles every pixel's variance (excess noise
 # factor F^2 = 2), so every variance derived from a Poisson pixel model has to
-# be scaled by it. Same factor as in gausslq.localization_precision.
+# be scaled by it. Same factor as in precision.localization_precision.
 _EM_EXCESS_NOISE_FACTOR = 2.0
 
 # Largest channel count the photon-decoupled (link-XYZ) spline fit supports.
 _LINK_XYZ_MAX_CHANNELS = 6
-
-# Batching for spline fits that pass per-fit ROI residuals to Gpufit. The model
-# indexes the residual block by ``chunk_index * n_fits + fit_index``, which is
-# only correct while a call stays in one chunk, so keep each call comfortably
-# below Gpufit's own (free-VRAM-derived) chunk size. Whichever bound bites
-# first wins: the point budget covers large boxes / many channels, the fit
-# count covers small ones.
-_GPUFIT_MAX_POINTS_PER_CALL = 20_000_000
-_GPUFIT_MAX_FITS_PER_CALL = 50_000
-
-
-def _gpufit_batch_size(n_points: int) -> int:
-    """Spots per Gpufit call so that Gpufit does not split it into chunks."""
-    by_points = _GPUFIT_MAX_POINTS_PER_CALL // max(int(n_points), 1)
-    return int(max(1, min(by_points, _GPUFIT_MAX_FITS_PER_CALL)))
-
 
 # Axial multi-start. A single in-focus seed leaves a spline fit z-degenerate at
 # large |z|. Several seeds spanning the calibration stack are run per spot and the
@@ -178,6 +164,8 @@ SET_COLS = [
     "Min. Net Gradient",
     "Pixelsize",
 ]
+# Memory budget for the cached temporal windows of TemporalMedianMovie.
+TEMPORAL_MEDIAN_CACHE_BYTES = 512 * 1024**2
 # Default bead-detection / matching parameters for `calibrate_affine_transform`.
 _AFFINE_MATCH_MAX_DIST_PX = 40.0  # max distance between matched pair
 _AFFINE_XCORR_HALF_WIDTH = 18  # half-width of bead crop for xcorr
@@ -457,6 +445,401 @@ def _as_roi_list(
     return rois if len(rois) else None
 
 
+def _temporal_median(
+    frames: np.ndarray, max_stripe_bytes: int = 64 * 1024**2
+) -> lib.FloatArray2D:
+    """Per-pixel median of a stack of frames, i.e. the median along
+    axis 0.
+
+    ``np.partition`` is used instead of ``np.median`` because only the
+    middle order statistic is needed and because it keeps the data in its
+    native (usually integer) dtype - ``np.median`` promotes to float64,
+    which doubles the memory traffic. The stack is processed in stripes of
+    rows so that the copy ``np.partition`` makes internally stays bounded
+    regardless of the window length and the frame size.
+
+    Parameters
+    ----------
+    frames : np.ndarray
+        Stack of frames of shape (N, Y, X).
+    max_stripe_bytes : int, optional
+        Approximate memory budget for one stripe. Default is 64 MB.
+
+    Returns
+    -------
+    lib.FloatArray2D
+        Per-pixel median, 2D array of shape (Y, X) and dtype float32.
+    """
+    n_frames, height, width = frames.shape
+    median = np.empty((height, width), dtype=np.float32)
+    lower = (n_frames - 1) // 2
+    upper = n_frames // 2  # == lower for an odd number of frames
+    kth = lower if lower == upper else (lower, upper)
+    stripe_rows = max(
+        1, int(max_stripe_bytes // max(n_frames * width * frames.itemsize, 1))
+    )
+    for y0 in range(0, height, stripe_rows):
+        y1 = min(y0 + stripe_rows, height)
+        stripe = np.partition(frames[:, y0:y1], kth, axis=0)
+        if lower == upper:
+            median[y0:y1] = stripe[lower]
+        else:  # cast before adding, the sum can overflow the input dtype
+            median[y0:y1] = 0.5 * (
+                stripe[lower].astype(np.float32)
+                + stripe[upper].astype(np.float32)
+            )
+    return median
+
+
+class _TemporalMedianBlock:
+    """One cached temporal window of a ``TemporalMedianMovie``.
+
+    ``ready`` is set once ``median`` (and possibly ``frames``) has been
+    filled in, or once the attempt has failed and ``error`` holds the
+    exception. Threads that did not win the race to compute the block wait
+    on it.
+    """
+
+    __slots__ = ("start", "stop", "median", "frames", "ready", "error")
+
+    def __init__(self, start: int, stop: int) -> None:
+        self.start = start
+        self.stop = stop
+        self.median: lib.FloatArray2D | None = None
+        self.frames: np.ndarray | None = None
+        self.ready = threading.Event()
+        self.error: BaseException | None = None
+
+    @property
+    def nbytes(self) -> int:
+        """Memory held by this block."""
+        total = 0 if self.median is None else self.median.nbytes
+        if self.frames is not None:
+            total += self.frames.nbytes
+        return total
+
+
+class TemporalMedianMovie:
+    """Lazily evaluated, read-only temporal median filtered view of a
+    movie.
+
+    Frame ``t`` is ``max(movie[t] - median(movie[window(t)]), 0)`` as
+    float32, where ``window(t)`` is a window of ``window`` frames centered
+    on ``t``. At the edges of the movie the window is shifted inwards
+    rather than truncated, so it always covers ``window`` frames.
+
+    Computing that median for every single frame is far too slow for real
+    movies, so the median is only evaluated at *anchor* frames spaced
+    ``stride`` apart and shared by the frames in between. The default
+    ``stride=window`` gives ``n_frames / window`` medians; ``stride=1``
+    reproduces the exact per-frame filter.
+
+    This class is meant for spot identification only - fitting, spot
+    cutting and photon conversion must always use the raw movie, since
+    the subtracted background would otherwise corrupt the photon counts.
+    It deliberately does not implement the ``io.AbstractPicassoMovie``
+    interface so that accidentally handing it to ``fit2D`` trips that
+    function's input assertion instead of silently returning wrong
+    photon numbers.
+
+    Note that subtracting a per-pixel background changes the scale of the
+    net gradient, so the minimum net gradient has to be re-tuned when the
+    filter is switched on or off.
+
+    References
+    ----------
+    Martens, K. J. A., Turkowyd, B. & Endesfelder, U.
+    "Raw Data to Results: A Hands-On Introduction and Overview of
+    Computational Analysis for Single-Molecule Localization Microscopy."
+    Frontiers in Bioinformatics 1, 817254 (2022).
+    https://doi.org/10.3389/fbinf.2021.817254
+
+    Parameters
+    ----------
+    movie : lib.IntArray3D
+        The raw movie, i.e. any object supporting ``len()`` and integer
+        indexing that returns 2D frames.
+    window : int, optional
+        Number of frames in the temporal window used for the median.
+        Clipped to the length of the movie. Default is 51.
+    stride : int or None, optional
+        Spacing (in frames) between the anchors at which the median is
+        evaluated. Clipped to ``[1, window]``. None (the default) uses
+        ``window``, which is the fastest setting; 1 evaluates the median
+        for every frame.
+    roi : tuple, list of tuples or None, optional
+        Region(s) of interest that will be identified in, in the same
+        format as ``identify``. When given, the median is only computed
+        inside their (padded) bounding box and the returned frames are
+        zero outside it. Default is None (whole frame).
+    roi_pad : int, optional
+        Number of pixels the ROI bounding box is grown by, so that the
+        gradients of maxima sitting on the ROI border are still computed
+        from filtered pixels. Pass ``int(box / 2) + 1``. Default is 0.
+    cache_bytes : int, optional
+        Memory budget for the cached temporal windows. Default is
+        ``TEMPORAL_MEDIAN_CACHE_BYTES``.
+
+    Attributes
+    ----------
+    raw : lib.IntArray3D
+        The underlying unfiltered movie.
+    window, stride, roi : as above
+    """
+
+    # The wrapper is internally thread safe (see _read_lock), so it tells
+    # identify_by_frame_number not to serialize reads on the identification
+    # lock - that lock is also what _identify_worker hands out frame
+    # numbers with, so holding it across a median would stall every worker.
+    supports_concurrent_reads = True
+
+    def __init__(
+        self,
+        movie: lib.IntArray3D,
+        window: int = 51,
+        *,
+        stride: int | None = None,
+        roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
+        roi_pad: int = 0,
+        cache_bytes: int = TEMPORAL_MEDIAN_CACHE_BYTES,
+    ) -> None:
+        self.raw = movie
+        self.n_frames = len(movie)
+        if self.n_frames == 0:
+            raise ValueError("Cannot temporally filter an empty movie.")
+        self.window = max(1, min(int(window), self.n_frames))
+        stride = self.window if stride is None else int(stride)
+        self.stride = max(1, min(stride, self.window))
+        self.roi = roi
+        self.roi_pad = int(roi_pad)
+        self.cache_bytes = int(cache_bytes)
+        # one read to learn the frame geometry; movies do not agree on
+        # whether they expose .shape (TiffMap does not) or a usable .dtype
+        probe = np.asarray(movie[0])
+        self.frame_shape = probe.shape
+        self._raw_dtype = probe.dtype
+        self._bbox = self._roi_bbox(roi, self.roi_pad)
+        self._cache: OrderedDict[int, _TemporalMedianBlock] = OrderedDict()
+        self._lock = threading.Lock()  # guards _cache only, never held long
+        concurrent = getattr(
+            movie, "supports_concurrent_reads", False
+        ) or isinstance(movie, np.memmap)
+        self._read_lock = None if concurrent else threading.Lock()
+
+    def _roi_bbox(
+        self,
+        roi: tuple[tuple[int, int], tuple[int, int]] | list | None,
+        pad: int,
+    ) -> tuple[slice, slice] | None:
+        """Bounding box of the ROIs, grown by ``pad`` and clipped to the
+        frame, or None to use the whole frame."""
+        rois = _as_roi_list(roi)
+        if rois is None:
+            return None
+        height, width = self.frame_shape
+        y0 = max(0, min(int(r[0][0]) for r in rois) - pad)
+        x0 = max(0, min(int(r[0][1]) for r in rois) - pad)
+        y1 = min(height, max(int(r[1][0]) for r in rois) + pad)
+        x1 = min(width, max(int(r[1][1]) for r in rois) + pad)
+        if y1 <= y0 or x1 <= x0:
+            return None
+        # the median costs O(window * area), so restricting it only pays
+        # off when the bounding box is substantially smaller than the frame
+        if (y1 - y0) * (x1 - x0) > 0.5 * height * width:
+            return None
+        return slice(y0, y1), slice(x0, x1)
+
+    def _block_index(self, frame_number: int) -> int:
+        """Index of the temporal window used to filter ``frame_number``.
+        Frames are tiled into groups of ``stride``, each sharing one
+        median."""
+        return frame_number // self.stride
+
+    def _bounds(self, block_index: int) -> tuple[int, int]:
+        """Start (inclusive) and stop (exclusive) frame of a block's
+        temporal window.
+
+        The window covers the block's own ``stride`` frames and is grown
+        symmetrically around them up to ``window`` frames; at the edges of
+        the movie it is shifted inwards rather than truncated, so it
+        always spans ``window`` frames. Every frame of the block therefore
+        lies inside its own window, which is what lets the block serve raw
+        frames straight out of its cached window.
+
+        The two extremes are exactly the ones we care about:
+        ``stride == window`` tiles the movie into non-overlapping blocks,
+        and ``stride == 1`` reduces to a window centered on the frame,
+        i.e. the exact per-frame filter.
+        """
+        start = block_index * self.stride - (self.window - self.stride) // 2
+        stop = start + self.window
+        if start < 0:
+            stop -= start
+            start = 0
+        if stop > self.n_frames:
+            start -= stop - self.n_frames
+            stop = self.n_frames
+        return max(start, 0), min(stop, self.n_frames)
+
+    def _read_frame(self, index: int) -> np.ndarray:
+        if self._read_lock is None:
+            return np.asarray(self.raw[index])
+        with self._read_lock:
+            return np.asarray(self.raw[index])
+
+    def _read(self, start: int, stop: int) -> np.ndarray:
+        """Read frames ``[start, stop)`` into one array. Frames are read
+        one by one because not every movie class supports slice
+        indexing."""
+        frames = np.empty(
+            (stop - start, *self.frame_shape), dtype=self._raw_dtype
+        )
+        if self._read_lock is None:
+            for i in range(start, stop):
+                frames[i - start] = self.raw[i]
+        else:
+            with self._read_lock:
+                for i in range(start, stop):
+                    frames[i - start] = self.raw[i]
+        return frames
+
+    def _fill(self, block: _TemporalMedianBlock) -> None:
+        """Compute a block's median (and keep its frames if they fit in
+        the cache budget)."""
+        frames = self._read(block.start, block.stop)
+        if self._bbox is None:
+            block.median = _temporal_median(frames)
+        else:
+            sy, sx = self._bbox
+            block.median = _temporal_median(frames[:, sy, sx])
+        # every frame this block serves lies inside its own window (since
+        # stride <= window), so keeping the frames means each frame of the
+        # movie is read exactly once overall. Two blocks stay resident, so
+        # only keep the frames if two windows still fit in the budget.
+        if 2 * frames.nbytes <= self.cache_bytes:
+            block.frames = frames
+
+    def _evict(self) -> None:
+        """Keep the cache within its memory budget. Must be called with
+        ``_lock`` held.
+
+        Raw frames are dropped before whole blocks: a block's median is
+        tiny (one float32 image) and re-reading a frame is far cheaper
+        than recomputing a median. The two most recent blocks are always
+        kept intact, since the worker pool straddles at most two of them.
+        """
+        if len(self._cache) <= 2:
+            return
+        total = sum(block.nbytes for block in self._cache.values())
+        if total <= self.cache_bytes:
+            return
+        for block in list(self._cache.values())[:-2]:  # oldest first
+            if block.frames is not None:
+                total -= block.frames.nbytes
+                block.frames = None
+                if total <= self.cache_bytes:
+                    return
+        while len(self._cache) > 2 and total > self.cache_bytes:
+            total -= self._cache.popitem(last=False)[1].nbytes
+
+    def _block(self, frame_number: int) -> _TemporalMedianBlock:
+        """The cached block used to filter ``frame_number``, computing it
+        if necessary. Exactly one thread computes a given block; the
+        others wait for it without holding the cache lock."""
+        index = self._block_index(frame_number)
+        with self._lock:
+            block = self._cache.get(index)
+            owner = block is None
+            if owner:
+                block = _TemporalMedianBlock(*self._bounds(index))
+                self._cache[index] = block
+            else:
+                self._cache.move_to_end(index)
+        if not owner:
+            block.ready.wait()
+            if block.error is not None:
+                raise block.error
+            return block
+        try:
+            self._fill(block)
+        except BaseException as error:
+            block.error = error
+            with self._lock:
+                self._cache.pop(index, None)
+            raise
+        finally:
+            block.ready.set()
+        with self._lock:
+            self._evict()
+        return block
+
+    def clear_cache(self) -> None:
+        """Drop all cached temporal windows."""
+        with self._lock:
+            self._cache.clear()
+
+    def __getitem__(self, it):
+        if isinstance(it, tuple):
+            if len(it) == 1:
+                return self[it[0]]
+            return self[it[0]][tuple(it[1:])]
+        if isinstance(it, slice):
+            return np.stack(
+                [self[i] for i in range(*it.indices(self.n_frames))]
+            )
+        index = int(it)
+        if index < 0:
+            index += self.n_frames
+        if not 0 <= index < self.n_frames:
+            raise IndexError(
+                f"Frame {it} is out of range for a movie with "
+                f"{self.n_frames} frames."
+            )
+        block = self._block(index)
+        # bind once: another thread's eviction may clear block.frames
+        # between the check and the lookup
+        frames = block.frames
+        if frames is not None:
+            raw = frames[index - block.start]
+        else:
+            raw = self._read_frame(index)
+        if self._bbox is None:
+            return np.maximum(raw.astype(np.float32) - block.median, 0)
+        sy, sx = self._bbox
+        filtered = np.zeros(self.frame_shape, dtype=np.float32)
+        filtered[sy, sx] = np.maximum(
+            raw[sy, sx].astype(np.float32) - block.median, 0
+        )
+        return filtered
+
+    def __iter__(self):
+        for i in range(self.n_frames):
+            yield self[i]
+
+    def __len__(self) -> int:
+        return self.n_frames
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self.n_frames, *self.frame_shape)
+
+    @property
+    def dtype(self) -> np.dtype:
+        return np.dtype(np.float32)
+
+    def close(self) -> None:
+        self.clear_cache()
+        close = getattr(self.raw, "close", None)
+        if close is not None:
+            close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
 def identify_in_frame(
     frame: lib.IntArray2D,
     minimum_ng: float,
@@ -572,6 +955,18 @@ def identify_by_frame_number(
         DataFrame containing the frame number, x and y coordinates of
         the identified maxima, and their net gradient.
     """
+    # check frame bounds before reading, so that frames that are skipped
+    # anyway cost nothing (a TemporalMedianMovie would otherwise compute a
+    # whole temporal window for them)
+    if not lib.frame_in_bounds(frame_number, frame_bounds, len(movie)):
+        return pd.DataFrame(
+            {
+                "frame": pd.Series(dtype=int),
+                "x": pd.Series(dtype=int),
+                "y": pd.Series(dtype=int),
+                "net_gradient": pd.Series(dtype=np.float32),
+            }
+        )
     # Movies that read each frame through their own per-thread file
     # handle (TiffMap, STKMovie and the multi-file maps) or a memory map
     # are safe to read concurrently, so they skip the shared lock. This
@@ -586,16 +981,6 @@ def identify_by_frame_number(
             frame = movie[frame_number]
     else:
         frame = movie[frame_number]
-    # check frame bounds
-    if not lib.frame_in_bounds(frame_number, frame_bounds, len(movie)):
-        return pd.DataFrame(
-            {
-                "frame": pd.Series(dtype=int),
-                "x": pd.Series(dtype=int),
-                "y": pd.Series(dtype=int),
-                "net_gradient": pd.Series(dtype=np.float32),
-            }
-        )
     # identify
     y, x, net_gradient = identify_in_frame(frame, minimum_ng, box, roi)
     frame = frame_number * np.ones(len(x))
@@ -841,6 +1226,8 @@ def identify(
     roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
     frame_bounds: tuple[int, int] | list | None = None,
     threaded: bool = True,
+    temporal_median_window: int | None = None,
+    temporal_median_stride: int | None = None,
     progress_callback: (
         Callable[[list[int]], None] | Literal["console"] | None
     ) = None,
@@ -879,6 +1266,19 @@ def identify(
     threaded : bool, optional
         Whether to use threading for the identification process. Default
         is True.
+    temporal_median_window : int or None, optional
+        If given (and non-zero), a temporal median background is
+        subtracted from every frame before identifying, using a window of
+        this many frames, see ``TemporalMedianMovie``. The filter applies
+        to the identification only - the returned coordinates refer to
+        the raw movie, which is what the spots must be fitted on. Note
+        that ``minimum_ng`` has to be re-tuned when this is switched on
+        or off, since subtracting a background changes the scale of the
+        net gradient. Default is None (no filtering).
+    temporal_median_stride : int or None, optional
+        Spacing between the frames at which the temporal median is
+        evaluated, see ``TemporalMedianMovie``. None (the default) uses
+        ``temporal_median_window``, which is the fastest setting.
     progress_callback : callable, "console" or None, optional
         A callback function to report the progress of the identification
         process. If "console", progress will be printed to the console.
@@ -911,6 +1311,16 @@ def identify(
             "that picasso.localize.localize() will always return both "
             "the localizations and the metadata dictionary."
         )
+    if temporal_median_window:
+        # note that identify_async() is not wrapped: callers driving the
+        # thread pool themselves build a TemporalMedianMovie explicitly
+        movie = TemporalMedianMovie(
+            movie,
+            temporal_median_window,
+            stride=temporal_median_stride,
+            roi=roi,
+            roi_pad=int(box / 2) + 1,
+        )
     if threaded:
         ids = _identify_threaded(
             movie,
@@ -939,6 +1349,7 @@ def identify(
             "Box Size": box,
             "ROI": roi,
             "Frame Bounds": frame_bounds,
+            "Temporal Median Window": int(temporal_median_window or 0),
         }
         return ids, info
     else:
@@ -1481,6 +1892,11 @@ def locs_from_fits(
     """Convert the resulting localizations from the list of Futures
     into a data frame.
 
+    .. deprecated:: 0.11
+        Removed in Picasso 1.0. Left over from the old ``gaussmle`` GPU
+        pipeline and unused since; use :func:`locs_from_fits_gauss`,
+        which takes the fitters' ``theta`` layout directly.
+
     Parameters
     ----------
     identifications : pd.DataFrame
@@ -1506,6 +1922,10 @@ def locs_from_fits(
         `frame`, `x`, `y`, `photons`, `sx`, `sy`, `bg`, `lpx`, `lpy`,
         `net_gradient`, `log_likelihood`, and `iterations`.
     """
+    lib.deprecation_warning(
+        "picasso.localize.locs_from_fits is deprecated and will be removed "
+        "in Picasso 1.0. Use picasso.localize.locs_from_fits_gauss."
+    )
     # box_offset = int(box / 2)
     y = theta[:, 0] + identifications["y"]  # - box_offset
     x = theta[:, 1] + identifications["x"]  # - box_offset
@@ -1551,12 +1971,14 @@ def fit2D(
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
         "gaussmle-spherical-gpu",
+        "spline",
+        "spline-mle",
         "spline-gpu",
         "spline-mle-gpu",
         "avg",
     ] = "gausslq",
-    eps: float = 0.001,
-    max_it: int = 100,
+    eps: float | None = None,
+    max_it: int | None = None,
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
     multiprocess: bool = True,
@@ -1593,7 +2015,7 @@ def fit2D(
         fitting of a 2D Gaussian. "gausslq-gpu" for its GPU
         implemntation (if available). "gaussmle" for MLE 2D Gaussian
         fitting (CPU). "gaussmle-gpu" for MLE fitting of a 2D Gaussian
-        on the GPU (Gpufit's maximum likelihood estimator).
+        on the GPU (the Poisson maximum likelihood estimator).
         "gausslq-rotated" for CPU least-squares fitting, and
         "gausslq-rotated-gpu" and "gaussmle-rotated-gpu" for GPU
         least-squares and MLE fitting, respectively, of a rotated
@@ -1603,26 +2025,30 @@ def fit2D(
         "gausslq-spherical-gpu" and "gaussmle-spherical-gpu" for their
         GPU counterparts, of a spherical (isotropic) Gaussian with a
         single width; the saved "sx" and "sy" columns are identical.
-        "spline-gpu" and "spline-mle-gpu"
-        for GPU least-squares / maximum-likelihood fitting of an
-        experimentally measured cubic-spline PSF (Gpufit's SPLINE_2D /
-        SPLINE_3D models); both require ``spline_calibration``, and a 3D
-        spline calibration yields the fitted ``z`` directly. "avg" for
-        taking the average of each spot.
-    eps : float, optional
-        The convergence criterion for CPU MLE fitting. Ignored for
-        other methods (GPU fitting uses Gpufit's own convergence
-        settings). Default is 0.001.
-    max_it : int, optional
-        The maximum number of iterations for CPU MLE fitting. Ignored
-        for other methods (GPU fitting uses Gpufit's own convergence
-        settings). Default is 100.
+        "spline" and "spline-mle" for CPU least-squares /
+        maximum-likelihood fitting of an experimentally measured
+        cubic-spline PSF, and "spline-gpu" and "spline-mle-gpu" for their
+        GPU counterparts. All four
+        require ``spline_calibration``, and a 3D spline calibration yields
+        the fitted ``z`` directly. "avg" for taking the average of each
+        spot.
+    eps : float or None, optional
+        The convergence criterion, honoured by every iterating method on
+        either device (all of them except "avg"). None (the default)
+        picks the value that suits the method: 0.001 for "gaussmle",
+        0.01 for "gausslq" and the GPU Gaussians, and for either spline
+        backend 1e-4 with the axial multi-start and 1e-2 without.
+    max_it : int or None, optional
+        The maximum number of iterations per spot, as ``eps``. None (the
+        default) means 100 for "gaussmle", 200 for "gausslq" (MINPACK's
+        own default), 20 for the GPU Gaussians and, for either spline
+        backend, 100 with the axial multi-start and 20 without.
     mle_method : Literal["sigma", "sigmaxy"], optional
         The method used for CPU MLE fitting (impose same sigma in x and
         y or not, respectively). Default is "sigmaxy".
     spline_calibration : dict or None, optional
         Cubic-spline PSF calibration (see ``io.load_spline_calibration``),
-        required when ``fitting_method`` is "spline-gpu" and ignored
+        required for any "spline*" ``fitting_method`` and ignored
         otherwise. For a 3D spline calibration the resulting localizations
         contain the fitted ``z`` directly (no separate z-fitting step is
         needed). Default is None.
@@ -1667,39 +2093,21 @@ def fit2D(
         identifications, pd.DataFrame
     ), "identifications must be a DataFrame"
     assert isinstance(box, int) and box > 0, "box must be a positive integer"
-    assert fitting_method in [
-        "gausslq",
-        "gausslq-spherical",
-        "gausslq-rotated",
-        "gausslq-gpu",
-        "gausslq-rotated-gpu",
-        "gausslq-spherical-gpu",
-        "gaussmle",
-        "gaussmle-spherical",
-        "gaussmle-gpu",
-        "gaussmle-rotated-gpu",
-        "gaussmle-spherical-gpu",
-        "spline-gpu",
-        "spline-mle-gpu",
-        "avg",
-    ], (
-        "fitting_method must be one of 'gausslq', 'gausslq-spherical',"
-        " 'gausslq-rotated', 'gausslq-gpu', 'gausslq-rotated-gpu',"
-        " 'gausslq-spherical-gpu', 'gaussmle', 'gaussmle-spherical',"
-        " 'gaussmle-gpu', 'gaussmle-rotated-gpu', 'gaussmle-spherical-gpu',"
-        " 'spline-gpu', 'spline-mle-gpu', or 'avg'"
+    assert fitting_method in FIT_METHODS, (
+        f"fitting_method '{fitting_method}' is not one of "
+        f"{', '.join(FIT_METHODS)}"
     )
     if fitting_method.startswith("spline"):
         assert isinstance(spline_calibration, dict), (
             "spline_calibration (a spline PSF calibration dict, see "
             "io.load_spline_calibration) is required for spline fitting"
         )
-    assert (
+    assert eps is None or (
         isinstance(eps, (int, float)) and eps > 0
-    ), "eps must be a positive number"
-    assert (
+    ), "eps must be a positive number or None"
+    assert max_it is None or (
         isinstance(max_it, int) and max_it > 0
-    ), "max_it must be a positive integer"
+    ), "max_it must be a positive integer or None"
     assert mle_method in [
         "sigma",
         "sigmaxy",
@@ -1721,42 +2129,27 @@ def fit2D(
         progress_callback=cut_progress_callback,
     )
     em = camera_info["Gain"] > 1
-    if fitting_method in ("gausslq", "gausslq-spherical", "gausslq-rotated"):
-        locs = _fit2d_gausslq(
-            spots=spots,
-            identifications=identifications,
-            box=box,
-            em=em,
-            multiprocess=multiprocess,
-            progress_callback=progress_callback,
-            abort_callback=abort_callback,
-            spherical=fitting_method == "gausslq-spherical",
-            rotated=fitting_method == "gausslq-rotated",
-        )
-    elif fitting_method in (
-        "gausslq-gpu",
-        "gausslq-rotated-gpu",
-        "gausslq-spherical-gpu",
-        "gaussmle-gpu",
-        "gaussmle-rotated-gpu",
-        "gaussmle-spherical-gpu",
-    ):
-        if callable(progress_callback):
+    gauss_flags = parse_gauss_code(fitting_method)
+    if gauss_flags is not None:
+        if gauss_flags["use_gpu"] and callable(progress_callback):
             progress_callback(1)
-        locs = _fit2d_gauss_gpu(
+        locs = _fit2d_gauss(
             spots=spots,
             identifications=identifications,
             box=box,
             em=em,
-            rotated="-rotated-" in fitting_method,
-            mle=fitting_method.startswith("gaussmle"),
-            spherical="-spherical-" in fitting_method,
+            tolerance=eps,
+            max_iterations=max_it,
+            progress_callback=(
+                None if gauss_flags["use_gpu"] else progress_callback
+            ),
+            **gauss_flags,
         )
     elif fitting_method in ("spline-gpu", "spline-mle-gpu"):
         if callable(progress_callback):
             progress_callback(1)
-        # "spline-mle-gpu" uses Gpufit's Poisson maximum-likelihood estimator,
-        # "spline-gpu" least squares (as in the reference pyGpufit examples).
+        # "spline-mle-gpu" uses the Poisson maximum-likelihood estimator,
+        # "spline-gpu" least squares.
         # The GPU fit itself is a single call; progress_callback then tracks
         # the per-spot CRLB / precision computation in locs_from_fits_spline.
         locs = _fit2d_spline_gpu(
@@ -1767,26 +2160,26 @@ def fit2D(
             calibration=spline_calibration,
             mle=fitting_method == "spline-mle-gpu",
             progress_callback=progress_callback,
+            tolerance=eps,
+            max_iterations=max_it,
         )
-    elif fitting_method in ("gaussmle", "gaussmle-spherical"):
-        # "gaussmle-spherical" forces the isotropic single-width ("sigma")
-        # MLE path, which already outputs equal sx/sy; the plain "gaussmle"
-        # code respects the separate mle_method argument.
-        locs = _fit2d_gaussmle(
+    elif fitting_method in ("spline", "spline-mle"):
+        # The CPU cubic-spline fit (picasso.fitting.splinefit). Unlike the
+        # GPU path it is a per-spot loop, so progress_callback tracks the fit
+        # itself and the fit can be aborted. eps / max_it override the
+        # convergence schedule; None picks the one matching the multi-start.
+        locs = _fit2d_spline_cpu(
             spots=spots,
             identifications=identifications,
             box=box,
-            eps=eps,
-            max_it=max_it,
-            mle_method=(
-                "sigma"
-                if fitting_method == "gaussmle-spherical"
-                else mle_method
-            ),
+            em=em,
+            calibration=spline_calibration,
+            mle=fitting_method == "spline-mle",
+            tolerance=eps,
+            max_iterations=max_it,
             multiprocess=multiprocess,
             progress_callback=progress_callback,
             abort_callback=abort_callback,
-            spherical=fitting_method == "gaussmle-spherical",
         )
     elif fitting_method == "avg":
         locs = _fit2d_avg(
@@ -1803,9 +2196,14 @@ def fit2D(
         "Generated by": f"Picasso: v{__version__} Fit 2D",
         "Fit method": fitting_method,
     }
-    if fitting_method in ("gaussmle", "gaussmle-spherical"):
-        localize_info["Convergence criterion"] = eps
-        localize_info["Max iterations"] = max_it
+    # Record the schedule the fit actually ran with, per method - each
+    # backend has its own defaults, and "None" in the caller means "yours".
+    if gauss_flags is not None:
+        tolerance, max_iterations = gauss_schedule(
+            gauss_flags["mle"], gauss_flags["use_gpu"], eps, max_it
+        )
+        localize_info["Convergence criterion"] = tolerance
+        localize_info["Max iterations"] = max_iterations
     if fitting_method.startswith("spline"):
         localize_info["Spline calibration model"] = spline_calibration.get(
             "model"
@@ -1813,79 +2211,34 @@ def fit2D(
         localize_info["Spline calibration path"] = spline_calibration.get(
             "Path", "N/A"
         )
+        on_gpu = fitting_method.endswith("-gpu")
+        localize_info["Spline fit device"] = "GPU" if on_gpu else "CPU"
         localize_info["Spline CRLB device"] = (
-            "GPU" if SPLINE_CRLB_CUDA_AVAILABLE else "CPU"
+            "GPU" if CUDA_AVAILABLE else "CPU"
         )
+        # Record what the fit actually used, not what was requested: the
+        # schedule depends on whether the axial multi-start ran. Identical
+        # on both devices - they share ``_run_splinefit``.
+        n_z_starts = _default_n_z_starts(spline_calibration)
+        _, apply_seeds = _spline_z_seeds(spline_calibration, n_z_starts)
+        tolerance, max_iterations = _spline_schedule(apply_seeds, eps, max_it)
+        localize_info["Convergence criterion"] = tolerance
+        localize_info["Max iterations"] = max_iterations
+        localize_info["Axial seeds"] = n_z_starts if apply_seeds else 1
     new_info = localize_info | camera_info
     return locs, new_info
 
 
-def _fit2d_gausslq(
-    spots: lib.FloatArray3D,
-    identifications: pd.DataFrame,
-    box: int,
-    em: bool,
-    multiprocess: bool = True,
-    progress_callback: (
-        Callable[[int], None] | Literal["console"] | None
-    ) = None,
-    abort_callback: Callable[[], bool] | None = None,
-    spherical: bool = False,
-    rotated: bool = False,
-) -> pd.DataFrame | None:
-    """Fit 2D Gaussians using least-squares fitting (CPU). If
-    ``spherical``, an isotropic Gaussian with a single width is fitted
-    and the resulting ``sx`` and ``sy`` columns are identical. If
-    ``rotated``, a rotated elliptical Gaussian is fitted and the
-    resulting localizations contain the fitted rotation angle (in
-    degrees) in the column ``angle``. See ``fit_2D`` for more details."""
-    N = len(identifications)
-    if multiprocess:
-        fs = gausslq.fit_spots_parallel(
-            spots,
-            asynch=True,
-            spherical=spherical,
-            rotated=rotated,
-            return_chi_square=True,
-        )
-        theta = _process_fitting_futures(
-            fs, N, progress_callback, abort_callback
-        )
-        if theta is None:
-            return
-    else:
-        theta = gausslq.fit_spots(
-            spots,
-            progress_callback,
-            spherical=spherical,
-            rotated=rotated,
-            return_chi_square=True,
-        )
-    # The chi-square rides along as the last column of theta (see
-    # gausslq.fit_spot); split it off so locs_from_fits sees the plain
-    # parameter layout it detects the rotated model from.
-    theta, chi_square = theta[:, :-1], theta[:, -1]
-    locs = gausslq.locs_from_fits(
-        identifications,
-        theta,
-        box,
-        em,
-        spherical=spherical,
-        chi_square=chi_square,
-    )
-    return locs
-
-
-def _initial_parameters_gpufit(
+def _initial_parameters_gauss(
     spots: lib.FloatArray3D,
     size: int,
     rotated: bool = False,
     spherical: bool = False,
 ) -> lib.FloatArray2D:
-    """Initialize the parameters for the GPU fit - photons, x, y, sx,
+    """Initialize the parameters for a Gaussian fit - photons, x, y, sx,
     sy, bg (plus the rotation angle if ``rotated``). If ``spherical``,
     a single width is used and the layout is photons, x, y, s, bg
-    (Gpufit's isotropic ``GAUSS_2D`` model)."""
+    (the isotropic ``GAUSS_2D`` model)."""
     center = (size / 2.0) - 0.5
     initial_width = np.amax([size / 5.0, 1.0])
 
@@ -1914,7 +2267,7 @@ def _initial_parameters_gpufit(
     if rotated:
         # With sx == sy, the rotated Gaussian is independent of the
         # angle, so its derivative is exactly zero and the first LM
-        # Hessian is singular - Gpufit then aborts, returning the
+        # Hessian is singular - the fit then aborts, returning the
         # initial parameters. Break the symmetry of the widths to keep
         # the angle parameter well-defined.
         initial_parameters[:, 3] *= 1.1
@@ -1924,12 +2277,128 @@ def _initial_parameters_gpufit(
     return initial_parameters
 
 
-def fit_spots_gpufit(
+# Per-method convergence schedules. Each backend's own defaults, kept here so
+# the resolved values reach both the fit and the saved metadata, and so that
+# rerouting a method to a new backend cannot silently change where it stops.
+#: Tokens a Gaussian fit code may carry after ``gausslq``/``gaussmle``.
+_GAUSS_TOKENS = frozenset({"spherical", "rotated", "gpu"})
+
+
+def parse_gauss_code(fitting_method: str) -> dict | None:
+    """Flags of a Gaussian fit code, or None if it is not one.
+
+    The grammar is ``gauss{lq,mle}[-spherical|-rotated][-gpu]`` and it returns
+    ``{"mle", "spherical", "rotated", "use_gpu"}``.
+
+    Returns None for anything that is not a valid Gaussian code, so callers
+    can use it as both the parser and the validator.
+    """
+    tokens = fitting_method.split("-")
+    if tokens[0] not in ("gausslq", "gaussmle"):
+        return None
+    if len(set(tokens[1:])) != len(tokens[1:]):
+        return None  # a repeated token, e.g. "gausslq-gpu-gpu"
+    flags = {
+        "mle": tokens[0] == "gaussmle",
+        "spherical": False,
+        "rotated": False,
+        "use_gpu": False,
+    }
+    for token in tokens[1:]:
+        if token not in _GAUSS_TOKENS:
+            return None
+        if token == "spherical":
+            flags["spherical"] = True
+        elif token == "rotated":
+            flags["rotated"] = True
+        else:  # "gpu"
+            flags["use_gpu"] = True
+    if flags["spherical"] and flags["rotated"]:
+        return None
+    return flags
+
+
+def gauss_fit_methods() -> list[str]:
+    """Every Gaussian fit code :func:`parse_gauss_code` accepts.
+
+    Generated from the grammar rather than listed by hand, so a code cannot
+    be offered somewhere and rejected here."""
+    codes = []
+    for estimator in ("gausslq", "gaussmle"):
+        for shape in ("", "-spherical", "-rotated"):
+            for device in ("", "-gpu"):
+                code = f"{estimator}{shape}{device}"
+                if parse_gauss_code(code) is not None:
+                    codes.append(code)
+    return codes
+
+
+#: Every ``fit2D`` method. Generated for the Gaussians (see
+#: :func:`gauss_fit_methods`) and listed for the rest, which have no grammar.
+FIT_METHODS = tuple(
+    gauss_fit_methods()
+    + ["spline", "spline-mle", "spline-gpu", "spline-mle-gpu", "avg"]
+)
+
+
+_GAUSS_SCHEDULES = {
+    # (mle, use_gpu) -> (tolerance, max_iterations)
+    #
+    # On the CPU each estimator gets a schedule that converges it properly;
+    # for least squares that is the historical MINPACK schedule, kept in
+    # ``gaussfit`` as ``*_LSQ_CPU``. On the GPU both keep Gpufit's, which is
+    # looser - deliberate rather than ideal, since it is what every "-gpu"
+    # code has always meant and changing it would silently move existing
+    # results. These are only *defaults*: pass ``eps``/``max_it``, or use the
+    # Localize parameters dialog, to change them.
+    (False, False): (
+        gaussfit.TOLERANCE_LSQ_CPU,
+        gaussfit.MAX_ITERATIONS_LSQ_CPU,
+    ),
+    (True, False): (1e-5, 100),
+    (False, True): (gaussfit_cuda.TOLERANCE, gaussfit_cuda.MAX_ITERATIONS),
+    (True, True): (gaussfit_cuda.TOLERANCE, gaussfit_cuda.MAX_ITERATIONS),
+}
+
+
+def gauss_schedule(
+    mle: bool,
+    use_gpu: bool,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+) -> tuple:
+    """``(tolerance, max_iterations)`` a Gaussian fit uses, explicit values
+    winning. ``None`` picks the default of the method, which differs by
+    estimator and device - see :data:`_GAUSS_SCHEDULES`."""
+    default = _GAUSS_SCHEDULES[(bool(mle), bool(use_gpu))]
+    if tolerance is None:
+        tolerance = default[0]
+    if max_iterations is None:
+        max_iterations = default[1]
+    return float(tolerance), int(max_iterations)
+
+
+def _gauss_model(rotated: bool, spherical: bool) -> int:
+    """The :mod:`picasso.fitting.gaussfit` model of a method's flags."""
+    if spherical:
+        return gaussfit.SPHERICAL
+    if rotated:
+        return gaussfit.ROTATED
+    return gaussfit.ELLIPTIC
+
+
+def fit_spots_gauss(
     spots: lib.FloatArray3D,
     rotated: bool = False,
     mle: bool = False,
     spherical: bool = False,
+    use_gpu: bool = False,
     return_stats: bool = False,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
 ) -> (
     lib.FloatArray2D
     | tuple[
@@ -1939,117 +2408,96 @@ def fit_spots_gpufit(
         lib.FloatArray1D | None,
     ]
 ):
-    """Fit multiple spots using GPU-based Gaussian fitting. Each spot is
-    a 2D array representing the pixel values of the spot image. The
-    function returns a 2D array with the optimized parameters for each
-    spot, where each row corresponds to a spot and the columns are the
-    parameters in the following order: [photons, x, y, sx, sy, bg] or,
-    for the rotated elliptical Gaussian, [photons, x, y, sx, sy, bg,
-    angle], where angle is the rotation angle in radians.
+    """Fit spots with a 2D Gaussian on the CPU or the GPU.
 
-    Picasso vendors pyGPUfit under picasso/ext/pygpufit where the
-    License can be found too.
-
-    Only Windows with a CUDA-capable GPU is supported. Linux users
-    need to build the code first, see Localize documentation.
-
-    Cite: Przybylski, et al. Scientific Reports, 2017.
-    DOI: 10.1038/s41598-017-15313-9
+    The one entry point for every Gaussian method Picasso offers. Both devices
+    run the identical Levenberg-Marquardt algorithm
+    (:mod:`picasso.fitting.gaussfit` and ``gaussfit_cuda``), so ``use_gpu``
+    only affects speed - the arrangement :func:`fit_spots_spline` already uses
+    for the spline models.
 
     Parameters
     ----------
     spots : lib.FloatArray3D
-        A 3D array of shape (n_spots, size, size), where n_spots is the
-        number of spots and size is the length of one side of the square
-        spot image. Each slice along the first axis represents a single
-        spot image.
+        ``(n_spots, box, box)`` photon counts.
     rotated : bool, optional
-        If True, fit a rotated elliptical Gaussian (Gpufit's
-        GAUSS_2D_ROTATED model) whose seventh parameter is the rotation
-        angle. Default is False.
+        Fit a rotated elliptical Gaussian, whose seventh parameter is the
+        rotation angle in radians. Cannot be combined with ``spherical``.
     mle : bool, optional
-        If True, use Gpufit's maximum likelihood estimator (Poisson
-        noise model) instead of least squares. Default is False.
+        Use the Poisson maximum-likelihood estimator instead of least squares.
     spherical : bool, optional
-        If True, fit a spherical (isotropic) Gaussian with a single
-        width using Gpufit's ``GAUSS_2D`` model. The returned parameters
-        still use the standard elliptical layout with ``sx == sy`` so
-        the rest of the pipeline is unchanged. Cannot be combined with
-        ``rotated``. Default is False.
+        Fit a single shared width. The returned parameters still use the
+        elliptical layout with ``sx == sy``, so the rest of the pipeline is
+        unchanged.
+    use_gpu : bool, optional
+        Run on a CUDA GPU. Default False.
     return_stats : bool, optional
-        If True, additionally return the per-spot fit diagnostics
-        (log-likelihood, iteration counts and chi-square) reported by
-        Gpufit. Default is False.
+        Additionally return ``(log_likelihood, iterations, chi_square)``.
+    tolerance, max_iterations : optional
+        ``None`` uses the method's own schedule, see :func:`gauss_schedule`.
+    progress_callback : callable, "console" or None, optional
+        Reported per spot on the CPU; the GPU fit is one launch per chunk.
 
     Returns
     -------
     parameters : lib.FloatArray2D
-        A 2D array with the optimized parameters for each spot. The
-        columns correspond to [photons, x, y, sx, sy, bg] or
-        [photons, x, y, sx, sy, bg, angle] if ``rotated``.
-    log_likelihood : lib.FloatArray1D or None
-        Only returned if ``return_stats``. The per-spot Poisson
-        log-likelihood when ``mle`` (derived from Gpufit's chi-square,
-        whose MLE value equals twice the negative log-likelihood), or
-        None for least squares, which does not assume a noise model and
-        so has no likelihood to report (see ``chi_square`` instead).
-    number_iterations : lib.FloatArray1D
-        Only returned if ``return_stats``. The number of iterations
-        taken to converge for each spot.
-    chi_square : lib.FloatArray1D or None
-        Only returned if ``return_stats``. The per-spot residual sum of
-        squares at the fit optimum for a least-squares fit, or None when
-        ``mle`` (there the chi-square is the likelihood in disguise and
-        is reported as ``log_likelihood``).
+        ``[photons, x, y, sx, sy, bg]``, plus the rotation angle (radians) if
+        ``rotated``. Positions are box-local.
+    log_likelihood, number_iterations, chi_square
+        Only if ``return_stats``. ``log_likelihood`` is None for least
+        squares, ``chi_square`` is None for maximum likelihood - each
+        estimator reports the goodness of fit that means something for it.
     """
-    if not GPUFIT_INSTALLED:
-        raise ImportError(
-            "GPUfit could not be found, CUDA-capable GPU is required."
-        )
     if rotated and spherical:
         raise ValueError("'rotated' and 'spherical' are mutually exclusive.")
+    if use_gpu and not CUDA_AVAILABLE:
+        raise ImportError(
+            "GPU fitting was requested but no CUDA-capable GPU is available."
+        )
+    model = _gauss_model(rotated, spherical)
+    tolerance, max_iterations = gauss_schedule(
+        mle, use_gpu, tolerance, max_iterations
+    )
     if mle:
         spots = np.maximum(spots, 0)
     size = spots.shape[1]
-    initial_parameters = _initial_parameters_gpufit(
+    initial_parameters = _initial_parameters_gauss(
         spots, size, rotated=rotated, spherical=spherical
-    )
-    if spherical:
-        model_id = gf.ModelID.GAUSS_2D
-    elif rotated:
-        model_id = gf.ModelID.GAUSS_2D_ROTATED
-    else:
-        model_id = gf.ModelID.GAUSS_2D_ELLIPTIC
-    estimator_id = gf.EstimatorID.MLE if mle else gf.EstimatorID.LSE
+    ).astype(np.float64)
 
-    parameters, states, chi_squares, number_iterations, exec_time = gf.fit(
-        spots.reshape((len(spots), (size * size))),
-        None,
-        model_id,
+    backend = gaussfit_cuda if use_gpu else gaussfit
+    parameters, chi_squares, _states, number_iterations = backend.fit_spots(
+        model,
+        spots,
         initial_parameters,
-        tolerance=1e-2,
-        max_number_iterations=20,
-        estimator_id=estimator_id,
+        mle=mle,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        progress_callback=progress_callback,
     )
+    parameters = parameters.astype(np.float32)
+    chi_squares = chi_squares.astype(np.float32)
 
     if spherical:
-        # GAUSS_2D returns [amp, x, y, s, bg]. Expand to the standard
-        # elliptical layout [photons, x, y, sx, sy, bg] with sx == sy so
-        # the rest of the pipeline (CRLB, column building) is unchanged.
+        # The isotropic models return [amplitude, x, y, s, bg]. Expand to the
+        # standard elliptical layout with sx == sy so the rest of the pipeline
+        # (CRLB, column building) is unchanged.
         s = parameters[:, 3]
         expanded = np.empty((len(parameters), 6), dtype=parameters.dtype)
-        expanded[:, 0] = parameters[:, 0] * 2.0 * np.pi * s * s
+        expanded[:, 0] = parameters[:, 0]
         expanded[:, 1] = parameters[:, 1]
         expanded[:, 2] = parameters[:, 2]
         expanded[:, 3] = s
         expanded[:, 4] = s
         expanded[:, 5] = parameters[:, 4]
+        expanded[:, 0] *= 2.0 * np.pi * s * s
         parameters = expanded
     else:
+        # The models fit a peak height; convert to total photons.
         parameters[:, 0] *= 2.0 * np.pi * parameters[:, 3] * parameters[:, 4]
 
     if return_stats:
-        # Gpufit's MLE chi-square equals twice the negative Poisson
+        # The MLE chi-square equals twice the negative Poisson
         # log-likelihood, so -0.5 * chi_square reproduces the CPU MLE
         # fit's log_likelihood (both Stirling-approximated). For least
         # squares the chi-square is the plain residual sum of squares -
@@ -2061,22 +2509,54 @@ def fit_spots_gpufit(
     return parameters
 
 
+def fit_spots_gauss_gpu(
+    spots: lib.FloatArray3D,
+    rotated: bool = False,
+    mle: bool = False,
+    spherical: bool = False,
+    return_stats: bool = False,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+) -> (
+    lib.FloatArray2D
+    | tuple[
+        lib.FloatArray2D,
+        lib.FloatArray1D | None,
+        lib.FloatArray1D,
+        lib.FloatArray1D | None,
+    ]
+):
+    """Fit spots with a 2D Gaussian on the GPU.
+
+    Thin wrapper over :func:`fit_spots_gauss` with ``use_gpu=True``, kept
+    because it is the established public name. See there for the arguments
+    and the returned layout.
+    """
+    return fit_spots_gauss(
+        spots,
+        rotated=rotated,
+        mle=mle,
+        spherical=spherical,
+        use_gpu=True,
+        return_stats=return_stats,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+    )
+
+
 def _gauss_crlb(
     theta: lib.FloatArray2D,
     box: int,
     em: bool,
     rotated: bool = False,
 ) -> lib.FloatArray2D:
-    """Poisson Cramer-Rao lower bound for gpufit MLE Gaussian fits.
+    """Poisson Cramer-Rao lower bound for MLE Gaussian fits.
 
     Builds the Fisher information matrix ``I = Σ g gᵀ / μ`` (``g = ∂μ/∂θ``) of
-    the point-sampled Gaussian model gpufit actually optimizes
-    (``GAUSS_2D_ELLIPTIC`` / ``GAUSS_2D_ROTATED``) and returns the diagonal of
+    the Gaussian model that was actually optimized and returns the diagonal of
     its inverse — the variance an efficient maximum-likelihood estimator
     attains. Evaluated at the fitted parameters; the spot data is not needed.
-    Mirrors :func:`_spline_crlb` and ``gaussmle._mlefit_sigmaxy_crlb`` but for
-    the point-sampled Gaussian gpufit fits rather than the erf-integrated CPU
-    model.
+    Mirrors :func:`_spline_crlb` and ``gaussmle._mlefit_sigmaxy_crlb``.
 
     Model (photon units, spots are gain-converted before fitting)::
 
@@ -2086,21 +2566,21 @@ def _gauss_crlb(
     coordinate, and ``E`` is the (optionally rotated) unit-height Gaussian.
     Parametrizing the amplitude directly as the total photon count ``N``
     (Picasso's reported ``photons``) makes the returned variances line up with
-    the reported columns, with the ``N``/``sx``/``sy`` coupling of ``mu`` folded
-    into the derivatives.
+    the reported columns, with the ``N``/``sx``/``sy`` coupling of ``mu``
+    folded into the derivatives.
 
     Parameters
     ----------
     theta : lib.FloatArray2D
-        Fitted parameters in Picasso/gpufit order ``[photons (total N), x, y,
+        Fitted parameters in the fit's order ``[photons (total N), x, y,
         sx, sy, bg]`` (elliptic) or ``[..., bg, angle (radians)]`` (rotated).
         Positions are box-local (pixel = parameter, matching
-        :func:`_initial_parameters_gpufit`).
+        :func:`_initial_parameters_gauss`).
     box : int
         Fit box side length (pixels).
     em : bool
         EMCCD excess noise: doubles every parameter's variance (halves the
-        Fisher weight), as in :func:`gausslq.localization_precision`.
+        Fisher weight), as in :func:`precision.localization_precision`.
     rotated : bool, optional
         If True, ``theta`` carries the seventh (angle) column and the CRLB
         includes it. Default False.
@@ -2186,13 +2666,13 @@ def _gauss_crlb(
 
     if em:
         # EMCCD excess noise doubles every pixel's variance, hence the CRLB
-        # (matches the factor-2 in gausslq.localization_precision).
+        # (matches the factor-2 in precision.localization_precision).
         crlb *= _EM_EXCESS_NOISE_FACTOR
     crlb = np.where(crlb > 0.0, crlb, np.nan)
     return crlb
 
 
-def locs_from_fits_gpufit(
+def locs_from_fits_gauss(
     identifications: pd.DataFrame,
     theta: lib.FloatArray2D,
     box: int,
@@ -2203,8 +2683,12 @@ def locs_from_fits_gpufit(
     spherical: bool = False,
     chi_square: lib.FloatArray1D | None = None,
 ) -> pd.DataFrame:
-    """Convert the fit results from GPU-based fitting (Gaussian) into a
-    data frame array of localizations.
+    """Convert the fit results from a Gaussian fit into a data frame of
+    localizations.
+
+    Backend-agnostic: ``picasso.fitting.gaussfit`` (CPU) and
+    ``picasso.fitting.gaussfit_cuda`` (GPU) return the same ``theta``
+    layout, so both are converted here.
 
     Parameters
     ----------
@@ -2225,7 +2709,7 @@ def locs_from_fits_gpufit(
     em : bool
         Whether EMCCD was used for the localization.
     mle : bool, optional
-        Whether ``theta`` came from Gpufit's maximum-likelihood
+        Whether ``theta`` came from the maximum-likelihood
         estimator. If True, the localization precisions ``lpx`` / ``lpy``
         and the per-parameter uncertainties (``photons_unc``, ``bg_unc``,
         ``sx_unc``, ``sy_unc`` and, for the rotated model, ``angle_unc``)
@@ -2267,17 +2751,17 @@ def locs_from_fits_gpufit(
     y = theta[:, 2] + identifications["y"] - box_offset
     if mle:
         # Poisson Cramer-Rao bound from the Fisher information of the
-        # point-sampled Gaussian model Gpufit optimizes. Columns of ``crlb``
+        # point-sampled Gaussian model the fitters optimize. Columns of ``crlb``
         # follow ``theta``: [photons, x, y, sx, sy, bg, (angle)].
         crlb = _gauss_crlb(theta, box, em, rotated=rotated)
         with np.errstate(invalid="ignore"):
             lpx = np.sqrt(crlb[:, 1])
             lpy = np.sqrt(crlb[:, 2])
     else:
-        lpx = gausslq.localization_precision(
+        lpx = precision.localization_precision(
             theta[:, 0], theta[:, 3], theta[:, 4], theta[:, 5], em=em
         )
-        lpy = gausslq.localization_precision(
+        lpy = precision.localization_precision(
             theta[:, 0], theta[:, 4], theta[:, 3], theta[:, 5], em=em
         )
     columns = {
@@ -2323,11 +2807,35 @@ def locs_from_fits_gpufit(
     if chi_square is not None:
         columns["chi_square"] = np.asarray(chi_square).astype(np.float32)
     locs = pd.DataFrame(columns)
-    locs.sort_values(by="frame", kind="quicksort", inplace=True)
+    if "n_id" in identifications.columns:
+        # The cross-channel link index. Carried through and sorted on, as
+        # the spline path does - a multichannel fit needs every channel's
+        # localizations in the same order to pair them up.
+        locs["n_id"] = np.asarray(identifications["n_id"]).astype(np.uint32)
+        locs.sort_values(by="n_id", kind="quicksort", inplace=True)
+    else:
+        locs.sort_values(by="frame", kind="quicksort", inplace=True)
     return locs
 
 
-def _fit2d_gauss_gpu(
+def locs_from_fits_gauss_gpu(*args, **kwargs) -> pd.DataFrame:
+    """Convert the fit results from a Gaussian fit into a data frame of
+    localizations.
+
+    .. deprecated:: 0.11
+        Renamed to :func:`locs_from_fits_gauss` and removed under this
+        name in Picasso 1.0. The function never was GPU-specific: it
+        converts CPU and GPU Gaussian fits alike.
+    """
+    lib.deprecation_warning(
+        "picasso.localize.locs_from_fits_gauss_gpu is deprecated and will "
+        "be removed in Picasso 1.0. It handles CPU and GPU fits alike and "
+        "was renamed to picasso.localize.locs_from_fits_gauss."
+    )
+    return locs_from_fits_gauss(*args, **kwargs)
+
+
+def _fit2d_gauss(
     spots: lib.FloatArray3D,
     identifications: pd.DataFrame,
     box: int,
@@ -2335,18 +2843,31 @@ def _fit2d_gauss_gpu(
     rotated: bool = False,
     mle: bool = False,
     spherical: bool = False,
+    use_gpu: bool = False,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
 ) -> pd.DataFrame:
-    """Fit 2D Gaussians on the GPU using least squares or, if ``mle``,
-    maximum likelihood estimation. If ``rotated``, a rotated elliptical
-    Gaussian is fitted and the resulting localizations contain the
-    fitted rotation angle (in degrees) in the column ``angle``. If
-    ``spherical``, an isotropic Gaussian with a single width is fitted
-    and the resulting ``sx`` and ``sy`` columns are identical. See
-    ``fit_2D`` for more details."""
-    theta, log_likelihood, iterations, chi_square = fit_spots_gpufit(
-        spots, rotated=rotated, mle=mle, spherical=spherical, return_stats=True
+    """Fit 2D Gaussians with least squares or, if ``mle``, maximum
+    likelihood, on the CPU or the GPU. If ``rotated``, a rotated elliptical
+    Gaussian is fitted and the resulting localizations contain the fitted
+    rotation angle (in degrees) in the column ``angle``. If ``spherical``, an
+    isotropic Gaussian with a single width is fitted and the resulting ``sx``
+    and ``sy`` columns are identical. See ``fit2D`` for more details."""
+    theta, log_likelihood, iterations, chi_square = fit_spots_gauss(
+        spots,
+        rotated=rotated,
+        mle=mle,
+        spherical=spherical,
+        use_gpu=use_gpu,
+        return_stats=True,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        progress_callback=progress_callback,
     )
-    locs = locs_from_fits_gpufit(
+    locs = locs_from_fits_gauss(
         identifications,
         theta,
         box,
@@ -2361,25 +2882,18 @@ def _fit2d_gauss_gpu(
 
 
 # ----------------------------------------------------------------------
-# Cubic-spline PSF fitting (Gpufit SPLINE_2D / SPLINE_3D models)
+# Cubic-spline PSF fitting
 #
 # The spline models fit an experimentally measured PSF (a cubic-spline model
-# built from a bead z-stack with Gpuspline). Unlike the
-# Gaussian models, they need the spline coefficient table passed through
-# Gpufit's ``user_info`` argument; everything else mirrors ``fit_spots_gpufit``.
-# The coefficients live inside the calibration dict (see
-# ``io.load_spline_calibration``).
+# built from a bead z-stack, see ``spline.calibrate_spline``). Unlike the
+# Gaussian models they
+# need a coefficient table, which lives inside the calibration dict (see
+# ``io.load_spline_calibration``) and is handed to the kernels by
+# ``_spline_coeff_reshaped``.
 # ----------------------------------------------------------------------
 
 
 _LINK_XYZ_MODEL = "spline-3d-multichannel-link-xyz"
-_LINK_XYZ_MODEL_ID_NAMES = {
-    2: "SPLINE_3D_MULTICHANNEL_LINK_XYZ",
-    3: "SPLINE_3D_MULTICHANNEL_LINK_XYZ_C3",
-    4: "SPLINE_3D_MULTICHANNEL_LINK_XYZ_C4",
-    5: "SPLINE_3D_MULTICHANNEL_LINK_XYZ_C5",
-    6: "SPLINE_3D_MULTICHANNEL_LINK_XYZ_C6",
-}
 
 
 def _as_link_xyz_calibration(calibration: dict) -> dict:
@@ -2397,52 +2911,14 @@ def _as_link_xyz_calibration(calibration: dict) -> dict:
         raise ValueError(
             "Photon decoupling (link-XYZ) supports 2 to "
             f"{_LINK_XYZ_MAX_CHANNELS} channels; this calibration has "
-            f"{n_channels}. The limit is the set of link-XYZ fit models "
-            "compiled into Gpufit.dll (one per channel count). Keep photons "
-            "linked - the shared-amplitude model works for any number of "
-            "channels."
+            f"{n_channels}. The limit is the per-thread device memory the "
+            "fit kernel needs, which grows as the square of the parameter "
+            "count. Keep photons linked - the shared-amplitude model works "
+            "for any number of channels."
         )
     cal = dict(calibration)
     cal["model"] = _LINK_XYZ_MODEL
     return cal
-
-
-def _spline_model_id(model: str, n_channels: int | None = None) -> int:
-    """Map a spline calibration ``model`` string to a Gpufit ModelID.
-
-    ``n_channels`` is only consulted for the photon-decoupled (link-XYZ) model,
-    whose parameter count - and therefore its ModelID - depends on the number
-    of channels (see :data:`_LINK_XYZ_MODEL_ID_NAMES`). ``None`` means the
-    two-channel case, so a bare call keeps returning the id 15."""
-    if model == "spline-2d":
-        return gf.ModelID.SPLINE_2D
-    if model == "spline-3d":
-        return gf.ModelID.SPLINE_3D
-    if model == "spline-3d-multichannel":
-        # Shared amplitude/offset: 5 parameters whatever the channel count.
-        return gf.ModelID.SPLINE_3D_MULTICHANNEL
-    if model == _LINK_XYZ_MODEL:
-        c = 2 if n_channels is None else int(n_channels)
-        name = _LINK_XYZ_MODEL_ID_NAMES.get(c)
-        if name is None:
-            raise ValueError(
-                f"Photon decoupling (link-XYZ) supports 2 to "
-                f"{_LINK_XYZ_MAX_CHANNELS} channels, got {c}."
-            )
-        try:
-            return getattr(gf.ModelID, name)
-        except AttributeError:
-            raise ValueError(
-                f"The Gpufit binding has no model '{name}' (needed for a "
-                f"{c}-channel photon-decoupled fit). Rebuild Gpufit.dll from "
-                "the fork, copy it into picasso/ext/pygpufit/ and make sure "
-                "picasso/ext/pygpufit/gpufit.py lists the model id."
-            ) from None
-    raise ValueError(
-        f"Unknown spline calibration model '{model}'. Expected one of "
-        "'spline-2d', 'spline-3d', 'spline-3d-multichannel', "
-        f"'{_LINK_XYZ_MODEL}'."
-    )
 
 
 def _spline_n_channels(calibration: dict) -> int:
@@ -2455,189 +2931,6 @@ def _spline_n_channels(calibration: dict) -> int:
     if model in ("spline-3d-multichannel", _LINK_XYZ_MODEL):
         return int(calibration.get("n_channels", coeff.shape[-1]))
     return 1
-
-
-def _reorder_spline_coefficients_for_gpufit(
-    coefficients: np.ndarray, model: str
-) -> np.ndarray:
-    """Reorder a spline coefficient table into the axis order Gpufit indexes.
-
-    Gpuspline's ``spline_coefficients`` Python binding calls the C library with
-    its spatial axes **reversed** (it passes ``data.shape`` as
-    ``(size[-1], ..., size[0])``). The flat coefficient buffer it returns is
-    therefore interval-major but in reversed spatial-axis order, while NumPy
-    merely *labels* the array ``(4**d, *n_intervals)`` - the label does not
-    match the physical memory order. Gpufit's ``spline_2d.cuh`` /
-    ``spline_3d.cuh`` read coefficients in **forward** order
-    (``coeff[(i*niy*niz + j*niz + k)*64 + oi*16+oj*4+ok]``, with ``i`` the fast
-    pixel index = column = x). At the C level Gpuspline's own
-    ``Spline{2,3}D::calculate_value`` uses the identical formula, so the *only*
-    discrepancy is the binding's reversal.
-
-    Passing the buffer through unchanged (as the reference pyGpufit examples
-    and older Picasso did) makes Gpufit read every interval's coefficients from
-    the wrong location: the fit then diverges even when seeded at the true
-    minimum, while a CPU least-squares fit over the *same* coefficients (via
-    ``gpuspline.spline_values``) recovers it. This undoes the reversal by
-    transposing both the interval axes and the per-interval power axes back to
-    forward ``(x, y[, z])`` order. Returns a flat ``float32`` array ready to
-    drop into ``user_info``.
-    """
-    # The photon-decoupled (link-XYZ) model reuses the multichannel coefficient
-    # layout verbatim; only the fit's parameter handling differs.
-    if model == _LINK_XYZ_MODEL:
-        model = "spline-3d-multichannel"
-    coeff = np.ascontiguousarray(coefficients, dtype=np.float32)
-    if model == "spline-2d":
-        # label (16, nix, niy); the raw buffer reshapes to (niy, nix, 4, 4)
-        # = (y_interval, x_interval, y_power, x_power). Swap to forward (x, y).
-        _, nix, niy = coeff.shape
-        phys = coeff.ravel(order="C").reshape(niy, nix, 4, 4)
-        return np.ascontiguousarray(phys.transpose(1, 0, 3, 2)).ravel(
-            order="C"
-        )
-    if model == "spline-3d":
-        # label (64, nix, niy, niz); the raw buffer reshapes to
-        # (niz, niy, nix, 4, 4, 4) = (z, y, x, z_power, y_power, x_power).
-        # Swap to forward (x, y, z).
-        _, nix, niy, niz = coeff.shape
-        phys = coeff.ravel(order="C").reshape(niz, niy, nix, 4, 4, 4)
-        return np.ascontiguousarray(phys.transpose(2, 1, 0, 5, 4, 3)).ravel(
-            order="C"
-        )
-    if model == "spline-3d-multichannel":
-        # label (64, nix, niy, niz, n_channels); Gpufit expects the channel as
-        # the OUTERMOST axis, each channel a plain forward 3D table. Reorder
-        # each channel's block like the single-channel 3D case, concatenated
-        # channel-major.
-        _, nix, niy, niz, n_channels = coeff.shape
-        blocks = []
-        for c in range(n_channels):
-            sub = np.ascontiguousarray(coeff[..., c])
-            phys = sub.ravel(order="C").reshape(niz, niy, nix, 4, 4, 4)
-            blocks.append(
-                np.ascontiguousarray(phys.transpose(2, 1, 0, 5, 4, 3)).ravel(
-                    order="C"
-                )
-            )
-        return np.concatenate(blocks).astype(np.float32)
-    raise ValueError(f"Unknown spline model '{model}'.")
-
-
-def _pack_spline_user_info(
-    calibration: dict, residuals: np.ndarray | None = None
-) -> lib.FloatArray1D:
-    """Pack a spline calibration into Gpufit's ``user_info`` blob:
-
-    - 2D: ``[n_data_x, n_data_y, n_int_x, n_int_y, coefficients...]``
-    - 3D: ``[n_data_x, n_data_y, n_data_z(=1), n_int_x, n_int_y, n_int_z,
-      coefficients...]``
-    - 3D multichannel: ``[n_channels, n_data_x, n_data_y, n_data_z(=1),
-      n_int_x, n_int_y, n_int_z, coefficients...]``
-
-    The multichannel models take two further blocks after the coefficients,
-    each optional and each skipped by the model when the blob is too short:
-
-    1. the per-channel lateral affine (4 values per channel), and
-    2. ``residuals``, the per-fit sub-pixel ROI offsets, ``[fit][channel][x,
-       y]``. Because the model resolves its position as ``chunk_index *
-       n_fits + fit_index``, this block must cover **every fit of the call, in
-       call order** - see :func:`_run_gpufit_spline`, which batches its calls
-       so that ``chunk_index`` stays 0.
-
-    Block 2 can only be appended when block 1 is present, since the model
-    locates it at a fixed offset past the affine.
-
-    The coefficient block is the calibration's ``coefficients`` array reordered
-    by :func:`_reorder_spline_coefficients_for_gpufit` from Gpuspline's
-    (binding-reversed) layout into the forward axis order Gpufit's spline
-    models index. This reorder is essential: without it Gpufit reads scrambled
-    coefficients and the fit diverges (see that function's docstring). It is
-    what the reference pyGpufit examples get wrong.
-
-    IMPORTANT: the whole blob is cast to ``float32`` to match the
-    single-precision (``REAL=float``) Gpufit build shipped with Picasso. The
-    reference examples build ``user_info`` with ``np.hstack`` of mixed ints and
-    float32 arrays, which NumPy promotes to float64 - that only works against a
-    double-precision Gpufit build. Passing float64 to a single-precision build
-    makes Gpufit misread the coefficients, so the explicit ``float32`` cast
-    here is deliberate.
-    """
-    model = calibration["model"]
-    coefficients = np.ascontiguousarray(
-        calibration["coefficients"], dtype=np.float32
-    )
-    n_data = list(calibration["n_data"])
-    n_intervals = list(calibration["n_intervals"])
-    if model == "spline-2d":
-        header = [n_data[0], n_data[1], n_intervals[0], n_intervals[1]]
-    elif model in ("spline-3d-multichannel", _LINK_XYZ_MODEL):
-        # Both multichannel models use the same 7-value header; the link-XYZ
-        # (photon-decoupled) model shares the plain multichannel coefficient
-        # block. coeffs are (64, ix, iy, iz, n_channels).
-        n_channels = _spline_n_channels(calibration)
-        header = [
-            n_channels,
-            n_data[0],
-            n_data[1],
-            1,
-            n_intervals[0],
-            n_intervals[1],
-            n_intervals[2],
-        ]
-    else:  # 3D
-        # A single camera frame is fitted, so the number of data points in z
-        # is 1; the spline recovers the continuous z position.
-        header = [
-            n_data[0],
-            n_data[1],
-            1,
-            n_intervals[0],
-            n_intervals[1],
-            n_intervals[2],
-        ]
-    coefficient_block = _reorder_spline_coefficients_for_gpufit(
-        coefficients, model
-    )
-    blocks = [np.asarray(header, dtype=np.float32), coefficient_block]
-    if model in ("spline-3d-multichannel", _LINK_XYZ_MODEL):
-        # Per-channel lateral affine, appended channel-major after the
-        # coefficient block; the globLoc-style joint fit. Requires the
-        # updated CUDA models (spline_3d_multichannel.cuh / ..._link_xyz.cuh).
-        transforms = calibration.get("channel_transforms")
-        n_channels = _spline_n_channels(calibration)
-        has_affine = transforms is not None and len(transforms) == n_channels
-        if has_affine:
-            affine = []
-            for t in transforms:
-                lin = np.asarray(t, dtype=np.float32)[:, :2]
-                affine.extend([lin[0, 0], lin[0, 1], lin[1, 0], lin[1, 1]])
-            blocks.append(np.asarray(affine, dtype=np.float32))
-        if residuals is not None:
-            # Per-fit, per-channel sub-pixel ROI residual, laid out as
-            # [fit][channel][x, y].
-            # The model locates it at affine_begin + n_channels * 4, so it can
-            # only be appended when the affine block is actually there -
-            # otherwise the model would read these values as the affine.
-            if not has_affine:
-                raise ValueError(
-                    "ROI residuals need the per-channel affine block, but the "
-                    "calibration has no usable 'channel_transforms'."
-                )
-            res = np.ascontiguousarray(residuals, dtype=np.float32)
-            if res.ndim != 3 or res.shape[1:] != (n_channels, 2):
-                raise ValueError(
-                    "residuals must have shape (n_fits, n_channels, 2), got "
-                    f"{res.shape} for {n_channels} channels."
-                )
-            blocks.append(res.ravel(order="C"))
-    elif residuals is not None:
-        raise ValueError(
-            "ROI residuals only apply to the multichannel spline models, not "
-            f"to '{model}'."
-        )
-    user_info = np.hstack(blocks).astype(np.float32)
-    return user_info
 
 
 def crop_spline_calibration(calibration: dict, box: int) -> dict:
@@ -2712,10 +3005,10 @@ def _initial_parameters_spline(
 ) -> lib.FloatArray2D:
     """Initialize spline fit parameters per spot.
 
-    Parameter order matches the Gpufit spline models:
+    Parameter order matches the spline models:
     ``[amplitude, x_shift, y_shift, offset]`` (2D) or
     ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D and 3D
-    multichannel). The Gpufit spline model evaluates the spline at
+    multichannel). The spline model evaluates the spline at
     ``position = pixel_index - parameter`` (see ``spline_3d.cuh``), so:
 
     - x_shift/y_shift are the emitter's lateral offset from the (centered)
@@ -2765,424 +3058,415 @@ def _initial_parameters_spline(
     return initial
 
 
-def _run_gpufit_spline(
+# ----------------------------------------------------------------------
+# CPU cubic-spline fitting
+#
+# The numerical core lives in ``picasso.fitting.splinefit``, a numba port of
+# Gpufit's
+# Levenberg-Marquardt driver and its spline models). What follows is the
+# translation layer: calibration dict in, plain arrays out, plus the
+# device-agnostic entry points the multichannel fitters call so that a single
+# ``use_gpu`` flag selects the backend.
+# ----------------------------------------------------------------------
+
+
+def _spline_kind(model: str) -> int:
+    """``picasso.fitting.splinefit`` model kind for a spline calibration
+    ``model``."""
+    if model == "spline-2d":
+        return splinefit.KIND_2D
+    if model in ("spline-3d", "spline-3d-multichannel"):
+        return splinefit.KIND_3D
+    if model == _LINK_XYZ_MODEL:
+        return splinefit.KIND_LINK_XYZ
+    raise ValueError(
+        f"Unknown spline calibration model '{model}'. Expected one of "
+        "'spline-2d', 'spline-3d', 'spline-3d-multichannel', "
+        f"'{_LINK_XYZ_MODEL}'."
+    )
+
+
+def _spline_channel_major(
+    spots: lib.FloatArray3D, n_channels: int
+) -> np.ndarray:
+    """Spots as ``(n_spots, n_channels, box, box)`` for the CPU kernels.
+
+    Picasso stacks multichannel spots channel-*minor*, ``(n, box, box,
+    n_channels)``, so those need a transpose - the same reordering
+    the kernels' channel-major data layout needs. A
+    single-channel stack only needs a length-1 axis inserted, which is a free
+    reshape; transposing it instead would copy the entire spot stack for
+    nothing."""
+    if n_channels == 1:
+        if spots.ndim == 4 and spots.shape[3] == 1:
+            spots = spots[..., 0]
+        return spots.reshape(len(spots), 1, spots.shape[1], spots.shape[2])
+    if spots.ndim != 4:
+        raise ValueError(
+            "Multichannel spline fitting expects spots of shape "
+            "(n_spots, box, box, n_channels)."
+        )
+    if spots.shape[3] != n_channels:
+        raise ValueError(
+            f"Spots have {spots.shape[3]} channels but the calibration has "
+            f"{n_channels}."
+        )
+    return np.ascontiguousarray(spots.transpose(0, 3, 1, 2))
+
+
+def _spline_z_seeds(calibration: dict, n_z_starts: int) -> tuple:
+    """Axial seeds for the multi-start, as ``(z_seeds, apply_seeds)``.
+
+    The seeds span the calibration z-stack (``z_shift = -z_plane``, so
+    ``[-(n_z - 1), 0]``); both devices get the same grid, so they explore
+    the same axial minima."""
+    n_seeds = max(1, int(n_z_starts))
+    if n_seeds == 1 or calibration["model"] == "spline-2d":
+        return np.zeros(1), False
+    n_z = int(calibration["n_data"][2])
+    return np.linspace(-(n_z - 1), 0.0, n_seeds), True
+
+
+def _spline_schedule(
+    apply_seeds: bool,
+    tolerance: float | None,
+    max_iterations: int | None,
+) -> tuple:
+    """Resolve a spline fit's convergence schedule. Same on either device.
+
+    A multi-start has to rank its seeds on the chi-square and therefore needs a
+    much tighter stop than a single start. ``None`` picks whichever applies;
+    explicit values always win."""
+    return splinefit.resolve_schedule(apply_seeds, tolerance, max_iterations)
+
+
+def _run_splinefit(
     spots: lib.FloatArray3D,
     calibration: dict,
     mle: bool = False,
-    initial_parameters: lib.FloatArray2D | None = None,
-    tolerance: float = 1e-2,
-    max_number_iterations: int = 20,
+    n_z_starts: int | None = None,
     residuals: np.ndarray | None = None,
-) -> tuple:
-    """Low-level spline fit: crop the calibration to the spot box, pack the
-    coefficient ``user_info`` and run Gpufit's spline model.
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+    multiprocess: bool = True,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+    abort_callback: Callable[[], bool] | None = None,
+    use_gpu: bool = False,
+) -> tuple | None:
+    """Low-level spline fit: unpack the calibration and run the kernels.
 
-    Returns Gpufit's raw output tuple ``(parameters, states, chi_squares,
-    number_iterations, execution_time)``. :func:`fit_spots_gpufit_spline` wraps
-    this for the common case; :func:`fit_spline_multichannel_ratiometric` uses
-    it directly because it needs the per-fit ``states`` and ``chi_squares`` to
-    rank photon-ratio hypotheses.
+    Returns ``(theta, chi_squares, states, iterations)``, or None if
+    ``abort_callback`` asked to stop. The axial multi-start runs inside the
+    per-spot kernel on both devices, so every seed is tried while that spot's
+    data is still in cache and progress is reported once per spot rather than
+    once per pass.
 
-    ``initial_parameters`` overrides the default per-spot initialization (used
-    by the axial multi-start, which retries each spot from several z seeds). It
-    must be ``(n_spots, n_parameters)`` matching the model.
+    ``use_gpu`` selects :mod:`picasso.fitting.splinefit_cuda` over
+    :mod:`picasso.fitting.splinefit`. The two backends are driven from *this*
+    function
+    rather than from separate translation layers deliberately: everything above
+    the dispatch - the box crop, the channel-major reshape, the coefficient
+    view, the affines, the ROI residuals, the initial parameters and the
+    schedule - is computed once, so both devices are guaranteed to see
+    byte-identical inputs. That is what makes a CPU/GPU comparison meaningful
+    rather than a test of two translation layers agreeing.
 
-    ``residuals`` are the per-spot, per-channel sub-pixel ROI offsets from
-    :func:`get_spots_multichannel` (multichannel models only). When given, the
-    call is split into batches small enough that Gpufit keeps each one in a
-    single chunk. The model resolves a fit's residual as ``chunk_index *
-    n_fits + fit_index``, but ``n_fits`` is the *chunk* size, so for a short
-    final chunk that arithmetic silently points at the wrong fit. Keeping every
-    call to one chunk holds ``chunk_index`` at 0 and sidesteps it. Gpufit
-    derives its chunk size from free GPU memory and does not expose it, hence a
-    fixed, deliberately conservative batch here.
+    ``multiprocess`` keeps ``fit2D``'s argument name, but as for ``gaussmle``
+    it selects a **thread** pool: the CPU kernels are ``nogil``, so the workers
+    run concurrently while sharing the spots and the coefficient table rather
+    than pickling a copy of each into a subprocess. False runs the fit serially
+    in the calling thread, which is what the tests use for reproducibility. It
+    is ignored on the GPU, where one launch fits every spot.
     """
-    if not GPUFIT_INSTALLED:
-        raise ImportError(
-            "GPUfit could not be found, CUDA-capable GPU is required."
-        )
     box = spots.shape[1]
-    # Fit a smaller-than-calibration box against a centered crop of the
-    # calibration (equal box: no-op; larger box: raises). This makes the fitter
-    # self-sufficient - any caller may pass a smaller box without pre-cropping.
-    # NOTE: locs_from_fits_spline must be given the SAME box so its
-    # CRLB/reconstruction crop identically (it does so itself).
+    # Fit a smaller-than-calibration box against a centered crop, exactly as
+    # locs_from_fits_spline crops identically itself, so its CRLB matches
+    # the fit geometry.
     calibration = crop_spline_calibration(calibration, box)
     model = calibration["model"]
-    is_multichannel = model in (
-        "spline-3d-multichannel",
-        _LINK_XYZ_MODEL,
-    )
-    if is_multichannel:
-        # Multichannel spots are channel-stacked (n, box, box, n_channels);
-        # the per-fit data is the channels concatenated pixel-major, exactly
-        # as in the reference splinefit_3d_multi_channel example.
-        if spots.ndim != 4:
-            raise ValueError(
-                "Multichannel spline fitting expects spots of shape "
-                "(n_spots, box, box, n_channels)."
-            )
-        n_channels = _spline_n_channels(calibration)
-        if spots.shape[3] != n_channels:
-            raise ValueError(
-                f"Spots have {spots.shape[3]} channels but the calibration "
-                f"has {n_channels}."
-            )
-        n_points = box * box * n_channels
-    else:
-        n_channels = None
-        n_points = box * box
+    kind = _spline_kind(model)
+    n_channels = _spline_n_channels(calibration)
     if mle:
+        # A Poisson likelihood is undefined for negative counts; camera offset
+        # subtraction can push dim pixels below zero. Same clip as on the GPU.
         spots = np.maximum(spots, 0)
-    if initial_parameters is None:
-        initial_parameters = _initial_parameters_spline(spots, calibration)
-    else:
-        initial_parameters = np.ascontiguousarray(
-            initial_parameters, dtype=np.float32
-        )
-    model_id = _spline_model_id(model, n_channels)
-    if model == _LINK_XYZ_MODEL:
-        n_parameters = 3 + 2 * n_channels
-        if initial_parameters.shape[1] != n_parameters:
-            raise ValueError(
-                "Photon-decoupled (link-XYZ) fitting of "
-                f"{n_channels} channels needs {n_parameters} initial "
-                f"parameters per spot, got {initial_parameters.shape[1]}."
-            )
-        if int(_spline_n_channels(calibration)) != n_channels:
-            raise ValueError(
-                f"The calibration declares "
-                f"{int(_spline_n_channels(calibration))} channels but the fit "
-                f"model is set up for {n_channels}."
-            )
-    estimator_id = gf.EstimatorID.MLE if mle else gf.EstimatorID.LSE
-
-    if is_multichannel:
-        # Gpufit's multichannel model is channel-MAJOR: each channel occupies a
-        # contiguous box*box block (channel_id = point_index // (box*box), see
-        # spline_3d_multichannel.cuh). Picasso's spots are (n, box, box,
-        # n_channels) = channel-minor, so move the channel axis in front of the
-        # pixels before flattening.
-        fit_data = np.ascontiguousarray(spots.transpose(0, 3, 1, 2)).reshape(
-            (len(spots), n_points)
-        )
-    else:
-        fit_data = spots.reshape((len(spots), n_points))
-
-    def _fit(data, init, user_info):
-        return gf.fit(
-            data,
-            None,
-            model_id,
-            init,
-            tolerance=tolerance,
-            max_number_iterations=max_number_iterations,
-            estimator_id=estimator_id,
-            user_info=user_info,
-        )
-
-    res = None
-    if residuals is not None:
-        res = np.ascontiguousarray(residuals, dtype=np.float32)
-        if len(res) != len(fit_data):
-            raise ValueError(
-                f"Got {len(res)} ROI residuals for {len(fit_data)} spots."
-            )
-
-    if len(fit_data) == 0:
-        return (
-            np.zeros((0, initial_parameters.shape[1]), dtype=np.float32),
-            np.zeros(0, dtype=np.int32),  # states
-            np.zeros(0, dtype=np.float32),  # chi_squares
-            np.zeros(0, dtype=np.int32),  # number_iterations
-            0.0,  # execution_time
-        )
-
-    if res is None:
-        return _fit(
-            fit_data, initial_parameters, _pack_spline_user_info(calibration)
-        )
-
-    # One batch per Gpufit call, so the model's chunk_index is always 0 (see
-    # this function's docstring). Slices along axis 0 of a C-contiguous array
-    # stay contiguous, so no copy is made here.
-    batch = _gpufit_batch_size(n_points)
-    outputs = [
-        _fit(
-            fit_data[start : start + batch],
-            initial_parameters[start : start + batch],
-            _pack_spline_user_info(calibration, res[start : start + batch]),
-        )
-        for start in range(0, len(fit_data), batch)
-    ]
-    if len(outputs) == 1:
-        return outputs[0]
-    return (
-        np.concatenate([o[0] for o in outputs]),  # parameters
-        np.concatenate([o[1] for o in outputs]),  # states
-        np.concatenate([o[2] for o in outputs]),  # chi_squares
-        np.concatenate([o[3] for o in outputs]),  # number_iterations
-        float(sum(o[4] for o in outputs)),  # execution_time
+    fit_data = _spline_channel_major(spots, n_channels)
+    initial = np.ascontiguousarray(
+        _initial_parameters_spline(spots, calibration), dtype=np.float64
+    )
+    coefficients = _spline_coeff_reshaped(calibration)
+    affines = _spline_channel_affines(calibration, n_channels)
+    roi_residuals = _spline_crlb_residuals(residuals, len(spots), n_channels)
+    if n_z_starts is None:
+        n_z_starts = _default_n_z_starts(calibration)
+    z_seeds, apply_seeds = _spline_z_seeds(calibration, n_z_starts)
+    tolerance, max_iterations = _spline_schedule(
+        apply_seeds, tolerance, max_iterations
     )
 
+    args = (
+        kind,
+        fit_data,
+        coefficients,
+        affines,
+        roi_residuals,
+        initial,
+        z_seeds,
+        apply_seeds,
+    )
+    kwargs = {
+        "mle": mle,
+        "tolerance": tolerance,
+        "max_iterations": max_iterations,
+    }
+    aborted = callable(abort_callback) and abort_callback()
+    if aborted:
+        return None
+    if use_gpu:
+        stopped_early = False
 
-def fit_spots_gpufit_spline(
+        def _abort() -> bool:
+            nonlocal stopped_early
+            if abort_callback():
+                stopped_early = True
+                return True
+            return False
+
+        result = splinefit_cuda.fit_spots(
+            *args,
+            progress_callback=progress_callback,
+            abort_callback=_abort if callable(abort_callback) else None,
+            **kwargs,
+        )
+        return None if stopped_early else result
+    if not multiprocess or len(spots) == 0:
+        return splinefit.fit_spots(
+            *args, progress_callback=progress_callback, **kwargs
+        )
+
+    n_spots = len(spots)
+    fit = splinefit.fit_spots_async(*args, **kwargs)
+    use_tqdm = progress_callback == "console"
+    iter_range = (
+        tqdm(total=n_spots, desc="Fitting", unit="spot") if use_tqdm else None
+    )
+    last = 0
+    while fit.current[0] < n_spots:
+        if callable(abort_callback) and abort_callback():
+            fit.stop()
+            aborted = True
+            break
+        if use_tqdm:
+            iter_range.update(fit.current[0] - last)
+            last = fit.current[0]
+        elif callable(progress_callback):
+            progress_callback(fit.current[0])
+        # The workers write into preallocated arrays and nothing ever collects
+        # their futures, so a worker that died would leave the counter frozen
+        # and this loop spinning forever. Surface the error instead.
+        fit.raise_errors()
+        if fit.finished() and fit.current[0] < n_spots:
+            raise RuntimeError(
+                "The spline fitting workers stopped after "
+                f"{fit.current[0]} of {n_spots} spots."
+            )
+        time.sleep(0.2)
+    while not fit.finished():
+        # A spot is claimed before it is fitted, so the last few may still be
+        # in flight once the counter reaches n_spots. Aborted runs wait too, so
+        # no thread is left writing into the arrays after this returns.
+        fit.raise_errors()
+        time.sleep(0.05)
+    fit.raise_errors()
+    if use_tqdm:
+        if not aborted:
+            iter_range.update(n_spots - last)
+        iter_range.close()
+    if aborted:
+        return None
+    if callable(progress_callback):
+        # Report completion explicitly: a fit short enough to finish before the
+        # first poll would otherwise never call back at all.
+        progress_callback(n_spots)
+    return fit.results()
+
+
+def fit_spots_splinefit(
     spots: lib.FloatArray3D,
     calibration: dict,
     mle: bool = False,
     n_z_starts: int | None = None,
     return_stats: bool = False,
     residuals: np.ndarray | None = None,
-) -> (
-    lib.FloatArray2D
-    | tuple[
-        lib.FloatArray2D,
-        lib.FloatArray1D | None,
-        lib.FloatArray1D,
-        lib.FloatArray1D | None,
-    ]
-):
-    """Fit multiple spots with a cubic-spline PSF model on the GPU.
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+    multiprocess: bool = True,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+    abort_callback: Callable[[], bool] | None = None,
+    use_gpu: bool = False,
+) -> np.ndarray | tuple | None:
+    """Fit multiple spots with a cubic-spline PSF model using the numba kernels.
 
-    Mirrors ``fit_spots_gpufit`` but uses Gpufit's SPLINE_2D / SPLINE_3D model
-    with the coefficient table from ``calibration`` passed via ``user_info``.
+    Runs on the CPU by default and on the GPU with ``use_gpu``; the two are the
+    same algorithm, so the choice only affects speed. Same arguments, parameter
+    conventions and return shape as :func:`fit_spots_spline_gpu`, so all
+    three are interchangeable (see :func:`fit_spots_spline`, which picks between
+    them). Every spline model is supported: ``spline-2d``, ``spline-3d``,
+    ``spline-3d-multichannel`` and the photon-decoupled
+    ``spline-3d-multichannel-link-xyz``.
 
-    Parameters
-    ----------
-    spots : lib.FloatArray3D
-        Spot stack of shape ``(n_spots, box, box)``, or, for the multichannel
-        model, channel-stacked ``(n_spots, box, box, n_channels)`` (see
-        ``get_spots_multichannel``).
-    calibration : dict
-        Spline PSF calibration (see ``io.load_spline_calibration``). Must
-        contain ``model``, ``coefficients``, ``n_data`` and ``n_intervals``.
-    mle : bool, optional
-        Use Gpufit's maximum likelihood (Poisson) estimator. Default False.
-    n_z_starts : int, optional
-        Number of axial (z) seeds to try per spot. ``None`` (the default) picks
-        one from the calibration's z depth via :func:`_default_n_z_starts`; a
-        3D fit is z-degenerate at large |z| from a single seed, most sharply
-        for biplane / multichannel where the per-plane defocus cancels. Several
-        seeds spanning the calibration stack are tried and, per spot, the one
-        whose fit best explains the data (lowest chi-square) is kept. Pass 1 to
-        force the old single in-focus start - much faster, since the whole fit
-        runs once per seed, but liable to settle in the wrong axial minimum.
-        2D models always use a single start.
-    return_stats : bool, optional
-        Also return ``(log_likelihood, number_iterations, chi_square)``.
-        Default False.
-    residuals : np.ndarray, optional
-        Per-spot, per-channel sub-pixel ROI offsets ``(n_spots, n_channels,
-        2)`` from ``get_spots_multichannel(..., return_residuals=True)``.
-        Multichannel models only; without them the non-reference channels'
-        data sits up to half a pixel from where the model evaluates the
-        spline. See :func:`channel_roi_residuals`.
+    Progress is reported per spot on the CPU and per chunk on the GPU; see
+    ``tolerance``/``max_iterations`` for the convergence schedule and
+    :func:`_run_splinefit` for the multi-start.
 
-    Returns
-    -------
-    parameters : lib.FloatArray2D
-        Fitted parameters, columns ``[amplitude, x_shift, y_shift, offset]``
-        (2D), ``[amplitude, x_shift, y_shift, z_shift, offset]`` (3D / shared
-        multichannel) or ``[x_shift, y_shift, z_shift, N.., bg..]`` (link-XYZ).
-    log_likelihood, number_iterations, chi_square
-        Only if ``return_stats``. ``log_likelihood`` is None for least
-        squares (which assumes no noise model) and ``chi_square`` - the
-        residual sum of squares at the optimum - is None for MLE, where the
-        chi-square *is* the likelihood and is reported as such.
+    Returns None if ``abort_callback`` asked to stop.
     """
-    if n_z_starts is None:
-        n_z_starts = _default_n_z_starts(calibration)
-    if int(n_z_starts) <= 1:
-        parameters, states, chi_squares, number_iterations, exec_time = (
-            _run_gpufit_spline(
-                spots, calibration, mle=mle, residuals=residuals
-            )
-        )
-        if return_stats:
-            # As in fit_spots_gpufit: Gpufit's MLE chi-square is twice the
-            # negative Poisson log-likelihood; for least squares it is the
-            # plain residual sum of squares, reported as chi_square.
-            log_likelihood = -0.5 * chi_squares if mle else None
-            chi_square = None if mle else chi_squares
-            return parameters, log_likelihood, number_iterations, chi_square
-        return parameters
-
-    best_params, best_chi, _ok, best_it = _fit_spline_z_multistart(
+    result = _run_splinefit(
         spots,
         calibration,
         mle=mle,
         n_z_starts=n_z_starts,
         residuals=residuals,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        multiprocess=multiprocess,
+        progress_callback=progress_callback,
+        abort_callback=abort_callback,
+        use_gpu=use_gpu,
     )
+    if result is None:
+        return None
+    theta, chi_squares, _states, iterations = result
+    theta = theta.astype(np.float32)
     if return_stats:
-        log_likelihood = -0.5 * best_chi if mle else None
-        chi_square = None if mle else best_chi
-        return best_params, log_likelihood, best_it, chi_square
-    return best_params
+        # As in fit_spots_spline_gpu: the maximum-likelihood chi-square is
+        # twice the negative Poisson log-likelihood, the least-squares one is
+        # the residual sum of squares.
+        log_likelihood = (
+            (-0.5 * chi_squares).astype(np.float32) if mle else None
+        )
+        chi_square = None if mle else chi_squares.astype(np.float32)
+        return theta, log_likelihood, iterations, chi_square
+    return theta
 
 
-def _fit_spline_z_multistart(
+def _fit_splinefit_multistart(
     spots: lib.FloatArray3D,
     calibration: dict,
     mle: bool = False,
     n_z_starts: int = 1,
     residuals: np.ndarray | None = None,
+    use_gpu: bool = False,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
 ) -> tuple:
-    """Refit every spot from several axial seeds and keep the best per spot.
-
-    Runs the whole fit once per seed, the seeds spanning the calibration
-    z-stack, and keeps for each spot the seed whose fit best explains the data
-    (lowest chi-square), preferring converged fits over merely finite ones.
-    Seeded runs use a much tighter convergence than the single-start path
-    (``1e-4`` / 100 iterations vs ``1e-2`` / 20), since the point is to tell
-    genuinely different axial minima apart.
+    """Axial multi-start with the numba kernels, on either device.
 
     Returns ``(parameters, chi_squares, converged, n_iterations)``.
-    :func:`fit_spots_gpufit_spline` wraps this;
-    :func:`fit_spline_multichannel_ratiometric` calls it directly because it
-    ranks photon-ratio hypotheses on the chi-square.
-    """
-    model = calibration["model"]
-    if model == "spline-2d":
-        raise ValueError("A z multi-start requires a 3D spline model.")
-    # z_shift parameter column: 2 for the photon-decoupled model, else 3
-    z_col = 2 if model == _LINK_XYZ_MODEL else 3
-    spots_for_init = np.maximum(spots, 0) if mle else spots
-    base_init = _initial_parameters_spline(spots_for_init, calibration)
-    n_spots, n_params = base_init.shape
+    :func:`fit_spline_multichannel_ratiometric` uses this form because it ranks
+    photon-ratio hypotheses on the chi-square and needs to know which fits
+    converged.
 
-    best_ok_chi = np.full(n_spots, np.inf)
-    best_ok = np.full((n_spots, n_params), np.nan, np.float32)
-    best_ok_it = np.zeros(n_spots, np.int32)
-    best_fin_chi = np.full(n_spots, np.inf)
-    best_fin = np.full((n_spots, n_params), np.nan, np.float32)
-    best_fin_it = np.zeros(n_spots, np.int32)
-
-    # seeds span the calibration z-stack (z_shift = -z_plane, so
-    # [-(n_z-1), 0]); a single seed keeps the default in-focus init instead.
-    n_seeds = max(1, int(n_z_starts))
-    if n_seeds == 1:
-        seeds = [None]
-    else:
-        n_z = int(calibration["n_data"][2])
-        seeds = np.linspace(-(n_z - 1), 0.0, n_seeds)
-    for z0 in seeds:
-        init_k = base_init.copy()
-        if z0 is not None:
-            init_k[:, z_col] = np.float32(z0)
-        params, states, chi, nit, _ = _run_gpufit_spline(
-            spots,
-            calibration,
-            mle=mle,
-            initial_parameters=init_k,
-            tolerance=1e-4,
-            max_number_iterations=100,
-            residuals=residuals,
-        )
-        finite = np.isfinite(params).all(axis=1) & np.isfinite(chi)
-        converged = finite & ((states == 0) if mle else True)
-        fin_better = finite & (chi < best_fin_chi)
-        best_fin_chi[fin_better] = chi[fin_better]
-        best_fin[fin_better] = params[fin_better]
-        best_fin_it[fin_better] = nit[fin_better]
-        ok_better = converged & (chi < best_ok_chi)
-        best_ok_chi[ok_better] = chi[ok_better]
-        best_ok[ok_better] = params[ok_better]
-        best_ok_it[ok_better] = nit[ok_better]
-
-    has_ok = np.isfinite(best_ok_chi)
-    best_params = np.where(has_ok[:, None], best_ok, best_fin)
-    best_chi = np.where(has_ok, best_ok_chi, best_fin_chi)
-    best_it = np.where(has_ok, best_ok_it, best_fin_it)
-    return best_params, best_chi, has_ok, best_it
-
-
-def _spline_model_and_grad(
-    coeff: np.ndarray,
-    box: int,
-    x_shift: np.ndarray,
-    y_shift: np.ndarray,
-    z_eval: np.ndarray | None,
-) -> tuple:
-    """Vectorized cubic-spline model image and its analytic spatial derivatives.
-
-    Reimplements ``gpuspline.spline_values`` in NumPy for a batch of ``M``
-    localizations and, because a tricubic/bicubic is a polynomial in the local
-    fractional coordinate, also returns its exact spatial derivatives by
-    differentiating that polynomial term-by-term (the closed form Gpufit uses on
-    the GPU). This is the readable reference for the tricubic evaluation; the
-    production CRLB uses the equivalent parallel numba kernels
-    (:func:`_spline_infomats_3d` / :func:`_spline_infomats_2d`). It is kept for tests
-    and to validate the coefficient layout against ``gpuspline.spline_values``.
-
-    ``coeff`` is one channel's raw calibration coefficient table, ``(16, nix,
-    niy)`` (2D) or ``(64, nix, niy, niz)`` (3D). Its flat C-order buffer is the
-    Gpuspline-binding layout - it reshapes to ``(niy, nix, yp, xp)`` /
-    ``(niz, niy, nix, zp, yp, xp)`` (see
-    ``_reorder_spline_coefficients_for_gpufit``). The model pixel ``(i, j)``
-    (column ``i`` = x, row ``j`` = y) samples the template at ``x = i -
-    x_shift`` and ``y = j - y_shift`` ("position = pixel - parameter", see
-    ``_initial_parameters_spline``); ``z_eval`` is the native z coordinate.
-
-    Returns ``(phi, dphi_dx, dphi_dy, dphi_dz)``, each ``(M, box, box)`` indexed
-    ``[loc, x-pixel, y-pixel]`` (``dphi_dz`` is None for 2D). Derivatives are
-    w.r.t. the native coordinate; the shift derivative is their negative
-    (irrelevant to the sign-invariant CRLB diagonal).
-    """
-    x_shift = np.asarray(x_shift, dtype=np.float32)
-    y_shift = np.asarray(y_shift, dtype=np.float32)
-    grid = np.arange(box, dtype=np.float32)
-    xc = grid[None, :] - x_shift[:, None]  # (M, box) native x per pixel
-    yc = grid[None, :] - y_shift[:, None]
-
-    def _axis_basis(coords, n_int):
-        # interval index (clamped, so out-of-range extrapolates like Gpuspline)
-        # + value/derivative power bases [1,f,f^2,f^3] / [0,1,2f,3f^2].
-        idx = np.clip(np.floor(coords), 0, n_int - 1).astype(np.intp)
-        f = coords - idx
-        ones, zeros = np.ones_like(f), np.zeros_like(f)
-        p = np.stack([ones, f, f * f, f * f * f], axis=-1)
-        dp = np.stack([zeros, ones, 2.0 * f, 3.0 * f * f], axis=-1)
-        return idx, p, dp
-
-    coeff = np.ascontiguousarray(coeff, dtype=np.float32)
-    if z_eval is None:  # 2D bicubic
-        _, nix, niy = coeff.shape
-        c = coeff.reshape(-1).reshape(niy, nix, 4, 4)  # (yi, xi, yp, xp)
-        xi, px, dpx = _axis_basis(xc, nix)
-        yi, py, dpy = _axis_basis(yc, niy)
-        cg = c[yi[:, None, :], xi[:, :, None]]  # (M, box_x, box_y, yp, xp)
-        phi = np.einsum("mijyx,mjy,mix->mij", cg, py, px)
-        dphi_dx = np.einsum("mijyx,mjy,mix->mij", cg, py, dpx)
-        dphi_dy = np.einsum("mijyx,mjy,mix->mij", cg, dpy, px)
-        return phi, dphi_dx, dphi_dy, None
-
-    # 3D tricubic
-    _, nix, niy, niz = coeff.shape
-    c = coeff.reshape(-1).reshape(
-        niz, niy, nix, 4, 4, 4
-    )  # (zi,yi,xi,zp,yp,xp)
-    xi, px, dpx = _axis_basis(xc, nix)
-    yi, py, dpy = _axis_basis(yc, niy)
-    zc = np.asarray(z_eval, dtype=np.float32)
-    zidx = np.clip(np.floor(zc), 0, niz - 1).astype(np.intp)
-    fz = zc - zidx
-    pz = np.stack([np.ones_like(fz), fz, fz * fz, fz * fz * fz], axis=-1)
-    dpz = np.stack(
-        [np.zeros_like(fz), np.ones_like(fz), 2.0 * fz, 3.0 * fz * fz], axis=-1
+    There is no separate seed loop here: both kernels run the multi-start
+    per spot internally and return the winning seed, so this only has to
+    translate the fit state into the ``converged`` mask."""
+    theta, chi_squares, states, iterations = _run_splinefit(
+        spots,
+        calibration,
+        mle=mle,
+        n_z_starts=n_z_starts,
+        residuals=residuals,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        use_gpu=use_gpu,
     )
-    # z is one slice per loc: contract the z power first, then gather per pixel.
-    cz = c[zidx]  # (M, niy, nix, 4, 4, 4)
-    c_val = np.einsum("mYXzyx,mz->mYXyx", cz, pz)  # (M, niy, nix, yp, xp)
-    c_dz = np.einsum("mYXzyx,mz->mYXyx", cz, dpz)
-    mm = np.arange(len(x_shift))[:, None, None]
-    cg = c_val[mm, yi[:, None, :], xi[:, :, None]]  # (M, box_x, box_y, yp, xp)
-    cg_dz = c_dz[mm, yi[:, None, :], xi[:, :, None]]
-    phi = np.einsum("mijyx,mjy,mix->mij", cg, py, px)
-    dphi_dx = np.einsum("mijyx,mjy,mix->mij", cg, py, dpx)
-    dphi_dy = np.einsum("mijyx,mjy,mix->mij", cg, dpy, px)
-    dphi_dz = np.einsum("mijyx,mjy,mix->mij", cg_dz, py, px)
-    return phi, dphi_dx, dphi_dy, dphi_dz
+    finite = np.isfinite(theta).all(axis=1) & np.isfinite(chi_squares)
+    converged = finite & (
+        (states == splinefit.FIT_STATE_CONVERGED) if mle else True
+    )
+    return theta.astype(np.float32), chi_squares, converged, iterations
+
+
+def _spline_use_gpu(use_gpu: bool | None) -> bool:
+    """Resolve a ``use_gpu`` flag: None means "whatever is available".
+
+    Raises if the GPU was explicitly asked for but is unusable, so an explicit
+    request never silently becomes a (much slower) CPU fit."""
+    if use_gpu is None:
+        return CUDA_AVAILABLE
+    if use_gpu and not CUDA_AVAILABLE:
+        raise ImportError(
+            "GPU spline fitting was requested but no CUDA-capable GPU is "
+            "available. Pass use_gpu=False to fit the spline PSF on the CPU "
+            "instead."
+        )
+    return bool(use_gpu)
+
+
+def fit_spots_spline(
+    spots: lib.FloatArray3D,
+    calibration: dict,
+    mle: bool = False,
+    n_z_starts: int | None = None,
+    return_stats: bool = False,
+    residuals: np.ndarray | None = None,
+    use_gpu: bool | None = None,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> np.ndarray | tuple | None:
+    """Fit spots with a cubic-spline PSF model on the available device.
+
+    A thin wrapper over :func:`fit_spots_splinefit` that resolves the device:
+    ``use_gpu`` None (the default) uses the GPU when one is available. Both
+    devices run the same algorithm, so the choice only affects speed.
+
+    ``progress_callback`` is reported per spot on the CPU and per chunk on the
+    GPU."""
+    return fit_spots_splinefit(
+        spots,
+        calibration,
+        mle=mle,
+        n_z_starts=n_z_starts,
+        return_stats=return_stats,
+        residuals=residuals,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        progress_callback=progress_callback,
+        use_gpu=_spline_use_gpu(use_gpu),
+    )
+
+
+def _fit_spline_multistart(
+    spots: lib.FloatArray3D,
+    calibration: dict,
+    mle: bool = False,
+    n_z_starts: int = 1,
+    residuals: np.ndarray | None = None,
+    use_gpu: bool | None = None,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+) -> tuple:
+    """Axial multi-start on whichever device is available.
+
+    See :func:`_fit_splinefit_multistart`, which does the work on either
+    device; this only resolves which one."""
+    return _fit_splinefit_multistart(
+        spots,
+        calibration,
+        mle=mle,
+        n_z_starts=n_z_starts,
+        residuals=residuals,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        use_gpu=_spline_use_gpu(use_gpu),
+    )
 
 
 @numba.njit(parallel=True, cache=True, fastmath=True)
@@ -3203,9 +3487,7 @@ def _spline_infomats_3d(
     meat,
 ):
     """Fill the per-localization information matrices of the 3D cubic-spline
-    model. Parallel per-spot numba kernel; the readable reference is
-    :func:`_spline_model_and_grad`. ``coeff`` is
-    ``(n_channels, niz, niy, nix, 4, 4, 4)``. Non-converged rows are skipped
+    model. Parallel per-spot numba kernel. Non-converged rows are skipped
     (left as preset by the caller). Parameter order [x, y, z, amplitude, offset].
 
     ``aff`` is ``(n_channels, 4)`` ``[a00, a01, a10, a11]`` and ``res`` is
@@ -4472,7 +4754,7 @@ def _spline_crlb_link_xyz_kernel(
 
 
 def _require_crlb_cuda() -> None:
-    if not SPLINE_CRLB_CUDA_AVAILABLE:
+    if not CUDA_AVAILABLE:
         raise RuntimeError(
             "GPU spline CRLB requested but no CUDA-capable GPU is available."
         )
@@ -4823,7 +5105,7 @@ def _spline_link_xyz_crlb(
     res = _spline_crlb_residuals(residuals, n_locs, n_channels)
 
     crlb = None
-    if SPLINE_CRLB_CUDA_AVAILABLE:
+    if CUDA_AVAILABLE:
         try:
             crlb, failed = _spline_link_xyz_crlb_cuda(
                 _spline_coeff_reshaped(
@@ -4843,7 +5125,7 @@ def _spline_link_xyz_crlb(
                 progress_callback=progress_callback,
             )
         except Exception as exc:
-            # Degrade to the CPU (e.g. device out of memory while Gpufit still
+            # Degrade to the CPU (e.g. device out of memory while the fit still
             # holds allocations) rather than failing the whole fit.
             _warn_crlb_gpu_fallback(exc)
             crlb = None
@@ -4929,9 +5211,8 @@ def _spline_coeff_reshaped(
     calibration: dict, dtype: type = np.float64
 ) -> np.ndarray:
     """Raw calibration coefficients as ``(n_channels, niz, niy, nix, 4, 4, 4)``
-    (3D) or ``(n_channels, niy, nix, 4, 4)`` (2D), float64 for the numba kernels.
-    The flat C-order buffer is the Gpuspline-binding layout (see
-    :func:`_spline_model_and_grad`).
+    (3D) or ``(n_channels, niy, nix, 4, 4)`` (2D), float64 for the numba
+    kernels.
 
     ``dtype`` narrows the output; the CUDA kernels ask for float32 when the
     calibration itself is float32 (see :func:`_spline_crlb_coeff_dtype`), which
@@ -5119,7 +5400,7 @@ def _spline_crlb(
     ``gaussmle._mlefit_sigmaxy_crlb``.
 
     With ``mle`` False the result is the covariance of the *unweighted*
-    least-squares estimator (Gpufit's ``spline-gpu`` LSE mode), the Huber
+    least-squares estimator (the ``spline-gpu`` LSE mode), the Huber
     sandwich ``J⁻¹ M J⁻¹`` with normal matrix ``J = Σ g gᵀ`` and, for Poisson
     pixel noise (``σ² = μ``), meat ``M = Σ μ g gᵀ``. This is ≥ the Cramer-Rao
     bound elementwise (least squares is not efficient for Poisson data), so it
@@ -5188,7 +5469,7 @@ def _spline_crlb(
     x_shift = np.ascontiguousarray(theta[:, 1])
     y_shift = np.ascontiguousarray(theta[:, 2])
     offset = np.ascontiguousarray(theta[:, -1])
-    # Native z sampling coordinate = -z_shift (single-frame Gpufit
+    # Native z sampling coordinate = -z_shift (single-frame
     # "position = pixel_index - parameter", pixel_index_z = 0). The kernel
     # clamps the z-interval, so no pre-clamping is needed here.
     z_eval = np.ascontiguousarray(-theta[:, 3]) if is_3d else None
@@ -5200,7 +5481,7 @@ def _spline_crlb(
     res = _spline_crlb_residuals(residuals, n_locs, n_channels)
 
     crlb = None
-    if SPLINE_CRLB_CUDA_AVAILABLE:
+    if CUDA_AVAILABLE:
         try:
             crlb, failed = _spline_crlb_cuda(
                 _spline_coeff_reshaped(
@@ -5220,7 +5501,7 @@ def _spline_crlb(
                 progress_callback=progress_callback,
             )
         except Exception as exc:
-            # Degrade to the CPU (e.g. device out of memory while Gpufit still
+            # Degrade to the CPU (e.g. device out of memory while the fit still
             # holds allocations) rather than failing the whole fit.
             _warn_crlb_gpu_fallback(exc)
             crlb = None
@@ -5406,7 +5687,7 @@ def locs_from_fits_spline(
     ``log_likelihood`` (MLE) and ``chi_square`` (the least-squares residual
     sum of squares at the optimum) are the per-estimator goodness-of-fit
     metrics; each becomes a column when given. See
-    :func:`locs_from_fits_gpufit` for how to read ``chi_square``."""
+    :func:`locs_from_fits_gauss` for how to read ``chi_square``."""
     calibration = crop_spline_calibration(calibration, box)
     model = calibration["model"]
     if model == _LINK_XYZ_MODEL:
@@ -5516,6 +5797,8 @@ def _fit2d_spline_gpu(
         Callable[[int], None] | Literal["console"] | None
     ) = None,
     n_z_starts: int | None = None,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
 ) -> pd.DataFrame:
     """Fit an experimentally measured cubic-spline PSF on the GPU. For a 3D
     calibration the localizations contain the fitted ``z`` directly. See
@@ -5523,14 +5806,17 @@ def _fit2d_spline_gpu(
     computation in ``locs_from_fits_spline``.
 
     ``n_z_starts`` is the axial multi-start (see
-    :func:`fit_spots_gpufit_spline`); ``None`` picks it from the calibration.
+    :func:`fit_spots_splinefit`); ``None`` picks it from the calibration.
     Pass 1 for the single in-focus start."""
-    theta, log_likelihood, iterations, chi_square = fit_spots_gpufit_spline(
+    theta, log_likelihood, iterations, chi_square = fit_spots_splinefit(
         spots,
         calibration,
         mle=mle,
         return_stats=True,
         n_z_starts=n_z_starts,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        use_gpu=True,
     )
     locs = locs_from_fits_spline(
         identifications,
@@ -5547,8 +5833,67 @@ def _fit2d_spline_gpu(
     return locs
 
 
+def _fit2d_spline_cpu(
+    spots: lib.FloatArray3D,
+    identifications: pd.DataFrame,
+    box: int,
+    em: bool,
+    calibration: dict,
+    mle: bool = False,
+    n_z_starts: int | None = None,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+    multiprocess: bool = True,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+    abort_callback: Callable[[], bool] | None = None,
+) -> pd.DataFrame | None:
+    """Fit an experimentally measured cubic-spline PSF on the CPU. For a 3D
+    calibration the localizations contain the fitted ``z`` directly. See
+    ``fit2D`` for more details.
+
+    Unlike the GPU path, whose fit is one launch per chunk,
+    ``progress_callback`` here tracks the fit itself, one step per spot. The
+    per-spot CRLB pass in ``locs_from_fits_spline`` is a second sweep over the
+    same localizations, so it only gets the callback in ``"console"`` mode -
+    where it draws its own labelled progress bar - rather than rewinding a
+    GUI's counter back to zero.
+
+    Returns None if ``abort_callback`` asked to stop."""
+    result = fit_spots_splinefit(
+        spots,
+        calibration,
+        mle=mle,
+        n_z_starts=n_z_starts,
+        return_stats=True,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        multiprocess=multiprocess,
+        progress_callback=progress_callback,
+        abort_callback=abort_callback,
+    )
+    if result is None:
+        return None
+    theta, log_likelihood, iterations, chi_square = result
+    return locs_from_fits_spline(
+        identifications,
+        theta,
+        box,
+        em,
+        calibration,
+        mle=mle,
+        log_likelihood=log_likelihood,
+        iterations=iterations,
+        progress_callback=(
+            "console" if progress_callback == "console" else None
+        ),
+        chi_square=chi_square,
+    )
+
+
 # ----------------------------------------------------------------------
-# Multichannel cubic-spline PSF fitting (Gpufit SPLINE_3D_MULTICHANNEL)
+# Multichannel cubic-spline PSF fitting (shared-amplitude 3D model)
 #
 # Several spatially-registered channels (separate movies, e.g. biplane
 # microscopy) are fit simultaneously with shared x, y, z. A detection in
@@ -6046,6 +6391,9 @@ def fit_spline_multichannel(
     progress_callback: Callable[[int], None] | None = None,
     apply_roi_residuals: bool = True,
     n_z_starts: int | None = None,
+    use_gpu: bool | None = None,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
 ) -> pd.DataFrame:
     """Fit a multichannel cubic-spline PSF across several registered channels.
 
@@ -6053,7 +6401,7 @@ def fit_spline_multichannel(
     2022): every channel contributes to one fit with linked x, y and z.
 
     Ties ``get_spots_multichannel`` (extraction via the calibration's stored
-    ``channel_transforms``) to ``fit_spots_gpufit_spline`` and
+    ``channel_transforms``) to ``fit_spots_spline`` and
     ``locs_from_fits_spline``. The resulting localizations are in the
     reference channel's coordinates and contain the fitted ``z`` directly.
 
@@ -6071,7 +6419,12 @@ def fit_spline_multichannel(
     calibration : dict
         A ``"spline-3d-multichannel"`` calibration (see ``picasso.spline``).
     mle : bool, optional
-        Use Gpufit's maximum-likelihood estimator. Default False.
+        Use the Poisson maximum-likelihood estimator. Default False.
+    use_gpu : bool or None, optional
+        Fit on the GPU (``picasso.fitting.splinefit_cuda``) or on the CPU
+        (``picasso.fitting.splinefit``). None (the default) uses the GPU when
+        one is
+        available. Both compute the same quantity, so this only affects speed.
     link_photons : bool, optional
         If True (default), the shared-amplitude model links one photon
         amplitude and one background across all channels. If False, use
@@ -6085,8 +6438,7 @@ def fit_spline_multichannel(
         sits rather than at the nearest whole pixel. See
         :func:`channel_roi_residuals` for why this matters and by how much. Set
         False to reproduce results from before this correction, or to A/B the
-        two on the same data. Needs a ``Gpufit.dll`` built from the current
-        models; an older build ignores the residuals silently.
+        two on the same data.
     """
     if calibration.get("model") != "spline-3d-multichannel":
         raise ValueError(
@@ -6113,13 +6465,17 @@ def fit_spline_multichannel(
         progress_callback=progress_callback,
         return_residuals=True,
     )
-    theta, log_likelihood, iterations, chi_square = fit_spots_gpufit_spline(
+    theta, log_likelihood, iterations, chi_square = fit_spots_spline(
         spots,
         calibration,
         mle=mle,
         return_stats=True,
         residuals=residuals if apply_roi_residuals else None,
         n_z_starts=n_z_starts,
+        use_gpu=use_gpu,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        progress_callback=progress_callback,
     )
     em = camera_infos[0].get("Gain", 1) > 1
     return locs_from_fits_spline(
@@ -6148,7 +6504,7 @@ def scale_channel_blocks(
     scales that channel's model exactly: ``mu_c = offset + amplitude * r[c] *
     phi_c``. This is how a fixed per-channel photon **ratio** is imposed for
     ratiometric color assignment (and how an unequal biplane photon split is
-    baked in) without changing the compiled Gpufit model. Only the *relative*
+    baked in) without changing the model itself. Only the *relative*
     ratios matter - the shared amplitude absorbs any overall scale.
 
     Returns a new ``float32`` array; the input is not modified.
@@ -6197,6 +6553,9 @@ def fit_spline_multichannel_ratiometric(
     progress_callback: Callable[[int], None] | None = None,
     apply_roi_residuals: bool = True,
     n_z_starts: int | None = None,
+    use_gpu: bool | None = None,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
 ) -> pd.DataFrame:
     """Ratiometric multichannel spline fit with photon-ratio color assignment.
 
@@ -6213,9 +6572,11 @@ def fit_spline_multichannel_ratiometric(
     per-channel values matter (the shared amplitude absorbs the overall scale).
 
     Selection uses the **least-squares** residual by default (``mle=False``).
-    Gpufit's MLE estimator bails out (negative curvature) on a large fraction of
-    fits, so its chi-square is not a reliable cross-hypothesis score; when
-    ``mle=True`` the ranking is therefore restricted to converged fits.
+    The maximum-likelihood chi-square can still be unavailable for a spot whose
+    fit diverged, so when ``mle=True`` the ranking is restricted to converged
+    fits. (Before the Numba CUDA port this was a much bigger effect: Gpufit
+    abandoned any fit whose model rang negative, which was a large fraction of
+    them - see ``splinefit.MU_FLOOR``.)
 
     Returns localizations in the reference channel's coordinates with an added
     integer ``color`` column (the winning ratio index) and per-channel photon
@@ -6285,12 +6646,15 @@ def fit_spline_multichannel_ratiometric(
         calib_k["coefficients"] = scale_channel_blocks(
             calibration["coefficients"], ratios_norm[k]
         )
-        params, chi_squares, converged, _n_it = _fit_spline_z_multistart(
+        params, chi_squares, converged, _n_it = _fit_spline_multistart(
             spots,
             calib_k,
             mle=mle,
             n_z_starts=n_z_starts,
             residuals=roi_residuals,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
+            use_gpu=use_gpu,
         )
         thetas.append(params)
         chis.append(np.asarray(chi_squares))
@@ -6517,6 +6881,9 @@ def fit_spline_split_fov(
     progress_callback: Callable[[int], None] | None = None,
     apply_roi_residuals: bool = True,
     n_z_starts: int | None = None,
+    use_gpu: bool | None = None,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
 ) -> pd.DataFrame:
     """Fit a split-FOV multichannel spline PSF from a *single* movie whose
     rectangular sub-regions are the channels.
@@ -6585,6 +6952,9 @@ def fit_spline_split_fov(
             progress_callback=progress_callback,
             apply_roi_residuals=apply_roi_residuals,
             n_z_starts=n_z_starts,
+            use_gpu=use_gpu,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
         )
     if (
         photon_ratios is not None
@@ -6601,6 +6971,9 @@ def fit_spline_split_fov(
             progress_callback=progress_callback,
             apply_roi_residuals=apply_roi_residuals,
             n_z_starts=n_z_starts,
+            use_gpu=use_gpu,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
         )
     return fit_spline_multichannel(
         movies,
@@ -6613,69 +6986,10 @@ def fit_spline_split_fov(
         progress_callback=progress_callback,
         apply_roi_residuals=apply_roi_residuals,
         n_z_starts=n_z_starts,
+        use_gpu=use_gpu,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
     )
-
-
-def _fit2d_gaussmle(
-    spots,
-    identifications: pd.DataFrame,
-    box: int,
-    eps: float = 0.001,
-    max_it: int = 100,
-    mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
-    multiprocess: bool = True,
-    progress_callback: (
-        Callable[[int], None] | Literal["console"] | None
-    ) = None,
-    abort_callback: Callable[[], bool] | None = None,
-    spherical: bool = False,
-) -> pd.DataFrame | None:
-    """Fit 2D Gaussians using MLE fitting. If ``spherical``, an isotropic
-    Gaussian with a single width is fitted (``sx == sy``) and the
-    ellipticity column is omitted as it is always 0. See ``fit_2D`` for
-    more details."""
-    N = len(identifications)
-    # MLE API is a bit different (at least for now) so we cannot use
-    # _process_fitting_futures here
-    use_tqdm = progress_callback == "console"
-    if use_tqdm:
-        iter_range = tqdm(total=N, desc="Fitting", unit="spot")
-    if multiprocess:
-        curr, thetas, CRLBs, llhoods, iterations = gaussmle.gaussmle_async(
-            spots, eps, max_it, method=mle_method
-        )
-        last = 0
-        while curr[0] < N:
-            # abort check
-            if callable(abort_callback) and abort_callback():
-                if use_tqdm:
-                    iter_range.close()
-                return
-
-            # progress update
-            if use_tqdm:
-                iter_range.update(curr[0] - last)
-                last = curr[0]
-            elif callable(progress_callback):
-                progress_callback(curr[0])
-            time.sleep(0.2)
-        if use_tqdm:
-            iter_range.update(N - last)
-            iter_range.close()
-    else:
-        thetas, CRLBs, llhoods, iterations = gaussmle.gaussmle(
-            spots, eps, max_it, mle_method, progress_callback
-        )
-    locs = gaussmle.locs_from_fits(
-        identifications,
-        thetas,
-        CRLBs,
-        llhoods,
-        iterations,
-        box,
-        spherical=spherical,
-    )
-    return locs
 
 
 def _fit2d_avg(
@@ -6719,7 +7033,7 @@ def _process_fitting_futures(
     abort_callback: Callable[[], bool] | None = None,
 ) -> lib.FloatArray2D | None:
     """Convenience function for processing progress of fitting using
-    multiprocessing. See ``_fit2d_gausslq``, ``_fit2d_avg``."""
+    multiprocessing. See ``_fit2d_gauss``, ``_fit2d_avg``."""
     n_tasks = len(fs)
     use_tqdm = progress_callback == "console"
     if use_tqdm:
@@ -6768,12 +7082,14 @@ def localize(
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
         "gaussmle-spherical-gpu",
+        "spline",
+        "spline-mle",
         "spline-gpu",
         "spline-mle-gpu",
         "avg",
     ] = "gausslq",
-    eps: float = 0.001,
-    max_it: int = 100,
+    eps: float | None = None,
+    max_it: int | None = None,
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
     threaded: bool = True,
@@ -6803,6 +7119,9 @@ def localize(
         - `Min. Net Gradient`: Minimum net gradient for spot
           identification.
         - `Box Size`: Size of the box to cut out around each spot.
+        - `Temporal Median Window`: optional, window length (in frames)
+          of the temporal median filter applied before identification;
+          0 or missing disables it. Fitting always uses the raw movie.
     threaded : bool, optional
         Whether to use multithreading/multiprocessing. Default is True.
     movie_info : list[dict], optional
@@ -6823,11 +7142,13 @@ def localize(
             optional
         Which 2D fitting algorithm to use, see ``fit2D``. Default is
         "gausslq".
-    eps : float, optional
-        The convergence criterion for MLE fitting. Default is 0.001.
-    max_it : int, optional
-        The maximum number of iterations for MLE fitting. Default is
-        100.
+    eps : float or None, optional
+        The convergence criterion for CPU MLE and CPU spline fitting.
+        None (the default) picks the value that suits the method, see
+        ``fit2D``.
+    max_it : int or None, optional
+        The maximum number of iterations, as ``eps``. None (the default)
+        picks the value that suits the method.
     mle_method : Literal["sigma", "sigmaxy"], optional
         The method used for MLE fitting. Default is "sigmaxy".
     identification_progress_callback : callable or "console" or None
@@ -6872,6 +7193,7 @@ def localize(
         roi=roi,
         frame_bounds=frame_bounds,
         threaded=threaded,
+        temporal_median_window=parameters.get("Temporal Median Window", 0),
         progress_callback=identification_progress_callback,
     )
 
@@ -6918,14 +7240,17 @@ def localize_3D(
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
         "gaussmle-spherical-gpu",
+        "spline",
+        "spline-mle",
         "spline-gpu",
         "spline-mle-gpu",
     ] = "gausslq",
-    eps: float = 0.001,
-    max_it: int = 100,
+    eps: float | None = None,
+    max_it: int | None = None,
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
     multiprocess: bool = True,
+    temporal_median_window: int | None = None,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
@@ -6999,7 +7324,7 @@ def localize_3D(
         Default is "gausslq".
     eps : float, optional
         The convergence criterion for CPU MLE fitting. Ignored for
-        other methods (GPU fitting uses Gpufit's own convergence
+        other methods (GPU fitting uses its own convergence
         settings). Default is 0.001.
     max_it : int, optional
         The maximum number of iterations for CPU MLE fitting. Ignored
@@ -7045,6 +7370,8 @@ def localize_3D(
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
         "gaussmle-spherical-gpu",
+        "spline",
+        "spline-mle",
         "spline-gpu",
         "spline-mle-gpu",
     ], (
@@ -7092,6 +7419,7 @@ def localize_3D(
         mle_method=mle_method,
         spline_calibration=spline_calibration,
         multiprocess=multiprocess,
+        temporal_median_window=temporal_median_window,
         identification_progress_callback=identification_progress_callback,
         fit_progress_callback=fit_progress_callback,
         fit_z_progress_callback=fit_z_progress_callback,
@@ -7120,14 +7448,17 @@ def _localize_3D(
         "gaussmle-gpu",
         "gaussmle-rotated-gpu",
         "gaussmle-spherical-gpu",
+        "spline",
+        "spline-mle",
         "spline-gpu",
         "spline-mle-gpu",
     ] = "gausslq",
-    eps: float = 0.001,
-    max_it: int = 100,
+    eps: float | None = None,
+    max_it: int | None = None,
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
     multiprocess: bool = True,
+    temporal_median_window: int | None = None,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
@@ -7145,6 +7476,7 @@ def _localize_3D(
         parameters={
             "Min. Net Gradient": minimum_ng,
             "Box Size": box,
+            "Temporal Median Window": temporal_median_window,
         },
         roi=roi,
         frame_bounds=frame_bounds,

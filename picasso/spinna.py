@@ -33,7 +33,6 @@ from scipy.stats import ks_2samp, norm
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
 from sklearn.exceptions import ConvergenceWarning
-from tqdm import tqdm
 
 from . import io, lib, masking, render, __version__
 
@@ -3183,13 +3182,7 @@ class SPINNA:
         | tuple[tuple[lib.IntArray1D, ...], tuple[float, ...]]
     ):
         """Alias for ``self.fit()``."""
-        assert (
-            callback is None
-            or isinstance(callback, (lib.ProgressDialog, lib.MockProgress))
-            or callback == "console"
-        ), ("callback must be a ProgressDialog," " 'console', or None.")
-        if callback is None:
-            callback = lib.MockProgress()
+        callback = lib.normalize_progress(callback)
         assert fitting_mode in [
             "coarse-to-fine",
             "bayesian",
@@ -3338,6 +3331,7 @@ class SPINNA:
         save, asynch, bootstrap, callback
             Same as in ``fit``.
         """
+        callback = lib.normalize_progress(callback)
         if isinstance(N_structures, dict):
             N_structures = self.mixer.convert_N_structures_to_array(
                 N_structures
@@ -3360,9 +3354,8 @@ class SPINNA:
         fine_title = f"{base_title} | Fine pass" if base_title else "Fine pass"
 
         # adjust the progress bar
-        if isinstance(callback, lib.ProgressDialog):
-            callback.setMaximum(n_coarse)
-            callback.zero_progress(coarse_title)
+        callback.setMaximum(n_coarse)
+        callback.zero_progress(coarse_title)
         self.progress_title = coarse_title
         N_coarse, scores_coarse = self._run_brute_force(
             N_coarse, asynch, callback
@@ -3378,9 +3371,8 @@ class SPINNA:
         )
 
         # adjust the progress bar again
-        if isinstance(callback, lib.ProgressDialog):
-            callback.setMaximum(len(N_fine))
-            callback.zero_progress(fine_title)
+        callback.setMaximum(len(N_fine))
+        callback.zero_progress(fine_title)
         self.progress_title = fine_title
         spinna_results = self.fit_stoichiometry(
             N_fine,
@@ -3475,6 +3467,7 @@ class SPINNA:
             KS2 score of the best fit.
         """
 
+        callback = lib.normalize_progress(callback)
         if isinstance(N_structures, dict):
             N_structures = self.mixer.convert_N_structures_to_array(
                 N_structures
@@ -3517,20 +3510,22 @@ class SPINNA:
         )
 
         # --- Phase 2: GP-guided acquisition ---
-        progress_bar = self._init_gp_phase_progress(
-            n_iterations, callback, gp_title
-        )
-        evaluated, scores, _ = self._bayesian_gp_phase(
-            proportions=proportions,
-            N_structures=N_structures,
-            evaluated=evaluated,
-            scores=scores,
-            n_iterations=n_iterations,
-            callback=callback,
-            eval_count=0,
-            progress_bar=progress_bar,
-        )
-        self._finalize_progress(callback, progress_bar)
+        # skipped when the initial design already covered the whole
+        # search space (a zero range would show as a busy indicator)
+        if n_iterations > 0:
+            callback.zero_progress(gp_title)
+            callback.setMaximum(n_iterations)
+            evaluated, scores, _ = self._bayesian_gp_phase(
+                proportions=proportions,
+                N_structures=N_structures,
+                evaluated=evaluated,
+                scores=scores,
+                n_iterations=n_iterations,
+                callback=callback,
+                eval_count=0,
+            )
+            # fill the bar (the maximum was shrunk on early stopping)
+            callback.set_value(callback.maximum())
 
         # collect results for evaluated candidates only
         N_evaluated = N_structures[evaluated]
@@ -3569,46 +3564,14 @@ class SPINNA:
 
         Modifies ``evaluated`` and ``scores`` in place.
         """
-        if isinstance(callback, lib.ProgressDialog):
-            callback.zero_progress(title)
-            callback.setMaximum(n_initial)
-        progress_bar = None
-        if callback == "console":
-            progress_bar = tqdm(total=n_initial, desc=title)
+        callback.zero_progress(title)
+        callback.setMaximum(n_initial)
 
         init_idx = self._farthest_point_sampling(proportions, n_initial)
         for eval_count, idx in enumerate(init_idx, start=1):
             scores[idx] = self._evaluate_single(N_structures[idx])
             evaluated[idx] = True
-            self._tick_progress(callback, progress_bar, eval_count)
-
-        if progress_bar is not None:
-            progress_bar.close()
-
-    def _init_gp_phase_progress(self, n_iterations, callback, title):
-        """Set up progress tracking for the GP-guided acquisition phase."""
-        if isinstance(callback, lib.ProgressDialog):
-            callback.zero_progress(title)
-            callback.setMaximum(n_iterations)
-        if callback == "console":
-            return tqdm(total=n_iterations, desc=title)
-        return None
-
-    @staticmethod
-    def _tick_progress(callback, progress_bar, eval_count):
-        """Advance whichever progress tracker is active."""
-        if progress_bar is not None:
-            progress_bar.update(1)
-        elif callback is not None:
             callback.set_value(eval_count)
-
-    @staticmethod
-    def _finalize_progress(callback, progress_bar):
-        """Close the progress tracker once the GP phase finishes."""
-        if progress_bar is not None:
-            progress_bar.close()
-        elif isinstance(callback, lib.ProgressDialog):
-            callback.set_value(callback.maximum())
 
     def _save_bayesian_csv(self, N_evaluated, scores_evaluated, path):
         """Write evaluated candidates and their scores to ``path``."""
@@ -3636,7 +3599,6 @@ class SPINNA:
         n_iterations: int,
         callback,
         eval_count: int,
-        progress_bar=None,
     ) -> tuple[np.ndarray, np.ndarray, int]:
         """Run the GP-guided acquisition phase of Bayesian optimisation.
 
@@ -3657,12 +3619,10 @@ class SPINNA:
             Scores array (modified in-place).
         n_iterations : int
             Maximum number of GP-guided iterations.
-        callback : lib.ProgressDialog, "console", or None
-            Progress tracker.
+        callback : lib.ProgressType
+            Progress tracker (see ``lib.normalize_progress``).
         eval_count : int
             Number of evaluations already completed (for progress display).
-        progress_bar : tqdm or None
-            Active tqdm bar when ``callback == "console"``.
 
         Returns
         -------
@@ -3707,10 +3667,7 @@ class SPINNA:
             evaluated[best_idx] = True
             eval_count += 1
 
-            if callback == "console":
-                progress_bar.update(1)
-            elif callback is not None:
-                callback.set_value(eval_count)
+            callback.set_value(eval_count)
 
             # early stopping
             current_best = scores[evaluated].min()
@@ -3722,11 +3679,7 @@ class SPINNA:
             if no_improvement_count >= patience:
                 # shrink the progress target so the bar reaches 100%
                 # naturally instead of jumping at the end
-                if isinstance(callback, lib.ProgressDialog):
-                    callback.setMaximum(eval_count)
-                elif callback == "console" and progress_bar is not None:
-                    progress_bar.total = eval_count
-                    progress_bar.refresh()
+                callback.setMaximum(eval_count)
                 break
 
         return evaluated, scores, eval_count
@@ -3735,7 +3688,7 @@ class SPINNA:
         self,
         N_structures: lib.IntArray2D,
         asynch: bool,
-        callback: lib.ProgressDialog | Literal["console"] | lib.MockProgress,
+        callback: lib.ProgressType,
     ) -> tuple[lib.IntArray2D, lib.FloatArray1D]:
         """Score ``N_structures`` candidates, dispatching to parallel
         or single-thread mode.
@@ -3746,8 +3699,8 @@ class SPINNA:
             Candidates to evaluate.
         asynch : bool
             If True, multiprocessing is used.
-        callback : lib.ProgressDialog, "console", or lib.MockProgress
-            Progress tracker.
+        callback : lib.ProgressType
+            Progress tracker (see ``lib.normalize_progress``).
 
         Returns
         -------
@@ -3759,22 +3712,15 @@ class SPINNA:
         fs = self.fit_stoichiometry_parallel(N_structures)
         N = len(fs)
         N_ = N_structures.shape[0]
-        if callback == "console":
-            progress_bar = tqdm(total=N_, desc=self.progress_title)
+        callback.description_base = self.progress_title
+        callback.setMaximum(N_)
         while self.n_futures_done(fs) < N:
             fd = self.n_futures_done(fs)
             fd_ = int(fd * N_ / N)
-            if fd > 0 and callback != "console":
-                callback.description_base = self.progress_title
+            if fd > 0:
                 callback.set_value(fd_)
-            elif fd > 0 and callback == "console":
-                progress_bar.update(fd_ - progress_bar.n)
             time.sleep(0.1)
-        if callback != "console":
-            callback.set_value(N_)
-        else:
-            progress_bar.update(fd_ - progress_bar.n)
-            progress_bar.close()
+        callback.set_value(N_)
         return self.scores_from_futures(fs)
 
     def _run_bootstrap(
@@ -3783,7 +3729,7 @@ class SPINNA:
         opt_N_structures: lib.IntArray1D,
         opt_proportions: lib.FloatArray1D,
         score: float,
-        callback: lib.ProgressDialog | Literal["console"] | lib.MockProgress,
+        callback: lib.ProgressType,
     ) -> tuple[tuple, tuple]:
         """Bootstrap the best-fit result to estimate uncertainty.
 
@@ -3800,8 +3746,8 @@ class SPINNA:
             Best-fit proportions.
         score : float
             Best-fit KS2 score.
-        callback : lib.ProgressDialog, "console", or lib.MockProgress
-            Progress tracker.
+        callback : lib.ProgressType
+            Progress tracker (see ``lib.normalize_progress``).
 
         Returns
         -------
@@ -3812,16 +3758,14 @@ class SPINNA:
         N_structures_subset = self.get_subset_N_structures(
             N_structures, opt_N_structures
         )
-        if isinstance(callback, lib.ProgressDialog):
-            callback.setMaximum(len(N_structures_subset))
         bootstrap_scores = []
         boot_props = []
         for i in range(N_BOOTSTRAPS):
+            # NN_scorer below re-arms the progress tracker (title, range
+            # and ETA baseline) for each bootstrap round
             self.progress_title = (
                 f"Bootstrapping {i+1}/{N_BOOTSTRAPS}; spinning structures"
             )
-            if isinstance(callback, lib.ProgressDialog):
-                callback.t0_est = time.time()
             gt_coords_boot = self.mixer.run_simulation(opt_N_structures)
             self.dists_gt = get_NN_dist_experimental(
                 gt_coords_boot, self.mixer
@@ -3910,9 +3854,7 @@ class SPINNA:
     def NN_scorer(
         self,
         N_structures: lib.IntArray2D,
-        callback: (
-            lib.ProgressDialog | Literal["console"] | lib.MockProgress
-        ) = lib.MockProgress(),
+        callback: lib.ProgressType | Literal["console"] | None = None,
     ) -> tuple[lib.IntArray2D, lib.FloatArray1D]:
         """Score the simulations similarity to the ground truth dataset
         based on their nearest neighbor distances distribution using
@@ -3928,10 +3870,10 @@ class SPINNA:
             simulated for each iteration. Shape (N, M), where N is the
             number of simulations to be tested and M is the number of
             structures in mixer.
-        callback : {lib.ProgressDialog, "console", lib.MockProgress}, optional
+        callback : {lib.ProgressType, "console", None}, optional
             Progress bar to track fitting progress. If "console", the
-            progress bar is displayed in the console. If MockProgress,
-            no progress bar is displayed. Default is MockProgress.
+            progress bar is displayed in the console. If None, no
+            progress bar is displayed. Default is None.
 
         Returns
         -------
@@ -3941,15 +3883,13 @@ class SPINNA:
             1D array with fit scores for each combination of structures.
         """
         # Run simulations for each structure count and score them #
+        callback = lib.normalize_progress(callback, self.progress_title)
+        callback.description_base = self.progress_title
+        callback.zero_progress(self.progress_title)
+        callback.setMaximum(N_structures.shape[0])
         scores = np.zeros((N_structures.shape[0],))
-        if callback == "console":
-            iterator = tqdm(
-                range(N_structures.shape[0]), desc=self.progress_title
-            )
-        else:
-            iterator = range(N_structures.shape[0])
 
-        for ii in iterator:
+        for ii in range(N_structures.shape[0]):
             N = N_structures[ii]
             # calculate NNDs over self.N_sim repeated simulations
             dists_sim = get_NN_dist_simulated(
@@ -3957,9 +3897,7 @@ class SPINNA:
             )
             # score the simulation results
             scores[ii] = NND_score(dists_sim, self.dists_gt)
-            if callback != "console":
-                callback.description_base = self.progress_title
-                callback.set_value(ii)
+            callback.set_value(ii)
         return N_structures, scores
 
     def get_subset_N_structures(
@@ -4457,6 +4395,7 @@ def compare_models_given_label_unc(
         data.
     """
     # initialize
+    callback = lib.normalize_progress(callback)
     best_mixer = None
     best_idx = None
     best_score = np.inf
@@ -4503,13 +4442,10 @@ def compare_models_given_label_unc(
             savepath = os.path.join(
                 savedir, f"fit_scores_model_{i+1}_label_unc_{suffix}.csv"
             )
-        # adjust the progress dialog (zero_progress also resets the
+        # adjust the progress tracker (zero_progress also resets the
         # time-estimate baseline so the new phase gets a fresh ETA)
-        if isinstance(callback, lib.ProgressDialog):
-            callback.setMaximum(len(list(search_space.values())[0]))
-            callback.zero_progress(spinner_title)
-        elif callback == "console":
-            print(spinner_title)
+        callback.setMaximum(len(list(search_space.values())[0]))
+        callback.zero_progress(spinner_title)
         opt_props, score = spinner.fit_stoichiometry(
             N_structures=search_space,
             fitting_mode=fitting_mode,

@@ -1304,3 +1304,66 @@ class TestG5M3D:
                 calibration=None,
                 asynch=False,
             )
+
+
+# ---------------------------------------------------------------------
+# G5M progress reporting (uniform duck-typed interface, see
+# lib.normalize_progress)
+# ---------------------------------------------------------------------
+
+
+class _RecordingProgress:
+    """Duck-typed progress tracker recording the calls it receives."""
+
+    def __init__(self):
+        self.values = []
+        self.maxima = []
+        self.closed = False
+
+    def set_value(self, value):
+        self.values.append(value)
+
+    def setMaximum(self, maximum, *args, **kwargs):
+        self.maxima.append(maximum)
+
+    def maximum(self):
+        return self.maxima[-1] if self.maxima else 0
+
+    def zero_progress(self, description=None, *args, **kwargs):
+        pass
+
+    def close(self, *args, **kwargs):
+        self.closed = True
+
+
+class TestG5MProgress:
+    @pytest.fixture
+    def dbscan_locs(self, locs):
+        out = clusterer.dbscan(locs, radius=2 / 130, min_samples=2)[0]
+        assert len(out) > 0
+        return out
+
+    @pytest.mark.parametrize("callback_parent", [None, "console"])
+    def test_progress_modes(self, dbscan_locs, info, callback_parent):
+        mols, _, _ = g5m.g5m(
+            dbscan_locs,
+            info,
+            min_locs=5,
+            asynch=False,
+            callback_parent=callback_parent,
+        )
+        assert len(mols) > 0
+
+    def test_reports_progress_to_duck_typed_tracker(self, dbscan_locs, info):
+        tracker = _RecordingProgress()
+        g5m.g5m(
+            dbscan_locs,
+            info,
+            min_locs=5,
+            asynch=False,
+            callback_parent=tracker,
+        )
+        assert tracker.values, "no progress was reported"
+        assert tracker.closed, "progress tracker was not closed"
+        # the final update fills the bar
+        assert tracker.values[-1] == max(tracker.values)

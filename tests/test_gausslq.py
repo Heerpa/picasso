@@ -10,11 +10,14 @@ not just shapes.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from picasso import gausslq
+from picasso import gausslq, localize
+from picasso.fitting import precision
 
 from tests.conftest import BOX, make_rotated_gaussian_spot
 
@@ -130,6 +133,62 @@ class TestFitSpots:
         assert len(calls) == len(spots)
         # callback receives the running index, monotonically increasing
         assert calls == list(range(len(spots)))
+
+
+class TestConvergenceSchedule:
+    """``tolerance``/``max_iterations`` are exposed so the GUI and the CLI can
+    offer them for every fitting method, this one included."""
+
+    def test_defaults_reproduce_minpacks_own(self):
+        """MAX_ITERATIONS must map to exactly ``leastsq``'s default
+        ``maxfev``, so passing the default explicitly is a no-op and the
+        historical behaviour of ``gausslq`` is unchanged."""
+        for n_parameters in (5, 6, 7):
+            assert gausslq._max_function_evaluations(
+                gausslq.MAX_ITERATIONS, n_parameters
+            ) == 200 * (n_parameters + 1)
+
+    def test_defaults_match_passing_none(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        np.testing.assert_array_equal(
+            gausslq.fit_spots(spots),
+            gausslq.fit_spots(
+                spots,
+                tolerance=gausslq.TOLERANCE,
+                max_iterations=gausslq.MAX_ITERATIONS,
+            ),
+        )
+
+    def test_iteration_cap_bites(self, synthetic_spots):
+        """One iteration cannot reach the optimum a full fit finds."""
+        spots, gt = synthetic_spots
+        converged = gausslq.fit_spots(spots)
+        starved = gausslq.fit_spots(spots, max_iterations=1)
+        assert not np.allclose(converged, starved)
+        # ...and it is the starved fit that is wrong, not merely different
+        assert np.max(np.abs(starved[:, 0] - gt.x.values)) > np.max(
+            np.abs(converged[:, 0] - gt.x.values)
+        )
+
+    def test_tighter_tolerance_does_not_move_a_converged_fit(
+        self, synthetic_spots
+    ):
+        """The default stop is already at the optimum for clean spots, so
+        tightening it changes the position by far less than a pixel."""
+        spots, _ = synthetic_spots
+        loose = gausslq.fit_spots(spots)
+        tight = gausslq.fit_spots(spots, tolerance=1e-8, max_iterations=400)
+        assert np.max(np.abs(loose[:, :2] - tight[:, :2])) < 0.05
+
+    @pytest.mark.parametrize(
+        "kwargs", [{"spherical": True}, {"rotated": True}, {}]
+    )
+    def test_every_model_accepts_the_schedule(self, synthetic_spots, kwargs):
+        spots, _ = synthetic_spots
+        theta = gausslq.fit_spots(
+            spots[:3], tolerance=1e-3, max_iterations=50, **kwargs
+        )
+        assert np.all(np.isfinite(theta))
 
 
 # ---------------------------------------------------------------------------
@@ -393,29 +452,6 @@ class TestSigmaUncertainty:
         se = gausslq.sigma_uncertainty(sigma, sigma_orth, photons, bg)
         assert len(se) == 2
         assert (se > 0).all()
-
-
-# ---------------------------------------------------------------------------
-# Optional GPU backend — the Gpufit wrapper lives in picasso.localize
-# (tested in tests/test_localize.py); gausslq keeps backward-compatible
-# functions for the non-rotated least-squares fit, tested here.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(
-    not gausslq.GPUFIT_INSTALLED, reason="GPUfit/CUDA not available"
-)
-class TestGpufit:
-    """Tests for the backward-compatible GPU codepath. Skipped when the
-    Gpufit library or a CUDA-capable GPU is not available (which is true
-    for the typical test environment)."""
-
-    def test_fit_spots_gpufit(self, synthetic_spots):
-        spots, gt = synthetic_spots
-        theta = gausslq.fit_spots_gpufit(spots)
-        assert theta.shape == (len(spots), 6)
-        # GPU returns parameters as [photons, x, y, sx, sy, bg]
-        np.testing.assert_allclose(theta[:, 0], gt.photons.values, rtol=0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -735,3 +771,175 @@ class TestChiSquare:
         theta = gausslq.fit_spots(spots)
         locs = gausslq.locs_from_fits(self._ids(len(spots)), theta, BOX, False)
         assert "chi_square" not in locs.columns
+
+
+class TestDeprecation:
+    """``picasso.gausslq``'s fitters are deprecated in 0.11 and go in 1.0.
+
+    Two things have to hold: the public names warn, and Picasso's own code
+    does not trigger them - a library warning about its own internals is
+    noise, not a signal. The internal callers use the private
+    implementations (``_fit_spot`` and friends), which is what these tests
+    pin."""
+
+    ENTRY_POINTS = ["fit_spot", "fit_spots", "fit_spots_parallel"]
+
+    @pytest.mark.parametrize("name", ENTRY_POINTS + ["fit_spots_gauss_gpu"])
+    def test_documented_as_deprecated(self, name):
+        doc = getattr(gausslq, name).__doc__
+        assert ".. deprecated:: 0.11" in doc
+        assert "Picasso 1.0" in doc
+
+    def test_fit_spot_warns(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        with pytest.warns(DeprecationWarning, match="Picasso 1.0"):
+            gausslq.fit_spot(spots[0])
+
+    def test_fit_spots_warns_once_not_per_spot(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            gausslq.fit_spots(spots)
+        deprecations = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert len(deprecations) == 1
+
+    @pytest.mark.parametrize("name", ["fit_spot", "fit_spots"])
+    def test_private_implementation_is_silent(self, name, synthetic_spots):
+        """What Picasso itself calls. If these warned, every ordinary fit
+        would emit a deprecation notice about Picasso's own code.
+
+        ``_fit_spots_parallel`` is left out only because it needs
+        subprocesses; ``localize`` calling it is covered end to end by
+        ``test_localize.TestNoSelfDeprecation``."""
+        spots, _ = synthetic_spots
+        private = getattr(gausslq, "_" + name)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            private(spots[0] if name == "fit_spot" else spots)
+        assert not [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+
+    @pytest.mark.parametrize("name", ENTRY_POINTS)
+    def test_public_and_private_agree(self, name, synthetic_spots):
+        """The wrapper must add a warning and nothing else."""
+        spots, _ = synthetic_spots
+        public = getattr(gausslq, name)
+        private = getattr(gausslq, "_" + name)
+        if name == "fit_spot":
+            args = (spots[0],)
+        elif name == "fit_spots":
+            args = (spots,)
+        else:
+            pytest.skip("fit_spots_parallel needs subprocesses")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            np.testing.assert_array_equal(public(*args), private(*args))
+
+    def test_private_locs_from_fits_is_silent(self, synthetic_spots):
+        """``_locs_from_fits`` computes ``lpx``/``lpy``, so it must reach the
+        *new* home of ``localization_precision`` rather than the shim beside
+        it. It did not, once - and every least-squares fit warned about
+        Picasso's own code as a result."""
+        spots, _ = synthetic_spots
+        theta = gausslq._fit_spots(spots)
+        identifications = pd.DataFrame(
+            {
+                "frame": np.zeros(len(spots), np.uint32),
+                "x": np.full(len(spots), 10.0),
+                "y": np.full(len(spots), 10.0),
+                "net_gradient": np.full(len(spots), 5000.0),
+            }
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            gausslq._locs_from_fits(identifications, theta, BOX, em=False)
+        assert not [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+
+    def test_replacement_is_named(self):
+        """A deprecation without a migration path is just an annoyance."""
+        assert "picasso.fitting.gaussfit" in gausslq._DEPRECATION_MESSAGE
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "fit_spot",
+            "fit_spots",
+            "fit_spots_parallel",
+            "fit_spots_gauss_gpu",
+            "fits_from_futures",
+            "locs_from_fits",
+            "locs_from_fits_gauss_gpu",
+            "localization_precision",
+            "sigma_uncertainty",
+        ],
+    )
+    def test_every_public_name_is_deprecated(self, name):
+        """The *whole module* goes in 1.0, not just the fitters - so nothing
+        may be left here without a documented replacement."""
+        doc = getattr(gausslq, name).__doc__ or ""
+        assert ".. deprecated:: 0.11" in doc, name
+        assert "Picasso 1.0" in doc, name
+
+    def test_no_undeprecated_public_names_remain(self):
+        """Catches a *new* public function being added to a module that is
+        on its way out."""
+        undeprecated = [
+            name
+            for name in dir(gausslq)
+            if not name.startswith("_")
+            and callable(getattr(gausslq, name))
+            and getattr(getattr(gausslq, name), "__module__", "")
+            == "picasso.gausslq"
+            and ".. deprecated::" not in (getattr(gausslq, name).__doc__ or "")
+        ]
+        assert undeprecated == []
+
+    def test_precision_formulas_moved_verbatim(self):
+        """``localization_precision`` and ``sigma_uncertainty`` now live in
+        ``picasso.fitting.precision``. The numbers must not have moved with
+        them - these are published formulas, and ``lpx`` is in every saved
+        localization file."""
+        photons = np.array([500.0, 1200.0, 8000.0])
+        s = np.array([1.2, 1.4, 0.9])
+        s_orth = np.array([1.1, 1.5, 1.3])
+        bg = np.array([5.0, 12.0, 2.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            for em in (False, True):
+                np.testing.assert_array_equal(
+                    gausslq.localization_precision(photons, s, s_orth, bg, em),
+                    precision.localization_precision(
+                        photons, s, s_orth, bg, em
+                    ),
+                )
+            np.testing.assert_array_equal(
+                gausslq.sigma_uncertainty(s, s_orth, photons, bg),
+                precision.sigma_uncertainty_lsq(s, s_orth, photons, bg),
+            )
+
+    def test_new_home_does_not_warn(self):
+        """The replacement must be usable without tripping the warning the
+        old name raises."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            precision.localization_precision(
+                np.array([500.0]),
+                np.array([1.2]),
+                np.array([1.1]),
+                np.array([5.0]),
+                False,
+            )
+            precision.sigma_uncertainty_lsq(
+                np.array([1.2]),
+                np.array([1.1]),
+                np.array([500.0]),
+                np.array([5.0]),
+            )
+        assert not [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]

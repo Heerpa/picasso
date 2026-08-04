@@ -1078,10 +1078,13 @@ _FIT_METHOD_MAP = {
     "mle": "gaussmle",
     "mle-spherical": "gaussmle-spherical",
     "mle-spherical-gpu": "gaussmle-spherical-gpu",
+    "mle-rotated": "gaussmle-rotated",
     "mle-rotated-gpu": "gaussmle-rotated-gpu",
     "mle-3d": "gaussmle",
-    "spline": "spline-gpu",
-    "spline-mle": "spline-mle-gpu",
+    "spline": "spline",
+    "spline-mle": "spline-mle",
+    "spline-gpu": "spline-gpu",
+    "spline-mle-gpu": "spline-mle-gpu",
     "avg": "avg",
 }
 
@@ -1128,6 +1131,7 @@ def _localize_process_file(
     parameters = {
         "Min. Net Gradient": min_net_gradient,
         "Box Size": box,
+        "Temporal Median Window": args.temporal_median,
     }
 
     locs, info = localize(
@@ -1138,8 +1142,8 @@ def _localize_process_file(
         frame_bounds=frame_bounds,
         movie_info=info,
         fitting_method=fitting_method,
-        eps=convergence if convergence > 0 else 0.001,
-        max_it=max_iterations if max_iterations > 0 else 100,
+        eps=convergence if convergence > 0 else None,
+        max_it=max_iterations if max_iterations > 0 else None,
         spline_calibration=spline_calibration,
         threaded=True,
         identification_progress_callback="console",
@@ -1244,11 +1248,14 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     print("Localize - Parameters:")
     print("{:<8} {:<15} {:<10}".format("No", "Label", "Value"))
 
-    if args.fit_method in ("lq-gpu", "spline", "spline-mle"):
-        if localize.GPUFIT_INSTALLED:
-            print("GPUfit installed")
+    if args.fit_method in ("lq-gpu", "spline-gpu", "spline-mle-gpu"):
+        if localize.CUDA_AVAILABLE:
+            print("CUDA GPU found")
         else:
-            raise Exception("GPUfit not installed. Aborting.")
+            raise Exception(
+                "No CUDA-capable GPU found, so the requested GPU fit method "
+                "cannot run. Aborting."
+            )
 
     for index, element in enumerate(vars(args)):
         try:
@@ -1291,12 +1298,10 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
         "Qe": args.qe,
     }
 
-    if args.fit_method == "mle":
-        convergence = 0.001
-        max_iterations = 100
-    else:
-        convergence = 0
-        max_iterations = 0
+    # 0 means "let the fitting method use its own default", which differs
+    # per model and per device - see localize.fit2D's eps / max_it.
+    convergence = args.convergence
+    max_iterations = args.max_iterations
 
     z_params = None
     if "-3d" in args.fit_method:
@@ -1315,7 +1320,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
                 args.fit_z_gpu = False
 
     spline_calibration = None
-    if args.fit_method in ("spline", "spline-mle"):
+    if args.fit_method.startswith("spline"):
         from .io import load_spline_calibration
 
         if not args.spline_calibration:
@@ -1357,12 +1362,6 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
     picasso_logo()
     print("Spline PSF calibration")
     print("------------------------------------------")
-
-    if not localize.GPUSPLINE_INSTALLED:
-        raise Exception(
-            "Gpuspline is required to build a spline PSF calibration but "
-            "could not be loaded. See picasso/ext/pygpuspline/README.txt."
-        )
 
     camera_info = {
         "Baseline": args.baseline,
@@ -1467,8 +1466,19 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
             progress_callback=lambda i: print(f"  step {i}/3"),
         )
     print("------------------------------------------")
+    n_beads = calibration["n_beads"]
+    n_used = spline.n_beads_used(calibration)
+    built_from = f"{n_beads} beads"
+    if n_used < n_beads:
+        # the rejected beads are not in the PSF; the gallery next to the
+        # calibration shows which ones were dropped and why
+        built_from = (
+            f"{n_used} of {n_beads} detected beads "
+            f"({n_beads - n_used} rejected as outliers, see the "
+            "*_beads.png diagnostic)"
+        )
     print(
-        f"Spline PSF calibration built from {calibration['n_beads']} beads "
+        f"Spline PSF calibration built from {built_from} "
         f"and saved to {out_path}"
     )
 
@@ -2662,6 +2672,7 @@ def main():  # noqa: C901
             "mle",
             "mle-spherical",
             "mle-spherical-gpu",
+            "mle-rotated",
             "mle-rotated-gpu",
             "lq",
             "lq-spherical",
@@ -2674,12 +2685,17 @@ def main():  # noqa: C901
             "mle-3d",
             "spline",
             "spline-mle",
+            "spline-gpu",
+            "spline-mle-gpu",
             "avg",
         ],
         default="mle",
         help=(
-            "fitting method ('spline'/'spline-mle' fit an experimental "
-            "cubic-spline PSF on the GPU and need --spline-calibration)"
+            "fitting method. 'spline'/'spline-mle' fit an experimental "
+            "cubic-spline PSF on the CPU by least squares / maximum "
+            "likelihood, 'spline-gpu'/'spline-mle-gpu' do the same on the "
+            "GPU (needs a CUDA-capable GPU); all four need "
+            "--spline-calibration"
         ),
     )
     localize_parser.add_argument(
@@ -2689,11 +2705,52 @@ def main():  # noqa: C901
         default="",
         help=(
             "path to a cubic-spline PSF calibration (.hdf5) for the "
-            "'spline'/'spline-mle' fit methods"
+            "'spline', 'spline-mle', 'spline-gpu' and 'spline-mle-gpu' "
+            "fit methods"
         ),
     )
     localize_parser.add_argument(
         "-g", "--gradient", type=int, default=5000, help="minimum net gradient"
+    )
+    localize_parser.add_argument(
+        "-tm",
+        "--temporal-median",
+        type=int,
+        default=0,
+        help=(
+            "window length (in frames) of the temporal median filter applied"
+            " before spot identification; it subtracts a per-pixel rolling"
+            " median background, which suppresses inhomogeneous background"
+            " and static structures. 0 (the default) disables it. Fitting"
+            " always uses the raw movie, so the minimum net gradient needs"
+            " re-tuning when this is switched on"
+        ),
+    )
+    localize_parser.add_argument(
+        "-cc",
+        "--convergence",
+        type=float,
+        default=0,
+        help=(
+            "convergence criterion: the fit stops once the chi-square"
+            " changes by less than this, relative to its own magnitude."
+            " 0 (the default) uses the selected fit method's own value"
+            " (1e-5 for 'mle', 0.01 for 'lq' and every GPU Gaussian, and"
+            " for the splines 1e-4 with the axial multi-start, 1e-2"
+            " without)"
+        ),
+    )
+    localize_parser.add_argument(
+        "-mi",
+        "--max-iterations",
+        type=int,
+        default=0,
+        help=(
+            "maximum number of iterations per spot. 0 (the default) uses"
+            " the selected fit method's own value (100 for 'mle', 200 for"
+            " 'lq', 20 for every GPU Gaussian, and for the splines 100 with"
+            " the axial multi-start, 20 without)"
+        ),
     )
     localize_parser.add_argument(
         "-d",
@@ -2785,8 +2842,7 @@ def main():  # noqa: C901
     )
 
     # spline-calibrate: build a cubic-spline PSF calibration from a bead
-    # z-stack movie (Gpuspline; CPU) for later use with the 'spline' fit
-    # methods.
+    # z-stack movie for later use with the 'spline' fit methods.
     spline_calib_parser = subparsers.add_parser(
         "spline-calibrate",
         help="build a cubic-spline PSF calibration from a bead z-stack",

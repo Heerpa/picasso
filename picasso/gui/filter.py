@@ -17,13 +17,16 @@ import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+# must come after the PyQt6 import so that matplotlib's qt_compat
+# selects the PyQt6 binding (picasso core no longer imports PyQt6)
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg,
     NavigationToolbar2QT,
 )
 from matplotlib.widgets import SpanSelector, RectangleSelector
 from matplotlib.colors import LogNorm
-from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .. import io, lib, clusterer, __version__
 

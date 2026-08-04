@@ -10,7 +10,14 @@ repos:
     hooks:
       - id: sync-installer-readmes
         name: Sync shared sections into installer readmes
-        entry: python3 release/sync_installer_readmes.py
-        language: system
-        files: ^(readme\.rst|release/one_click_(macos|windows)_gui/readme\.rst|release/sync_installer_readmes\.py)$
+        entry: python release/sync_installer_readmes.py
+        # "python", not "system": a system hook resolves the interpreter from
+        # PATH, which fails when git runs from an IDE or a shell without the
+        # conda env activated (and Windows conda envs have no "python3" at
+        # all). This builds pre-commit's own env, so the interpreter is always
+        # there. The script is stdlib-only, so it needs nothing installed.
+        language: python
+        # The targets are .txt, so editing one directly also re-runs the sync
+        # and overwrites it - the main readme stays the single source.
+        files: ^(readme\.rst|release/one_click_(macos|windows)_gui/readme\.txt|release/sync_installer_readmes\.py)$
         pass_filenames: false

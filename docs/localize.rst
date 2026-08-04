@@ -5,16 +5,18 @@ localize
    :scale: 50 %
    :alt: UML Localize
 
-Localize allows performing super-resolution reconstruction of image stacks. For spot detection, a gradient-based approach is used. For Fitting, the following algorithms are implemented:
+Localize allows performing super-resolution reconstruction of image stacks. For spot detection, a gradient-based approach is used. For fitting, you choose a **PSF model** and, independently, an **optimizer**: least squares (LQ) or maximum likelihood (MLE, Poisson). Every PSF model can be fitted with either optimizer, on the CPU or on the GPU (see `GPU fitting`_ below).
 
-- MLE, integrated Gaussian (based on `Smith et al., 2010 <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2862147/>`_.). Fits an elliptical Gaussian with independent widths ``sx`` and ``sy``.
-- LQ, Gaussian (least squares). Fits an elliptical Gaussian with independent widths ``sx`` and ``sy``.
-- Spherical (isotropic) Gaussian, least squares or MLE. Fits a single shared width, so ``sx`` and ``sy`` are always equal. The ``ellipticity`` column is not saved for this model. Available on both CPU and GPU.
-- Rotated elliptical Gaussian. The fitted in-plane rotation angle is saved in the ``angle`` column, in degrees. Least squares runs on both CPU and GPU; MLE is GPU only (see `GPU fitting`_ below).
-- Experimental PSF (cubic spline), least squares or MLE (GPU only). Fits an experimentally measured PSF and a 3D calibration recovers ``z`` directly; see `Experimental PSF (cubic-spline) fitting`_ below.
-- Average of ROI (finds summed intensity of spots)
+The following PSF models are implemented:
 
-Picasso uses `Gpufit <https://github.com/gpufit/Gpufit>`_ for fitting on CUDA-capable GPUs (see `GPU fitting`_ below). On Windows the pre-compiled library (``Gpufit.dll``) is vendored into Picasso (``picasso/ext/pygpufit/``) and works automatically — no extra install step. On Linux there is no pre-compiled binary; you have to build ``libGpufit.so`` yourself from our fork of Gpufit (`github.com/rafalkowalewski1/Gpufit <https://github.com/rafalkowalewski1/Gpufit>`_), which contains the additional fit models Picasso needs, and drop it next to the Windows DLL (see `GPU fitting on Linux`_ below). When no GPU library is available, the GPU fitting option simply does not appear and Picasso uses the accessible CPU algorithms.
+- Elliptical Gaussian. Fits independent widths ``sx`` and ``sy``.
+- Spherical (isotropic) Gaussian. Fits a single shared width, so ``sx`` and ``sy`` are always equal. The ``ellipticity`` column is not saved for this model.
+- Rotated elliptical Gaussian. The fitted in-plane rotation angle is saved in the ``angle`` column, in degrees.
+- Experimental PSF (cubic spline). Fits an experimentally measured PSF; a 3D calibration recovers ``z`` directly; see `Experimental PSF (cubic-spline) fitting`_ below.
+
+In addition, ``Average of ROI`` is available as a non-fitting option that simply sums the intensity of each spot.
+
+Fitting can run on a CUDA-capable GPU (see `GPU fitting`_ below). The kernels are compiled at run time by Numba, so there is no library to build or install beyond the CUDA runtime (``pip install picassosr[gpu]``), on Windows and Linux alike. When no CUDA GPU is available, the GPU fitting option simply does not appear and Picasso uses the CPU algorithms.
 
 **Please note:** Picasso Localize supports file formats:
 
@@ -37,57 +39,21 @@ Zeiss ``.czi`` and Leica ``.lif`` movies are read via the optional `czifile <htt
 GPU fitting
 -----------
 
-Picasso can run several of its fitting algorithms on a CUDA-capable NVIDIA GPU via `Gpufit <https://github.com/gpufit/Gpufit>`_, a CUDA Levenberg-Marquardt library that serves as Picasso's GPU fitting backend. Picasso loads it through a small Python binding in ``picasso/ext/pygpufit/``, which expects a compiled Gpufit library next to it:
+Picasso can run all of its Gaussian and cubic-spline fitting on a CUDA-capable NVIDIA GPU. The fitting kernels are written in Python and compiled for the GPU at run time by numba.
 
-- ``Gpufit.dll`` on Windows — **shipped with Picasso**, so GPU fitting works out of the box.
-- ``libGpufit.so`` on Linux — **not shipped**, because the binary depends on your CUDA toolkit and GPU. You have to compile it yourself (see `GPU fitting on Linux`_), and copy it into ``picasso/ext/pygpufit/``.
+The fitting algorithm — the Levenberg-Marquardt driver, its damping rule, its estimators and its PSF models — is a port of `Gpufit <https://github.com/gpufit/Gpufit>`_ (Przybylski et al., *Scientific Reports* **7**, 15722, 2017), which earlier versions of Picasso used as a compiled dependency. Picasso no longer ships or links against the Gpufit binary; its licence is reproduced in ``LICENSES/Gpufit-LICENSE.txt``.
 
-.. important::
+Installation
+~~~~~~~~~~~~
 
-   Picasso needs fit models that are not part of upstream Gpufit. Build the library from our fork, `github.com/rafalkowalewski1/Gpufit <https://github.com/rafalkowalewski1/Gpufit>`_.
+The GPU kernels need the CUDA runtime, which is pulled in as an optional dependency::
 
-When the library is present and a CUDA GPU is detected, the GPU fitting option becomes available in the ``Parameters`` dialog (Picasso checks ``gpufit.cuda_available()`` at startup) for both optimizers, since Gpufit implements a least-squares and a maximum likelihood estimator. Otherwise the option stays hidden and Picasso uses the CPU implementations. For least squares the CPU and GPU implementations are equivalent, so results are the same — only slower; for MLE the CPU implementation fits an integrated Gaussian (Smith et al., 2010) whereas Gpufit fits a sampled Gaussian with its own convergence settings, so results can differ slightly. Using the GPU is entirely optional and only available if you have an NVIDIA (CUDA-capable) GPU.
+   pip install picassosr[gpu]
 
-GPU fitting on Linux
-~~~~~~~~~~~~~~~~~~~~~
+Using it
+~~~~~~~~
 
-The remainder of this section explains how to build ``libGpufit.so`` so that GPU fitting becomes available on Linux. (On Windows nothing needs to be done.)
-
-Prerequisites
-^^^^^^^^^^^^^
-
-- An NVIDIA GPU with the matching `CUDA toolkit <https://developer.nvidia.com/cuda-downloads>`_ installed.
-- ``CMake`` 3.11 or later.
-- A C/C++ compiler (GCC). CUDA only supports GCC up to a certain version; if ``make`` later complains *"unsupported GNU version! gcc versions later than X are not supported"*, install an older GCC and point CMake at it (see below).
-- ``git``.
-
-Building ``libGpufit.so``
-^^^^^^^^^^^^^^^^^^^^^^^^^
-
-From a terminal (note the fork — see the box above)::
-
-   git clone https://github.com/rafalkowalewski1/Gpufit.git Gpufit
-   mkdir Gpufit-build
-   cd Gpufit-build
-   cmake -DCMAKE_BUILD_TYPE=RELEASE ../Gpufit
-   make
-
-If ``make`` aborts with an *"unsupported GNU version"* error, your CUDA toolkit needs an older GCC. Install one (e.g. ``gcc-5``) and pass it to CMake::
-
-   cmake -DCMAKE_BUILD_TYPE=RELEASE -DCMAKE_C_COMPILER=gcc-5 ../Gpufit
-
-After a successful build, ``libGpufit.so`` is created inside the build directory (under ``Gpufit-build/Gpufit/``).
-
-Installing the library into Picasso
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Copy the freshly built ``libGpufit.so`` into Picasso's ``picasso/ext/pygpufit/`` folder (the same folder that already contains ``Gpufit.dll`` and ``gpufit.py``)::
-
-   cp Gpufit-build/Gpufit/libGpufit.so /path/to/picasso/picasso/ext/pygpufit/
-
-To locate that folder for a ``pip``-installed Picasso, run ``pip show picassosr`` and look at the ``Location:`` line; the target is ``<Location>/picasso/ext/pygpufit/``. For a cloned repository it is simply ``picasso/ext/pygpufit/`` inside your Picasso folder.
-
-Restart Picasso: Localize. If the library loaded and CUDA is available, the GPU fitting option appears in the ``Parameters`` dialog next to the supported fit methods, as described in `GPU fitting`_ above.
+When a CUDA GPU is detected, the **Use GPU** checkbox becomes available in the ``Parameters`` dialog for both optimizers, since Picasso implements a least-squares and a maximum-likelihood estimator on the GPU. Otherwise the checkbox stays hidden and the CPU implementations are used. GPU fitting is entirely optional; it is typically one to two orders of magnitude faster than a serial CPU fit.
 
 Identification and fitting of single-molecule spots
 ---------------------------------------------------
@@ -96,9 +62,28 @@ Identification and fitting of single-molecule spots
 2. Adjust the image contrast (select ``View`` > ``Contrast``) so that the single-molecule spots are clearly visible.
 3. To adjust spot identification and fit parameters, open the ``Parameters`` dialog (select ``Analyze`` > ``Parameters``).
 4. In the ``Identification`` group, set the ``Box side length`` to the rounded integer value of 6 × σ + 1, where σ is the standard deviation of the PSF. In an optimized microscope setup, σ is one pixel, and the respective ``Box side length`` should be set to 7. The value of ``Min. net gradient`` specifies a minimum threshold above which spots should be considered for fitting. The net gradient value of a spot is roughly proportional to its intensity, independent of its local background. By checking ``Preview``, the spots identified with the current settings will be marked in the displayed frame. Adjust ``Min. net gradient`` to a value at which only spots are detected (no background).
-5. (Optional) Restrict the analysis to one or more regions of interest (ROIs) instead of the whole frame; see *Regions of interest (ROIs)* below.
-6. In the ``Photon conversion`` group, adjust ``EM Gain``, ``Baseline``, ``Sensitivity`` and ``Quantum Efficiency`` according to your camera specifications and the experimental conditions. Set ``EM Gain`` to 1 for conventional output amplification. ``Baseline`` is the average dark camera count. ``Sensitivity`` is the conversion factor (electrons per analog-to-digital (A/D) count). ``Quantum Efficiency`` is not used since version 0.6.0 and is kept for backward compatibility only. These parameters are critical to converting camera counts to photons correctly. The quality of the upcoming maximum likelihood fit strongly depends on a Poisson photon noise model, and thus on the absolute photon count. For simulated data, generated with ``Picasso: Simulate``, set the parameters as follows: ``EM Gain`` = 1, ``Baseline`` = 0, ``Sensitivity`` = 1.
-7. From the menu bar, select ``Analyze`` > ``Localize (Identify & Fit)`` to start spot identification and fitting in all movie frames. The status of this computation is displayed in the window's status bar. After completion, the fit results will be saved in a new file in the same folder as the movie, in which the filename is the base name of the movie file with the extension ``_locs.hdf5``. Furthermore, information about the movie and analysis procedure will be saved in an accompanying file with the extension ``_locs.yaml``; this file can be inspected using a text editor.
+5. (Optional) Tick ``Temporal median filter`` in the ``Identification`` group to subtract a rolling per-pixel background before spots are identified; see *Temporal median filter* below.
+6. (Optional) Restrict the analysis to one or more regions of interest (ROIs) instead of the whole frame; see *Regions of interest (ROIs)* below.
+7. In the ``Photon conversion`` group, adjust ``EM Gain``, ``Baseline``, ``Sensitivity`` and ``Quantum Efficiency`` according to your camera specifications and the experimental conditions. Set ``EM Gain`` to 1 for conventional output amplification. ``Baseline`` is the average dark camera count. ``Sensitivity`` is the conversion factor (electrons per analog-to-digital (A/D) count). ``Quantum Efficiency`` is not used since version 0.6.0 and is kept for backward compatibility only. These parameters are critical to converting camera counts to photons correctly. The quality of the upcoming maximum likelihood fit strongly depends on a Poisson photon noise model, and thus on the absolute photon count. For simulated data, generated with ``Picasso: Simulate``, set the parameters as follows: ``EM Gain`` = 1, ``Baseline`` = 0, ``Sensitivity`` = 1.
+8. From the menu bar, select ``Analyze`` > ``Localize (Identify & Fit)`` to start spot identification and fitting in all movie frames. The status of this computation is displayed in the window's status bar. After completion, the fit results will be saved in a new file in the same folder as the movie, in which the filename is the base name of the movie file with the extension ``_locs.hdf5``. Furthermore, information about the movie and analysis procedure will be saved in an accompanying file with the extension ``_locs.yaml``; this file can be inspected using a text editor.
+
+Temporal median filter
+----------------------
+
+Fluorescence movies often sit on an uneven background: out-of-focus haze, autofluorescent structures or a non-uniform illumination profile. Because a given pixel contains a blinking emitter only for a small fraction of the movie, the *median* of that pixel over a window of frames is a good estimate of its background. Ticking ``Temporal median filter`` in the ``Identification`` group subtracts that estimate from every frame (clipped at zero) before spots are identified, which removes both the uneven background and any static structure, and should make the detection less sensitive to where in the field of view a spot sits.
+
+``Window (frames)`` sets how many frames go into the median. The default of 51 is a good starting point: it has to be long enough that a given emitter is dark for most of the window (otherwise the emitter ends up in its own background estimate) but short enough to follow slow drifts in the background.
+
+Two things are worth keeping in mind:
+
+- **The filter applies to identification only.** Spots are always cut out of, and fitted on, the *raw* movie, so photon counts, background estimates and the reported localization precisions are unaffected. It changes which spots are found, not how well they are localized.
+- **The net gradient scale changes.** Subtracting a background removes its contribution to the local gradients, so ``Min. net gradient`` has to be re-tuned after switching the filter on or off. Turn on ``Preview`` and sweep the value again — while the filter is active the displayed frame is the filtered one, so what you see is what the spot detection sees.
+
+The filter is deliberately **not** applied when calibrating a 3D or an experimental (cubic-spline) PSF: beads in a calibration stack are static and do not blink, so a temporal median would subtract the beads themselves.
+
+For a description of temporal median filtering in the wider context of SMLM analysis, see Martens KJA, Turkowyd B, Endesfelder U, `Raw data to results: a hands-on introduction and overview of computational analysis for single-molecule localization microscopy <https://doi.org/10.3389/fbinf.2021.817254>`_, *Frontiers in Bioinformatics* 1, 817254 (2022).
+
+Hovering the mouse cursor over a fit marker or over an identification box shows a tooltip listing the properties of that localization — all columns produced by the fit (e.g. ``x``, ``y``, ``photons``, ``bg``, ``sx``, ``sy``).
 
 Regions of interest (ROIs)
 --------------------------
@@ -123,8 +108,8 @@ Extra features
 - ``File`` > ``Open one multichannel movie``: Opens a single multichannel file (``.ims``, ``.czi``, ``.lif`` or ``.nd2``) and loads **every** channel at once, one per channel, rather than prompting for a single channel to load.
 - ``File`` > ``Open channels from several movies``: Opens several separate movie files and loads each as one channel. The channel name is taken from the file's metadata where available, otherwise from the file name.
 - ``File`` > ``Open MicroManager image folder``: Opens a MicroManager acquisition that was saved as **separate image files** (one single-page ``img_*.tif`` per frame in a folder, e.g. ``img_channel000_position000_time000000000_z000.tif`` in MicroManager 2.0 or ``img_000000000_Default_000.tif`` in MicroManager 1.4), rather than as a single multi-page stack. Select the acquisition folder and Picasso assembles the whole sequence into one movie, ordered by frame index. Channel, position and z are held fixed at the first frame's values, so a multi-channel or multi-position acquisition is **not** interleaved into a single movie. Only the first frame is read when the movie is opened (the rest are read on demand during localization), so even acquisitions of tens of thousands of files open quickly. You can also reach the same result through ``File`` > ``Open movie`` by selecting any one ``img_*.tif`` file in the folder — Picasso detects the remaining frames automatically, exactly as it does for split μManager stacks.
-- ``File`` > ``Save identifications``: Saves the current set of identifications (frame, x, y, net gradient and identification id, where applicable) to an HDF5 file with a companion YAML metadata file. By default the suggested filename is ``<movie_base>_identifications.hdf5``. The accompanying YAML stores the original movie metadata together with the ``Box Size`` and ``Min. Net Gradient`` used at the time of saving, so the parameters can be restored when the identifications are loaded again.
-- ``File`` > ``Load identifications``: Loads identifications previously saved with ``Save identifications``. The identifications are clipped to the current movie's bounds (using the current ``Box Size``) and the identification parameters stored in the YAML sidecar (``Box Size``, ``Min. Net Gradient``) are restored. *As with the other identification loading actions, changing any identification parameter (box size, min. net gradient, etc.) will reset the loaded identifications, and ``Analyze`` > ``Fit`` should be used (rather than ``Localize (Identify & Fit)``) to fit them without resetting.*
+- ``File`` > ``Save identifications``: Saves the current set of identifications (frame, x, y, net gradient and identification id, where applicable) to an HDF5 file with a companion YAML metadata file. By default the suggested filename is ``<movie_base>_identifications.hdf5``. The accompanying YAML stores the original movie metadata together with the ``Box Size``, ``Min. Net Gradient`` and ``Temporal Median Window`` used at the time of saving, so the parameters can be restored when the identifications are loaded again.
+- ``File`` > ``Load identifications``: Loads identifications previously saved with ``Save identifications``. The identifications are clipped to the current movie's bounds (using the current ``Box Size``) and the identification parameters stored in the YAML sidecar (``Box Size``, ``Min. Net Gradient``, ``Temporal Median Window``) are restored. *As with the other identification loading actions, changing any identification parameter (box size, min. net gradient, etc.) will reset the loaded identifications, and ``Analyze`` > ``Fit`` should be used (rather than ``Localize (Identify & Fit)``) to fit them without resetting.*
 - ``File`` > ``Load picks as identifications``: Allows the user to load circular picks (from Picasso Render) as identifications. Additionally, the drift correction file (.txt) can be loaded to adjust the positions of the identifications throughout acquisition. The current box size will be used to make the identification, however, min. net gradient will **not** be applied to the identifications. *Note that changing any of the identification parameters (box size, min. net gradient, etc) will reset the loaded identifications. Furthermore, use ``Analyze`` > ``Fit``, rather than ``Analyze`` > ``Localize (Identify & Fit)``, to fit the loaded identifications without reseting them.*
 - ``File`` > ``Load locs as identifications``: Similar to loading picks as identifications (see above) but uses localizations as input. The user is asked to provide the number of frames around localizations to be used for the identifications, i.e., how many frames before and after the frame of the localization should be included in the identifications. For each localization, 2 * n_frames + 1 identifications will be assigned, thus if localizations are close together the identifications may overlap. *Note that changing any of the identification parameters (box size, min. net gradient, etc) will reset the loaded identifications. Furthermore, use ``Analyze`` > ``Fit``, rather than ``Analyze`` > ``Localize (Identify & Fit)``, to fit the loaded identifications without reseting them.*
 - ``File`` > ``Save spots``: Cuts out and saves the identified spots (NxBxB array, with N spots and B being the box side length). The spots can be saved as a .npy file or as a .tif file.
@@ -287,20 +272,20 @@ As with the z-calibration, the matching spline calibration is loaded automatical
 Experimental PSF (cubic-spline) fitting
 ---------------------------------------
 
-Picasso can fit an **experimentally measured PSF** to every spot. The measured PSF is stored as a cubic spline — a smooth, piecewise-polynomial model built from a bead z-stack — and each spot is fit to that spline on the GPU. This captures aberrations and engineered PSFs (e.g. astigmatism) that a Gaussian cannot describe, and a 3D calibration recovers the axial position ``z`` directly: a single fit returns ``x``, ``y``, ``z``, photons and background, with no separate astigmatism z-calibration step. A 2D calibration models a single focal plane (no ``z``).
+Picasso can fit an **experimentally measured PSF** to every spot. The measured PSF is stored as a cubic spline — a smooth, piecewise-polynomial model built from a bead z-stack — and each spot is fit to that spline. This captures aberrations and engineered PSFs (e.g. astigmatism) that a Gaussian cannot describe, and a 3D calibration recovers the axial position ``z`` directly: a single fit returns ``x``, ``y``, ``z``, photons and background, with no separate astigmatism z-calibration step. A 2D calibration models a single focal plane (no ``z``).
 
 *This feature is experimental — please report any unexpected behavior on our `GitHub issues page <https://github.com/jungmannlab/picasso/issues>`_.*
 
-**Requirements.** Fitting runs only on a CUDA-capable NVIDIA GPU through `Gpufit <https://github.com/gpufit/Gpufit>`_ (see `GPU fitting`_ above); if no GPU library is available, the model and its controls do not appear. *Building* a calibration additionally uses Gpuspline, which — despite the name — is a CPU library, so the calibration step needs no GPU but is only distributed on Windows directly. The .so file for Linux needs to be built and distributed by the user. When Gpuspline cannot be loaded, the ``Calibration`` menu shows neither ``Calibrate spline PSF`` nor ``Re-align channels (current signal)``.
+Fitting runs on the CPU, or on any CUDA-capable GPU — see `GPU fitting`_ above; the kernels are compiled at run time by Numba, so no platform-specific binary is involved. *Building* a calibration follows the scheme of `Gpuspline <https://github.com/gpufit/Gpuspline>`_, its licence is reproduced in ``LICENSES/Gpuspline-LICENSE.txt``.
 
-**Localization precision.** Gpufit returns the fitted parameters but no uncertainties, so Picasso evaluates the Cramer-Rao lower bound separately to fill ``lpx``, ``lpy``, ``lpz``, ``photons_unc`` and ``bg_unc``. GPU with CUDA is used if detected, otherwise the process runs on the CPU.
+**Localization precision.** The fit returns the fitted parameters but no uncertainties, so Picasso evaluates the Cramer-Rao lower bound separately to fill ``lpx``, ``lpy``, ``lpz``, ``photons_unc`` and ``bg_unc``. GPU with CUDA is used if detected, otherwise the process runs on the CPU.
 
-The method combines three published works: the experimental-PSF localization workflow and bead alignment of `Li et al., Nature Methods 15, 367–369 (2018) <https://doi.org/10.1038/nmeth.4661>`_, the cubic-spline PSF model for single-molecule data introduced by `Babcock & Zhuang, Scientific Reports 7, 552 (2017) <https://doi.org/10.1038/s41598-017-00622-w>`_, and the GPU localization-fitting and calibration-building backend of `Przybylski et al., Scientific Reports 7, 15722 (2017) <https://doi.org/10.1038/s41598-017-15313-9>`_. The multichannel variant (see `Multichannel spline PSF (e.g. biplane)`_ below) additionally follows the global-fitting approach of globLoc, `Li et al., Nature Communications 13, 3133 (2022) <https://doi.org/10.1038/s41467-022-30719-4>`_.
+The method combines three published works: the experimental-PSF localization workflow and bead alignment of `Li et al., Nature Methods 15, 367–369 (2018) <https://doi.org/10.1038/nmeth.4661>`_, the cubic-spline PSF model for single-molecule data introduced by `Babcock & Zhuang, Scientific Reports 7, 552 (2017) <https://doi.org/10.1038/s41598-017-00622-w>`_, and the fitting algorithm of `Przybylski et al., Scientific Reports 7, 15722 (2017) <https://doi.org/10.1038/s41598-017-15313-9>`_. The multichannel variant (see `Multichannel spline PSF (e.g. biplane)`_ below) additionally follows the global-fitting approach of globLoc, `Li et al., Nature Communications 13, 3133 (2022) <https://doi.org/10.1038/s41467-022-30719-4>`_.
 
 Building a spline calibration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-A calibration is built from a **bead z-stack**: image a sample of sparse, bright, sub-diffraction beads while scanning the stage through focus in even steps. Picasso detects the beads (once, near focus — they are static in x/y), cuts a box around each, averages them across all beads and fields of view, registers them in 3D, normalizes the result to a clean PSF volume, and computes the cubic-spline coefficients. This is the workflow described in `Li et al., Nature Methods 15, 367–369 (2018) <https://doi.org/10.1038/nmeth.4661>`_, however, PSF scaling was adapted to fit GPUfit's workflow.
+A calibration is built from a **bead z-stack**: image a sample of sparse, bright, sub-diffraction beads while scanning the stage through focus in even steps. Picasso detects the beads (once, near focus — they are static in x/y), cuts a box around each, averages them across all beads and fields of view, registers them in 3D, normalizes the result to a clean PSF volume, and computes the cubic-spline coefficients. This is the workflow described in `Li et al., Nature Methods 15, 367–369 (2018) <https://doi.org/10.1038/nmeth.4661>`_, however, PSF scaling was adapted to fit Gpufit's workflow.
 
 In the GUI, load the bead movie and select ``Calibration`` > ``Calibrate spline PSF``. A dialog collects:
 
@@ -310,7 +295,7 @@ In the GUI, load the bead movie and select ``Calibration`` > ``Calibrate spline 
 - **Magnification factor** (default 0.79) — scales the fitted ``z`` to correct for the refractive-index mismatch, as in the astigmatism fit (Huang et al., 2008). It is stored in the calibration and applied at fit time, not during calibration.
 - **Set z = 0 at max. intensity** — define ``z = 0`` at the axial intensity peak of the averaged PSF instead of the center of the stage scan. Only meaningful for a PSF with a single, well-defined focus (e.g. astigmatism); off by default. This will impact the behavior of magnification factor if the measured calibration data is offset.
 
-The box size and minimum net gradient are taken from the main ``Parameters`` dialog. You are then asked where to save the calibration ``.hdf5``; a **diagnostic plot** (a ``.png`` with the same base name) is written next to it.
+The box size and minimum net gradient are taken from the main ``Parameters`` dialog. You are then asked where to save the calibration ``.hdf5``; a **diagnostic plot** (a ``.png`` with the same base name) and a **bead gallery** (``<base>_beads.png``, showing which individual beads were averaged into the PSF and which were rejected) are written next to it.
 
 The same calibration can be built from the command line::
 
@@ -335,15 +320,25 @@ For a 3D calibration, when a GPU is present Picasso also re-fits the individual 
 - **Axial bias** — the mean signed z error per step; ideally flat and near 0 nm.
 - **Axial precision** — the spread of the recovered z per step (nm).
 
+Checking which beads went into the PSF
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Not every detected bead is averaged into the PSF. While registering the beads, Picasso compares each one against the running average and discards those whose shape disagrees with it — by correlation and by residual — keeping at least half of them. This aims to remove doublets, aggregates, and beads sitting at a different height, but it is worth looking at: if many beads are dropped, the PSF may genuinely vary across the field of view, and the calibration is then built from a biased subset.
+
+To look at the filtering, click ``Inspect beads...`` in the message shown when a calibration finishes, or use ``Calibration`` > ``Inspect calibration beads``; the same gallery is written next to the calibration as ``<base>_beads.png``. Each channel of a multichannel or split-FOV calibration builds its own PSF from its own beads and therefore filters independently: the inspector has a channel selector, and one gallery per channel is saved as ``<base>_ch{c}_beads.png``.
+
+A healthy calibration rejects a few clearly odd beads. Rejected beads that look just like the kept ones — or rejections concentrated in one corner of the field of view — mean the PSF is field-dependent, and a smaller ROI will describe the data better.
+
 Fitting with the spline PSF
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 1. Open ``Analyze`` > ``Parameters`` and set **Model** to ``Experimental PSF (cubic spline)``.
 2. In the **Experimental PSF (spline)** box, click ``Load calibration`` and choose your ``.hdf5``. The last-used calibration is remembered between sessions, and calibrations can be loaded automatically per camera and emission wavelength via the ``spline-calibrations`` config field described above.
-3. Choose the **Optimizer**: ``Least squares`` or ``MLE`` (Poisson maximum likelihood). Both run on the GPU. ``MLE`` is recommended.
-4. Run ``Analyze`` > ``Localize (Identify & Fit)`` (or ``Fit`` for already-identified spots).
+3. Choose the **Optimizer**: ``Least squares`` or ``MLE`` (Poisson maximum likelihood). ``MLE`` is recommended.
+4. Tick **Use GPU** to run the fit on the GPU; leave it unticked to fit on the CPU. The checkbox is only available when a CUDA GPU is detected.
+6. Run ``Analyze`` > ``Localize (Identify & Fit)`` (or ``Fit`` for already-identified spots).
 
-In addition to the usual columns, spline fits report per-localization precisions (``lpx``, ``lpy``, and ``lpz`` for 3D, in nm), ``photons`` and ``bg`` with their uncertainties (``photons_unc``, ``bg_unc``), and, for MLE, ``log_likelihood`` and ``iterations``. A 3D calibration adds the recovered ``z`` (and ``lpz``). The accompanying ``_locs.yaml`` records the spline calibration model and file path used.
+In addition to the usual columns, spline fits report per-localization precisions (``lpx``, ``lpy``, and ``lpz`` for 3D, in nm), ``photons`` and ``bg`` with their uncertainties (``photons_unc``, ``bg_unc``), and, for MLE, ``log_likelihood`` and ``iterations``. A 3D calibration adds the recovered ``z`` (and ``lpz``). The accompanying ``_locs.yaml`` records the spline calibration model and file path used, and which device performed the fit.
 
 Multichannel spline PSF (e.g. biplane)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -368,5 +363,7 @@ If photon counts are not linked, the resulting localizations contain per-channel
 
 Picasso builds a PSF for every channel and registers each non-reference channel to the reference by an affine transform estimated from matching beads; the per-channel PSFs and transforms are stored in one calibration ``.hdf5``. Alongside the usual diagnostic plot, a ``<base>_registration.png`` is written showing how well the channels align (residuals and the decomposed shift / rotation / scale / mirror) — check it before fitting.
 
-To fit, load the same channels, load the multichannel calibration under **Experimental PSF (spline)**, and run the fit with the ``Experimental PSF (cubic spline)`` model. Only spots detected in *every* channel are fitted, so identify each channel first. If the channel alignment has drifted since the bead stack was taken, ``Calibration`` > ``Re-align channels (current signal)`` re-estimates the transforms from the blinking data itself. Because the correction is derived by pairing the shared single-molecule signal frame by frame, a dialog first asks for the frame window to use and how many frames are evenly sampled from it. The result is reported per channel as the number of paired signals and the residual RMS (in camera pixels). **The re-alignment updates the loaded calibration only; the calibration file is never modified.**
+To fit, load the same channels, load the multichannel calibration under **Experimental PSF (spline)**, and run the fit with the ``Experimental PSF (cubic spline)`` model. Only spots detected in *every* channel are fitted, so identify each channel first.
+
+Multichannel spline fitting benefits greatly from re-aligning the channels on the data that is actually being fitted: the joint fit assumes each molecule maps onto the same ``x``, ``y``, ``z`` in every channel, so even a sub-pixel error in the transforms degrades the fit. After identifying the channels, run ``Calibration`` > ``Re-align channels (current signal)`` to re-estimate the transforms from the blinking data itself. **This is strongly recommended whenever the bead stack and the measurement were not acquired directly one after another** (e.g. calibration from a previous day or session). Because the correction is derived by pairing the shared single-molecule signal frame by frame, a dialog first asks for the frame window to use and how many frames are evenly sampled from it. The result is reported per channel as the number of paired signals and the residual RMS (in camera pixels). Additionally, we recommend using bright spots for the re-alignment (simply select higher min. net gradient). **The re-alignment updates the loaded calibration only; the calibration file is never modified.**
 

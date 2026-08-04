@@ -22,17 +22,18 @@ import time
 from abc import ABCMeta, abstractmethod
 from concurrent.futures import ProcessPoolExecutor
 from itertools import chain as itchain
-from typing import Literal, Any
+from typing import Literal, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 from numba import njit
 from scipy.special import erf
 from sklearn.utils import check_random_state
-from tqdm import tqdm
-from PyQt6 import QtWidgets
 
 from . import lib, zfit, __version__
+
+if TYPE_CHECKING:
+    from PyQt6 import QtWidgets  # only used in type annotations
 
 # default min. number of localizations per molecule
 MIN_LOCS = 10
@@ -2353,8 +2354,7 @@ def _g5m(
     max_locs_per_cluster: int,
     asynch: bool,
     n_steps: int,
-    progress: Any,
-    callback_parent: Any,
+    progress: lib.ProgressType,
     mode: Literal["astigmatism", "spline"] = "astigmatism",
 ) -> tuple[list[pd.DataFrame], list[pd.DataFrame]]:
     """Run G5M with or without multiprocessing. The function returns the
@@ -2377,10 +2377,7 @@ def _g5m(
         # display progress
         while lib.n_futures_done(fs) < n_steps:
             n_done = lib.n_futures_done(fs)
-            if callback_parent != "console":
-                progress.set_value(n_done)
-            else:
-                progress.update(n_done - progress.n)
+            progress.set_value(n_done)
             time.sleep(0.2)
 
         # extract centers from futures
@@ -2421,16 +2418,11 @@ def _g5m(
                 centers.append(centers_)
                 clustered_locs.append(clustered_locs_)
 
-            if callback_parent == "console":
-                progress.update(1)
-            else:
-                progress.set_value(i)
+            progress.set_value(i)
 
-    # close progress widget if present
-    if callback_parent != "console":
-        progress.close()
-    else:
-        progress.update(1)
+    # complete and close the progress tracker
+    progress.set_value(n_steps)
+    progress.close()
 
     return centers, clustered_locs
 
@@ -2514,11 +2506,13 @@ def g5m(
         prior to G5M. Use "group_input" when the "group" column has been
         overwritten but the original cluster ids are preserved in
         "group_input". Default is "group".
-    callback_parent : {QtWidgets.QMainWindow, "console", None}, optional
-        Callback function's parent object for displaying progress bar.
-        If "console" tqdm is used to display the progress bar in the
-        console. If None, no progress is displayed. Default is
-        "console".
+    callback_parent : QMainWindow, ProgressType, "console" or None, optional
+        Where progress is reported. A parent widget builds a
+        ``lib.ProgressDialog`` for it; "console" uses tqdm; None
+        displays nothing. A ready-made progress tracker (anything with
+        the ``ProgressDialog`` interface, see
+        ``lib.normalize_progress``) can also be passed and is driven
+        directly. Default is "console".
 
     Returns
     -------
@@ -2576,12 +2570,19 @@ def g5m(
     # determine how many steps are displayed in the progress bar
     n_steps = N_TASKS if asynch else len(np.unique(locs["group"]))
 
-    # initialize the progress bar
-    if callback_parent == "console":
-        progress = tqdm(total=n_steps, desc="Running G5M...")
-    elif callback_parent is None:
-        progress = lib.MockProgress()
-    else:
+    # initialize the progress bar. Everything below drives the same
+    # ProgressDialog-like interface (see lib.normalize_progress), so a
+    # ready-made tracker can be passed instead of a parent window.
+    if callback_parent is None or callback_parent == "console":
+        progress = lib.normalize_progress(
+            callback_parent, description="Running G5M..."
+        )
+        progress.setMaximum(n_steps)
+    elif callable(getattr(callback_parent, "set_value", None)):
+        progress = callback_parent
+        progress.zero_progress("Running G5M...")
+        progress.setMaximum(n_steps)
+    else:  # a parent widget: build the dialog for it
         progress = lib.ProgressDialog(
             "Running G5M...", 0, n_steps, callback_parent
         )
@@ -2600,7 +2601,6 @@ def g5m(
         asynch=asynch,
         n_steps=n_steps,
         progress=progress,
-        callback_parent=callback_parent,
         mode=mode,
     )
     # stack centers to form a pd.DataFrame in the format of localizations

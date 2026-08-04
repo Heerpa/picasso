@@ -14,7 +14,7 @@ scale bar and picks.
 from __future__ import annotations
 
 import os
-from typing import Literal, Callable
+from typing import Literal, Callable, TYPE_CHECKING
 
 import numba
 import numpy as np
@@ -24,9 +24,17 @@ import imageio.v2 as imageio
 from scipy import signal, ndimage
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
-from PyQt6 import QtGui, QtCore, QtSvg
 
 from . import io, lib, __version__
+
+if TYPE_CHECKING:
+    from PyQt6 import QtGui, QtCore, QtSvg
+else:
+    # PyQt6 is imported on first attribute access so that importing
+    # picasso.render does not require PyQt6.
+    QtGui = lib._LazyQtModule("PyQt6.QtGui")
+    QtCore = lib._LazyQtModule("PyQt6.QtCore")
+    QtSvg = lib._LazyQtModule("PyQt6.QtSvg")
 
 
 _DRAW_MAX_SIGMA = 3  # max. sigma from mean to render (mu +/- 3 sigma)
@@ -2172,10 +2180,12 @@ def _draw_picks_circle(
     pick_size: float,  # diameter in camera pixels
     point_picks: bool = False,
     annotate_picks: bool = False,
-    color: QtGui.QColor = QtGui.QColor("yellow"),
+    color: QtGui.QColor | None = None,  # default: yellow
 ) -> QtGui.QImage:
     """Draw circular picks onto the image of rendered localizations.
     See ``draw_picks`` for more details."""
+    if color is None:
+        color = QtGui.QColor("yellow")
     if point_picks:  # draw circular picks as points
         painter = QtGui.QPainter(image)
         painter.setBrush(QtGui.QBrush(color))
@@ -2216,10 +2226,12 @@ def _draw_picks_rectangle(
     picks: list[tuple],  # picks in camera pixels
     pick_size: float,  # width in camera pixels
     annotate_picks: bool = False,
-    color: QtGui.QColor = QtGui.QColor("yellow"),
+    color: QtGui.QColor | None = None,  # default: yellow
 ) -> QtGui.QImage:
     """Draw rectangular picks onto the image of rendered
     localizations. See ``draw_picks`` for more details."""
+    if color is None:
+        color = QtGui.QColor("yellow")
     w = pick_size * image.width() / viewport_width(viewport)
     painter = QtGui.QPainter(image)
     painter.setPen(color)
@@ -2245,10 +2257,12 @@ def _draw_picks_polygon(
     viewport: tuple[tuple[float, float], tuple[float, float]],  # cam. px
     picks: list[tuple],  # picks in camera pixels
     annotate_picks: bool = False,
-    color: QtGui.QColor = QtGui.QColor("yellow"),
+    color: QtGui.QColor | None = None,  # default: yellow
 ) -> QtGui.QImage:
     """Draw polygon picks onto the image of rendered localizations. See
     ``draw_picks`` for more details."""
+    if color is None:
+        color = QtGui.QColor("yellow")
     painter = QtGui.QPainter(image)
     painter.setPen(color)
     for i, pick in enumerate(picks):
@@ -2282,9 +2296,11 @@ def _draw_picks_square(
     picks: list[tuple],  # picks in camera pixels
     pick_size: float,  # side length in camera pixels
     annotate_picks: bool = False,
-    color: QtGui.QColor = QtGui.QColor("yellow"),
+    color: QtGui.QColor | None = None,  # default: yellow
 ) -> QtGui.QImage:
     """Draw square picks onto the image of rendered localizations."""
+    if color is None:
+        color = QtGui.QColor("yellow")
     w = int(pick_size * image.width() / viewport_width(viewport))
     painter = QtGui.QPainter(image)
     painter.setPen(color)
@@ -2320,7 +2336,7 @@ def draw_picks(
     pick_size: float | None,  # diameter in camera pixels
     point_picks: bool = False,
     annotate_picks: bool = False,
-    color: QtGui.QColor = QtGui.QColor("yellow"),
+    color: QtGui.QColor | None = None,  # default: yellow
 ) -> QtGui.QImage:
     """Draw all selected picks onto the image (QImage) of rendered
     localizations.
@@ -2402,7 +2418,7 @@ def draw_points(
     viewport: tuple[tuple[float, float], tuple[float, float]],  # cam. px
     points: list[tuple],  # points in camera pixels,
     pixelsize: int | float,  # camera pixel size in nm
-    color: QtGui.QColor = QtGui.QColor("yellow"),
+    color: QtGui.QColor | None = None,  # default: yellow
     mark_width: int = 20,  # width of the drawn crosses in display pixels
     cursor: tuple | None = None,  # live cursor position in camera pixels
 ) -> QtGui.QImage:
@@ -2434,6 +2450,8 @@ def draw_points(
     image : QImage
         Image with the drawn points.
     """
+    if color is None:
+        color = QtGui.QColor("yellow")
     painter = QtGui.QPainter(image)
     painter.setPen(color)
 
@@ -2507,7 +2525,7 @@ def draw_scalebar(
     scalebar_length_nm: int | float,
     pixelsize: int | float,
     display_length: bool = True,
-    color: QtGui.QColor = QtGui.QColor("white"),
+    color: QtGui.QColor | None = None,  # default: white
     display_height: int = 10,
     margin: tuple[int, int] = (35, 20),
     text_spacer: int = 40,
@@ -2546,6 +2564,8 @@ def draw_scalebar(
     image : QImage
         Image with the drawn scalebar.
     """
+    if color is None:
+        color = QtGui.QColor("white")
     painter = QtGui.QPainter(image)
     painter.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen))
     painter.setBrush(QtGui.QBrush(color))
@@ -2653,8 +2673,8 @@ def draw_minimap(
     image: QtGui.QImage,
     viewport: tuple[tuple[float, float], tuple[float, float]],  # cam. px
     max_viewport_size: tuple[float, float],  # in camera pixels,
-    color_main: QtGui.QColor = QtGui.QColor("yellow"),
-    color_frame: QtGui.QColor = QtGui.QColor("white"),
+    color_main: QtGui.QColor | None = None,  # default: yellow
+    color_frame: QtGui.QColor | None = None,  # default: white
     length_minimap: int = 100,
     margin: tuple[int, int] = (20, 20),
 ) -> QtGui.QImage:
@@ -2684,6 +2704,10 @@ def draw_minimap(
     image : QImage
         Image with the drawn minimap.
     """
+    if color_main is None:
+        color_main = QtGui.QColor("yellow")
+    if color_frame is None:
+        color_frame = QtGui.QColor("white")
     movie_height, movie_width = max_viewport_size
     height_minimap = int(movie_height / movie_width * length_minimap)
     # draw in the upper right corner, overview rectangle
@@ -2795,7 +2819,7 @@ def draw_rotation(
 def draw_rotation_angles(
     image: QtGui.QImage,
     ang: tuple[float, float, float],
-    color: QtGui.QColor = QtGui.QColor("white"),
+    color: QtGui.QColor | None = None,  # default: white
 ) -> QtGui.QImage:
     """Draw rotation angles (numbers in degrees) on the image.
 
@@ -2814,6 +2838,8 @@ def draw_rotation_angles(
     image : QImage
         Image with the drawn rotation angles.
     """
+    if color is None:
+        color = QtGui.QColor("white")
     angx, angy, angz = [int(np.round(_ * 180 / np.pi, 0)) for _ in ang]
     text = f"{angx} {angy} {angz}"
     x = image.width() - len(text) * 8 - 10

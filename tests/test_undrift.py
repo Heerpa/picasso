@@ -871,3 +871,56 @@ def test_recovers_known_drift(
     new_locs, drift = adapter(locs_, info_)
     _assert_drift_recovers(drift, injected_drift_2d, tol=tol)
     _assert_undrifted_locs_invariants(new_locs, locs_)
+
+
+# ---------------------------------------------------------------------
+# AIM progress reporting (uniform duck-typed interface, see
+# lib.normalize_progress)
+# ---------------------------------------------------------------------
+
+
+class _RecordingProgress:
+    """Duck-typed progress tracker recording the calls it receives."""
+
+    def __init__(self):
+        self.values = []
+        self.titles = []
+        self.closed = False
+        self.description_base = ""
+
+    def set_value(self, value):
+        self.values.append(value)
+
+    def setMaximum(self, maximum, *args, **kwargs):
+        pass
+
+    def zero_progress(self, description=None, *args, **kwargs):
+        self.titles.append(description)
+
+    def get_iterator(self, start=0, end=100, unit="segment"):
+        return range(start, end)
+
+    def close(self, *args, **kwargs):
+        self.closed = True
+
+
+@pytest.mark.parametrize("progress", [None, "console"])
+def test_aim_progress_modes(locs, info, progress):
+    _, _, drift = aim.aim(
+        locs, info, segmentation=SEGMENTATION, progress=progress
+    )
+    assert len(drift) == lib.get_from_metadata(info, "Frames")
+
+
+def test_aim_reports_progress_to_duck_typed_tracker(locs, info):
+    tracker = _RecordingProgress()
+    aim.aim(locs, info, segmentation=SEGMENTATION, progress=tracker)
+    assert tracker.values, "no progress was reported"
+    # AIM runs in two passes and relabels the tracker between them
+    assert any(t and "2/2" in t for t in tracker.titles)
+    assert tracker.closed
+
+
+def test_aim_invalid_progress_raises(locs, info):
+    with pytest.raises((TypeError, ValueError)):
+        aim.aim(locs, info, segmentation=SEGMENTATION, progress="bogus")

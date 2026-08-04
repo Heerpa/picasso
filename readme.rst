@@ -65,11 +65,6 @@ Via PyPI
 6. You can optionally install dependencies for .czi and .lif formats by passing ``pip install picassosr[czi]`` or ``pip install picassosr[lif]``.
 7. To enable GPU-accelerated (numba.cuda) code, install the CUDA dependencies with ``pip install picassosr[gpu]``. This requires an NVIDIA (CUDA-capable) GPU. The ``gpu`` extra targets CUDA toolkit 12.x; for other toolkits use ``pip install picassosr[cuda11]`` or ``pip install picassosr[cuda13]`` instead. Without these extras, Picasso runs fine on the CPU and GPU-only options are hidden.
 
-GPU fitting (optional)
-^^^^^^^^^^^^^^^^^^^^^^^
-
-Picasso: Localize can accelerate several of its fitting algorithms on a CUDA-capable NVIDIA GPU via `Gpufit <https://github.com/gpufit/Gpufit>`__. On **Windows** the pre-compiled library is bundled with Picasso and works out of the box. On **Linux** there is no pre-compiled binary, so you have to build ``libGpufit.so`` yourself and copy it into ``picasso/ext/pygpufit/``. Build it from our fork, `github.com/rafalkowalewski1/Gpufit <https://github.com/rafalkowalewski1/Gpufit>`__, which adds the fit models Picasso needs (upstream Gpufit does not provide them); see the `GPU fitting on Linux <https://picassosr.readthedocs.io/en/latest/localize.html#gpu-fitting-on-linux>`__ section of the documentation for step-by-step instructions. Without the GPU library, Picasso transparently uses the native fitting algorithms (LQ, MLE Gaussian 2D elliptical fitting). A few fit models run **only** on the GPU, namely the rotated elliptical Gaussian and the `experimental PSF (cubic spline) <https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting>`__ model.
-
 For Developers (local, editable installation)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -137,15 +132,14 @@ If you use Picasso in your research, please cite our Nature Protocols publicatio
 |
 | If you use some of the functionalities provided by Picasso, please also cite the respective publications:
 
+- All fitting methods are ports of Gpufit. DOI: `10.1038/s41598-017-15313-9 <https://doi.org/10.1038/s41598-017-15313-9>`__. License can be found `here <https://github.com/jungmannlab/picasso/blob/master/LICENSES/Gpufit-LICENSE.txt>`__.
+- Experimental PSF (cubic-spline) fitting. DOIs: `10.1038/nmeth.4661 <https://doi.org/10.1038/nmeth.4661>`__ (Li et al., experimental-PSF localization and bead alignment) and `10.1038/s41598-017-00622-w <https://doi.org/10.1038/s41598-017-00622-w>`__ (Babcock & Zhuang, cubic-spline PSF model). The spline calibration follows the coefficient scheme of Gpuspline; license can be found `here <https://github.com/jungmannlab/picasso/blob/master/LICENSES/Gpuspline-LICENSE.txt>`__.
+- Multichannel (global) experimental-PSF fitting. DOI: `10.1038/s41467-022-30719-4 <https://doi.org/10.1038/s41467-022-30719-4>`__ (Li et al., globLoc).
+- 3D fitting via astigmatism. DOI: `10.1126/science.1153529 <https://www.science.org/doi/10.1126/science.1153529>`__.
 - NeNA. DOI: `10.1007/s00418-014-1192-3 <https://doi.org/10.1007/s00418-014-1192-3>`__
 - FRC. DOI: `10.1038/nmeth.2448 <https://doi.org/10.1038/nmeth.2448>`__
-- Theoretical lateral localization precision (Gauss LQ). DOI: `10.1038/nmeth.1447 <https://doi.org/10.1038/nmeth.1447>`__
-- Theoretical axial localization precision (Gauss LQ and MLE). DOI: `10.1038/s41467-026-70198-5 <https://doi.org/10.1038/s41467-026-70198-5>`__
-- MLE fitting. DOI: `10.1038/nmeth.1449 <https://doi.org/10.1038/nmeth.1449>`__
-- GPU fitting (LQ and MLE, also used for experimental-PSF spline fitting). DOI: `10.1038/s41598-017-15313-9 <https://doi.org/10.1038/s41598-017-15313-9>`__. License can be found `here <https://github.com/jungmannlab/picasso/tree/master/picasso/ext/pygpufit>`__.
-- 3D fitting via astigmatism. DOI: `10.1126/science.1153529 <https://www.science.org/doi/10.1126/science.1153529>`__.
-- Experimental PSF (cubic-spline) fitting. DOIs: `10.1038/nmeth.4661 <https://doi.org/10.1038/nmeth.4661>`__ (Li et al., experimental-PSF localization and bead alignment) and `10.1038/s41598-017-00622-w <https://doi.org/10.1038/s41598-017-00622-w>`__ (Babcock & Zhuang, cubic-spline PSF model).
-- Multichannel (global) experimental-PSF fitting. DOI: `10.1038/s41467-022-30719-4 <https://doi.org/10.1038/s41467-022-30719-4>`__ (Li et al., globLoc).
+- Theoretical lateral localization precision (``lpx`` / ``lpy``, Gaussian least-squares). DOI: `10.1038/nmeth.1447 <https://doi.org/10.1038/nmeth.1447>`__
+- Theoretical axial localization precision (``lpz`` values, Gaussian). DOI: `10.1038/s41467-026-70198-5 <https://doi.org/10.1038/s41467-026-70198-5>`__
 - RCC undrifting: DOI: `10.1364/OE.22.015982 <https://doi.org/10.1364/OE.22.015982>`__
 - AIM undrifting. DOI: `10.1126/sciadv.adm776 <https://www.science.org/doi/10.1126/sciadv.adm7765>`__
 - SMLM clusterer. DOIs: `10.1038/s41467-021-22606-1 <https://doi.org/10.1038/s41467-021-22606-1>`__ and `10.1038/s41586-023-05925-9 <https://doi.org/10.1038/s41586-023-05925-9>`__

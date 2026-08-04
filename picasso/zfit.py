@@ -27,8 +27,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.optimize import minimize_scalar
 
-from . import io, lib, gausslq, gaussmle, __version__
-
+from . import lib, __version__
+from .fitting import precision
 
 plt.style.use("ggplot")
 
@@ -1098,13 +1098,13 @@ def _axial_localization_precision_astig(
     """
     if fitting_method == "gausslq":
         se_sx = (
-            gausslq.sigma_uncertainty(
+            precision.sigma_uncertainty_lsq(
                 locs["sx"], locs["sy"], locs["photons"], locs["bg"]
             )
             * pixelsize
         )
         se_sy = (
-            gausslq.sigma_uncertainty(
+            precision.sigma_uncertainty_lsq(
                 locs["sy"], locs["sx"], locs["photons"], locs["bg"]
             )
             * pixelsize
@@ -1112,13 +1112,13 @@ def _axial_localization_precision_astig(
     elif fitting_method == "gaussmle":
         if "sx_unc" not in locs.columns or "sy_unc" not in locs.columns:
             se_sx = (
-                gaussmle.sigma_uncertainty(
+                precision.sigma_uncertainty_mle(
                     locs["sx"], locs["sy"], locs["photons"], locs["bg"]
                 )
                 * pixelsize
             )
             se_sy = (
-                gaussmle.sigma_uncertainty(
+                precision.sigma_uncertainty_mle(
                     locs["sy"], locs["sx"], locs["photons"], locs["bg"]
                 )
                 * pixelsize

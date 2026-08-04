@@ -434,3 +434,12 @@ def picasso_movie(movie, movie_info):
     ``localize.localize_3D`` tests — those functions assert their movie
     argument ``isinstance`` of ``AbstractPicassoMovie``."""
     return _MemmapPicassoMovie(movie, movie_info)
+
+
+@pytest.fixture(scope="session")
+def picasso_movie_factory():
+    """Wrap an arbitrary ndarray as an ``AbstractPicassoMovie``.
+
+    As ``picasso_movie``, but for tests that build their own synthetic movie
+    (with known ground truth) rather than using the bundled .raw."""
+    return _MemmapPicassoMovie

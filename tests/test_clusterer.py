@@ -533,3 +533,52 @@ def test_find_cluster_centers_real_data(db_locs):
     centers = clusterer.find_cluster_centers(db_locs)
     assert len(centers) > 0
     assert {"x", "y", "group"}.issubset(centers.columns)
+
+
+# ---------------------------------------------------------------------
+# Progress reporting (uniform duck-typed interface, see
+# lib.normalize_progress)
+# ---------------------------------------------------------------------
+
+
+class _RecordingProgress:
+    """Minimal duck-typed tracker implementing the ProgressDialog
+    interface."""
+
+    def __init__(self):
+        self.maximum_set = None
+        self.values = []
+
+    def set_value(self, value):
+        self.values.append(value)
+
+    def setMaximum(self, maximum):
+        self.maximum_set = maximum
+
+
+@pytest.mark.parametrize("progress", [None, "console"])
+def test_cluster_progress_modes(synth_locs_2d, progress):
+    out = clusterer.cluster(
+        synth_locs_2d,
+        radius_xy=GA_RADIUS,
+        min_locs=GA_MIN_LOCS,
+        frame_analysis=False,
+        return_info=False,
+        progress=progress,
+    )
+    assert len(np.unique(out["group"])) == len(BLOB_CENTERS_2D)
+
+
+def test_cluster_accepts_duck_typed_progress(synth_locs_2d):
+    tracker = _RecordingProgress()
+    clusterer.cluster(
+        synth_locs_2d,
+        radius_xy=GA_RADIUS,
+        min_locs=GA_MIN_LOCS,
+        frame_analysis=False,
+        return_info=False,
+        progress=tracker,
+    )
+    assert tracker.maximum_set is not None and tracker.maximum_set > 0
+    assert tracker.values, "progress was never reported"
+    assert max(tracker.values) <= tracker.maximum_set
