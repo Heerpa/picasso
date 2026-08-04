@@ -6005,6 +6005,49 @@ class TestMultichannelWorkerRouting:
 
 
 # ---------------------------------------------------------------------------
+# Hover tooltips over fit markers / identification boxes
+#
+# Hovering a FitMarker or an identification box in the localize GUI shows
+# the columns of the corresponding localization (or identification, before
+# fitting). These tests cover the tooltip text formatting and the matching
+# of a box position to the fitted localization inside it.
+# ---------------------------------------------------------------------------
+
+
+class TestHoverTooltips:
+    def test_format_hover_tooltip_lists_all_columns(self):
+        row = pd.Series(
+            {"frame": 3, "x": 234.123456, "y": 12.654, "photons": 1234.5678}
+        )
+        text = localize_gui.format_hover_tooltip(row)
+        assert text.splitlines() == [
+            "frame: 3",
+            "x: 234.123",
+            "y: 12.654",
+            "photons: 1234.57",
+        ]
+
+    def test_loc_near_picks_closest_within_radius(self):
+        locs = pd.DataFrame(
+            {
+                "x": [10.4, 12.0, 30.0],
+                "y": [9.8, 11.5, 30.0],
+                "photons": [100.0, 200.0, 300.0],
+            }
+        )
+        loc = localize_gui.Window._loc_near(locs, 10, 10, 3)
+        assert loc is not None
+        assert loc["photons"] == 100.0
+
+    def test_loc_near_none_outside_radius_or_without_locs(self):
+        locs = pd.DataFrame({"x": [30.0], "y": [30.0]})
+        assert localize_gui.Window._loc_near(locs, 10, 10, 3) is None
+        assert localize_gui.Window._loc_near(None, 10, 10, 3) is None
+        empty = locs[locs["x"] < 0]
+        assert localize_gui.Window._loc_near(empty, 10, 10, 3) is None
+
+
+# ---------------------------------------------------------------------------
 # Temporal median filter (identification-only background subtraction)
 # ---------------------------------------------------------------------------
 

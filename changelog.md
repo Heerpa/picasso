@@ -47,6 +47,7 @@ Last change: 04-AUG-2026 CEST
 - Contrast spin boxes use logarithmic scaling
 - GPU MLE-fitted localizations save log-likelihood and iterations
 - GPU Gaussian MLE-fitted localizations' precisions corrected/included (`lpx`, `photon_unc`, etc)
+- Hovering over a fit marker or an identification box shows a tooltip listing the properties of the fitted localization (all saved columns, e.g. `x`, `y`, `photons`, `bg`) [#239](https://github.com/jungmannlab/picasso/issues/239)
 - Fixed ImageJ "contiguous stack" `.tif`/`.tiff` files (as written by ImageJ's "Save As > Tiff" for large stacks) being read as a single frame; all planes are now detected and read.
 - Fixed a gap of roughly one box size in the identified spots along the borders between adjacent (e.g. overlapping) ROIs
 - Fixed handling abortions during identification

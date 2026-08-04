@@ -779,6 +779,17 @@ class Scene(QtWidgets.QGraphicsScene):
         self.window.open(path)
 
 
+def format_hover_tooltip(row: pd.Series) -> str:
+    """Multi-line ``name: value`` text listing all columns of a
+    localization / identification row, shown as a hover tooltip."""
+    lines = []
+    for name, value in row.items():
+        if isinstance(value, (float, np.floating)):
+            value = f"{value:.6g}"
+        lines.append(f"{name}: {value}")
+    return "\n".join(lines)
+
+
 class FitMarker(QtWidgets.QGraphicsItemGroup):
     """Marker showing fitted position."""
 
@@ -5269,14 +5280,12 @@ class Window(QtWidgets.QMainWindow):
                     )
                 else:
                     self.status_bar.showMessage("")
-            if self.locs_display is not None:
-                locs_frame = self.locs_display[
-                    self.locs_display.frame == self.curr_frame_number
-                ]
+            locs_frame = self._current_frame_locs()
+            if locs_frame is not None:
                 for _, loc in locs_frame.iterrows():
-                    self.scene.addItem(
-                        FitMarker(loc["x"] + 0.5, loc["y"] + 0.5, 1)
-                    )
+                    marker = FitMarker(loc["x"] + 0.5, loc["y"] + 0.5, 1)
+                    marker.setToolTip(format_hover_tooltip(loc))
+                    self.scene.addItem(marker)
             self.draw_scalebar()
 
     def draw_identifications(
@@ -5285,12 +5294,49 @@ class Window(QtWidgets.QMainWindow):
         box: int,
         color: QtGui.QColor,
     ) -> None:
-        """Draw identification boxes in the scene."""
+        """Draw identification boxes in the scene. Hovering a box shows
+        the properties of the fitted localization inside it (or of the
+        identification itself, before fitting)."""
         box_half = int(box / 2)
+        locs_frame = self._current_frame_locs()
         for _, identification in identifications.iterrows():
             x = identification["x"]
             y = identification["y"]
-            self.scene.addRect(x - box_half, y - box_half, box, box, color)
+            item = self.scene.addRect(
+                x - box_half, y - box_half, box, box, color
+            )
+            loc = self._loc_near(locs_frame, x, y, box_half)
+            item.setToolTip(
+                format_hover_tooltip(identification if loc is None else loc)
+            )
+
+    def _current_frame_locs(self) -> pd.DataFrame | None:
+        """Fitted localizations in the currently displayed frame, or
+        None if no localizations are available."""
+        if self.locs_display is None:
+            return None
+        return self.locs_display[
+            self.locs_display.frame == self.curr_frame_number
+        ]
+
+    @staticmethod
+    def _loc_near(
+        locs_frame: pd.DataFrame | None,
+        x: float,
+        y: float,
+        radius: float,
+    ) -> pd.Series | None:
+        """The localization closest to (x, y) that lies within
+        ``radius`` pixels of it in both coordinates, or None."""
+        if locs_frame is None or not len(locs_frame):
+            return None
+        dx = locs_frame["x"] - x
+        dy = locs_frame["y"] - y
+        inside = (dx.abs() <= radius) & (dy.abs() <= radius)
+        if not inside.any():
+            return None
+        d2 = dx[inside] ** 2 + dy[inside] ** 2
+        return locs_frame.loc[d2.idxmin()]
 
     def _draw_linked_identifications(
         self, frame_number: int, box: int
@@ -5339,8 +5385,16 @@ class Window(QtWidgets.QMainWindow):
         if boxes is None:
             return False
         box_half = int(box / 2)
+        locs_frame = self._current_frame_locs()
         for x, y, color in boxes:
-            self.scene.addRect(x - box_half, y - box_half, box, box, color)
+            item = self.scene.addRect(
+                x - box_half, y - box_half, box, box, color
+            )
+            loc = self._loc_near(locs_frame, x, y, box_half)
+            if loc is not None:
+                item.setToolTip(format_hover_tooltip(loc))
+            else:
+                item.setToolTip(f"x: {x:.6g}\ny: {y:.6g}")
         return True
 
     def _link_calibration_for_mode(
