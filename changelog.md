@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 04-AUG-2026 CEST
+Last change: 05-AUG-2026 CEST
 
 ## 0.11.0
 
@@ -91,6 +91,7 @@ Last change: 04-AUG-2026 CEST
 - Removed folder `distribution` from the repository; `create_linux_shortcuts.py` was moved to `release`
 - Removed `notification_sounds` folder, the users can add their notification sounds in the `.picasso` folder
 - Progress reporting now goes through a uniform duck-typed interface (`lib.normalize_progress`): `None`, `"console"` and `lib.ProgressDialog` arguments are normalized once at the public entry points and driven with plain method calls, replacing the per-call-site `isinstance`/`"console"` branches — so headless runs never touch Qt at runtime either. `lib.TqdmProgress` and `lib.MockProgress` now implement the full `ProgressDialog` interface (`setMaximum`, `maximum`, `zero_progress`, `close`)
+- Localizations imported from ThunderSTORM and SMAP maintain all their columns, not only the Picasso pre-defined ones
 
 ### **Backward incompatible changes:**
 - All the functions deprecated in v0.10 were removed, see section 0.10.0 below
