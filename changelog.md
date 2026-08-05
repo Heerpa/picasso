@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 04-AUG-2026 CEST
+Last change: 05-AUG-2026 CEST
 
 ## 0.11.0
 
@@ -69,6 +69,7 @@ Last change: 04-AUG-2026 CEST
 - Re-grouping localizations (picking, DBSCAN/HDBSCAN/SMLM clustering) now preserves the previous grouping in the `group_input` column instead of discarding it, so the original cluster ids remain available (e.g. for G5M)
 - Updated G5M documentation - drift correction importance
 - Test clusterer with a constrast bar
+- Select localizations in the center of the binding event added. See [Steen et al., Nature Methods 21, 1755-1762 (2024)](https://doi.org/10.1038/s41592-024-02374-8), Extended Data Fig. 1f
 - Fixed removed plugins menu after removing all localizations
 - Fixed pick similar numba error [#684](https://github.com/jungmannlab/picasso/issues/684)
 - Fixed "Combine all channels" when saving localizations only saving the first channel when channels had differing columns

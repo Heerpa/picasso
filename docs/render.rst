@@ -506,7 +506,13 @@ Arranges an average in a square so that each structure is displayed individually
 
 Link localizations
 ^^^^^^^^^^^^^^^^^^
-Links consecutive localizations
+Links localizations originating from individual binding events. If the localizations were already grouped the binding events are never linked across two input groups.
+
+Select central frames localizations
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Groups localizations into binding events, exactly like *Link localizations* (same dialog: maximum distance and maximum number of transient dark frames), but instead of merging each binding event into a single localization, it keeps the localizations that are not at the borders of the event, i.e., those in the first and the last frame of each event are discarded, see `Steen et al., Nature Methods 21, 1755-1762 (2024) <https://doi.org/10.1038/s41592-024-02374-8>`_, Extended Data Fig. 1f.
+
+The retained localizations of each binding event are assigned a unique value in the *group* column. If the localizations were already grouped (e.g., by picking or clustering), the previous grouping is preserved in the *group_input* column, and binding events are never linked across two input groups.
 
 Align channels (RCC or from picked)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
