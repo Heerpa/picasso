@@ -2226,6 +2226,20 @@ def fit2D(
         number of spots cut so far while extracting the spots from the
         movie (before fitting). It must accept one integer input.
         Default is None.
+    camera_calibration : dict or None, optional
+        Per-pixel sCMOS camera calibration (see
+        ``io.load_camera_calibration`` and ``scmos.calibrate_scmos``),
+        holding the maps "offset" (ADU), "variance" (ADU^2) and,
+        optionally, "gain" (ADU/e-). The maps must match the full frame
+        shape of ``movie``. When given, they replace the scalar
+        "Baseline" (and, if a gain map is present, "Sensitivity") of
+        ``camera_info``, and the per-pixel readout variance enters the
+        noise model of Huang et al., Nat. Methods 10:653 (2013): every
+        MLE fit and every uncertainty estimate ("lpx", "lpy", CRLB) then
+        de-emphasises noisy pixels. Least-squares fits are unaffected by
+        the variance term itself (the shift cancels), but their
+        uncertainties do grow on noisy pixels; prefer an MLE method for
+        sCMOS data. Default is None.
 
     Returns
     -------
