@@ -8013,16 +8013,14 @@ class View(QtWidgets.QLabel):
         if not ok:
             return
 
-        max_locs_per_channel = []
         channels = (
             range(len(self.locs)) if channel == len(self.locs) else [channel]
         )
-        for i in channels:
-            if not self.check_group(i, params["group_column"]):
-                return
-            max_locs_per_channel.append(
-                self.check_max_locs(i, params["group_column"])
-            )
+        max_locs_per_channel = self._g5m_max_locs_per_channel(
+            channels, params["group_column"]
+        )
+        if max_locs_per_channel is None:  # a channel is not clustered
+            return
         params["max_locs_per_cluster"] = max_locs_per_channel
 
         # for subcluster check plots
@@ -8145,6 +8143,26 @@ class View(QtWidgets.QLabel):
         )
         return centers, clustered_locs, info
 
+    def _g5m_max_locs_per_channel(
+        self, channels, group_column: str = "group"
+    ) -> dict[int, float] | None:
+        """Max. locs per cluster for each channel to be processed.
+
+        Keyed by the *absolute* channel index, because ``View._g5m``
+        looks the value up by channel. A list would only be correct when
+        every channel is processed; running a single channel of
+        multichannel data would index out of range.
+
+        Returns None if any channel is not clustered, meaning G5M should
+        not run.
+        """
+        max_locs_per_channel = {}
+        for i in channels:
+            if not self.check_group(i, group_column):
+                return None
+            max_locs_per_channel[i] = self.check_max_locs(i, group_column)
+        return max_locs_per_channel
+
     def check_group(self, channel: int, group_column: str = "group") -> bool:
         """Check whether the data has been grouped (clustered) in
         channel i using the given group column."""
@@ -8187,8 +8205,7 @@ class View(QtWidgets.QLabel):
             )
             if ret == qm.StandardButton.Yes:
                 return max_locs
-        else:
-            return np.inf
+        return np.inf
 
     @check_pick
     def clear_picks(self) -> None:

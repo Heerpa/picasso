@@ -2441,10 +2441,8 @@ def _convert_G5M_results(
             # orientation of the major axis, in the same convention as
             # the "angle" column written by picasso.localize: degrees
             # wrapped into [-90, 90)
-            fitted_angle = np.rad2deg(
-                np.arctan2(eigvecs[:, 1, 1], eigvecs[:, 0, 1])
-            )
-            fitted_angle = np.mod(fitted_angle + 90.0, 180.0) - 90.0
+            angle = np.rad2deg(np.arctan2(eigvecs[:, 1, 1], eigvecs[:, 0, 1]))
+            angle = np.mod(angle + 90.0, 180.0) - 90.0
         else:
             sigma_x = np.sqrt(covariances[:, 0]) * pixelsize
             sigma_y = np.sqrt(covariances[:, 1]) * pixelsize
@@ -2553,17 +2551,13 @@ def _convert_G5M_results(
             }
         )
         if rotated:
-            # extra shape columns for the rotated model. The column is
-            # deliberately named "fitted_angle" and not "angle":
-            # picasso.render switches to the rotated Gaussian renderer
-            # when it sees an "angle" column and would then rotate the
-            # lpx/lpy uncertainty ellipse by the molecule's shape angle.
+            # extra shape columns for the rotated model
             centers["fitted_sigma_major"] = sigma_major.astype(np.float32)
             centers["fitted_sigma_minor"] = sigma_minor.astype(np.float32)
             centers["rel_sigma_major"] = rel_sigma_major.astype(np.float32)
             centers["rel_sigma_minor"] = rel_sigma_minor.astype(np.float32)
             centers["axis_ratio"] = axis_ratio.astype(np.float32)
-            centers["fitted_angle"] = fitted_angle.astype(np.float32)
+            centers["angle"] = angle.astype(np.float32)
     else:
         centers = pd.DataFrame(
             {
@@ -2595,6 +2589,7 @@ def _convert_G5M_results(
         "lpz",
         "group",
         "group_input",
+        "angle",
     ]
     for col in locs_group.columns:
         if col not in ignore_columns:
@@ -3221,11 +3216,10 @@ def g5m(
         rotated elliptical Gaussian PSF model. It requires 3D localizations,
         ``mode="astigmatism"`` and an "angle" column, and adds the
         columns "fitted_sigma_major", "fitted_sigma_minor",
-        "rel_sigma_major", "rel_sigma_minor", "axis_ratio" and
-        "fitted_angle" to the output. "auto" selects "rotated" for 3D
-        astigmatism data with the "angle" column; "diagonal" for 3D
-        astigmatism data without the column and "spherical" for 2D data.
-        Default is "auto".
+        "rel_sigma_major", "rel_sigma_minor", "axis_ratio" and "angle"
+        to the output. "auto" selects "rotated" for 3D astigmatism data
+        with the "angle" column; "diagonal" for 3D astigmatism data
+        without the column and "spherical" for 2D data. Default is "auto".
     postprocess : bool, optional
         If True, the G5M components are postprocessed to remove likely
         sticky events (mean frame, std frame, n_events filtering).

@@ -460,7 +460,7 @@ class TestRotatedAngleConvention:
             postprocess=False,
         )
         assert len(mols) == 1
-        got = float(mols["fitted_angle"].iloc[0])
+        got = float(mols["angle"].iloc[0])
         # axial data: compare modulo 180 deg
         diff = (got - angle_deg + 90.0) % 180.0 - 90.0
         assert (
@@ -552,7 +552,7 @@ class TestAutoSelection:
             postprocess=False,
         )
         assert out_info[-1]["Covariance type"] == "diagonal"
-        assert "fitted_angle" not in mols.columns
+        assert "angle" not in mols.columns
 
 
 class TestErrorPaths:
@@ -649,12 +649,12 @@ class TestOutputContract:
             "rel_sigma_major",
             "rel_sigma_minor",
             "axis_ratio",
-            "fitted_angle",
+            "angle",
         ]:
             assert col in mols.columns, f"missing new column '{col}'"
-        # "angle" would make picasso.render rotate the lpx/lpy
-        # uncertainty ellipse by the molecule's shape angle
-        assert "angle" not in mols.columns
+        # the molecule's own orientation replaces the input column
+        # rather than being averaged into "angle_mean"
+        assert "angle_mean" not in mols.columns
 
     def test_rel_sigma_plot_still_works(self, info, tmp_path):
         """``lib.plot_rel_sigma_check`` indexes rel_sigma_x/y/z directly
@@ -812,6 +812,40 @@ class TestRenderDialog:
         labels = [w.text() for w in dialog.findChildren(QtWidgets.QLabel)]
         assert not any("shape" in text.lower() for text in labels)
 
+    def test_max_locs_keyed_by_absolute_channel(self, qt_offscreen):
+        """``View._g5m`` looks max_locs_per_cluster up by the absolute
+        channel index. Building it as a list over only the processed
+        channels raised IndexError whenever a single channel other than
+        the first was run on multichannel data."""
+        from picasso.gui.render import View
+
+        class _Stub:
+            locs = [None] * 3  # three loaded channels
+            check_group = staticmethod(lambda i, col: True)
+            check_max_locs = staticmethod(lambda i, col: 100 * (i + 1))
+            _g5m_max_locs_per_channel = View._g5m_max_locs_per_channel
+
+        stub = _Stub()
+
+        # single channel, not the first one
+        out = stub._g5m_max_locs_per_channel([2], "group")
+        assert out[2] == 300  # would IndexError on a 1-element list
+
+        # all channels
+        out_all = stub._g5m_max_locs_per_channel(range(3), "group")
+        assert out_all == {0: 100, 1: 200, 2: 300}
+
+    def test_max_locs_returns_none_when_not_clustered(self, qt_offscreen):
+        from picasso.gui.render import View
+
+        class _Stub:
+            locs = [None] * 2
+            check_group = staticmethod(lambda i, col: False)
+            check_max_locs = staticmethod(lambda i, col: 1)
+            _g5m_max_locs_per_channel = View._g5m_max_locs_per_channel
+
+        assert _Stub()._g5m_max_locs_per_channel([0], "group") is None
+
     def test_getparams_leaves_covariance_type_to_g5m(self):
         """``getParams`` must not pin covariance_type, so that
         ``View._g5m`` falls back to "auto" and the model is resolved from
@@ -829,7 +863,11 @@ class TestRenderDialog:
         assert 'params.get("covariance_type", "auto")' in src
 
 
-class TestBootstrapSpline:
+class TestBootstrap:
+    """``_bootstrap_sem`` refits the model on resampled data, so it must
+    rebuild it with the *same* settings. Getting this wrong is either a
+    crash (mode) or, worse, a silently biased SEM (covariance_type)."""
+
     def test_bootstrap_sem_works_in_spline_mode(self, dbscan_locs_3d, info):
         """``_bootstrap_sem`` used to rebuild ``G5M_3D`` without passing
         ``mode``, so spline data (calibration is None) tripped the
@@ -846,6 +884,75 @@ class TestBootstrapSpline:
         )
         assert len(mols) > 0
         # SEM must be a real, positive uncertainty
+        for col in ["lpx", "lpy", "lpz"]:
+            assert np.isfinite(mols[col]).all()
+            assert (mols[col] > 0).all()
+
+    @staticmethod
+    def _fit_rotated(locs, pixelsize=130.0):
+        X = locs[["x", "y", "z"]].to_numpy().astype(float)
+        X[:, 2] /= pixelsize
+        lp = locs[["lpx", "lpy", "lpz"]].to_numpy().astype(float)
+        lp[:, 2] /= pixelsize
+        angles = np.deg2rad(locs["angle"].to_numpy())
+        fit = g5m.G5M_3D(
+            n_components=1,
+            min_locs=20,
+            sigma_bounds=(0.3, 3.0),
+            calibration=CALIB_ASTIG,
+            covariance_type="rotated",
+        ).fit(X, lp=lp, loc_prec_handle="local", angles=angles)
+        assert fit is not None
+        return fit
+
+    def test_bootstrap_sem_rebuilds_the_same_model(self, monkeypatch):
+        """The resampling model must carry over mode, covariance_type
+        and the angles. Dropping covariance_type does not raise - it just
+        bootstraps a different (diagonal) model - so assert on how it is
+        constructed."""
+        locs = _rotated_cluster(30.0)
+        fit = self._fit_rotated(locs)
+
+        seen = {}
+        real_cls = g5m.G5M_3D
+
+        class _Recording(real_cls):
+            def __init__(self, *args, **kwargs):
+                seen.update(kwargs)
+                super().__init__(*args, **kwargs)
+
+            def fit(self, X, lp, loc_prec_handle="local", angles=None):
+                seen["angles_passed"] = angles
+                return super().fit(X, lp, loc_prec_handle, angles)
+
+        monkeypatch.setattr(g5m, "G5M_3D", _Recording)
+        sem = g5m._bootstrap_sem(fit, locs, n_bootstraps=2)
+
+        assert seen["covariance_type"] == "rotated"
+        assert seen["mode"] == "astigmatism"
+        assert seen["calibration"] is not None
+        angles = seen["angles_passed"]
+        assert angles is not None and len(angles) == len(locs)
+        # radians, matching the m-step's expectation
+        np.testing.assert_allclose(angles, np.deg2rad(30.0), atol=1e-6)
+
+        assert sem.shape == (1, 3)
+        assert np.isfinite(sem).all() and (sem > 0).all()
+
+    def test_bootstrap_end_to_end_for_rotated(self, info):
+        mols, _, out_info = g5m.g5m(
+            _rotated_cluster(30.0),
+            info,
+            min_locs=20,
+            bootstrap_check=True,
+            covariance_type="rotated",
+            calibration=CALIB_ASTIG,
+            sigma_bounds=(0.3, 3.0),
+            asynch=False,
+            postprocess=False,
+        )
+        assert out_info[-1]["Covariance type"] == "rotated"
+        assert len(mols) > 0
         for col in ["lpx", "lpy", "lpz"]:
             assert np.isfinite(mols[col]).all()
             assert (mols[col] > 0).all()
