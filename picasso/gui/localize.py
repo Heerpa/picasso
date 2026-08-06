@@ -62,7 +62,7 @@ IMAGE_FILTER = (
     ";;STK files (*.stk)"
 )
 
-# Distinct box colours for the cross-channel link overlay (grey is kept
+# Distinct box colors for the cross-channel link overlay (grey is kept
 # out of the palette so it reads as "unmatched"). tab20-style hues.
 LINK_COLORS = [
     QtGui.QColor(*_rgb)
@@ -1986,7 +1986,7 @@ class CalibrateAffineDialog(lib.Dialog):
 
     The same calibration corrects two things, chosen at the top of the
     dialog: the lateral distortion of a cylindrical lens (astigmatism) or
-    chromatic aberration between two colour channels. Below it are a
+    chromatic aberration between two color channels. Below it are a
     reference bead image, the bead image to be mapped onto it, and the
     calibration file the transform is appended to - an existing Gaussian
     astigmatism (YAML) or spline PSF (HDF5) calibration, or a new
@@ -2010,7 +2010,7 @@ class CalibrateAffineDialog(lib.Dialog):
             "Image of in-focus beads in the reference color channel,"
             " i.e. the channel every other channel is mapped onto",
             "Target channel image:",
-            "Image of the same in-focus beads in the colour channel to be"
+            "Image of the same in-focus beads in the color channel to be"
             " corrected",
         ),
     }
@@ -2033,7 +2033,7 @@ class CalibrateAffineDialog(lib.Dialog):
         self.type_combo.setToolTip(
             "What the transform corrects. Both are fitted the same way,\n"
             "from two bead images, and are stored as an ordered list in\n"
-            "the calibration file: for 3D two-colour data, calibrate both\n"
+            "the calibration file: for 3D two-color data, calibrate both\n"
             "into the same file and they are applied one after another."
         )
         self.type_combo.currentIndexChanged.connect(self._update_labels)
@@ -2455,7 +2455,7 @@ class ParametersDialog(lib.Dialog):
         tm_row.addStretch(1)
         identification_grid.addLayout(tm_row, 4, 0, 1, 2)
 
-        # preview identifications + cross-channel link colour overlay
+        # preview identifications + cross-channel link color overlay
         preview_row = QtWidgets.QHBoxLayout()
         self.preview_checkbox = QtWidgets.QCheckBox("Preview")
         self.preview_checkbox.setToolTip(
@@ -3706,7 +3706,7 @@ class ParametersDialog(lib.Dialog):
         self.window.draw_frame()
 
     def on_link_colors_changed(self) -> None:
-        """Redraw with/without cross-channel link colour-coding of the
+        """Redraw with/without cross-channel link color-coding of the
         identification boxes."""
         self.window.draw_frame()
 
@@ -5905,14 +5905,14 @@ class Window(QtWidgets.QMainWindow):
     def _draw_linked_identifications(
         self, frame_number: int, box: int
     ) -> bool:
-        """Draw this frame's identification boxes colour-coded by cross-channel
+        """Draw this frame's identification boxes color-coded by cross-channel
         link, when 'Link colors' is on and a multichannel / split-FOV spline
         calibration is loaded.
 
         Spots paired across channels (matched to the reference channel via the
         calibration's inter-channel transform, as the signal re-registration
-        does) share a colour; unmatched spots are grey. Returns True if it
-        handled the drawing, False to fall back to plain single-colour boxes.
+        does) share a color; unmatched spots are grey. Returns True if it
+        handled the drawing, False to fall back to plain single-color boxes.
         """
         pdialog = self.parameters_dialog
         if not getattr(pdialog, "link_colors_checkbox", None):
@@ -5923,7 +5923,7 @@ class Window(QtWidgets.QMainWindow):
         n_channels = int(cal.get("n_channels", 0))
         if n_channels >= 2:
             # a loaded calibration always provides the registration - the
-            # colours then show exactly what the fit will pair, so a bad
+            # colors then show exactly what the fit will pair, so a bad
             # registration is visible and can be re-registered deliberately
             # (Postprocess > re-register from signal)
             cal = self._link_calibration_for_mode(cal, n_channels)
@@ -5968,7 +5968,7 @@ class Window(QtWidgets.QMainWindow):
         currently laid out (split-FOV regions vs. separate channels).
 
         The calibration is *always* the source of the inter-channel transform
-        when one is loaded - the link colours then show exactly the pairing the
+        when one is loaded - the link colors then show exactly the pairing the
         fit will use, so a stale registration shows up as grey boxes and can be
         re-registered on purpose rather than being silently papered over. Only
         the placement is adapted when the layout differs from the calibration's:
@@ -6149,8 +6149,8 @@ class Window(QtWidgets.QMainWindow):
     def _linked_boxes_split_fov(
         self, cal: dict, n_channels: int, frame_number: int, tol: float
     ) -> list | None:
-        """Colour-coded boxes for a split-FOV calibration: every region lives in
-        one frame, so paired boxes across regions get the same colour. Returns a
+        """Color-coded boxes for a split-FOV calibration: every region lives in
+        one frame, so paired boxes across regions get the same color. Returns a
         list of ``(x, y, QColor)`` for all this-frame spots, or None to fall
         back."""
         ids = self.identifications
@@ -6197,7 +6197,7 @@ class Window(QtWidgets.QMainWindow):
         colors = [LINK_UNMATCHED_COLOR] * len(xy)
         # A reference spot links only if matched in EVERY other region/channel
         # (the bead is found in all channels). Count per reference spot, then
-        # colour; spots missing from any channel stay grey.
+        # color; spots missing from any channel stay grey.
         n_ref = len(ref_local)
         match_count = np.zeros(n_ref, dtype=int)
         per_channel: list = []
@@ -6218,7 +6218,7 @@ class Window(QtWidgets.QMainWindow):
             if n_checked
             else np.zeros(n_ref, dtype=bool)
         )
-        # colour non-reference spots that pair with a fully-linked ref spot
+        # color non-reference spots that pair with a fully-linked ref spot
         for chan_local, matches in per_channel:
             for tj, rk in matches.items():
                 if complete[rk]:
@@ -6232,9 +6232,9 @@ class Window(QtWidgets.QMainWindow):
     def _linked_boxes_multichannel(
         self, cal: dict, n_channels: int, frame_number: int, tol: float
     ) -> list | None:
-        """Colour-coded boxes for a multichannel calibration (separate movies /
+        """Color-coded boxes for a multichannel calibration (separate movies /
         one multichannel file): only the current channel is on screen, so a spot
-        keeps its group colour as the user switches channels. Returns a list of
+        keeps its group color as the user switches channels. Returns a list of
         ``(x, y, QColor)`` for the current channel's this-frame spots, or None to
         fall back."""
         transforms = cal.get("channel_transforms")
@@ -6283,7 +6283,7 @@ class Window(QtWidgets.QMainWindow):
 
         c = self.current_channel
         if c == 0:
-            # colour reference spots only if they pair in ALL other channels
+            # color reference spots only if they pair in ALL other channels
             return [
                 (
                     ref_xy[rk, 0],
@@ -6296,7 +6296,7 @@ class Window(QtWidgets.QMainWindow):
                 )
                 for rk in range(n_ref)
             ]
-        # a non-reference channel: colour its detections by the reference spot
+        # a non-reference channel: color its detections by the reference spot
         # they pair with, but only when that reference spot links across ALL
         # channels; otherwise grey (matches that spot's box in channel 0)
         cur_xy = frame_xy(self.identifications)

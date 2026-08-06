@@ -6062,7 +6062,7 @@ def _matched_mask_within_tol(
     Each reference proposes its nearest target; conflicts are resolved in order
     of increasing distance so every reference and every target is used at most
     once. Returns a boolean mask over ``pred_xy`` marking the paired rows - the
-    same pairing the viewer's link colours use (``_nearest_unique_match`` in
+    same pairing the viewer's link colors use (``_nearest_unique_match`` in
     ``picasso.gui.localize``), reduced to "was this reference spot matched".
     """
     n_pred = len(pred_xy)
@@ -8373,12 +8373,12 @@ def calibrate_affine_transform(
     - ``"astigmatism"``: the cylindrical-lens image is mapped into the
       reference (no-lens) frame, undoing the lateral distortion the
       cylindrical lens introduces.
-    - ``"chromatic"``: one colour channel is mapped into the reference
-      colour channel, correcting chromatic aberration.
+    - ``"chromatic"``: one color channel is mapped into the reference
+      color channel, correcting chromatic aberration.
 
     Both are stored as entries of an ordered ``"Affine transforms"`` list
     and applied to ``x``/``y`` in that order after fitting, so a 3D
-    two-colour experiment can chain the astigmatism correction and the
+    two-color experiment can chain the astigmatism correction and the
     chromatic one. The list is read from whatever calibration the fit uses
     - Gaussian astigmatism (YAML) or cubic-spline PSF (HDF5) - and an empty
     ``calibration`` dict starts a standalone affine calibration file, which
@@ -8400,7 +8400,7 @@ def calibrate_affine_transform(
     movie_ref, movie_target : AbstractPicassoMovie
         In-focus bead movies of the reference and of the frame to be
         corrected: without / with the cylindrical lens for
-        ``"astigmatism"``, reference / other colour channel for
+        ``"astigmatism"``, reference / other color channel for
         ``"chromatic"``. If a movie has multiple frames they are
         averaged; a single-frame movie is used as-is.
     calibration : dict

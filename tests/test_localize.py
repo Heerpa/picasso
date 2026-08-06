@@ -2981,7 +2981,7 @@ class TestSplineHelpers:
         assert kwargs["max_iterations"] == 100
 
     def test_ratiometric_multistarts_every_hypothesis(self, monkeypatch):
-        # colour is decided by comparing hypotheses' residuals, so they all
+        # color is decided by comparing hypotheses' residuals, so they all
         # need the same axial search - otherwise a hypothesis can win merely by
         # having stumbled into a better z minimum
         calib = _fake_spline_calibration(

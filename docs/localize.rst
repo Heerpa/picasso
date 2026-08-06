@@ -247,7 +247,7 @@ c[5]z1 .. + c[0]z6``.
 Affine corrections of x and y
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Two things distort the lateral coordinates of a measurement: a cylindrical lens inserted for astigmatic 3D imaging shifts, rotates and stretches the image relative to the unmodified light path, and chromatic aberration displaces one colour channel relative to another. Both are corrected the same way, by an affine transform fitted from two bead images and applied to ``x`` / ``y`` after fitting.
+Two things distort the lateral coordinates of a measurement: a cylindrical lens inserted for astigmatic 3D imaging shifts, rotates and stretches the image relative to the unmodified light path, and chromatic aberration displaces one color channel relative to another. Both are corrected the same way, by an affine transform fitted from two bead images and applied to ``x`` / ``y`` after fitting.
 
 Open ``3D`` > ``Calibrate affine transform (astigmatism / chromatic)`` and choose what to correct:
 
