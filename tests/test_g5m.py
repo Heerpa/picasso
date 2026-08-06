@@ -769,7 +769,7 @@ class TestRenderDialog:
     user, so the Render dialog must expose no control for it."""
 
     @staticmethod
-    def _dialog(has_angle, is_3d=True):
+    def _dialog(has_angle, is_3d=True, extra_info=None):
         import pandas as pd
         from PyQt6 import QtWidgets
 
@@ -788,9 +788,12 @@ class TestRenderDialog:
         if has_angle:
             cols["angle"] = np.zeros(n)
 
+        info = {"Pixelsize": 130.0, "Frames": 100}
+        info.update(extra_info or {})
+
         class _View:
             locs = [pd.DataFrame(cols)]
-            infos = [[{"Pixelsize": 130.0, "Frames": 100}]]
+            infos = [[info]]
             pixelsize = 130.0
 
         class _Window(QtWidgets.QMainWindow):
@@ -811,6 +814,36 @@ class TestRenderDialog:
         assert not hasattr(dialog, "covariance_type")
         labels = [w.text() for w in dialog.findChildren(QtWidgets.QLabel)]
         assert not any("shape" in text.lower() for text in labels)
+
+    def test_no_fit_mode_control(self, qt_offscreen):
+        """Astigmatism vs. spline follows from the localizations, so the
+        dialog must not offer a combo box to pick between them."""
+        from PyQt6 import QtWidgets
+
+        dialog = self._dialog(has_angle=False, is_3d=True)
+        assert not hasattr(dialog, "z_mode")
+        for combo in dialog.findChildren(QtWidgets.QComboBox):
+            items = [combo.itemText(i) for i in range(combo.count())]
+            assert not any("spline" in text.lower() for text in items)
+
+    @pytest.mark.parametrize(
+        "extra_info, expected",
+        [
+            ({"Fit method": "spline-mle"}, "spline"),
+            ({"Spline calibration model": "spline-3d"}, "spline"),
+            ({"Fit method": "lq-3d"}, "astigmatism"),
+            ({}, "astigmatism"),
+        ],
+    )
+    def test_fit_mode_detected_from_metadata(
+        self, qt_offscreen, extra_info, expected
+    ):
+        dialog = self._dialog(
+            has_angle=False, is_3d=True, extra_info=extra_info
+        )
+        assert dialog.spline_mode == (expected == "spline")
+        # the calibration button is only meaningful for astigmatism
+        assert dialog.load_calib_button.isHidden() == (expected == "spline")
 
     def test_max_locs_keyed_by_absolute_channel(self, qt_offscreen):
         """``View._g5m`` looks max_locs_per_cluster up by the absolute
