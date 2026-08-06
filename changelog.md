@@ -70,6 +70,7 @@ Last change: 05-AUG-2026 CEST
 - Re-grouping localizations (picking, DBSCAN/HDBSCAN/SMLM clustering) now preserves the previous grouping in the `group_input` column instead of discarding it, so the original cluster ids remain available (e.g. for G5M)
 - Updated G5M documentation - drift correction importance
 - Test clusterer with a constrast bar
+- Select localizations in the center of the binding event added. See [Steen et al., Nature Methods 21, 1755-1762 (2024)](https://doi.org/10.1038/s41592-024-02374-8), Extended Data Fig. 1f
 - Fixed `picasso.g5m` bootstrap SEM (`bootstrap_check=True`) raising `AssertionError` for spline 3D data, because the resampling model was rebuilt without carrying over the fit mode
 - Fixed `picasso.g5m.sum_G5Ms` raising `TypeError` for a list of 2D models, because a calibration was passed to `G5M_2D`, which does not accept one
 - Fixed removed plugins menu after removing all localizations
