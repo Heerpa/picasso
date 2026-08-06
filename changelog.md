@@ -4,9 +4,11 @@ Last change: 06-AUG-2026 CEST
 
 ## 0.11.0
 
+This update focuses mainly on (but is not limited to) the expansion of the Localize modules. A number of features have been added to allow the users to load many new file formats and use a range of fitting algorithms.
+
 ### **General updates:**
 - Localization metadata is now embedded directly in the `.hdf5` file (under the `/metadata` dataset, as a JSON string), making the file self-contained even if moved or renamed without its `.yaml` sidecar. When loading, Picasso looks for the metadata in the `.yaml` file first, then falls back to the embedded copy. Writing the `.yaml` sidecar is still on by default but can be disabled via the new user setting `Save metadata in .yaml` in `~/.picasso/settings.yaml` (also available via any module under File > Picasso settings). See [file formats documentation](https://picassosr.readthedocs.io/en/latest/files.html) for more info.
-- Improved architecture for plugins, see[here](https://picassosr.readthedocs.io/en/latest/plugins.html). Note that the plugins must now be stored in a different location.
+- Improved architecture for plugins, see [here](https://picassosr.readthedocs.io/en/latest/plugins.html). Note that the plugins must now be stored in a different location.
 - Plugins can now be easily downloaded from our repository, using Plugins > Browse online plugins
 - `config.yaml` can now be stored in the `.picasso` directory and the location is easily accessible via Localize
 - PyQt6 is now imported lazily across the core library: the Qt widget classes formerly in `picasso.lib` moved to the new `picasso.lib_qt` module but remain accessible under their old `lib.<name>` names, and PyQt6 is only imported on first use — so `import picasso` and headless/CLI workflows no longer require PyQt6 to be installed

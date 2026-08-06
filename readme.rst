@@ -39,9 +39,9 @@ A comprehensive documentation can be found here: `Read the Docs <https://picasso
 
 To see all changes introduced across releases, see `the changelog <https://github.com/jungmannlab/picasso/blob/master/changelog.md>`_.
 
-Picasso 0.10
+Picasso 0.11
 ------------
-In this version, a lot of new architectural (behind the scenes) changes were introduced to make Picasso more modular, maintainable and accessible to both developers and end-users. The adaptations include flexible dependencies and Python versions, integration of GPUfit, faster SPINNA and **many** more. You can explore these improvements in the `changelog <https://github.com/jungmannlab/picasso/blob/master/changelog.md>`_.
+This update focuses mainly on (but is not limited to) the expansion of the Localize modules. A number of features have been added to allow the users to load many new file formats and use a range of fitting algorithms, including spline fitting. You can explore these improvements in the `changelog <https://github.com/jungmannlab/picasso/blob/master/changelog.md>`_.
 
 Installation
 ------------
