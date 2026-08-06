@@ -8901,23 +8901,23 @@ class View(QtWidgets.QLabel):
         # blur method
         disp_dlg = self.window.display_settings_dlg
         pixelsize = self.pixelsize
-        if self._pan:  # no blur when panning
-            blur_method = None
-        else:  # selected method
-            if blur_method is None:
-                blur_method = disp_dlg.blur_methods[
-                    disp_dlg.blur_buttongroup.checkedButton()
-                ]
-            else:
-                blur_method = {
-                    "None": None,
-                    "One-pixel": "smooth",
-                    "Global loc. prec.": "convolve",
-                    "Individual loc. prec.": "gaussian",
-                    "Individual loc. prec., iso": "gaussian_iso",
-                }[
-                    blur_method
-                ]  # convert from display name to render name
+        # if self._pan:  # no blur when panning
+        #     blur_method = None
+        # else:  # selected method
+        if blur_method is None:
+            blur_method = disp_dlg.blur_methods[
+                disp_dlg.blur_buttongroup.checkedButton()
+            ]
+        else:
+            blur_method = {
+                "None": None,
+                "One-pixel": "smooth",
+                "Global loc. prec.": "convolve",
+                "Individual loc. prec.": "gaussian",
+                "Individual loc. prec., iso": "gaussian_iso",
+            }[
+                blur_method
+            ]  # convert from display name to render name
 
         # oversampling
         optimal_oversampling = self.display_pixels_per_viewport_pixels()
