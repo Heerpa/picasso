@@ -50,6 +50,10 @@ MAX_SIGMA_FACTOR = 1.5
 N_TASKS = 500
 # to avoid spending eternity on fitting too large clusters
 N_COMPONENTS_MAX = 100
+# available shapes of the G5M components: "spherical" (isotropic, 2D
+# only), "diagonal" (axis-aligned, 3D only) and "rotated" (like diagonal
+# but with xy-plane rotation)
+COVARIANCE_TYPES = ("spherical", "diagonal", "rotated")
 
 
 # helper functions for numba operations along axes
@@ -160,6 +164,112 @@ def _poly1d(
     return out
 
 
+@njit(fastmath=fastmath)
+def _circular_weighted_mean_angle(
+    resp: lib.FloatArray2D,  # shape (n_samples, n_components)
+    angles: lib.FloatArray1D,  # shape (n_samples,), radians
+) -> lib.FloatArray1D:
+    """Responsibility-weighted mean of axial angles, per component.
+
+    The rotated elliptical PSF angle is *axial*, i.e. it has a period of
+    pi (an ellipse at +89 deg and one at -89 deg point in almost the same
+    direction). A plain weighted mean of such data is wrong: it would
+    average +89 and -89 to 0, which is perpendicular to the truth.
+    Averaging the doubled angle and halving the result avoids this.
+
+    Parameters
+    ----------
+    resp : np.ndarray
+        Responsibilities of the G5M components, shape (n_samples,
+        n_components).
+    angles : np.ndarray
+        Angle of each localization in radians, shape (n_samples,).
+
+    Returns
+    -------
+    theta : np.ndarray
+        Mean angle per component in radians, shape (n_components,).
+    """
+    n_components = resp.shape[1]
+    theta = np.zeros(n_components, dtype=np.float64)
+    for k in range(n_components):
+        sin_sum = 0.0
+        cos_sum = 0.0
+        for i in range(resp.shape[0]):
+            sin_sum += resp[i, k] * np.sin(2.0 * angles[i])
+            cos_sum += resp[i, k] * np.cos(2.0 * angles[i])
+        # the (identical) weight normalization cancels in arctan2
+        theta[k] = 0.5 * np.arctan2(sin_sum, cos_sum)
+    return theta
+
+
+@njit(fastmath=fastmath)
+def _assemble_covs_3D_rot(
+    cov_maj: lib.FloatArray1D,
+    cov_min: lib.FloatArray1D,
+    cov_z: lib.FloatArray1D,
+    theta: lib.FloatArray1D,
+) -> lib.FloatArray3D:
+    """Build block covariance matrices from principal-axis variances.
+
+    Each component gets ``blockdiag(R(theta) @ diag(cov_maj, cov_min) @
+    R(theta).T, cov_z)``, i.e. a full 2x2 xy block rotated by ``theta``
+    and an independent z variance.
+
+    Returns
+    -------
+    covs : np.ndarray
+        Covariance matrices, shape (n_components, 3, 3).
+    """
+    n_components = len(cov_maj)
+    covs = np.zeros((n_components, 3, 3), dtype=np.float64)
+    for k in range(n_components):
+        ct = np.cos(theta[k])
+        st = np.sin(theta[k])
+        covs[k, 0, 0] = cov_maj[k] * ct * ct + cov_min[k] * st * st
+        covs[k, 1, 1] = cov_maj[k] * st * st + cov_min[k] * ct * ct
+        covs[k, 0, 1] = (cov_maj[k] - cov_min[k]) * ct * st
+        covs[k, 1, 0] = covs[k, 0, 1]
+        covs[k, 2, 2] = cov_z[k]
+    return covs
+
+
+@njit(fastmath=fastmath)
+def _precision_chol_3D_rot(covs: lib.FloatArray3D) -> lib.FloatArray3D:
+    """Cholesky decomposition of the precision matrices, for the block
+    covariance produced by ``_assemble_covs_3D_rot``.
+
+    Follows sklearn's convention for full covariances: the returned C is
+    upper triangular and satisfies ``C @ C.T == inv(covs)``. For a 2x2
+    xy block ``[[a, b], [b, c]]`` with ``d = a*c - b**2`` this has the
+    closed form used below, so no matrix routines are needed inside njit.
+    Note that for ``b == 0`` it reduces to the plain ``1 / sqrt(cov)``
+    used by the diagonal 3D model.
+
+    Parameters
+    ----------
+    covs : np.ndarray
+        Covariance matrices, shape (n_components, 3, 3).
+
+    Returns
+    -------
+    precisions_chol : np.ndarray
+        Shape (n_components, 3, 3), upper triangular per component.
+    """
+    n_components = covs.shape[0]
+    precisions_chol = np.zeros((n_components, 3, 3), dtype=np.float64)
+    for k in range(n_components):
+        a = covs[k, 0, 0]
+        b = covs[k, 0, 1]
+        c = covs[k, 1, 1]
+        d = a * c - b * b  # det of the xy block; > 0, see _m_step_3D_rot
+        precisions_chol[k, 0, 0] = 1.0 / np.sqrt(a)
+        precisions_chol[k, 0, 1] = -b / np.sqrt(a * d)
+        precisions_chol[k, 1, 1] = np.sqrt(a / d)
+        precisions_chol[k, 2, 2] = 1.0 / np.sqrt(covs[k, 2, 2])
+    return precisions_chol
+
+
 # In sklearn's GaussianMixture implementation, the term in the nominator
 # of the exponential term ((x - mu)^2 / sigma^2) is calculated as
 # (x^2 - 2*x*mu + mu^2). This can cause numerical instability when x and
@@ -197,6 +307,34 @@ def _gauss_exponential_term_3D(
         for j in range(n_components):
             for k in range(3):
                 sq_diff[i, j] += (X[i, k] - means[j, k]) ** 2 * precision[j, k]
+    return sq_diff
+
+
+@njit(fastmath=fastmath)
+def _gauss_exponential_term_3D_rot(
+    X: lib.FloatArray2D,  # shape (n_samples, 3)
+    means: lib.FloatArray2D,  # shape (n_components, 3)
+    precisions_chol: lib.FloatArray3D,  # shape (n_components, 3, 3)
+) -> lib.FloatArray2D:
+    """Same as ``_gauss_exponential_term_3D`` but for the rotated xy
+    block model, where the precision is stored as its (upper triangular)
+    Cholesky factor C with ``C @ C.T = inv(cov)``.
+
+    Computes ``|(x - mu) @ C|^2 = (x - mu) inv(cov) (x - mu).T``. As in
+    the other kernels, the difference is taken before squaring, which
+    is what keeps the result stable for large coordinates."""
+    n_samples = X.shape[0]
+    n_components = means.shape[0]
+    sq_diff = np.zeros((n_samples, n_components), dtype=X.dtype)
+    for i in range(n_samples):
+        for j in range(n_components):
+            dx = X[i, 0] - means[j, 0]
+            dy = X[i, 1] - means[j, 1]
+            dz = X[i, 2] - means[j, 2]
+            y0 = dx * precisions_chol[j, 0, 0]
+            y1 = dx * precisions_chol[j, 0, 1] + dy * precisions_chol[j, 1, 1]
+            y2 = dz * precisions_chol[j, 2, 2]
+            sq_diff[i, j] = y0 * y0 + y1 * y1 + y2 * y2
     return sq_diff
 
 
@@ -400,15 +538,21 @@ class G5M(metaclass=ABCMeta):
         min_locs: int,
         sigma_bounds: tuple[float, float],
         *,
+        covariance_type: Literal["spherical", "diagonal", "rotated"],
         means_init: np.ndarray | None = None,
     ) -> None:
 
         assert sigma_bounds[0] >= 0.0 and sigma_bounds[1] >= 0.0
         assert sigma_bounds[1] >= sigma_bounds[0]
+        assert covariance_type in COVARIANCE_TYPES, (
+            f"covariance_type must be one of {COVARIANCE_TYPES}, got "
+            f"'{covariance_type}'."
+        )
 
         self.n_components = int(n_components)
         self.min_locs = int(min_locs)
         self.sigma_bounds = sigma_bounds
+        self.covariance_type = covariance_type
         self.n_init = max(int(n_components), 3)
         self.random_state = 42
         self.converged = False
@@ -456,6 +600,7 @@ class G5M(metaclass=ABCMeta):
         X: lib.FloatArray2D,
         lp: lib.FloatArray1D | lib.FloatArray2D,
         loc_prec_handle: Literal["local", "abs"] = "local",
+        angles: lib.FloatArray1D | None = None,
     ) -> G5M | None:
         """Fit G5M to data X. Return None if fitting failed.
 
@@ -472,6 +617,10 @@ class G5M(metaclass=ABCMeta):
             precisions of points around each component are used to bound
             sigmas. Else, sigma_bounds specifies the absolute bounds on
             sigmas. Default is "local".
+        angles : np.ndarray or None, optional
+            Angle of each localization in radians, shape (n_samples,).
+            Required for ``covariance_type="rotated"``, ignored
+            otherwise. Default is None.
 
         Returns
         -------
@@ -488,10 +637,20 @@ class G5M(metaclass=ABCMeta):
         self.n_samples = X.shape[0]
         self.loc_prec_handle = loc_prec_handle
 
+        if angles is None:
+            # empty float sentinel; unused unless the covariance type is
+            # "rotated", but required so the njit m-step's angles stays
+            # typed as a float array
+            angles = np.array([])
+        angles = np.ascontiguousarray(np.float64(angles))
+
         if self.n_dimensions == 2:
             initialize_G5M = _initialize_G5M_2D
         elif self.n_dimensions == 3:
-            initialize_G5M = _initialize_G5M_3D
+            if self.covariance_type == "rotated":
+                initialize_G5M = _initialize_G5M_3D_rot
+            else:
+                initialize_G5M = _initialize_G5M_3D
         else:
             raise ValueError("Only 2D and 3D data are supported.")
 
@@ -533,6 +692,7 @@ class G5M(metaclass=ABCMeta):
             cx=cx,
             cy=cy,
             mag_factor=mag_factor,
+            angles=angles,
         )
         if w is None:
             return None
@@ -558,6 +718,25 @@ class G5M(metaclass=ABCMeta):
     def precisions_cholesky(self) -> np.ndarray:
         """Valid precision."""
         return self.precisions_cholesky_[self.valid_idx]
+
+    @property
+    def sqrt_det_covariances(self) -> np.ndarray:
+        """``sqrt(det(covariance))`` per valid component.
+
+        Used for the analytic expected log-likelihood behind ``p_val``.
+        """
+        covariances = self.covariances
+        if self.covariance_type == "spherical":
+            # covariance is sigma**2, so sqrt(det) = sigma**2 exactly
+            return covariances
+        elif self.covariance_type == "diagonal":
+            return np.sqrt(covariances).prod(1)
+        # rotated: blockdiag(2x2 xy, z)
+        det_xy = (
+            covariances[:, 0, 0] * covariances[:, 1, 1]
+            - covariances[:, 0, 1] ** 2
+        )
+        return np.sqrt(det_xy) * np.sqrt(covariances[:, 2, 2])
 
     def predict(self, X: lib.FloatArray2D) -> lib.IntArray1D:
         """Predict the cluster labels for the data X."""
@@ -756,11 +935,12 @@ def _m_step_2D(
     cx: dict | None = None,  # for 3D consistency
     cy: dict | None = None,  # for 3D consistency
     mag_factor: float | None = None,  # for 3D consistency
+    angles: lib.FloatArray1D = np.array([]),  # for rotated 3D consistency
 ) -> tuple[
     lib.FloatArray1D, lib.FloatArray2D, lib.FloatArray1D, lib.FloatArray1D
 ]:
-    """2D m step. cx, cy and mag_factor are not used and are here for
-    compatibility with the 3D m step."""
+    """2D m step. cx, cy, mag_factor and angles are not used and are here
+    for compatibility with the 3D m steps."""
     min_cov = sigma_bounds[0] ** 2
     max_cov = sigma_bounds[1] ** 2
     resp = np.exp(log_resp)
@@ -995,6 +1175,7 @@ class G5M_2D(G5M):
             n_components=n_components,
             min_locs=min_locs,
             sigma_bounds=sigma_bounds,
+            covariance_type="spherical",
             means_init=means_init,
         )
         self.n_dimensions = 2
@@ -1219,10 +1400,12 @@ def _m_step_3D(
     cx: lib.FloatArray1D = np.array([]),
     cy: lib.FloatArray1D = np.array([]),
     mag_factor: float = 0.79,
+    angles: lib.FloatArray1D = np.array([]),  # for rotated 3D consistency
 ) -> tuple[
     lib.FloatArray1D, lib.FloatArray2D, lib.FloatArray2D, lib.FloatArray2D
 ]:
-    """Modified m-step to handle astigmatism in 3D G5M.
+    """Modified m-step to handle astigmatism in 3D G5M. ``angles`` is not
+    used and is here for compatibility with the rotated 3D m step.
 
     The astigmatism modification handles the astigmatism effect in
     3D DNA-PAINT data. As in sklearn's implementation, the weights,
@@ -1310,6 +1493,288 @@ def _m_step_3D(
     return weights, means, covs, precisions_cholesky
 
 
+# 3D G5M with a rotated xy covariance block #
+#
+# Used when the localizations were fitted with the rotated elliptical
+# Gaussian PSF model The component covariance is blockdiag(R(theta) @
+# diag(cov_u, cov_v) @ R(theta).T, cov_z), where cov_u is the variance
+# along the axis at angle theta.
+#
+# Angle is not a free parameter and is taken as the mean value from the
+# surrounding localizations.
+#
+# The u axis corresponds to the PSF fit's sx and the v axis to sy: the
+# rotated PSF model in picasso.fitting.gaussfit projects onto
+# (cos a, -sin a) with internal angle a, and localize saves
+# angle = -rad2deg(a), so the saved angle is already the standard-
+# convention angle of the sx axis and needs no sign flip here.
+@njit
+def _estimate_gaussian_parameters_3D_rot(
+    X: lib.FloatArray2D,
+    resp: lib.FloatArray2D,
+    theta: lib.FloatArray1D,
+    reg_covar: float = 1e-6,
+) -> tuple[lib.FloatArray1D, lib.FloatArray2D, lib.FloatArray2D]:
+    """MLE parameters for the rotated 3D model.
+
+    Second moments are taken in each component's own rotated frame, so
+    the returned covariances are the principal-axis variances
+    ``(cov_u, cov_v, cov_z)`` rather than camera-axis ones.
+
+    Returns
+    -------
+    nk, means, covariances : tuple
+        Number of localizations per component, means, and principal-axis
+        covariances of shape (n_components, 3).
+    """
+    nk = (
+        _sum_along_axis0(resp, (resp.shape[1],))
+        + 10.0 * np.finfo(resp.dtype).eps
+    )
+    means = _matmul(resp.T, X) / nk[:, np.newaxis]
+    covariances = np.zeros((resp.shape[1], 3), dtype=np.float64)
+    for k in range(resp.shape[1]):
+        ct = np.cos(theta[k])
+        st = np.sin(theta[k])
+        s_uu = 0.0
+        s_vv = 0.0
+        s_zz = 0.0
+        for i in range(X.shape[0]):
+            r = resp[i, k]
+            dx = X[i, 0] - means[k, 0]
+            dy = X[i, 1] - means[k, 1]
+            dz = X[i, 2] - means[k, 2]
+            du = dx * ct + dy * st
+            dv = -dx * st + dy * ct
+            s_uu += r * du * du
+            s_vv += r * dv * dv
+            s_zz += r * dz * dz
+        covariances[k, 0] = s_uu / nk[k] + reg_covar
+        covariances[k, 1] = s_vv / nk[k] + reg_covar
+        covariances[k, 2] = s_zz / nk[k] + reg_covar
+    return (
+        np.asarray(nk, dtype=np.float64),
+        np.asarray(means, dtype=np.float64),
+        np.asarray(covariances, dtype=np.float64),
+    )
+
+
+@njit
+def _estimate_log_gaussian_prob_3D_rot(
+    X: lib.FloatArray2D,
+    means: lib.FloatArray2D,
+    precisions_chol: lib.FloatArray3D,
+) -> lib.FloatArray2D:
+    n_components = precisions_chol.shape[0]
+    log_det = np.zeros(n_components, dtype=np.float64)
+    for k in range(n_components):
+        log_det[k] = (
+            np.log(precisions_chol[k, 0, 0])
+            + np.log(precisions_chol[k, 1, 1])
+            + np.log(precisions_chol[k, 2, 2])
+        )
+    log_prob = _gauss_exponential_term_3D_rot(X, means, precisions_chol)
+    return -0.5 * (3 * np.log(2 * np.pi) + log_prob) + log_det
+
+
+@njit
+def _e_step_3D_rot(
+    X: lib.FloatArray2D,
+    weights: lib.FloatArray1D,
+    means: lib.FloatArray2D,
+    precisions_cholesky: lib.FloatArray3D,
+) -> tuple[float, lib.FloatArray2D]:
+    weighted_log_prob = _estimate_log_gaussian_prob_3D_rot(
+        X, means, precisions_cholesky
+    ) + np.log(weights)
+    log_prob_norm = _logsumexp_axis1(weighted_log_prob, (X.shape[0],))
+    log_resp = weighted_log_prob - log_prob_norm[:, np.newaxis]
+    return np.mean(log_prob_norm), log_resp.astype(np.float64)
+
+
+@njit
+def _check_G5M_resolution_3D_rot(
+    means: lib.FloatArray2D,
+    weights: lib.FloatArray1D,
+    precisions_chol: lib.FloatArray3D,
+) -> bool:
+    """Sparrow limit check for ``G5M_3D`` with a rotated xy block. Same
+    procedure as ``_check_G5M_resolution_3D``."""
+    n_valid_components = means.shape[0]
+    if n_valid_components == 0:
+        return False
+    elif n_valid_components == 1:
+        return True
+
+    for i in range(n_valid_components):
+        for j in range(i + 1, n_valid_components):
+            prec_chol_ = np.zeros((2, 3, 3), dtype=np.float64)
+            prec_chol_[0, :, :] = precisions_chol[i]
+            prec_chol_[1, :, :] = precisions_chol[j]
+            weights_ = np.array([weights[i], weights[j]])
+            means_ = np.zeros((2, 3), dtype=np.float64)
+            means_[0, :] = means[i]
+            means_[1, :] = means[j]
+
+            direction_vector = means_[1, :] - means_[0, :]
+            t = np.linspace(0, 1, 40)
+            x = means_[0, 0] + direction_vector[0] * t
+            y = means_[0, 1] + direction_vector[1] * t
+            z = means_[0, 2] + direction_vector[2] * t
+
+            X = np.stack((x, y, z)).T
+            ll = _estimate_log_gaussian_prob_3D_rot(
+                X, means_, prec_chol_
+            ) + np.log(weights_)
+            pdf = _sum_along_axis1(np.exp(ll), ll.shape[0])
+
+            if not len(lib.find_local_minima(pdf)):
+                return False
+
+    return True
+
+
+@njit
+def _initialize_G5M_3D_rot(
+    X: lib.FloatArray2D, n_init: int, n_components: int, random_state: int
+) -> tuple[lib.FloatArray2D, lib.FloatArray3D, lib.FloatArray4D]:
+    """Initialize the rotated 3D G5M parameters using kmeans++.
+
+    The angle is seeded at zero (an axis-aligned block); the first m-step
+    replaces it with the measured mean angle of each component."""
+    n_samples = X.shape[0]
+    init_weights = np.zeros((n_init, n_components), dtype=np.float64)
+    init_means = np.zeros((n_init, n_components, 3), dtype=np.float64)
+    init_precisions_cholesky = np.zeros(
+        (n_init, n_components, 3, 3), dtype=np.float64
+    )
+    zero_theta = np.zeros(n_components, dtype=np.float64)
+    for ii in range(n_init):
+        resp = np.zeros((n_samples, n_components), dtype=np.float64)
+        indices = _kmeans_plusplus(X, n_components, random_state)
+
+        for i in range(n_components):
+            resp[indices[i], i] = 1
+
+        weights, means, covariances = _estimate_gaussian_parameters_3D_rot(
+            X, resp, zero_theta
+        )
+        weights /= n_samples
+        init_weights[ii] = weights
+        init_means[ii] = means
+        init_precisions_cholesky[ii] = _precision_chol_3D_rot(
+            _assemble_covs_3D_rot(
+                covariances[:, 0],
+                covariances[:, 1],
+                covariances[:, 2],
+                zero_theta,
+            )
+        )
+
+        random_state += 1
+
+    return (
+        np.asarray(init_weights, dtype=np.float64),
+        np.asarray(init_means, dtype=np.float64),
+        np.asarray(init_precisions_cholesky, dtype=np.float64),
+    )
+
+
+@njit
+def _m_step_3D_rot(
+    X: lib.FloatArray2D,
+    log_resp: lib.FloatArray2D,
+    sigma_bounds: tuple[float, float],
+    lp: lib.FloatArray2D,
+    loc_prec_handle: Literal["local", "abs"],
+    cx: lib.FloatArray1D = np.array([]),
+    cy: lib.FloatArray1D = np.array([]),
+    mag_factor: float = 0.79,
+    angles: lib.FloatArray1D = np.array([]),
+) -> tuple[
+    lib.FloatArray1D, lib.FloatArray2D, lib.FloatArray3D, lib.FloatArray3D
+]:
+    """M-step for the 3D G5M with a rotated xy covariance block.
+
+    Identical in structure to ``_m_step_3D``, but the second moments,
+    the sigma bounds and the astigmatism coupling are all applied in each
+    component's own rotated frame instead of the camera frame. The angle
+    is measured from the localizations rather than fitted."""
+    resp = np.exp(log_resp)
+    # angle of each component, measured from the localizations
+    theta = _circular_weighted_mean_angle(resp, angles)
+    weights, means, covs = _estimate_gaussian_parameters_3D_rot(X, resp, theta)
+
+    if loc_prec_handle == "local":
+        # in-plane precision is a single scalar: once the frame is
+        # rotated, lpx and lpy no longer match the principal axes
+        lpxy = np.ascontiguousarray(0.5 * (lp[:, 0] + lp[:, 1])).reshape(-1, 1)
+        lpz = np.ascontiguousarray(lp[:, 2]).reshape(-1, 1)
+
+        resp_sum = _sum_along_axis0(resp, (resp.shape[1]))
+        mean_lpxy_per_component = (
+            _sum_along_axis0(resp * lpxy, (resp.shape[1])) / resp_sum
+        )
+        mean_lpz_per_component = (
+            _sum_along_axis0(resp * lpz, (resp.shape[1])) / resp_sum
+        )
+
+        mean_covxy_per_component = _square_elements_1d(mean_lpxy_per_component)
+        mean_covz_per_component = _square_elements_1d(mean_lpz_per_component)
+
+        min_cov_u = sigma_bounds[0] ** 2 * mean_covxy_per_component
+        max_cov_u = sigma_bounds[1] ** 2 * mean_covxy_per_component
+        min_cov_v = min_cov_u.copy()
+        max_cov_v = max_cov_u.copy()
+        min_cov_z = sigma_bounds[0] ** 2 * mean_covz_per_component
+
+        # decrease max z cov because the lpz is already pretty high
+        max_cov_z = (
+            (sigma_bounds[1] - 1.0) * 0.5 + 1.0
+        ) ** 2 * mean_covz_per_component
+    elif loc_prec_handle == "abs":
+        min_cov_u = np.full(covs.shape[0], sigma_bounds[0] ** 2)
+        max_cov_u = np.full(covs.shape[0], sigma_bounds[1] ** 2)
+        min_cov_v = np.full(covs.shape[0], sigma_bounds[0] ** 2)
+        max_cov_v = np.full(covs.shape[0], sigma_bounds[1] ** 2)
+        # roughly account for worse z precision
+        min_cov_z = np.full(covs.shape[0], sigma_bounds[0] ** 2 * 2.0**2)
+        max_cov_z = np.full(covs.shape[0], sigma_bounds[1] ** 2 * 2.5**2)
+
+    # covs holds (cov_u, cov_v, cov_z), so the diagonal clipper applies
+    # unchanged - it is agnostic to which frame the axes are in
+    _clip_covs_3D(
+        covs,
+        min_cov_u,
+        max_cov_u,
+        min_cov_v,
+        max_cov_v,
+        min_cov_z,
+        max_cov_z,
+    )
+
+    # impose the astigmatism coupling, now between the two principal
+    # axes rather than the camera axes
+    if cx.size > 0 and cy.size > 0:
+        z_position_calib = means[:, 2] / mag_factor
+        spot_width = _poly1d(cx, z_position_calib)
+        spot_height = _poly1d(cy, z_position_calib)
+        ratio = spot_width / spot_height
+
+        covs_uv = np.empty((covs.shape[0], 2))
+        covs_uv[:, 0] = covs[:, 0]
+        covs_uv[:, 1] = covs[:, 1]
+        mean_uv_covs = _mean_along_axis1(covs_uv, (covs_uv.shape[0],))
+        covs[:, 0] = mean_uv_covs * ratio
+        covs[:, 1] = mean_uv_covs / ratio
+    weights /= weights.sum()
+    covs_full = _assemble_covs_3D_rot(
+        covs[:, 0], covs[:, 1], covs[:, 2], theta
+    )
+    precisions_cholesky = _precision_chol_3D_rot(covs_full)
+    return weights, means, covs_full, precisions_cholesky
+
+
 def _find_optimal_G5M_3D(
     X: lib.FloatArray2D,
     min_locs: int,
@@ -1319,6 +1784,8 @@ def _find_optimal_G5M_3D(
     lp: lib.FloatArray2D,
     loc_prec_handle: Literal["local", "abs"] = "local",
     mode: Literal["astigmatism", "spline"] = "astigmatism",
+    covariance_type: Literal["diagonal", "rotated"] = "diagonal",
+    angles: lib.FloatArray1D | None = None,
     max_rounds_without_best_bic: int = MAX_ROUNDS_WITHOUT_BEST_BIC,
 ) -> G5M_3D:
     """Find optimal G5M for given 3D data X.
@@ -1350,6 +1817,13 @@ def _find_optimal_G5M_3D(
     mode : {"astigmatism", "spline"}, optional
         Fitting mode of the input localizations. Default is
         "astigmatism".
+    covariance_type : {"diagonal", "rotated"}, optional
+        Shape of the G5M components. "diagonal" is axis-aligned;
+        "rotated" gives the xy block a rotation measured from `angles`.
+        Default is "diagonal".
+    angles : np.ndarray or None, optional
+        Angle of each localization in radians, shape (n_samples,).
+        Required for ``covariance_type="rotated"``. Default is None.
     max_rounds_without_best_bic : int, optional
         Maximum number of rounds without BIC improvement to terminate
         the search for optimal G5M n_components. Default is
@@ -1366,6 +1840,11 @@ def _find_optimal_G5M_3D(
         "Localization precisions (lp) must have the shape of (N, 3) "
         "where N is the number of localizations."
     )
+    if covariance_type == "rotated":
+        assert angles is not None and len(angles) == len(X), (
+            "Angles must be provided for each localization when "
+            "covariance_type is 'rotated'."
+        )
     if mode == "astigmatism":
         for key in [
             "X Coefficients",
@@ -1395,8 +1874,19 @@ def _find_optimal_G5M_3D(
             sigma_bounds=sigma_bounds,
             calibration=calibration,
             mode=mode,
-        ).fit(X, lp=lp, loc_prec_handle=loc_prec_handle)
-        if g5m is None or not _check_G5M_resolution_3D(
+            covariance_type=covariance_type,
+        ).fit(
+            X,
+            lp=lp,
+            loc_prec_handle=loc_prec_handle,
+            angles=angles,
+        )
+        check_resolution = (
+            _check_G5M_resolution_3D_rot
+            if covariance_type == "rotated"
+            else _check_G5M_resolution_3D
+        )
+        if g5m is None or not check_resolution(
             g5m.means, g5m.weights, g5m.precisions_cholesky
         ):
             current_bic = np.inf
@@ -1427,6 +1917,7 @@ def _run_g5m_group_3D(
     sigma_bounds: tuple[float, float] = (MIN_SIGMA_FACTOR, MAX_SIGMA_FACTOR),
     pixelsize: float = 130.0,
     mode: Literal["astigmatism", "spline"] = "astigmatism",
+    covariance_type: Literal["diagonal", "rotated"] = "diagonal",
     max_rounds_without_best_bic: int = MAX_ROUNDS_WITHOUT_BEST_BIC,
     bootstrap_check: bool = False,
     max_locs_per_cluster: int = np.inf,
@@ -1517,6 +2008,13 @@ def _run_g5m_group_3D(
     X[:, 2] /= pixelsize  # convert z to camera pixels
     lp[:, 2] /= pixelsize  # convert lpz to camera pixels
 
+    if covariance_type == "rotated":
+        # the "angle" column is written by picasso.localize in degrees;
+        # the m-step works in radians
+        angles = np.deg2rad(locs_group["angle"].to_numpy())
+    else:
+        angles = None
+
     g5m = _find_optimal_G5M_3D(
         X,
         min_locs=min_locs,
@@ -1525,6 +2023,8 @@ def _run_g5m_group_3D(
         loc_prec_handle=loc_prec_handle,
         calibration=calibration,
         mode=mode,
+        covariance_type=covariance_type,
+        angles=angles,
         max_rounds_without_best_bic=max_rounds_without_best_bic,
     )
     if g5m is None or len(g5m.valid_idx) == 0:
@@ -1572,12 +2072,22 @@ class G5M_3D(G5M):
         *,
         calibration: dict | None,
         mode: Literal["astigmatism", "spline"] = "astigmatism",
+        covariance_type: Literal["diagonal", "rotated"] = "diagonal",
         means_init: np.ndarray | None = None,
     ) -> None:
         assert mode in [
             "astigmatism",
             "spline",
         ], "mode must be 'astigmatism' or 'spline'."
+        assert covariance_type in (
+            "diagonal",
+            "rotated",
+        ), "covariance_type must be 'diagonal' or 'rotated' for 3D data."
+        # the rotated model couples the two principal axes via the
+        # calibration, so it is only defined in astigmatism mode
+        assert not (
+            covariance_type == "rotated" and mode == "spline"
+        ), "covariance_type='rotated' requires mode='astigmatism'."
         if mode == "astigmatism":
             for key in [
                 "X Coefficients",
@@ -1593,6 +2103,7 @@ class G5M_3D(G5M):
             n_components=n_components,
             min_locs=min_locs,
             sigma_bounds=sigma_bounds,
+            covariance_type=covariance_type,
             means_init=means_init,
         )
         self.calibration = calibration
@@ -1602,6 +2113,12 @@ class G5M_3D(G5M):
     def estimate_log_prob(self, X: lib.FloatArray2D) -> lib.FloatArray2D:
         """Calculate the log probabilities of the data X under the G5M,
         without weights."""
+        if self.covariance_type == "rotated":
+            return _estimate_log_gaussian_prob_3D_rot(
+                X,
+                self.means,
+                self.precisions_cholesky,
+            )
         return _estimate_log_gaussian_prob_3D(
             X,
             self.means,
@@ -1628,15 +2145,33 @@ class G5M_3D(G5M):
         rng = check_random_state(self.random_state)
         n_samples_comp = rng.multinomial(n_samples, self.weights)
 
-        X = np.vstack(
-            [
-                mean
-                + rng.standard_normal(size=(sample, 3)) * np.sqrt(covariance)
-                for (mean, covariance, sample) in zip(
-                    self.means, self.covariances, n_samples_comp
+        if self.covariance_type == "rotated":
+            samples = []
+            for mean, covariance, sample in zip(
+                self.means, self.covariances, n_samples_comp
+            ):
+                eigvals, eigvecs = np.linalg.eigh(covariance)
+                eigvals = np.maximum(eigvals, 0.0)
+                samples.append(
+                    mean
+                    + (
+                        rng.standard_normal(size=(sample, 3))
+                        * np.sqrt(eigvals)
+                    )
+                    @ eigvecs.T
                 )
-            ]
-        )
+            X = np.vstack(samples)
+        else:
+            X = np.vstack(
+                [
+                    mean
+                    + rng.standard_normal(size=(sample, 3))
+                    * np.sqrt(covariance)
+                    for (mean, covariance, sample) in zip(
+                        self.means, self.covariances, n_samples_comp
+                    )
+                ]
+            )
 
         y = np.concatenate(
             [
@@ -1716,8 +2251,13 @@ def _approximate_sem(g5m: G5M, locs: pd.DataFrame) -> np.ndarray:
     weights = g5m.weights
     covariances = g5m.covariances
 
-    if "z" not in locs.columns:
+    if g5m.covariance_type == "spherical":
         covariances = np.repeat(covariances, 2).reshape(-1, 2)
+    elif g5m.covariance_type == "rotated":
+        # lpx/lpy/lpz are per camera axis, so the marginal variances
+        # (the diagonal) are the right quantity even though the xy block
+        # is rotated
+        covariances = np.diagonal(covariances, axis1=1, axis2=2)
     N = len(locs) * weights.reshape(len(weights), -1)
     sem = np.sqrt(covariances / N)
     return sem
@@ -1750,15 +2290,20 @@ def _bootstrap_sem(
     boot_means = []
     for i in range(n_bootstraps):
         X_boot = g5m.sample(len(locs))[0]
+        angles = None
         if "z" in locs.columns:
             g5m_boot = G5M_3D(
                 n_components=len(g5m.valid_idx),
                 min_locs=g5m.min_locs,
                 sigma_bounds=g5m.sigma_bounds,
                 calibration=g5m.calibration,
+                mode=g5m.mode,
+                covariance_type=g5m.covariance_type,
                 means_init=g5m.means,
             )
             lp = locs[["lpx", "lpy", "lpz"]].to_numpy()
+            if g5m.covariance_type == "rotated":
+                angles = np.deg2rad(locs["angle"].to_numpy())
         else:
             g5m_boot = G5M_2D(
                 n_components=len(g5m.valid_idx),
@@ -1767,7 +2312,12 @@ def _bootstrap_sem(
                 means_init=g5m.means,
             )
             lp = locs[["lpx", "lpy"]].mean(axis=1).to_numpy()
-        g5m_boot.fit(X_boot, lp=lp, loc_prec_handle=g5m.loc_prec_handle)
+        g5m_boot.fit(
+            X_boot,
+            lp=lp,
+            loc_prec_handle=g5m.loc_prec_handle,
+            angles=angles,
+        )
         if hasattr(g5m_boot, "means_"):  # converged
             boot_means.append(g5m_boot.means_)
     sem = np.std(boot_means, axis=0)
@@ -1816,7 +2366,10 @@ def _convert_G5M_results(
     if "z" in locs_group.columns:
         X = locs_group[["x", "y", "z"]].to_numpy()
         X[:, 2] /= pixelsize  # convert z to camera pixels
-        e_step = _e_step_3D
+        if g5m.covariance_type == "rotated":
+            e_step = _e_step_3D_rot
+        else:
+            e_step = _e_step_3D
     else:
         X = locs_group[["x", "y"]].to_numpy()
         e_step = _e_step_2D
@@ -1844,15 +2397,12 @@ def _convert_G5M_results(
     # calculated as the cumulative distribution function of the normal
     # distribution with mu and sigma as the expected value and standard
     # deviation of the mean log likelihood of the component.
-    if X.shape[1] == 2:  # (2D)
-        expected = np.log(weights / (2 * np.pi * covariances)) - 1
-    else:  # 3D
-        expected = (
-            np.log(
-                weights / ((2 * np.pi) ** 1.5 * np.sqrt(covariances).prod(1))
-            )
-            - 1.5
-        )
+    # For x drawn from component k, E[log(w_k * N(x; mu_k, cov_k))] is
+    # log(w_k / ((2*pi)**(D/2) * sqrt(det cov_k))) - D/2, since
+    # E[chi2_D] = D. sqrt(det cov)
+    n_dim = X.shape[1]
+    norm = 2 * np.pi if n_dim == 2 else (2 * np.pi) ** 1.5
+    expected = np.log(weights / (norm * g5m.sqrt_det_covariances)) - n_dim / 2
     stdev = np.sqrt(X.shape[1] * 0.5 / (len(X) * weights))
     # gauss CDF
     p_val = (
@@ -1871,11 +2421,32 @@ def _convert_G5M_results(
     lpx = sem[:, 0]
     lpy = sem[:, 1]
 
+    rotated = g5m.covariance_type == "rotated"
     if "z" in locs_group.columns:
         z = means[:, 2] * pixelsize
-        sigma_x = np.sqrt(covariances[:, 0]) * pixelsize
-        sigma_y = np.sqrt(covariances[:, 1]) * pixelsize
-        sigma_z = np.sqrt(covariances[:, 2]) * pixelsize
+        if rotated:
+            # marginal (camera-axis) widths, so that fitted_sigma_x/y/z
+            # keep the same meaning as for the diagonal model
+            marginal = np.diagonal(covariances, axis1=1, axis2=2)
+            sigma_x = np.sqrt(marginal[:, 0]) * pixelsize
+            sigma_y = np.sqrt(marginal[:, 1]) * pixelsize
+            sigma_z = np.sqrt(marginal[:, 2]) * pixelsize
+            # principal axes of the xy block; eigh returns ascending
+            # eigenvalues, so the major axis is the second one
+            eigvals, eigvecs = np.linalg.eigh(covariances[:, :2, :2])
+            eigvals = np.maximum(eigvals, 0.0)
+            sigma_minor = np.sqrt(eigvals[:, 0]) * pixelsize
+            sigma_major = np.sqrt(eigvals[:, 1]) * pixelsize
+            axis_ratio = sigma_major / sigma_minor
+            # orientation of the major axis, in the same convention as
+            # the "angle" column written by picasso.localize: degrees
+            # wrapped into [-90, 90)
+            angle = np.rad2deg(np.arctan2(eigvecs[:, 1, 1], eigvecs[:, 0, 1]))
+            angle = np.mod(angle + 90.0, 180.0) - 90.0
+        else:
+            sigma_x = np.sqrt(covariances[:, 0]) * pixelsize
+            sigma_y = np.sqrt(covariances[:, 1]) * pixelsize
+            sigma_z = np.sqrt(covariances[:, 2]) * pixelsize
         lpz = sem[:, 2] * pixelsize
         weighted_lpx = (
             (resp * locs_group["lpx"].to_numpy().reshape(-1, 1)).sum(0) / rsum
@@ -1889,6 +2460,13 @@ def _convert_G5M_results(
         rel_sigma_x = sigma_x / weighted_lpx / pixelsize
         rel_sigma_y = sigma_y / weighted_lpy / pixelsize
         rel_sigma_z = sigma_z / weighted_lpz
+        if rotated:
+            # the principal axes do not correspond to the camera axes,
+            # so they are normalized by the mean in-plane precision -
+            # the same scalar the m-step bounds them with
+            weighted_lpxy = 0.5 * (weighted_lpx + weighted_lpy)
+            rel_sigma_major = sigma_major / weighted_lpxy / pixelsize
+            rel_sigma_minor = sigma_minor / weighted_lpxy / pixelsize
     else:
         sigma = np.sqrt(covariances) * pixelsize
         # relative sigma
@@ -1972,6 +2550,14 @@ def _convert_G5M_results(
                 "group_input": group_input.astype(np.int32),
             }
         )
+        if rotated:
+            # extra shape columns for the rotated model
+            centers["fitted_sigma_major"] = sigma_major.astype(np.float32)
+            centers["fitted_sigma_minor"] = sigma_minor.astype(np.float32)
+            centers["rel_sigma_major"] = rel_sigma_major.astype(np.float32)
+            centers["rel_sigma_minor"] = rel_sigma_minor.astype(np.float32)
+            centers["axis_ratio"] = axis_ratio.astype(np.float32)
+            centers["angle"] = angle.astype(np.float32)
     else:
         centers = pd.DataFrame(
             {
@@ -2003,6 +2589,7 @@ def _convert_G5M_results(
         "lpz",
         "group",
         "group_input",
+        "angle",
     ]
     for col in locs_group.columns:
         if col not in ignore_columns:
@@ -2042,22 +2629,39 @@ def sum_G5Ms(g5ms: list[G5M]) -> G5M:
             n_locs.append(n)
     n_locs = np.array(n_locs).astype(float)
     weights = n_locs / n_locs.sum()
+    # check that all G5Ms use the same component shape
+    if not all(_.covariance_type == g5ms[0].covariance_type for _ in g5ms):
+        raise ValueError("All G5Ms must have the same covariance_type.")
+
     # get means
     means = np.vstack([_.means for _ in g5ms])
-    # get covariances, note that the shape of the covs array depends
-    # on the dimensionality: 2D -> shape: (n_components, ), 3D -> shape:
-    # (n_components, 3)
-    if g5ms[0].__class__ == G5M_2D:
+    # get covariances, note that the shape of the covs array depends on
+    # the covariance type: spherical -> (n_components,), diagonal ->
+    # (n_components, 3), rotated -> (n_components, 3, 3)
+    covariance_type = g5ms[0].covariance_type
+    if covariance_type == "spherical":
         covs = np.hstack([_.covariances for _ in g5ms])
-    elif g5ms[0].__class__ == G5M_3D:
+        pc = 1 / np.sqrt(covs)
+    elif covariance_type == "diagonal":
         covs = np.stack([_.covariances for _ in g5ms]).reshape(len(weights), 3)
-    pc = 1 / np.sqrt(covs)
+        pc = 1 / np.sqrt(covs)
+    else:  # rotated
+        covs = np.concatenate([_.covariances for _ in g5ms], axis=0)
+        pc = _precision_chol_3D_rot(covs)
 
+    kwargs = {}
+    if isinstance(g5ms[0], G5M_3D):
+        # G5M_2D takes no calibration/mode/covariance_type
+        kwargs = {
+            "calibration": g5ms[0].calibration,
+            "mode": g5ms[0].mode,
+            "covariance_type": covariance_type,
+        }
     sum_g5m = g5ms[0].__class__(
         n_components=len(weights),
         min_locs=g5ms[0].min_locs,
         sigma_bounds=g5ms[0].sigma_bounds,
-        calibration=g5ms[0].calibration,
+        **kwargs,
     )
 
     # set parameters (just like after fitting)
@@ -2081,6 +2685,7 @@ def _fit_G5M(
     cx: np.ndarray = np.array([]),
     cy: np.ndarray = np.array([]),
     mag_factor: float = 0.79,
+    angles: np.ndarray = np.array([]),
 ) -> tuple[
     tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     bool,
@@ -2127,6 +2732,9 @@ def _fit_G5M(
     mag_factor : float, optional
         Magnification factor for astigmatism fitting. Required for 3D
         data only.
+    angles : np.ndarray, optional
+        Angle of each localization in radians, shape (n_samples,). Used
+        only by the rotated 3D model; empty otherwise.
 
     Returns
     -------
@@ -2137,6 +2745,20 @@ def _fit_G5M(
     valid_idx : np.ndarray
         Indices of the valid components (min_locs).
     """
+    # The kernels are selected by the ndim of init_precisions_cholesky.
+    # numba constant-folds .ndim for a direct argument and prunes the
+    # dead branches, so each specialization compiles exactly one of
+    # these. This works only while every model maps to a distinct ndim:
+    #   2D spherical (n_init, K)       -> 2
+    #   3D diagonal  (n_init, K, 3)    -> 3
+    #   3D rotated   (n_init, K, 3, 3) -> 4
+    # Adding a 2D diagonal (n_init, K, 2) or 2D rotated
+    # (n_init, K, 2, 2) model would collide with the 3D entries above
+    # and this dispatch would have to be replaced - e.g. by passing the
+    # three kernels in as numba Dispatcher arguments chosen from a
+    # Python-level table keyed on (n_dimensions, covariance_type). Note
+    # that such callees must not use keyword-only arguments, which
+    # cannot be bound through a Dispatcher-typed argument.
     if init_precisions_cholesky.ndim == 2:  # 2D data
         e_step = _e_step_2D
         m_step = _m_step_2D
@@ -2145,6 +2767,10 @@ def _fit_G5M(
         e_step = _e_step_3D
         m_step = _m_step_3D
         check_resolution = _check_G5M_resolution_3D
+    elif init_precisions_cholesky.ndim == 4:  # 3D, rotated xy block
+        e_step = _e_step_3D_rot
+        m_step = _m_step_3D_rot
+        check_resolution = _check_G5M_resolution_3D_rot
     else:
         raise ValueError(
             "Only 2D and 3D data are supported. Data points suggest "
@@ -2189,6 +2815,7 @@ def _fit_G5M(
                 cx=cx,
                 cy=cy,
                 mag_factor=mag_factor,
+                angles=angles,
             )
             lower_bound = log_prob_norm
             change = lower_bound - prev_lower_bound
@@ -2232,9 +2859,13 @@ def _run_g5m_in_clusters(
     calibration: dict | None,
     max_locs_per_cluster: int,
     mode: Literal["astigmatism", "spline"] = "astigmatism",
+    covariance_type: Literal["diagonal", "rotated"] = "diagonal",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run G5M for a given group of localizations clusters. See ``g5m``
     for parameters explanation.
+
+    Note that the arguments are passed positionally by
+    ``_run_g5m_parallel``, so their order must be kept in sync there.
 
     Parameters
     ----------
@@ -2264,6 +2895,7 @@ def _run_g5m_in_clusters(
                 sigma_bounds=sigma_bounds,
                 pixelsize=pixelsize,
                 mode=mode,
+                covariance_type=covariance_type,
                 max_rounds_without_best_bic=max_rounds_without_best_bic,
                 bootstrap_check=bootstrap_check,
                 max_locs_per_cluster=max_locs_per_cluster,
@@ -2297,6 +2929,7 @@ def _run_g5m_parallel(
     calibration: dict | None = None,
     max_locs_per_cluster: int = np.inf,
     mode: Literal["astigmatism", "spline"] = "astigmatism",
+    covariance_type: Literal["diagonal", "rotated"] = "diagonal",
 ) -> list:
     """Run G5M in parallel using multiprocessing. See ``g5m`` for
     parameters explanation.
@@ -2337,6 +2970,7 @@ def _run_g5m_parallel(
                 calibration,
                 max_locs_per_cluster,
                 mode,
+                covariance_type,
             )
         )
     return fs
@@ -2356,6 +2990,7 @@ def _g5m(
     n_steps: int,
     progress: lib.ProgressType,
     mode: Literal["astigmatism", "spline"] = "astigmatism",
+    covariance_type: Literal["diagonal", "rotated"] = "diagonal",
 ) -> tuple[list[pd.DataFrame], list[pd.DataFrame]]:
     """Run G5M with or without multiprocessing. The function returns the
     centers of the G5M components and localizations with assigned cluster
@@ -2372,6 +3007,7 @@ def _g5m(
             calibration=calibration,
             max_locs_per_cluster=max_locs_per_cluster,
             mode=mode,
+            covariance_type=covariance_type,
         )
 
         # display progress
@@ -2399,6 +3035,7 @@ def _g5m(
                     sigma_bounds=sigma_bounds,
                     pixelsize=pixelsize,
                     mode=mode,
+                    covariance_type=covariance_type,
                     max_rounds_without_best_bic=max_rounds_without_best_bic,
                     bootstrap_check=bootstrap_check,
                     max_locs_per_cluster=max_locs_per_cluster,
@@ -2427,6 +3064,85 @@ def _g5m(
     return centers, clustered_locs
 
 
+def _resolve_covariance_type(
+    covariance_type: Literal["auto", "spherical", "diagonal", "rotated"],
+    locs: pd.DataFrame,
+    mode: Literal["astigmatism", "spline"],
+) -> Literal["spherical", "diagonal", "rotated"]:
+    """Resolve the ``"auto"`` sentinel and validate the requested
+    covariance type against the data.
+
+    "auto" selects "rotated" for 3D astigmatism localizations that carry
+    an ``angle`` column, i.e. those fitted with the rotated elliptical
+    Gaussian PSF model. For such data the astigmatic stretch does not run
+    along the camera axes, so the axis-aligned model would apply the
+    calibration in the wrong frame. Everything else keeps the model it
+    has always used.
+
+    Parameters
+    ----------
+    covariance_type : {"auto", "spherical", "diagonal", "rotated"}
+        Requested covariance type.
+    locs : pd.DataFrame
+        Localizations, used to detect dimensionality and the presence of
+        an "angle" column.
+    mode : {"astigmatism", "spline"}
+        Fitting mode of the input localizations (3D only).
+
+    Returns
+    -------
+    covariance_type : {"spherical", "diagonal", "rotated"}
+        Resolved covariance type.
+    """
+    is_3d = "z" in locs.columns
+    has_angle = "angle" in locs.columns
+
+    if covariance_type not in ("auto",) + COVARIANCE_TYPES:
+        raise ValueError(
+            f"covariance_type must be 'auto' or one of {COVARIANCE_TYPES}, "
+            f"got '{covariance_type}'."
+        )
+
+    if covariance_type == "auto":
+        if not is_3d:
+            return "spherical"
+        if mode == "astigmatism" and has_angle:
+            return "rotated"
+        return "diagonal"
+
+    # explicitly requested - validate it against the data
+    if covariance_type == "spherical" and is_3d:
+        raise ValueError(
+            "covariance_type='spherical' is not available for 3D data: "
+            "the axial localization precision is several times worse "
+            "than the lateral one, so an isotropic component is not "
+            "meaningful. Use 'diagonal' or 'rotated'."
+        )
+    if covariance_type in ("diagonal", "rotated") and not is_3d:
+        raise ValueError(
+            f"covariance_type='{covariance_type}' is not available for 2D "
+            "data. Use 'spherical'."
+        )
+    if covariance_type == "rotated":
+        if mode != "astigmatism":
+            raise ValueError(
+                "covariance_type='rotated' requires mode='astigmatism'. "
+                "The rotated model couples the two principal axes of the "
+                "xy block via the astigmatism calibration, which spline "
+                "fitting does not provide. Use mode='astigmatism', or "
+                "covariance_type='diagonal'."
+            )
+        if not has_angle:
+            raise ValueError(
+                "covariance_type='rotated' requires an 'angle' column in "
+                "the localizations. It is written by picasso.localize "
+                "when fitting with a rotated elliptical Gaussian model "
+                "(e.g. 'gausslq-rotated'). Use covariance_type='diagonal' "
+                "for localizations fitted without rotation."
+            )
+    return covariance_type
+
+
 def g5m(
     locs: pd.DataFrame,
     info: list[dict],
@@ -2438,6 +3154,9 @@ def g5m(
     bootstrap_check: bool = False,
     calibration: dict | None = None,
     mode: Literal["astigmatism", "spline"] = "astigmatism",
+    covariance_type: Literal[
+        "auto", "spherical", "diagonal", "rotated"
+    ] = "auto",
     postprocess: bool = True,
     max_locs_per_cluster: int = np.inf,
     asynch: bool = True,
@@ -2489,6 +3208,18 @@ def g5m(
         model (independent x/y/z covariances) and reads z/lpz directly
         from the localizations, requiring no calibration. Ignored for 2D
         data. Default is "astigmatism".
+    covariance_type : {"auto", "spherical", "diagonal", "rotated"}, optional
+        Shape of the fitted loc. clouds. "spherical" is the isotropic
+        2D model and "diagonal" the axis-aligned 3D one. "rotated"
+        orients each component's xy covariance along the angle reported
+        by the localizations, for 3D astigmatism data localized with the
+        rotated elliptical Gaussian PSF model. It requires 3D localizations,
+        ``mode="astigmatism"`` and an "angle" column, and adds the
+        columns "fitted_sigma_major", "fitted_sigma_minor",
+        "rel_sigma_major", "rel_sigma_minor", "axis_ratio" and "angle"
+        to the output. "auto" selects "rotated" for 3D astigmatism data
+        with the "angle" column; "diagonal" for 3D astigmatism data
+        without the column and "spherical" for 2D data. Default is "auto".
     postprocess : bool, optional
         If True, the G5M components are postprocessed to remove likely
         sticky events (mean frame, std frame, n_events filtering).
@@ -2553,6 +3284,10 @@ def g5m(
         "spline",
     ], "mode must be 'astigmatism' or 'spline'."
 
+    # resolve "auto" once, here, so that everything downstream (and the
+    # metadata) sees the concrete model that was actually used
+    covariance_type = _resolve_covariance_type(covariance_type, locs, mode)
+
     pixelsize = lib.get_from_metadata(info, "Pixelsize")
     if pixelsize is None:
         raise ValueError("Camera pixel size must be provided in info.")
@@ -2602,6 +3337,7 @@ def g5m(
         n_steps=n_steps,
         progress=progress,
         mode=mode,
+        covariance_type=covariance_type,
     )
     # stack centers to form a pd.DataFrame in the format of localizations
     if len(centers):
@@ -2625,6 +3361,9 @@ def g5m(
         "Max. rounds w/o BIC improvement": max_rounds_without_best_bic,
         "Bootstrap SEM": bootstrap_check,
         "Initialization method": "KMeans++",
+        # the resolved type, not the requested one, so the saved file
+        # always records the model that actually ran
+        "Covariance type": covariance_type,
         "Filtered": False,
     }
     if loc_prec_handle == "local":

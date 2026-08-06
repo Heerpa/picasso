@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 04-AUG-2026 CEST
+Last change: 06-AUG-2026 CEST
 
 ## 0.11.0
 
@@ -66,10 +66,15 @@ Last change: 04-AUG-2026 CEST
 - "Apply to all sequentially" available for drift correction algorithms, including drift from an external file
 - "Apply to all sequentially" available in Apply expression to localizations
 - G5M now supports 3D localizations fit with the experimental spline PSF, not only astigmatism.
+- G5M can model rotated (elliptical) molecules in 3D
 - G5M accepts `group_input` as the cluster id columns (useful if `group` is overwritten after clustering)
 - Re-grouping localizations (picking, DBSCAN/HDBSCAN/SMLM clustering) now preserves the previous grouping in the `group_input` column instead of discarding it, so the original cluster ids remain available (e.g. for G5M)
 - Updated G5M documentation - drift correction importance
 - Test clusterer with a constrast bar
+- Select localizations in the center of the binding event added. See [Steen et al., Nature Methods 21, 1755-1762 (2024)](https://doi.org/10.1038/s41592-024-02374-8), Extended Data Fig. 1f
+- Removed the switch to no blur method while panning
+- Fixed `picasso.g5m` bootstrap SEM (`bootstrap_check=True`) raising `AssertionError` for spline 3D data, because the resampling model was rebuilt without carrying over the fit mode
+- Fixed `picasso.g5m.sum_G5Ms` raising `TypeError` for a list of 2D models, because a calibration was passed to `G5M_2D`, which does not accept one
 - Fixed removed plugins menu after removing all localizations
 - Fixed pick similar numba error [#684](https://github.com/jungmannlab/picasso/issues/684)
 - Fixed "Combine all channels" when saving localizations only saving the first channel when channels had differing columns
@@ -92,6 +97,7 @@ Last change: 04-AUG-2026 CEST
 - Removed folder `distribution` from the repository; `create_linux_shortcuts.py` was moved to `release`
 - Removed `notification_sounds` folder, the users can add their notification sounds in the `.picasso` folder
 - Progress reporting now goes through a uniform duck-typed interface (`lib.normalize_progress`): `None`, `"console"` and `lib.ProgressDialog` arguments are normalized once at the public entry points and driven with plain method calls, replacing the per-call-site `isinstance`/`"console"` branches — so headless runs never touch Qt at runtime either. `lib.TqdmProgress` and `lib.MockProgress` now implement the full `ProgressDialog` interface (`setMaximum`, `maximum`, `zero_progress`, `close`)
+- Localizations imported from ThunderSTORM and SMAP maintain all their columns, not only the Picasso pre-defined ones
 
 ### **Backward incompatible changes:**
 - All the functions deprecated in v0.10 were removed, see section 0.10.0 below

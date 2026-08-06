@@ -1972,6 +1972,88 @@ def link(
     return linked_locs
 
 
+def select_binding_event_cores(
+    locs: pd.DataFrame,
+    r_max: float = 0.1,
+    max_dark_time: int = 0,
+    min_n_locs: int = 3,
+) -> pd.DataFrame:
+    """Select the localizations in the temporal centers of binding
+    events.
+
+    Localizations are grouped into binding events by their
+    spatiotemporal proximity (as in ``link``), and only the
+    localizations that are not at the borders of a binding event are
+    kept, i.e., those in the first and the last frame of each event are
+    discarded. Such localizations only capture a part of the emission
+    event (the imager binds or unbinds during the camera exposure) and
+    thus have a biased photon count, see Steen et al., Nat Methods 21,
+    1755-1762 (2024), Extended Data Fig. 1f.
+
+    Each retained binding event is assigned a unique value in the
+    'group' column. If ``locs`` was already grouped, the previous
+    grouping is preserved in the 'group_input' column (and the binding
+    events do not span several input groups).
+
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations.
+    r_max : float, optional
+        Maximum distance (camera pixels) between localizations to be
+        considered as originating from the same binding event. Default
+        is 0.1.
+    max_dark_time : int, optional
+        Maximum number of frames between localizations to be considered
+        as originating from the same binding event. Default is 0.
+    min_n_locs : int, optional
+        Minimum number of localizations in a binding event for it to be
+        considered. Events with fewer localizations are discarded
+        entirely. Since the first and the last localization of each
+        event are discarded, values below 3 leave no localizations.
+        Default is 3.
+
+    Returns
+    -------
+    out_locs : pd.DataFrame
+        Localizations in the cores of binding events, with the 'group'
+        column assigned uniquely to each binding event. If ``locs`` was
+        already grouped, the previous grouping is kept in
+        'group_input'.
+    """
+    out_locs = locs.sort_values(kind="quicksort", by="frame")
+    if len(out_locs) == 0:
+        return lib.append_group(out_locs.copy(), np.array([], dtype=np.int32))
+
+    if "group" in out_locs.columns:
+        group = out_locs["group"].to_numpy()
+    else:
+        group = np.zeros(len(out_locs), dtype=np.int32)
+    frame = out_locs["frame"].to_numpy()
+    x = out_locs["x"].to_numpy()
+    y = out_locs["y"].to_numpy()
+    link_group = _get_link_groups(frame, x, y, r_max, max_dark_time, group)
+
+    # find the first and the last frame of each binding event; a link
+    # group holds at most one localization per frame
+    n_locs = len(link_group)
+    n_groups = link_group.max() + 1
+    n_locs_per_event = _link_group_count(link_group, n_locs, n_groups)
+    first_frame, last_frame = _link_group_min_max(
+        frame, link_group, n_locs, n_groups
+    )
+
+    keep = (
+        (n_locs_per_event[link_group] >= min_n_locs)
+        & (frame != first_frame[link_group])
+        & (frame != last_frame[link_group])
+    )
+    out_locs = out_locs[keep].copy()
+    # relabel the surviving events with consecutive group ids
+    event_id = np.unique(link_group[keep], return_inverse=True)[1]
+    return lib.append_group(out_locs, event_id.astype(np.int32))
+
+
 def combine_locs_in_picks(
     locs: pd.DataFrame,
     info: list[dict],

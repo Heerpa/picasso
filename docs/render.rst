@@ -95,6 +95,8 @@ Note that G5M assumes that the localization precision values (``lpx``, ``lpy`` a
 
 Prior to molecular mapping, clustering of localizations is required to split the data into smaller chunks. For many datasets, DBSCAN works well. While in some cases some adjustments may be needed, we recommend the following DBSCAN parameters: In 2D, DBSCAN radius (epsilon) of 2*LP, in 3D - 3*LP (LP - average localization precision of the dataset, for example, NeNA or median localization precision). Default min. samples is set to 4. Clustering in Picasso adds the ``group`` column to the localization file, which is required for G5M. **Note: G5M relies on the information in the ``group`` column, therefore, if it is overwritten (for example, by picking localizations after DBSCAN clustering), G5M will not work.**
 
+Localizations obtained with the rotated elliptical Gaussian model will automatically take the mean value of the xy-plane rotation and apply it to the fitted molecule.
+
 To account for fluorophore non-specific sticking, frame analysis is normally recommended (especially the filtering of st. dev. of frame per molecule). However, if localizations from neighboring localization clouds overlap, this is not sufficient due to ambigous assignment of localizations to molecules. Therefore, we recommend filtering of molecules that express too few binding events (saved in the column ``n_events``). In the publication, we recommend a threshold of at least 3 binding events per molecule.
 
 The final postprocessing step is log-likelihood filtering (using the column ``p_val``). The recommended threshold is ``> 0.0015``, however, it might need to be adjusted for your data, especially in 3D this can be too conservative.
@@ -506,7 +508,13 @@ Arranges an average in a square so that each structure is displayed individually
 
 Link localizations
 ^^^^^^^^^^^^^^^^^^
-Links consecutive localizations
+Links localizations originating from individual binding events. If the localizations were already grouped the binding events are never linked across two input groups.
+
+Select central frames localizations
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Groups localizations into binding events, exactly like *Link localizations* (same dialog: maximum distance and maximum number of transient dark frames), but instead of merging each binding event into a single localization, it keeps the localizations that are not at the borders of the event, i.e., those in the first and the last frame of each event are discarded, see `Steen et al., Nature Methods 21, 1755-1762 (2024) <https://doi.org/10.1038/s41592-024-02374-8>`_, Extended Data Fig. 1f.
+
+The retained localizations of each binding event are assigned a unique value in the *group* column. If the localizations were already grouped (e.g., by picking or clustering), the previous grouping is preserved in the *group_input* column, and binding events are never linked across two input groups.
 
 Align channels (RCC or from picked)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

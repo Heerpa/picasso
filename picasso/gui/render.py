@@ -2729,13 +2729,18 @@ class LinkDialog(lib.Dialog):
     ----------
     max_dark_time : QDoubleSpinBox
         Contains the maximum gap between localizations (frames) to be
-        considered as belonging to the same group of linked locs.
+        considered as belonging to the same group of linked locs. The
+        suggested value is set by the caller, see ``getParams``.
     max_distance : QDoubleSpinBox
         Contains the maximum distance (nm) between locs to be
         considered as belonging to the same group of linked locs.
     """
 
-    def __init__(self, window: QtWidgets.QMainWindow) -> None:
+    def __init__(
+        self,
+        window: QtWidgets.QMainWindow,
+        max_dark_time: int = 3,
+    ) -> None:
         super().__init__(window)
         self.window = window
         self.setWindowTitle("Enter parameters")
@@ -2759,7 +2764,7 @@ class LinkDialog(lib.Dialog):
         grid.addWidget(dark_label, 1, 0)
         self.max_dark_time = QtWidgets.QSpinBox()
         self.max_dark_time.setRange(0, int(1e9))
-        self.max_dark_time.setValue(3)
+        self.max_dark_time.setValue(max_dark_time)
         grid.addWidget(self.max_dark_time, 1, 1)
         vbox.addLayout(grid)
         hbox = QtWidgets.QHBoxLayout()
@@ -2778,10 +2783,12 @@ class LinkDialog(lib.Dialog):
     @staticmethod
     def getParams(
         parent: QtWidgets.QMainWindow | None = None,
+        max_dark_time: int = 3,
     ) -> tuple[dict, bool]:
         """Create the dialog and return the requested values for
-        linking."""
-        dialog = LinkDialog(parent)
+        linking. ``max_dark_time`` sets the value suggested in the
+        dialog."""
+        dialog = LinkDialog(parent, max_dark_time=max_dark_time)
         result = dialog.exec()
         return (
             dialog.max_distance.value(),
@@ -2943,6 +2950,18 @@ class SMLMDialog(lib.Dialog):
         )
 
 
+def locs_are_spline(infos: list[dict]) -> bool:
+    """Return True if the localizations described by ``infos`` were fit
+    with a cubic-spline PSF (based on the localization metadata)."""
+    fit_method = lib.get_from_metadata(infos, "Fit method")
+    if fit_method is not None and "spline" in str(fit_method).lower():
+        return True
+    for key in ("Spline calibration model", "Spline Calibration Model"):
+        if lib.get_from_metadata(infos, key) is not None:
+            return True
+    return False
+
+
 class G5MDialog(lib.Dialog):
     """Extract parameters for G5M: ``min_locs``, ``min_sigma``,
     ``max_sigma``. For 3D, calibration is requested. The user can also
@@ -2965,6 +2984,7 @@ class G5MDialog(lib.Dialog):
         first_row = QtWidgets.QHBoxLayout()
         grid.addLayout(first_row, 0, 0, 1, 2)
         self.calibration = None
+        self.spline_mode = False
 
         first_row.addWidget(lib.HelpButton(self.DOCS_URL))
         # min locs per molecule
@@ -3100,20 +3120,24 @@ class G5MDialog(lib.Dialog):
             QtCore.Qt.Orientation.Horizontal,
             self,
         )
-        if self.flag_3D:  # 3d data - choose astigmatism vs spline
-            # mode selector: astigmatism needs a calibration, spline
-            # recovers z (and lpz) directly and needs none
-            self.z_mode = QtWidgets.QComboBox()
-            self.z_mode.setToolTip(
-                "Fitting mode of the input 3D localizations.\n"
+        if self.flag_3D:  # 3d data - astigmatism or spline
+            # the mode is detected from the localization metadata, not
+            # chosen by the user: astigmatism needs a 3D calibration,
+            # spline recovers z (and lpz) directly and needs none
+            self.spline_mode = self._locs_are_spline()
+            z_mode_label = QtWidgets.QLabel("3D fit mode:")
+            self.z_mode_label = QtWidgets.QLabel(
+                "Spline PSF" if self.spline_mode else "Astigmatism (Gaussian)"
+            )
+            self.z_mode_label.setToolTip(
+                "Fitting mode of the input 3D localizations, detected\n"
+                "automatically from the localization metadata.\n"
                 "'Astigmatism (Gaussian)' couples the x/y widths via the\n"
                 "3D calibration; 'Spline PSF' uses a plain diagonal 3D\n"
                 "model and reads z/lpz directly from the localizations."
             )
-            self.z_mode.addItems(["Astigmatism (Gaussian)", "Spline PSF"])
-            z_mode_label = QtWidgets.QLabel("3D fit mode:")
             grid.addWidget(z_mode_label, grid.rowCount(), 0)
-            grid.addWidget(self.z_mode, grid.rowCount() - 1, 1)
+            grid.addWidget(self.z_mode_label, grid.rowCount() - 1, 1)
 
             self.load_calib_button = QtWidgets.QPushButton(
                 "Load 3D calibration"
@@ -3126,11 +3150,11 @@ class G5MDialog(lib.Dialog):
             self.load_calib_button.clicked.connect(self.load_calibration)
             grid.addWidget(self.load_calib_button, grid.rowCount(), 0, 1, 2)
 
-            self.z_mode.currentIndexChanged.connect(self.handle_z_mode)
-            # default to spline if the locs were fit with a spline PSF
-            if self._locs_are_spline():
-                self.z_mode.setCurrentIndex(1)
-            self.handle_z_mode(self.z_mode.currentIndex())
+            if self.spline_mode:  # no calibration required
+                self.load_calib_button.setVisible(False)
+            else:  # astigmatism - OK stays disabled until a calibration
+                self.buttons.buttons()[0].setEnabled(False)
+                self.automatic_load_calibration()
 
         vbox.addWidget(self.buttons)  # these must be added at the end
         self.buttons.accepted.connect(self.accept)
@@ -3165,11 +3189,7 @@ class G5MDialog(lib.Dialog):
             "postprocess_check": dialog.postprocess_check.isChecked(),
         }
         if dialog.flag_3D:
-            mode = (
-                "spline"
-                if dialog.z_mode.currentIndex() == 1
-                else "astigmatism"
-            )
+            mode = "spline" if dialog.spline_mode else "astigmatism"
             params["mode"] = mode
             params["pixelsize"] = px
             if mode == "astigmatism":
@@ -3206,31 +3226,11 @@ class G5MDialog(lib.Dialog):
             self.min_sigma.setValue(5.0)
             self.max_sigma.setValue(20.0)
 
-    def handle_z_mode(self, idx: int) -> None:
-        """Switch between astigmatism (needs a calibration) and spline
-        (no calibration needed) 3D fitting modes."""
-        if idx == 1:  # spline PSF - no calibration required
-            self.load_calib_button.setEnabled(False)
-            self.buttons.buttons()[0].setEnabled(True)
-        else:  # astigmatism - require a calibration
-            self.load_calib_button.setEnabled(True)
-            # OK stays disabled until a calibration is loaded
-            self.buttons.buttons()[0].setEnabled(self.calibration is not None)
-            if self.calibration is None:
-                self.automatic_load_calibration()
-
     def _locs_are_spline(self) -> bool:
         """Return True if the loaded localizations were fit with a
         spline PSF (based on the localization metadata)."""
         ch = self.channel if self.channel != len(self.window.view.locs) else 0
-        infos = self.window.view.infos[ch]
-        fit_method = lib.get_from_metadata(infos, "Fit method")
-        if fit_method is not None and "spline" in str(fit_method).lower():
-            return True
-        for key in ("Spline calibration model", "Spline Calibration Model"):
-            if lib.get_from_metadata(infos, key) is not None:
-                return True
-        return False
+        return locs_are_spline(self.window.view.infos[ch])
 
     def load_calibration(self) -> None:
         """Load the calibration file selected by the user."""
@@ -3544,10 +3544,13 @@ class TestClustererDialog(lib.Dialog):
         idx = self.channels.currentIndex()
         if idx < 0 or idx >= len(self.window.view.locs):
             is_3d = False
+            is_spline = False
         else:
             is_3d = "z" in self.window.view.locs[idx].columns
+            is_spline = locs_are_spline(self.window.view.infos[idx])
         self.test_dbscan_params.set_3d(is_3d)
         self.test_smlm_params.set_3d(is_3d)
+        self.test_g5m_params.set_3d(is_3d, is_spline)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         self._update_3d_visibility()
@@ -3678,7 +3681,7 @@ class TestClustererDialog(lib.Dialog):
             params["G5M"][
                 "postprocess"
             ] = self.test_g5m_params.postprocess_check.isChecked()
-            if self.test_g5m_params.z_mode.currentIndex() == 1:  # spline
+            if self.test_g5m_params.spline_mode:  # spline
                 params["G5M"]["mode"] = "spline"
                 params["G5M"]["calibration"] = None
             else:  # astigmatism
@@ -4089,25 +4092,37 @@ class TestG5MParams(QtWidgets.QWidget):
             "- p_val < 0.015"
         )
 
-        # 3D fit mode (only consulted for 3D data): astigmatism needs a
-        # calibration, spline recovers z/lpz directly and needs none
-        self.z_mode = QtWidgets.QComboBox()
-        self.z_mode.setToolTip(
-            "Fitting mode of the input 3D localizations.\n"
+        # 3D fit mode (only consulted for 3D data), detected from the
+        # localization metadata rather than chosen by the user:
+        # astigmatism needs a calibration, spline recovers z/lpz directly
+        self.spline_mode = False
+        self.z_mode_title = QtWidgets.QLabel("3D fit mode:")
+        self.z_mode_label = QtWidgets.QLabel("Astigmatism (Gaussian)")
+        self.z_mode_label.setToolTip(
+            "Fitting mode of the input 3D localizations, detected\n"
+            "automatically from the localization metadata.\n"
             "'Astigmatism (Gaussian)' couples the x/y widths via the 3D\n"
             "calibration; 'Spline PSF' uses a plain diagonal 3D model and\n"
             "reads z/lpz directly from the localizations (no calibration)."
         )
-        self.z_mode.addItems(["Astigmatism (Gaussian)", "Spline PSF"])
-        z_mode_label = QtWidgets.QLabel("3D fit mode (3D only):")
-        grid.addWidget(z_mode_label, grid.rowCount(), 0)
-        grid.addWidget(self.z_mode, grid.rowCount() - 1, 1)
+        grid.addWidget(self.z_mode_title, grid.rowCount(), 0)
+        grid.addWidget(self.z_mode_label, grid.rowCount() - 1, 1)
 
-        load_calib_button = QtWidgets.QPushButton(
-            "Load 3D calibration (astigmatism only)"
+        self.load_calib_button = QtWidgets.QPushButton("Load 3D calibration")
+        self.load_calib_button.clicked.connect(self.load_calibration)
+        grid.addWidget(self.load_calib_button, grid.rowCount(), 0, 1, 2)
+        self.set_3d(False)
+
+    def set_3d(self, is_3d: bool, is_spline: bool = False) -> None:
+        """Show the detected 3D fit mode and only offer the calibration
+        button when it is actually needed (3D astigmatism data)."""
+        self.spline_mode = is_3d and is_spline
+        self.z_mode_label.setText(
+            "Spline PSF" if self.spline_mode else "Astigmatism (Gaussian)"
         )
-        load_calib_button.clicked.connect(self.load_calibration)
-        grid.addWidget(load_calib_button, grid.rowCount(), 0, 1, 2)
+        self.z_mode_title.setVisible(is_3d)
+        self.z_mode_label.setVisible(is_3d)
+        self.load_calib_button.setVisible(is_3d and not self.spline_mode)
 
     def load_calibration(self) -> None:
         """Load the 3D calibration .yaml file."""
@@ -4122,7 +4137,7 @@ class TestG5MParams(QtWidgets.QWidget):
                 "Please load a 3D calibration .yaml file produced by"
                 " Picasso: Localize."
             )
-            QtWidgets.QMessageBox.information(self.window, "Warning", message)
+            QtWidgets.QMessageBox.information(self, "Warning", message)
             return
         self.calibration = calib
 
@@ -7595,6 +7610,59 @@ class View(QtWidgets.QLabel):
                     )
                 self.update_scene(resample_locs=True)
 
+    def select_binding_event_cores(self) -> None:
+        """Keep only the localizations that are not at the borders of
+        their binding events and group them by binding event.
+
+        See ``picasso.postprocess.select_binding_event_cores`` for more
+        details."""
+        channel = self.get_channel("Select binding event cores")
+        if channel is None:
+            return
+        if "len" in self.locs[channel].columns:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Select binding event cores",
+                "Localizations are already linked. Aborting.",
+            )
+            return
+        # by default, do not allow transient dark frames, so that only
+        # localizations in strictly consecutive frames form an event
+        r_max, max_dark, ok = LinkDialog.getParams(max_dark_time=0)
+        if not ok:
+            return
+        r_max /= self.pixelsize  # nm to pixels
+        status = lib.StatusDialog("Selecting binding event cores...", self)
+        locs = postprocess.select_binding_event_cores(
+            self.locs[channel],
+            r_max=r_max,
+            max_dark_time=max_dark,
+        )
+        status.close()
+        if len(locs) == 0:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Select binding event cores",
+                (
+                    "No localizations left. Consider increasing the maximum"
+                    " distance and/or the maximum number of transient dark"
+                    " frames."
+                ),
+            )
+            return
+        self.locs[channel] = locs
+        self.infos[channel].append(
+            {
+                "Generated by": (
+                    f"Picasso v{__version__} Render : Binding event cores"
+                ),
+                "Max. distance (nm)": r_max * self.pixelsize,
+                "Max. transient dark frames": max_dark,
+            }
+        )
+        self.group_color = render.get_group_color(locs, shuffle=True)
+        self.update_scene(resample_locs=True)
+
     def dbscan(self) -> None:
         """Get a channel, parameters and path for DBSCAN."""
         channel = self.get_channel_all_seq("DBSCAN")
@@ -8013,16 +8081,14 @@ class View(QtWidgets.QLabel):
         if not ok:
             return
 
-        max_locs_per_channel = []
         channels = (
             range(len(self.locs)) if channel == len(self.locs) else [channel]
         )
-        for i in channels:
-            if not self.check_group(i, params["group_column"]):
-                return
-            max_locs_per_channel.append(
-                self.check_max_locs(i, params["group_column"])
-            )
+        max_locs_per_channel = self._g5m_max_locs_per_channel(
+            channels, params["group_column"]
+        )
+        if max_locs_per_channel is None:  # a channel is not clustered
+            return
         params["max_locs_per_cluster"] = max_locs_per_channel
 
         # for subcluster check plots
@@ -8136,6 +8202,7 @@ class View(QtWidgets.QLabel):
             bootstrap_check=params["bootstrap_check"],
             calibration=params.get("calibration", None),
             mode=params.get("mode", "astigmatism"),
+            covariance_type=params.get("covariance_type", "auto"),
             postprocess=params["postprocess_check"],
             max_locs_per_cluster=params["max_locs_per_cluster"][channel],
             asynch=params["multiprocessing_check"],
@@ -8143,6 +8210,26 @@ class View(QtWidgets.QLabel):
             callback_parent=self.window,
         )
         return centers, clustered_locs, info
+
+    def _g5m_max_locs_per_channel(
+        self, channels, group_column: str = "group"
+    ) -> dict[int, float] | None:
+        """Max. locs per cluster for each channel to be processed.
+
+        Keyed by the *absolute* channel index, because ``View._g5m``
+        looks the value up by channel. A list would only be correct when
+        every channel is processed; running a single channel of
+        multichannel data would index out of range.
+
+        Returns None if any channel is not clustered, meaning G5M should
+        not run.
+        """
+        max_locs_per_channel = {}
+        for i in channels:
+            if not self.check_group(i, group_column):
+                return None
+            max_locs_per_channel[i] = self.check_max_locs(i, group_column)
+        return max_locs_per_channel
 
     def check_group(self, channel: int, group_column: str = "group") -> bool:
         """Check whether the data has been grouped (clustered) in
@@ -8186,8 +8273,7 @@ class View(QtWidgets.QLabel):
             )
             if ret == qm.StandardButton.Yes:
                 return max_locs
-        else:
-            return np.inf
+        return np.inf
 
     @check_pick
     def clear_picks(self) -> None:
@@ -8815,23 +8901,23 @@ class View(QtWidgets.QLabel):
         # blur method
         disp_dlg = self.window.display_settings_dlg
         pixelsize = self.pixelsize
-        if self._pan:  # no blur when panning
-            blur_method = None
-        else:  # selected method
-            if blur_method is None:
-                blur_method = disp_dlg.blur_methods[
-                    disp_dlg.blur_buttongroup.checkedButton()
-                ]
-            else:
-                blur_method = {
-                    "None": None,
-                    "One-pixel": "smooth",
-                    "Global loc. prec.": "convolve",
-                    "Individual loc. prec.": "gaussian",
-                    "Individual loc. prec., iso": "gaussian_iso",
-                }[
-                    blur_method
-                ]  # convert from display name to render name
+        # if self._pan:  # no blur when panning
+        #     blur_method = None
+        # else:  # selected method
+        if blur_method is None:
+            blur_method = disp_dlg.blur_methods[
+                disp_dlg.blur_buttongroup.checkedButton()
+            ]
+        else:
+            blur_method = {
+                "None": None,
+                "One-pixel": "smooth",
+                "Global loc. prec.": "convolve",
+                "Individual loc. prec.": "gaussian",
+                "Individual loc. prec., iso": "gaussian_iso",
+            }[
+                blur_method
+            ]  # convert from display name to render name
 
         # oversampling
         optimal_oversampling = self.display_pixels_per_viewport_pixels()
@@ -12406,6 +12492,12 @@ class Window(QtWidgets.QMainWindow):
             "Link localizations (binding events)"
         )
         link_action.triggered.connect(self.view.link)
+        event_cores_action = postprocess_menu.addAction(
+            "Select central frames localizations"
+        )
+        event_cores_action.triggered.connect(
+            self.view.select_binding_event_cores
+        )
         align_action = postprocess_menu.addAction(
             "Align channels (RCC or from picked)"
         )

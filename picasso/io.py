@@ -3946,8 +3946,24 @@ def export_thunderstorm(
     loctxt.to_csv(path, index=False)
 
 
+def _sanitize_column_name(name: str) -> str:
+    """Convert an arbitrary column name to a valid identifier (e.g.,
+    ``"uncertainty_z [nm]"`` -> ``"uncertainty_z_nm"``) so it survives
+    saving as an HDF5 structured array and attribute-style access."""
+    name = re.sub(r"\W+", "_", name.strip()).strip("_")
+    if not name:
+        name = "column"
+    if name[0].isdigit():
+        name = "_" + name
+    return name
+
+
 def import_ts(path: str, pixelsize: float) -> tuple[pd.DataFrame, list[dict]]:
     """Import localization data from a ThunderSTORM .csv file.
+
+    Columns that do not map onto predefined Picasso fields are kept
+    (numeric columns only), with their names sanitized to valid
+    identifiers.
 
     Parameters
     ----------
@@ -4042,6 +4058,23 @@ def import_ts(path: str, pixelsize: float) -> tuple[pd.DataFrame, list[dict]]:
                 "lpy": lpy.astype(np.float32),
             }
         )
+
+    # Keep any additional (non-predefined) numeric columns from the
+    # input file.
+    used_columns = set(expected_columns) | set(expected_columns_z)
+    for name in data.columns:
+        if name in used_columns:
+            continue
+        values = data[name]
+        if not pd.api.types.is_numeric_dtype(values):
+            continue
+        new_name = _sanitize_column_name(name)
+        if new_name in locs.columns:
+            continue
+        if pd.api.types.is_float_dtype(values):
+            values = values.astype(np.float32)
+        locs[new_name] = values
+
     locs.sort_values(kind="quicksort", by="frame", inplace=True)
 
     img_info = {}
@@ -4153,6 +4186,10 @@ def import_smap(
 ) -> tuple[pd.DataFrame, list[dict]]:
     """Import localization data from a SMAP ``_sml.mat`` file.
 
+    Fields that do not map onto predefined Picasso columns (e.g.,
+    ``channel``, ``numberInGroup``) are kept as extra columns, with
+    their names sanitized to valid identifiers.
+
     Parameters
     ----------
     path : str
@@ -4229,6 +4266,31 @@ def import_smap(
 
     if "znm" in loc and "locprecznm" in loc:
         data["lpz"] = loc["locprecznm"].astype(np.float32)
+
+    # Keep any additional (non-predefined) fields from the SMAP file.
+    used_fields = {
+        "frame",
+        "xnm",
+        "ynm",
+        "znm",
+        "phot",
+        "PSFxnm",
+        "PSFynm",
+        "bg",
+        "locprecnm",
+        "locprecxnm",
+        "locprecynm",
+        "locprecznm",
+    }
+    for field, values in loc.items():
+        if field in used_fields or len(values) != n:
+            continue
+        name = _sanitize_column_name(field)
+        if name in data:
+            continue
+        if values.dtype.kind == "f":
+            values = values.astype(np.float32)
+        data[name] = values
 
     locs = pd.DataFrame(data)
     locs.sort_values(kind="quicksort", by="frame", inplace=True)

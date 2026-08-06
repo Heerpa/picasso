@@ -1201,6 +1201,178 @@ def test_spinna_fit_save_csv_creates_file(
     assert "Kolmogorov-Smirnov statistic" in df.columns
 
 
+def test_convert_counts_to_props_squeezes_single_row(mixer_2d_csr):
+    """Single-row input returns 1D, not (1, n_structures).
+
+    Every caller that np.hstack's the result with a 2D counts array
+    must therefore re-expand it (see the save= paths of the three
+    fitting modes).
+    """
+    props = mixer_2d_csr.convert_counts_to_props(
+        np.array([[100, 50]], dtype=np.int32)
+    )
+    assert props.ndim == 1
+    assert props.shape == (2,)
+
+
+def _single_row_fit_setup(het_structures):
+    """2 targets / 2 structures → search space with exactly one row."""
+    structures = [het_structures[0], het_structures[2]]  # MonA + HetAB
+    mixer = StructureMixer(
+        structures=structures,
+        label_unc={"A": LABEL_UNC, "B": LABEL_UNC},
+        le={"A": LE, "B": LE},
+        width=ROI,
+        height=ROI,
+    )
+    ss = spinna.generate_N_structures(
+        structures, {"A": 200, "B": 200}, granularity=5
+    )
+    return structures, mixer, ss
+
+
+@pytest.mark.parametrize(
+    "fitting_mode", ["brute-force", "coarse-to-fine", "bayesian"]
+)
+def test_spinna_fit_save_csv_single_row_search_space(
+    het_structures, tmp_path, fitting_mode
+):
+    """Saving must work when the search space collapses to one row.
+
+    convert_counts_to_props squeezes such a result to 1D, which used to
+    break the np.hstack in every save= branch.
+    """
+    structures, mixer, ss = _single_row_fit_setup(het_structures)
+    assert len(ss["MonA"]) == 1, "fixture no longer yields a 1-row space"
+
+    gt_mixer = StructureMixer(
+        structures=structures,
+        label_unc={"A": LABEL_UNC, "B": LABEL_UNC},
+        le={"A": LE, "B": LE},
+        width=ROI,
+        height=ROI,
+    )
+    np.random.seed(0)
+    gt = gt_mixer.run_simulation([100, 100])
+
+    spinner = SPINNA(mixer=mixer, gt_coords=gt, N_sim=1)
+    np.random.seed(0)
+    out_csv = tmp_path / f"fits_{fitting_mode}.csv"
+    spinner.fit_stoichiometry(
+        N_structures=ss,
+        fitting_mode=fitting_mode,
+        asynch=False,
+        save=str(out_csv),
+    )
+    df = pd.read_csv(out_csv)
+    assert len(df) == 1
+    assert {"N_MonA", "N_HetAB", "Prop_MonA", "Prop_HetAB"}.issubset(
+        df.columns
+    )
+    assert np.allclose(df["Prop_MonA"] + df["Prop_HetAB"], 100.0)
+
+
+@pytest.mark.parametrize("fitting_mode", ["coarse-to-fine", "bayesian"])
+def test_spinna_fit_save_csv_non_brute_force_modes(
+    mixer_2d_csr, monomer_dimer_structures, tmp_path, fitting_mode
+):
+    """coarse-to-fine and bayesian have their own save= code paths."""
+    np.random.seed(0)
+    gt = mixer_2d_csr.run_simulation([100, 50])
+    mixer = StructureMixer(
+        structures=monomer_dimer_structures,
+        label_unc={"target": LABEL_UNC},
+        le={"target": LE},
+        width=ROI,
+        height=ROI,
+    )
+    ss = spinna.generate_N_structures(
+        monomer_dimer_structures, {"target": 200}, granularity=10
+    )
+    spinner = SPINNA(mixer=mixer, gt_coords=gt, N_sim=1)
+    np.random.seed(0)
+    out_csv = tmp_path / f"fits_{fitting_mode}.csv"
+    spinner.fit_stoichiometry(
+        N_structures=ss,
+        fitting_mode=fitting_mode,
+        asynch=False,
+        save=str(out_csv),
+    )
+    if fitting_mode == "coarse-to-fine":
+        # two files are written: coarse and fine pass
+        paths = sorted(tmp_path.glob("*.csv"))
+        assert paths, "no csv written"
+    else:
+        paths = [out_csv]
+    for path in paths:
+        df = pd.read_csv(path)
+        assert len(df) >= 1
+        prop_cols = [c for c in df.columns if c.startswith("Prop_")]
+        assert len(prop_cols) == 2
+        assert np.allclose(df[prop_cols].sum(axis=1), 100.0)
+
+
+def test_coarse_to_fine_save_with_single_candidate_fine_pass(
+    mixer_2d_csr, monomer_dimer_structures, tmp_path
+):
+    """A radius small enough to keep only the coarse winner makes the
+    fine pass a single row — its own save= branch must survive that.
+
+    fit_coarse_to_fine is called directly because fit_stoichiometry
+    exposes no radius argument.
+    """
+    np.random.seed(0)
+    gt = mixer_2d_csr.run_simulation([100, 50])
+    mixer = StructureMixer(
+        structures=monomer_dimer_structures,
+        label_unc={"target": LABEL_UNC},
+        le={"target": LE},
+        width=ROI,
+        height=ROI,
+    )
+    ss = spinna.generate_N_structures(
+        monomer_dimer_structures, {"target": 200}, granularity=10
+    )
+    spinner = SPINNA(mixer=mixer, gt_coords=gt, N_sim=1)
+    np.random.seed(0)
+    out_csv = tmp_path / "c2f.csv"
+    spinner.fit_coarse_to_fine(
+        ss, radius=1e-6, save=str(out_csv), asynch=False
+    )
+    written = sorted(tmp_path.glob("*.csv"))
+    assert written, "no csv written"
+    for path in written:
+        df = pd.read_csv(path)
+        prop_cols = [c for c in df.columns if c.startswith("Prop_")]
+        assert len(prop_cols) == 2
+        assert np.allclose(df[prop_cols].sum(axis=1), 100.0)
+
+
+def test_bayesian_save_with_single_evaluated_candidate(
+    mixer_2d_csr, monomer_dimer_structures, tmp_path
+):
+    """Only one evaluated candidate → 1-row props in _save_bayesian_csv."""
+    np.random.seed(0)
+    gt = mixer_2d_csr.run_simulation([100, 50])
+    mixer = StructureMixer(
+        structures=monomer_dimer_structures,
+        label_unc={"target": LABEL_UNC},
+        le={"target": LE},
+        width=ROI,
+        height=ROI,
+    )
+    ss = spinna.generate_N_structures(
+        monomer_dimer_structures, {"target": 200}, granularity=10
+    )
+    spinner = SPINNA(mixer=mixer, gt_coords=gt, N_sim=1)
+    np.random.seed(0)
+    out_csv = tmp_path / "bayes.csv"
+    spinner.fit_bayesian(ss, n_initial=1, n_iterations=0, save=str(out_csv))
+    df = pd.read_csv(out_csv)
+    assert len(df) == 1
+    assert np.allclose(df["Prop_Monomer"] + df["Prop_Dimer"], 100.0)
+
+
 def test_spinna_evaluate_single_returns_finite_float(
     mixer_2d_csr, monomer_dimer_structures
 ):

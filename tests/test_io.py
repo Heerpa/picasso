@@ -490,6 +490,34 @@ class TestThunderstormRoundtrip:
         # Frame count is preserved (frames re-zeroed by import_ts)
         assert out_info[0]["Frames"] == 3
 
+    def test_extra_columns_kept(self, tmp_path):
+        # Columns that do not map onto predefined Picasso fields must
+        # survive the import (with names sanitized to identifiers).
+        data = pd.DataFrame(
+            {
+                "id": [1, 2, 3],
+                "frame": [1, 2, 3],
+                "x [nm]": [650.0, 1300.0, 1950.0],
+                "y [nm]": [650.0, 1300.0, 1950.0],
+                "intensity [photon]": [1000.0, 2000.0, 3000.0],
+                "offset [photon]": [10.0, 10.0, 10.0],
+                "uncertainty_xy [nm]": [6.5, 6.5, 6.5],
+                "sigma [nm]": [130.0, 130.0, 130.0],
+                "chi2": [1.1, 2.2, 3.3],
+                "uncertainty_z [nm]": [20.0, 30.0, 40.0],
+            }
+        )
+        path = tmp_path / "ts_extra.csv"
+        data.to_csv(path, index=False)
+
+        out_locs, _ = io.import_ts(str(path), pixelsize=PIXELSIZE)
+        assert "id" in out_locs.columns
+        np.testing.assert_allclose(
+            out_locs["chi2"].to_numpy(), [1.1, 2.2, 3.3], atol=1e-5
+        )
+        # Names with units/spaces are sanitized to valid identifiers.
+        assert "uncertainty_z_nm" in out_locs.columns
+
 
 # ---------------------------------------------------------------------------
 # SMAP round-trip
@@ -570,6 +598,20 @@ class TestSMAPRoundtrip:
             out_locs["lpz"].to_numpy(), locs["lpz"].to_numpy(), atol=1e-3
         )
 
+    def test_extra_fields_kept(self, tmp_path):
+        # export_smap writes a 'channel' field, which is not a
+        # predefined Picasso column — import must keep it.
+        locs = self._locs_2d()
+        info = self._info()
+        path = tmp_path / "extra_sml.mat"
+        io.export_smap(str(path), locs, info)
+
+        out_locs, _ = io.import_smap(str(path), pixelsize=PIXELSIZE)
+        assert "channel" in out_locs.columns
+        np.testing.assert_array_equal(
+            out_locs["channel"].to_numpy(), np.zeros(len(locs))
+        )
+
     def test_export_enforces_sml_suffix(self, tmp_path):
         # SMAP recognizes localizations by the '_sml' suffix; export
         # appends it when missing.
@@ -626,9 +668,12 @@ class TestSMAPRoundtrip:
             loc.create_dataset("phot", data=np.full((1, n), 500.0))
             loc.create_dataset("bg", data=np.full((1, n), 12.0))
             loc.create_dataset("locprecnm", data=np.full((1, n), 13.0))
+            loc.create_dataset("numberInGroup", data=np.full((1, n), 2.0))
 
         locs, info = io.import_smap(str(path), pixelsize=PIXELSIZE)
         assert len(locs) == n
+        # Non-predefined SMAP fields are kept as extra columns.
+        assert "numberInGroup" in locs.columns
         # SMAP frames are 1-based; import re-zeroes them.
         assert int(locs["frame"].min()) == 0
         np.testing.assert_allclose(

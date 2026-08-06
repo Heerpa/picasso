@@ -1,5 +1,4 @@
-"""Test ``picasso.postprocess`` and the closely associated
-``picasso.g5m``.
+"""Test ``picasso.postprocess``.
 
 Most fixtures (``locs``, ``info``) live in ``tests/conftest.py``.
 
@@ -13,9 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from picasso import clusterer, g5m, postprocess, zfit
-
-from tests.conftest import CALIB_3D
+from picasso import clusterer, postprocess
 
 
 # Reused parameters
@@ -602,6 +599,60 @@ class TestLinking:
         assert len(np.unique(lg)) == len(sl)
 
 
+class TestBindingEventCores:
+    def test_drops_border_locs_of_each_event(self):
+        # Two binding events at distinct positions: one 4 frames long,
+        # one 2 frames long (too short to have a core).
+        locs = pd.DataFrame(
+            {
+                "frame": np.array([0, 1, 2, 3, 0, 1], dtype=np.int32),
+                "x": np.array([1, 1, 1, 1, 50, 50], dtype=np.float32),
+                "y": np.array([1, 1, 1, 1, 50, 50], dtype=np.float32),
+            }
+        )
+        out = postprocess.select_binding_event_cores(locs, r_max=0.05)
+        # only frames 1 and 2 of the first event survive
+        assert out["frame"].tolist() == [1, 2]
+        assert out["group"].tolist() == [0, 0]
+
+    def test_min_n_locs_discards_short_events(self):
+        locs = pd.DataFrame(
+            {
+                "frame": np.array([0, 1, 2, 3], dtype=np.int32),
+                "x": np.ones(4, dtype=np.float32),
+                "y": np.ones(4, dtype=np.float32),
+            }
+        )
+        out = postprocess.select_binding_event_cores(
+            locs, r_max=0.05, min_n_locs=5
+        )
+        assert len(out) == 0
+
+    def test_groups_are_consecutive(self, locs):
+        out = postprocess.select_binding_event_cores(locs.copy())
+        assert len(out) < len(locs)
+        groups = np.unique(out["group"].to_numpy())
+        assert (groups == np.arange(len(groups))).all()
+        assert "group_input" not in out.columns
+
+    def test_existing_group_preserved_as_group_input(self, locs):
+        sub = locs.copy()
+        # two input groups, split spatially so events cannot span both
+        sub["group"] = (sub["x"].to_numpy() > sub["x"].median()).astype(
+            np.int32
+        )
+        out = postprocess.select_binding_event_cores(sub)
+        assert "group_input" in out.columns
+        assert set(np.unique(out["group_input"].to_numpy())) <= {0, 1}
+        # binding events must not span two input groups
+        assert (out.groupby("group")["group_input"].nunique() == 1).all()
+
+    def test_empty_locs(self, locs):
+        out = postprocess.select_binding_event_cores(locs.iloc[0:0].copy())
+        assert len(out) == 0
+        assert "group" in out.columns
+
+
 class TestDarkTimes:
     def test_dark_times_min_positive(self, locs, info):
         linked = postprocess.link(locs.copy(), info)
@@ -1186,184 +1237,3 @@ class TestResi:
                 radius_xy=2 / 130,
                 min_locs=[2, 3, 4],
             )
-
-
-# ---------------------------------------------------------------------------
-# g5m end-to-end (consumes postprocess output)
-# ---------------------------------------------------------------------------
-
-
-class TestG5M:
-    @pytest.fixture
-    def dbscan_locs(self, locs):
-        out = clusterer.dbscan(locs, radius=2 / 130, min_samples=2)[0]
-        assert len(out) > 0
-        return out
-
-    def test_g5m_2d_with_bootstrap(self, dbscan_locs, info):
-        mols, _, _ = g5m.g5m(
-            dbscan_locs, info, min_locs=5, bootstrap_check=True, asynch=False
-        )
-        assert "p_val" in mols.columns
-        # p-values must be in [0, 1]
-        assert (mols["p_val"] >= 0).all() and (mols["p_val"] <= 1).all()
-
-    def test_g5m_2d_global_loc_prec(self, dbscan_locs, info):
-        mols, _, _ = g5m.g5m(
-            dbscan_locs,
-            info,
-            min_locs=5,
-            bootstrap_check=False,
-            loc_prec_handle="abs",
-            sigma_bounds=(1 / 130, 3 / 130),
-        )
-        assert "p_val" in mols.columns
-        assert len(mols) > 0
-
-
-class TestG5M3D:
-    @pytest.fixture
-    def dbscan_locs_3d(self, locs, info):
-        out = clusterer.dbscan(locs, radius=2 / 130, min_samples=2)[0]
-        assert len(out) > 0
-        rng = np.random.default_rng(42)
-        out = out.copy()
-        out["z"] = rng.normal(0, 2, size=len(out))
-        out["lpz"] = zfit.axial_localization_precision(
-            out, info, calibration=CALIB_3D, fitting_method="gaussmle"
-        )
-        return out
-
-    def test_g5m_3d_with_bootstrap(self, dbscan_locs_3d, info):
-        mols, _, _ = g5m.g5m(
-            dbscan_locs_3d,
-            info,
-            min_locs=5,
-            bootstrap_check=True,
-            calibration=CALIB_3D,
-            asynch=False,
-        )
-        assert len(mols) > 0
-        assert "p_val" in mols.columns
-        assert (mols["p_val"] >= 0).all() and (mols["p_val"] <= 1).all()
-
-    def test_g5m_3d_global_loc_prec(self, dbscan_locs_3d, info):
-        mols, _, _ = g5m.g5m(
-            dbscan_locs_3d,
-            info,
-            min_locs=5,
-            bootstrap_check=False,
-            calibration=CALIB_3D,
-            loc_prec_handle="abs",
-            sigma_bounds=(1 / 130, 3 / 130),
-        )
-        assert len(mols) > 0
-        assert "p_val" in mols.columns
-
-    def test_g5m_3d_spline_no_calibration(self, dbscan_locs_3d, info):
-        # spline mode uses the plain diagonal 3D model and reads lpz
-        # directly from the locs, so no calibration is required
-        mols, _, out_info = g5m.g5m(
-            dbscan_locs_3d,
-            info,
-            min_locs=5,
-            bootstrap_check=False,
-            mode="spline",
-            calibration=None,
-            asynch=False,
-        )
-        assert len(mols) > 0
-        assert "z" in mols.columns
-        assert "p_val" in mols.columns
-        assert (mols["p_val"] >= 0).all() and (mols["p_val"] <= 1).all()
-        # info records the fit mode but no astigmatism coefficients
-        assert out_info[-1]["Fit mode"] == "spline"
-        assert "X Coefficients" not in out_info[-1]
-
-    def test_g5m_3d_spline_requires_lpz(self, dbscan_locs_3d, info):
-        locs_no_lpz = dbscan_locs_3d.drop(columns=["lpz"])
-        with pytest.raises(ValueError):
-            g5m.g5m(
-                locs_no_lpz,
-                info,
-                min_locs=5,
-                mode="spline",
-                calibration=None,
-                asynch=False,
-            )
-
-    def test_g5m_3d_astigmatism_requires_calibration(
-        self, dbscan_locs_3d, info
-    ):
-        with pytest.raises(ValueError):
-            g5m.g5m(
-                dbscan_locs_3d,
-                info,
-                min_locs=5,
-                mode="astigmatism",
-                calibration=None,
-                asynch=False,
-            )
-
-
-# ---------------------------------------------------------------------
-# G5M progress reporting (uniform duck-typed interface, see
-# lib.normalize_progress)
-# ---------------------------------------------------------------------
-
-
-class _RecordingProgress:
-    """Duck-typed progress tracker recording the calls it receives."""
-
-    def __init__(self):
-        self.values = []
-        self.maxima = []
-        self.closed = False
-
-    def set_value(self, value):
-        self.values.append(value)
-
-    def setMaximum(self, maximum, *args, **kwargs):
-        self.maxima.append(maximum)
-
-    def maximum(self):
-        return self.maxima[-1] if self.maxima else 0
-
-    def zero_progress(self, description=None, *args, **kwargs):
-        pass
-
-    def close(self, *args, **kwargs):
-        self.closed = True
-
-
-class TestG5MProgress:
-    @pytest.fixture
-    def dbscan_locs(self, locs):
-        out = clusterer.dbscan(locs, radius=2 / 130, min_samples=2)[0]
-        assert len(out) > 0
-        return out
-
-    @pytest.mark.parametrize("callback_parent", [None, "console"])
-    def test_progress_modes(self, dbscan_locs, info, callback_parent):
-        mols, _, _ = g5m.g5m(
-            dbscan_locs,
-            info,
-            min_locs=5,
-            asynch=False,
-            callback_parent=callback_parent,
-        )
-        assert len(mols) > 0
-
-    def test_reports_progress_to_duck_typed_tracker(self, dbscan_locs, info):
-        tracker = _RecordingProgress()
-        g5m.g5m(
-            dbscan_locs,
-            info,
-            min_locs=5,
-            asynch=False,
-            callback_parent=tracker,
-        )
-        assert tracker.values, "no progress was reported"
-        assert tracker.closed, "progress tracker was not closed"
-        # the final update fills the bar
-        assert tracker.values[-1] == max(tracker.values)
