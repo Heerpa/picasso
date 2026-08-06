@@ -2589,6 +2589,7 @@ def _g5m(
     bootstrap_sem: bool = False,
     calibration: str = "",
     mode: Literal["astigmatism", "spline"] = "astigmatism",
+    covariance_type: str = "auto",
     postprocess: bool = True,
     max_locs: int = 100000,
     asynch: bool = True,
@@ -2635,6 +2636,7 @@ def _g5m(
             bootstrap_check=bootstrap_sem,
             calibration=calib,
             mode=mode,
+            covariance_type=covariance_type,
             postprocess=postprocess,
             max_locs_per_cluster=max_locs,
             asynch=asynch,
@@ -3487,6 +3489,22 @@ def main():  # noqa: C901
         ),
     )
     g5m_parser.add_argument(
+        "--covariance-type",
+        type=str,
+        choices=["auto", "spherical", "diagonal", "rotated"],
+        default="auto",
+        help=(
+            "shape of the G5M components: 'rotated' gives the xy "
+            "covariance a rotation read from the 'angle' column, for 3D "
+            "astigmatism data localized with a rotated elliptical "
+            "Gaussian; 'diagonal' is the axis-aligned 3D model and "
+            "'spherical' the isotropic 2D one. "
+            "'auto' (default) picks 'rotated' for 3D astigmatism locs "
+            "that carry an 'angle' column and otherwise keeps the "
+            "established model"
+        ),
+    )
+    g5m_parser.add_argument(
         "-p",
         "--postprocess",
         action="store_false",
@@ -3852,6 +3870,7 @@ def main():  # noqa: C901
                 args.bootstrap_sem,
                 args.calibration,
                 args.mode,
+                args.covariance_type,
                 args.postprocess,
                 args.max_locs,
                 args.asynch,

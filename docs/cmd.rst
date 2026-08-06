@@ -249,6 +249,7 @@ The positional ``files`` argument is a unix-style path to one or more clustered 
    '--max-rounds', type=int, default=3, help='max. rounds without BIC improvement to terminate'
    '--bootstrap-sem', action='store_true', help='bootstrap to estimate SEM of molecule positions'
    '-c', '--calibration', type=str, default='', help='path to calibration file (3D only)'
+   '--covariance-type', type=str, choices=['auto', 'spherical', 'diagonal', 'rotated'], default='auto', help="shape of the fitted molecules; 'auto' picks 'rotated' for 3D astigmatism locs carrying an 'angle' column, 'diagonal' for 3D localizations without the 'angle' column and spherical for 2D data"
    '-p', '--postprocess', action='store_false', help='do not postprocess results to remove sticking events and low-quality fits'
    '--max-locs', type=int, default=100000, help='maximum number of localizations to process per cluster; useful for excluding fiducials'
    '-a', '--asynch', action='store_false', help='do not perform fitting asynchronously (multiprocessing)'

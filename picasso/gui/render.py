@@ -8136,6 +8136,7 @@ class View(QtWidgets.QLabel):
             bootstrap_check=params["bootstrap_check"],
             calibration=params.get("calibration", None),
             mode=params.get("mode", "astigmatism"),
+            covariance_type=params.get("covariance_type", "auto"),
             postprocess=params["postprocess_check"],
             max_locs_per_cluster=params["max_locs_per_cluster"][channel],
             asynch=params["multiprocessing_check"],

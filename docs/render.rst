@@ -95,6 +95,8 @@ Note that G5M assumes that the localization precision values (``lpx``, ``lpy`` a
 
 Prior to molecular mapping, clustering of localizations is required to split the data into smaller chunks. For many datasets, DBSCAN works well. While in some cases some adjustments may be needed, we recommend the following DBSCAN parameters: In 2D, DBSCAN radius (epsilon) of 2*LP, in 3D - 3*LP (LP - average localization precision of the dataset, for example, NeNA or median localization precision). Default min. samples is set to 4. Clustering in Picasso adds the ``group`` column to the localization file, which is required for G5M. **Note: G5M relies on the information in the ``group`` column, therefore, if it is overwritten (for example, by picking localizations after DBSCAN clustering), G5M will not work.**
 
+Localizations obtained with the rotated elliptical Gaussian model will automatically take the mean value of the xy-plane rotation and apply it to the fitted molecule.
+
 To account for fluorophore non-specific sticking, frame analysis is normally recommended (especially the filtering of st. dev. of frame per molecule). However, if localizations from neighboring localization clouds overlap, this is not sufficient due to ambigous assignment of localizations to molecules. Therefore, we recommend filtering of molecules that express too few binding events (saved in the column ``n_events``). In the publication, we recommend a threshold of at least 3 binding events per molecule.
 
 The final postprocessing step is log-likelihood filtering (using the column ``p_val``). The recommended threshold is ``> 0.0015``, however, it might need to be adjusted for your data, especially in 3D this can be too conservative.

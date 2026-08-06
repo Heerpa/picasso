@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 04-AUG-2026 CEST
+Last change: 05-AUG-2026 CEST
 
 ## 0.11.0
 
@@ -65,10 +65,13 @@ Last change: 04-AUG-2026 CEST
 - "Apply to all sequentially" available for drift correction algorithms, including drift from an external file
 - "Apply to all sequentially" available in Apply expression to localizations
 - G5M now supports 3D localizations fit with the experimental spline PSF, not only astigmatism.
+- G5M can model rotated (elliptical) molecules in 3D
 - G5M accepts `group_input` as the cluster id columns (useful if `group` is overwritten after clustering)
 - Re-grouping localizations (picking, DBSCAN/HDBSCAN/SMLM clustering) now preserves the previous grouping in the `group_input` column instead of discarding it, so the original cluster ids remain available (e.g. for G5M)
 - Updated G5M documentation - drift correction importance
 - Test clusterer with a constrast bar
+- Fixed `picasso.g5m` bootstrap SEM (`bootstrap_check=True`) raising `AssertionError` for spline 3D data, because the resampling model was rebuilt without carrying over the fit mode
+- Fixed `picasso.g5m.sum_G5Ms` raising `TypeError` for a list of 2D models, because a calibration was passed to `G5M_2D`, which does not accept one
 - Fixed removed plugins menu after removing all localizations
 - Fixed pick similar numba error [#684](https://github.com/jungmannlab/picasso/issues/684)
 - Fixed "Combine all channels" when saving localizations only saving the first channel when channels had differing columns
