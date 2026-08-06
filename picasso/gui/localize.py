@@ -89,6 +89,17 @@ LINK_COLORS = [
 ]
 LINK_UNMATCHED_COLOR = QtGui.QColor(150, 150, 150)
 
+# Below this many frames the temporal median filter cannot do anything: the
+# rolling median over one frame is that frame, so the filtered movie is
+# identically zero (see Window.identification_movie).
+_TEMPORAL_MEDIAN_MIN_FRAMES = 2
+
+
+def _normalized_path(path: str) -> str:
+    """A path in a form that can be compared for identity across the
+    dialogs (absolute, and case-insensitive where the platform is)."""
+    return os.path.normcase(os.path.abspath(path)) if path else ""
+
 
 def _nearest_unique_match(
     pred_xy: np.ndarray, target_xy: np.ndarray, tol: float
@@ -1995,6 +2006,10 @@ class CalibrateAffineDialog(lib.Dialog):
     one after another.
     """
 
+    # Emitted when "Calibrate" is pressed. Not ``accepted``: the dialog
+    # stays open so the pairing can be inspected on both bead images.
+    calibrate_requested = QtCore.pyqtSignal()
+
     # transform type -> (reference label/tooltip, target label/tooltip)
     IMAGE_LABELS = {
         "astigmatism": (
@@ -2107,14 +2122,28 @@ class CalibrateAffineDialog(lib.Dialog):
         if window.movie_path:
             self.reference_edit.setText(window.movie_path)
 
+        # "Calibrate" does not close the dialog: the bead
+        # pairing is drawn over whichever of the two images is displayed,
+        # so the "Show" buttons above are what the user reaches for right
+        # after a fit. Closing here would mean reopening the dialog and
+        # re-picking all three paths to look at the other image.
         self.buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            QtWidgets.QDialogButtonBox.StandardButton.Close,
             QtCore.Qt.Orientation.Horizontal,
             self,
         )
+        self.calibrate_button = self.buttons.addButton(
+            "Calibrate",
+            QtWidgets.QDialogButtonBox.ButtonRole.ApplyRole,
+        )
+        self.calibrate_button.setToolTip(
+            "Fit the transform and append it to the calibration file.\n"
+            "The dialog stays open so the bead pairing can be inspected\n"
+            "on both images with 'Show'."
+        )
+        self.calibrate_button.setDefault(True)
+        self.calibrate_button.clicked.connect(self.calibrate_requested.emit)
         vbox.addWidget(self.buttons)
-        self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
 
     @property
@@ -2435,6 +2464,11 @@ class ParametersDialog(lib.Dialog):
             "off.\n\nNot applied to bead stacks (3D / spline calibration)."
         )
         self.temporal_median_checkbox.setTristate(False)
+        self.temporal_median_checkbox.setChecked(False)
+        # kept so ``Window._update_temporal_median_availability`` can restore
+        # them after showing why the filter is unavailable
+        self._temporal_median_text = self.temporal_median_checkbox.text()
+        self._temporal_median_tip = self.temporal_median_checkbox.toolTip()
         self.temporal_median_checkbox.stateChanged.connect(
             self.on_temporal_median_changed
         )
@@ -4086,6 +4120,9 @@ class Window(QtWidgets.QMainWindow):
         # both created lazily when the calibration is first opened/run.
         self._affine_dialog = None
         self.affine_calibration_worker = None
+        # Bead pairing of the last affine calibration, drawn over whichever
+        # of the two bead images is displayed (see draw_affine_pairing).
+        self.affine_pairing = None
         # Bookkeeping for a multichannel "Identify" (Ctrl+I) batch that runs
         # identification on every channel in turn; None when not running.
         self._multi_identify = None
@@ -4486,16 +4523,17 @@ class Window(QtWidgets.QMainWindow):
         """Open the affine-transform calibration dialog (astigmatism or
         chromatic aberration).
 
-        The dialog is non-modal so the user can keep interacting with the
-        main window and the parameters dialog (e.g. via "Show") while it
-        is open. The transform is fitted once the dialog is accepted.
+        The dialog is non-modal, and "Calibrate" leaves it open, so the
+        user can keep working in the main window - in particular load
+        either bead image with "Show" to see the pairing the fit found -
+        and re-run the fit without re-picking the paths.
         """
         # Reuse an existing dialog if it is already open, otherwise create
-        # one and run the calibration when it is accepted.
+        # one and run the calibration whenever "Calibrate" is pressed.
         dialog = getattr(self, "_affine_dialog", None)
         if dialog is None:
             dialog = CalibrateAffineDialog(self)
-            dialog.accepted.connect(self._run_calibrate_affine)
+            dialog.calibrate_requested.connect(self._run_calibrate_affine)
             self._affine_dialog = dialog
         dialog.show()
         dialog.raise_()
@@ -4580,8 +4618,17 @@ class Window(QtWidgets.QMainWindow):
         self.affine_calibration_worker = None
         self.status_bar.showMessage(
             f"Affine calibration appended to {os.path.basename(path)} "
-            f"({n_pairs} bead pairs)."
+            f"({n_pairs} bead pairs). Load either bead image to see which "
+            "beads were paired."
         )
+        # Keep the pairing so it can be inspected in the viewer: load either
+        # bead image ("Show" in the calibration dialog) and the matched beads
+        # are boxed, sharing a color between the two images.
+        try:
+            self.set_affine_pairing(qc)
+            self.draw_frame()
+        except Exception:  # bookkeeping must never lose a finished fit
+            self.affine_pairing = None
         plot_path = os.path.splitext(path)[0] + "_affine.png"
         try:
             localize.plot_affine_calibration(qc, save_path=plot_path)
@@ -5320,6 +5367,7 @@ class Window(QtWidgets.QMainWindow):
         frame_number = min(max(0, frame_number), max(0, last_frame))
         self.set_frame(frame_number)
         self.fit_in_view()
+        self._update_temporal_median_availability()
         base = os.path.basename(self.movie_path) if self.movie_path else ""
         title = f"Picasso v{__version__}: Localize. File: {base}"
         if len(self.channels) > 1:
@@ -5746,10 +5794,12 @@ class Window(QtWidgets.QMainWindow):
             frame = frame.astype("float32")
             if self.contrast_dialog.auto_checkbox.isChecked():
                 frame -= frame.min()
-                frame /= frame.max()
+                frame /= max(float(frame.max()), 1e-12)
             else:
                 frame -= self.contrast_dialog.black_spinbox.value()
-                frame /= self.contrast_dialog.white_spinbox.value()
+                frame /= max(
+                    float(self.contrast_dialog.white_spinbox.value()), 1e-12
+                )
             frame *= 255.0
             frame = np.maximum(frame, 0)
             frame = np.minimum(frame, 255)
@@ -5803,7 +5853,9 @@ class Window(QtWidgets.QMainWindow):
                     text.setFlag(
                         QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations
                     )
-            if self.ready_for_fit:
+            if self.draw_affine_pairing():
+                pass
+            elif self.ready_for_fit:
                 box = self.last_identification_info["Box Size"]
                 if not self._draw_linked_identifications(
                     self.curr_frame_number, box
@@ -5851,6 +5903,93 @@ class Window(QtWidgets.QMainWindow):
                     marker.setToolTip(format_hover_tooltip(loc))
                     self.scene.addItem(marker)
             self.draw_scalebar()
+
+    def set_affine_pairing(self, qc: dict) -> None:
+        """Keep the bead pairing of an affine calibration so it can be drawn
+        over the two bead images (see :meth:`draw_affine_pairing`).
+
+        ``qc`` is what ``localize.fit_affine_transform`` returns: every
+        refined detection in each image plus the indices of the matched
+        ones, pair ``k`` being ``(idx_ref[k], idx_target[k])``.
+        """
+
+        def side(beads, matched) -> dict:
+            # pair id per detection; -1 for the ones that stayed unmatched
+            beads = np.asarray(beads, dtype=float)
+            pair_id = np.full(len(beads), -1, dtype=int)
+            matched = np.asarray(matched, dtype=int)
+            pair_id[matched] = np.arange(len(matched))
+            return {"beads": beads, "pair_id": pair_id}
+
+        self.affine_pairing = {
+            "ref": side(qc["beads_ref"], qc["idx_ref"]),
+            "target": side(qc["beads_target"], qc["idx_target"]),
+            "paths": {
+                "ref": _normalized_path(qc.get("ref_path", "")),
+                "target": _normalized_path(qc.get("target_path", "")),
+            },
+            "n_pairs": int(qc["n_pairs"]),
+            "box": int(qc.get("box", self.parameters["Box Size"])),
+            "transform_type": qc.get("transform_type", "astigmatism"),
+        }
+
+    def draw_affine_pairing(self) -> bool:
+        """Draw the last affine calibration's bead pairing as color-coded
+        identification boxes over the displayed image.
+
+        A bead and the bead it was matched with carry the same color in the
+        reference and in the target image, so switching between the two
+        (the calibration dialog's "Show" buttons) shows which bead went with
+        which; detections that stayed unmatched are grey. This is the same
+        reading as the cross-channel link colors
+        (:meth:`_draw_linked_identifications`), and it uses the same palette.
+
+        Returns True when it drew, i.e. when a calibration has run and the
+        displayed movie is one of its two bead images - False to leave the
+        normal identification boxes to the caller.
+        """
+        pairing = self.affine_pairing
+        if pairing is None:
+            return False
+        current = _normalized_path(self.movie_path or "")
+        for name in ("ref", "target"):
+            if current and current == pairing["paths"][name]:
+                side = pairing[name]
+                break
+        else:
+            return False
+
+        box = pairing["box"]
+        box_half = int(box / 2)
+        n_pairs = pairing["n_pairs"]
+        other = "target" if side is pairing["ref"] else "reference"
+        n_unmatched = int(np.count_nonzero(side["pair_id"] < 0))
+        for (row, col), pair_id in zip(side["beads"], side["pair_id"]):
+            matched = pair_id >= 0
+            color = (
+                LINK_COLORS[int(pair_id) % len(LINK_COLORS)]
+                if matched
+                else LINK_UNMATCHED_COLOR
+            )
+            item = self.scene.addRect(
+                col - box_half, row - box_half, box, box, color
+            )
+            item.setToolTip(
+                (
+                    f"bead pair {int(pair_id) + 1} of {n_pairs}\n"
+                    f"same color in the {other} image"
+                    if matched
+                    else f"not paired with any bead in the {other} image"
+                )
+                + f"\nx: {col:.6g}\ny: {row:.6g}"
+            )
+        self.status_bar.showMessage(
+            f"{pairing['transform_type'].capitalize()} calibration: "
+            f"{n_pairs:,} bead pairs shown"
+            + (f", {n_unmatched:,} unpaired (grey)" if n_unmatched else "")
+            + "."
+        )
+        return True
 
     def draw_identifications(
         self,
@@ -6427,10 +6566,52 @@ class Window(QtWidgets.QMainWindow):
             "Min. Net Gradient": dialog.mng_slider.value(),
             "Temporal Median Window": (
                 dialog.temporal_median_spinbox.value()
-                if dialog.temporal_median_checkbox.isChecked()
+                if (
+                    dialog.temporal_median_checkbox.isChecked()
+                    # a movie too short for the filter reports it as off, so
+                    # display, preview and identification all agree
+                    and self.temporal_median_applicable()
+                )
                 else 0
             ),
         }
+
+    def temporal_median_applicable(self) -> bool:
+        """Whether the loaded movie is long enough for the temporal median
+        filter to mean anything. Over a single frame the rolling median IS
+        that frame, so the filtered movie would be identically zero - a
+        black view and no identifications."""
+        try:
+            movie = self.movie
+        except (AttributeError, RuntimeError):
+            # ``parameters`` is also read from a partially built window,
+            # where the filter setting stands on its own
+            return True
+        return movie is None or len(movie) >= _TEMPORAL_MEDIAN_MIN_FRAMES
+
+    def _update_temporal_median_availability(self) -> None:
+        """Show on the checkbox itself whether the temporal median filter
+        applies to the loaded movie, so a movie that is too short for it
+        does not look as though it were being filtered."""
+        dialog = self.parameters_dialog
+        checkbox = dialog.temporal_median_checkbox
+        if self.temporal_median_applicable():
+            checkbox.setEnabled(True)
+            checkbox.setText(dialog._temporal_median_text)
+            checkbox.setToolTip(dialog._temporal_median_tip)
+            return
+        checkbox.setEnabled(False)
+        checkbox.setText(
+            f"{dialog._temporal_median_text} "
+            f"(needs >= {_TEMPORAL_MEDIAN_MIN_FRAMES} frames)"
+        )
+        checkbox.setToolTip(
+            "This movie has "
+            f"{0 if self.movie is None else len(self.movie)} frame(s). The "
+            "filter subtracts a running per-pixel median, which needs a "
+            "stack: over a single frame it would subtract the frame from "
+            "itself. It is ignored for this movie."
+        )
 
     def identification_movie(self) -> lib.IntArray3D:
         """The movie the display and the identification preview run on:
@@ -6442,6 +6623,9 @@ class Window(QtWidgets.QMainWindow):
         """
         window = self.parameters["Temporal Median Window"]
         if not window or self.movie is None:
+            self._temporal_movie = None
+            return self.movie
+        if not self.temporal_median_applicable():
             self._temporal_movie = None
             return self.movie
         rois = self.view.rois or None

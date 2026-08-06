@@ -256,6 +256,8 @@ Open ``3D`` > ``Calibrate affine transform (astigmatism / chromatic)`` and choos
 
 Beads are detected with the current ``Box side length`` and ``Min. net gradient`` (use ``Show`` to tune them on either image with a live preview), refined by a 2D Gaussian fit, matched by mutual nearest neighbour, and a 6-DOF affine transform mapping the second image onto the reference is fitted by least squares. A diagnostic figure is shown and saved next to the calibration as ``<base>_affine.png``: overlays before and after the correction, and the mean per-bead cross-correlation before and after, whose peak should sit at the origin once the correction is applied.
 
+After the fit, the bead pairing is drawn in the main window as color-coded identification boxes: load either bead image (the ``Show`` buttons in the calibration dialog) and every detected bead is boxed — a bead and the bead it was matched with carry the **same color** in the reference and in the target image, while detections that stayed unmatched are grey. Hovering a box says which pair it belongs to. This is the same reading as the cross-channel link colors used for multichannel data, and it makes a wrong or missing match visible on the data itself.
+
 The transform is stored as one entry of an ordered ``Affine transforms`` list in the calibration file you select, which can be:
 
 - an existing Gaussian 3D calibration (``.yaml``) or spline PSF calibration (``.hdf5``) — the transform is appended to it and applied automatically whenever that calibration is used to fit, whether the fit is Gaussian astigmatism or cubic spline;

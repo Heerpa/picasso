@@ -7893,22 +7893,42 @@ def _affine_refine_bead_positions(
 
 
 def _affine_match_bead_pairs(
-    coords_ref: np.ndarray, coords_mov: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
+    coords_ref: np.ndarray,
+    coords_mov: np.ndarray,
+    return_indices: bool = False,
+) -> tuple:
     """Match beads via mutual nearest-neighbour with a distance threshold.
-    Returns (pairs_ref, pairs_mov), each (M, 2)."""
+    Returns (pairs_ref, pairs_mov), each (M, 2).
+
+    With ``return_indices``, the indices the pairs have in ``coords_ref``
+    and ``coords_mov`` are returned as well, so a caller can tell which
+    detections stayed unmatched - the Localize viewer greys those out when
+    it draws the pairing (see ``Window.draw_affine_pairing``)."""
     if len(coords_ref) == 0 or len(coords_mov) == 0:
-        return np.empty((0, 2)), np.empty((0, 2))
+        empty = np.empty((0, 2))
+        if return_indices:
+            idx = np.empty(0, dtype=int)
+            return empty, empty, idx, idx
+        return empty, empty
     D = cdist(coords_ref, coords_mov)
     nn_r2m = np.argmin(D, axis=1)
     nn_m2r = np.argmin(D, axis=0)
-    pairs_r, pairs_m = [], []
+    pairs_r, pairs_m, idx_r, idx_m = [], [], [], []
     for i, j in enumerate(nn_r2m):
         if D[i, j] < _AFFINE_MATCH_MAX_DIST_PX and nn_m2r[j] == i:
             pairs_r.append(coords_ref[i])
             pairs_m.append(coords_mov[j])
+            idx_r.append(i)
+            idx_m.append(j)
     pairs_ref = np.array(pairs_r) if pairs_r else np.empty((0, 2))
     pairs_mov = np.array(pairs_m) if pairs_m else np.empty((0, 2))
+    if return_indices:
+        return (
+            pairs_ref,
+            pairs_mov,
+            np.asarray(idx_r, dtype=int),
+            np.asarray(idx_m, dtype=int),
+        )
     return pairs_ref, pairs_mov
 
 
@@ -8280,8 +8300,8 @@ def fit_affine_transform(
     refined_target = _affine_refine_bead_positions(
         img_target, coarse_target, box
     )
-    pairs_ref, pairs_target = _affine_match_bead_pairs(
-        refined_ref, refined_target
+    pairs_ref, pairs_target, idx_ref, idx_target = _affine_match_bead_pairs(
+        refined_ref, refined_target, return_indices=True
     )
 
     if len(pairs_ref) < 3:
@@ -8319,6 +8339,14 @@ def fit_affine_transform(
         # is computed here and only displayed by the plotting function
         "img_cor": _affine_apply(img_target, M),
         "pairs_ref": pairs_ref,
+        # Every detection in each image plus the indices of the matched
+        # ones (pair k is (idx_ref[k], idx_target[k])), so the Localize
+        # viewer can draw the pairing as color-coded identification boxes.
+        "beads_ref": refined_ref,
+        "beads_target": refined_target,
+        "idx_ref": idx_ref,
+        "idx_target": idx_target,
+        "box": int(box),
         "decomposition": decomp,
         "n_pairs": int(len(pairs_ref)),
         "pixelsize": pixelsize,

@@ -1337,6 +1337,15 @@ class TestLocalize3D:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _keep_user_settings(monkeypatch):
+    """Never let a test write the developer's real ``~/.picasso``
+    settings: closing a Localize ``Window`` persists the dialog state
+    (last folder, box size, min. net gradient, fit model, temporal median),
+    which a test must not do to the machine it runs on."""
+    monkeypatch.setattr(io, "save_user_settings", lambda settings: None)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _qt_app():
     """A QApplication must exist before any QObject (the worker) is built."""
@@ -6817,6 +6826,11 @@ class TestFitAffineTransform:
             "img_target",
             "img_cor",
             "pairs_ref",
+            "beads_ref",
+            "beads_target",
+            "idx_ref",
+            "idx_target",
+            "box",
             "decomposition",
             "n_pairs",
             "pixelsize",
@@ -6824,6 +6838,11 @@ class TestFitAffineTransform:
             "ref_path",
             "target_path",
         }
+        # every detection, and which of them were matched, so the viewer can
+        # color-code the pairing and grey out the beads that were dropped
+        assert len(qc["beads_ref"]) >= len(qc["pairs_ref"])
+        assert len(qc["idx_ref"]) == len(qc["pairs_ref"])
+        assert len(qc["idx_target"]) == len(qc["pairs_ref"])
         assert qc["img_cor"].shape == qc["img_ref"].shape
         assert qc["pixelsize"] == PIXELSIZE
         # the warp brings the cylindrical image onto the reference: the
@@ -6878,6 +6897,151 @@ class TestFitAffineTransform:
         assert drawn["qc"]["n_pairs"] == 25
 
 
+class TestShortMovieDisplayGUI:
+    """A movie too short for the temporal median filter must still be
+    visible: the in-focus bead images an affine calibration uses are single
+    frames, and the filter would make them identically zero (black)."""
+
+    @pytest.fixture
+    def window(self):
+        window = localize_gui.Window()
+        yield window
+        window.close()
+
+    @staticmethod
+    def _bead_movie(n_frames=1):
+        frame = np.full((64, 64), 100, dtype=np.uint16)
+        frame[9:12, 19:22] = 6000  # one bright bead
+        return np.repeat(frame[np.newaxis], n_frames, axis=0)
+
+    def _show(self, window, movie):
+        """Display ``movie`` the way loading one does, and return the
+        brightest pixel actually painted."""
+        window.movie = movie
+        window.info = [{"Frames": len(movie), "Height": 64, "Width": 64}]
+        window.curr_frame_number = 0
+        window._apply_channel_to_ui(0)
+        item = [
+            i for i in window.scene.items() if "Pixmap" in type(i).__name__
+        ][0]
+        image = item.pixmap().toImage()
+        return max(
+            image.pixelColor(x, y).red()
+            for y in range(image.height())
+            for x in range(image.width())
+        )
+
+    def test_single_frame_movie_is_not_blank(self, window):
+        window.parameters_dialog.temporal_median_checkbox.setChecked(True)
+        movie = self._bead_movie(1)
+        brightest = self._show(window, movie)
+        assert brightest > 0, "single-frame movie displayed as all black"
+        # identification and the preview see the same raw movie
+        assert window.identification_movie() is movie
+        assert window.parameters["Temporal Median Window"] == 0
+
+    def test_the_checkbox_says_why_the_filter_is_unavailable(self, window):
+        window.parameters_dialog.temporal_median_checkbox.setChecked(True)
+        checkbox = window.parameters_dialog.temporal_median_checkbox
+        self._show(window, self._bead_movie(1))
+        assert not checkbox.isEnabled()
+        assert "frames" in checkbox.text()
+        assert "1 frame(s)" in checkbox.toolTip()
+        # ... and it comes back for a movie the filter can work on
+        self._show(window, self._bead_movie(8))
+        assert checkbox.isEnabled()
+        assert checkbox.text() == "Temporal median filter"
+
+    def test_the_filter_still_runs_on_a_long_enough_movie(self, window):
+        window.parameters_dialog.temporal_median_checkbox.setChecked(True)
+        movie = self._bead_movie(8)
+        self._show(window, movie)
+        assert window.parameters["Temporal Median Window"] > 0
+        assert window.identification_movie() is not movie
+
+    def test_a_uniform_frame_does_not_cast_nan(self, window):
+        """Auto contrast divides by the frame range; a uniform frame made
+        that 0/0, and casting NaN to uint8 painted the view black."""
+        window.parameters_dialog.temporal_median_checkbox.setChecked(False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            brightest = self._show(
+                window, np.full((3, 32, 32), 100, dtype=np.uint16)
+            )
+        assert brightest == 0  # uniform data really is featureless
+
+
+class TestAffinePairingOverlayGUI:
+    """The bead pairing of an affine calibration, drawn in the Localize
+    viewer as color-coded identification boxes."""
+
+    QC = {
+        "beads_ref": np.array([[10.0, 20.0], [50.0, 60.0], [90.0, 30.0]]),
+        "beads_target": np.array([[12.0, 17.0], [52.0, 57.0]]),
+        "idx_ref": np.array([0, 1]),
+        "idx_target": np.array([0, 1]),
+        "n_pairs": 2,
+        "box": 7,
+        "ref_path": "/tmp/ref.tif",
+        "target_path": "/tmp/target.tif",
+        "transform_type": "chromatic",
+    }
+
+    @pytest.fixture
+    def window(self):
+        window = localize_gui.Window()
+        window.set_affine_pairing(dict(self.QC))
+        yield window
+        window.close()
+
+    def _draw(self, window, movie_path):
+        """Draw onto a fresh scene and return the box colors, in the order
+        they were added."""
+        window.movie_path = movie_path
+        window.scene = QtWidgets.QGraphicsScene()
+        drew = window.draw_affine_pairing()
+        colors = [
+            item.pen().color().name() for item in window.scene.items()[::-1]
+        ]
+        return drew, colors
+
+    def test_matched_beads_share_a_color_between_the_images(self, window):
+        drew_ref, ref_colors = self._draw(window, self.QC["ref_path"])
+        drew_target, target_colors = self._draw(window, self.QC["target_path"])
+        assert drew_ref and drew_target
+        # one box per detection in each image
+        assert len(ref_colors) == 3 and len(target_colors) == 2
+        # pair k has the same color on both sides, and pairs differ
+        assert ref_colors[:2] == target_colors
+        assert target_colors[0] != target_colors[1]
+
+    def test_unmatched_beads_are_grey(self, window):
+        _, ref_colors = self._draw(window, self.QC["ref_path"])
+        assert ref_colors[2] == localize_gui.LINK_UNMATCHED_COLOR.name()
+        assert "1 unpaired" in window.status_bar.currentMessage()
+
+    def test_boxes_use_the_calibration_box_size(self, window):
+        window.movie_path = self.QC["ref_path"]
+        window.scene = QtWidgets.QGraphicsScene()
+        window.draw_affine_pairing()
+        rect = window.scene.items()[-1].rect()
+        assert rect.width() == self.QC["box"]
+        # centered on the bead: [row, col] = [10, 20] with box 7 -> x = 17
+        assert rect.x() == 20.0 - 3 and rect.y() == 10.0 - 3
+
+    def test_not_drawn_for_another_movie(self, window):
+        drew, colors = self._draw(window, "/tmp/some_other_movie.tif")
+        assert not drew and colors == []
+
+    def test_nothing_drawn_before_a_calibration_ran(self):
+        window = localize_gui.Window()
+        try:
+            window.movie_path = self.QC["ref_path"]
+            assert window.draw_affine_pairing() is False
+        finally:
+            window.close()
+
+
 class TestCalibrateAffineDialogGUI:
     """The calibration dialog serves both transform types and can start a
     standalone calibration file."""
@@ -6898,6 +7062,27 @@ class TestCalibrateAffineDialogGUI:
         assert dialog.transform_type == "chromatic"
         assert "channel" in dialog.target_label.text().lower()
         assert "channel" in dialog.reference_label.text().lower()
+
+    def test_calibrate_requests_a_fit_without_closing(self):
+        """The dialog must stay open: the bead pairing is inspected right
+        after the fit by loading either image with 'Show', and re-picking
+        all three paths to do that would be absurd."""
+        dialog = self._dialog()
+        dialog.show()
+        requested = []
+        dialog.calibrate_requested.connect(lambda: requested.append(True))
+        dialog.calibrate_button.click()
+        assert requested == [True]
+        assert dialog.isVisible()
+
+    def test_close_button_closes_it(self):
+        dialog = self._dialog()
+        dialog.show()
+        close = dialog.buttons.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Close
+        )
+        close.click()
+        assert not dialog.isVisible()
 
 
 class TestAffineCalibrationWorkerGUI:
