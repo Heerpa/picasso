@@ -106,15 +106,30 @@ def locs_from_fits(
     theta: lib.FloatArray2D,
     box: int,
     em: float,
+    readout_variance: lib.FloatArray1D | float = 0.0,
 ) -> pd.DataFrame:
-    """Convert fit results to localization DataFrame."""
+    """Convert fit results to localization DataFrame.
+
+    ``readout_variance`` is the mean sCMOS readout variance over each spot's
+    box, in photoelectrons squared; it adds to the background term of the
+    closed-form precision. See ``picasso.fitting.precision``."""
     x = theta[:, 0] + identifications["x"]
     y = theta[:, 1] + identifications["y"]
     lpx = precision.localization_precision(
-        theta[:, 2], theta[:, 4], theta[:, 5], theta[:, 3], em=em
+        theta[:, 2],
+        theta[:, 4],
+        theta[:, 5],
+        theta[:, 3],
+        em=em,
+        readout_variance=readout_variance,
     )
     lpy = precision.localization_precision(
-        theta[:, 2], theta[:, 5], theta[:, 4], theta[:, 3], em=em
+        theta[:, 2],
+        theta[:, 5],
+        theta[:, 4],
+        theta[:, 3],
+        em=em,
+        readout_variance=readout_variance,
     )
     a = np.maximum(theta[:, 4], theta[:, 5])
     b = np.minimum(theta[:, 4], theta[:, 5])

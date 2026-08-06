@@ -17,6 +17,7 @@ import re
 import sys
 import threading
 import time
+import warnings
 from collections import UserDict
 from dataclasses import dataclass, field
 from typing import Literal
@@ -32,6 +33,7 @@ from .. import (
     localize,
     lib,
     postprocess,
+    scmos,
     spline,
     __version__,
     zfit,
@@ -178,6 +180,20 @@ MODEL_TOOLTIP = (
     " tick Use GPU to run it on the GPU instead (much faster).\n\n"
     "Average of ROI: reports the spot's center of mass and integrated "
     "intensity in the fit box."
+)
+
+CAMERA_CALIB_TOOLTIP = (
+    "Per-pixel offset, readout-variance and (optionally) gain maps measured\n"
+    "from a dark movie and (optionally) a light movie, as in Huang et al.,"
+    "Nat. Methods 2013.\n\n"
+    "When loaded, the offset map replaces Baseline and the gain map replaces\n"
+    "Sensitivity, and maximum-likelihood fits use the pixel-dependent sCMOS "
+    "noise model.\n\n"
+    "Least-squares fits are unaffected by the noise model itself but their "
+    "reported\n"
+    "uncertainty grows. **For sCMOS data prefer an MLE method, whose Cramer-Rao"
+    "\nbound is exact under the model.**\n\n"
+    "Build one with Calibrate > Compute sCMOS camera calibration."
 )
 
 OPTIMIZER_TOOLTIP = (
@@ -2062,6 +2078,8 @@ class ParametersDialog(lib.Dialog):
         self.z_calibration_path = None
         self.spline_calibration = {}
         self.spline_calibration_path = None
+        self.camera_calibration = {}
+        self.camera_calibration_path = None
         # calibration group boxes, toggled by the selected fit model; set up
         # further below
         self.z_groupbox = None
@@ -2473,6 +2491,29 @@ class ParametersDialog(lib.Dialog):
         self.pixelsize.setSingleStep(1)
         self.pixelsize.valueChanged.connect(self.on_pixelsize_changed)
         photon_grid.addWidget(self.pixelsize, 4, 1)
+
+        # sCMOS per-pixel camera calibration
+        camera_calib_label = QtWidgets.QLabel("sCMOS noise maps:")
+        camera_calib_label.setToolTip(CAMERA_CALIB_TOOLTIP)
+        photon_grid.addWidget(camera_calib_label, 5, 0)
+        self.camera_calib_label = QtWidgets.QLabel(
+            "-- no calibration loaded --"
+        )
+        self.camera_calib_label.setToolTip(CAMERA_CALIB_TOOLTIP)
+        self.camera_calib_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignCenter
+        )
+        photon_grid.addWidget(self.camera_calib_label, 5, 1)
+        camera_calib_buttons = QtWidgets.QHBoxLayout()
+        load_camera_calib_button = QtWidgets.QPushButton("Load...")
+        load_camera_calib_button.clicked.connect(self.load_camera_calib)
+        camera_calib_buttons.addWidget(load_camera_calib_button)
+        clear_camera_calib_button = QtWidgets.QPushButton("Clear")
+        clear_camera_calib_button.clicked.connect(
+            lambda: self.update_camera_calib(None)
+        )
+        camera_calib_buttons.addWidget(clear_camera_calib_button)
+        photon_grid.addLayout(camera_calib_buttons, 6, 0, 1, 2)
 
         # Fit Settings
         fit_groupbox = QtWidgets.QGroupBox("Fit Settings")
@@ -2982,6 +3023,110 @@ class ParametersDialog(lib.Dialog):
         if path:
             self.update_z_calib(path)
 
+    def load_camera_calib(self) -> None:
+        """Load a per-pixel sCMOS camera calibration from an HDF5."""
+        if self.camera_calibration_path:
+            dialog_directory, _ = os.path.split(self.camera_calibration_path)
+        else:
+            dialog_directory = None
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load sCMOS camera calibration",
+            directory=dialog_directory,
+            filter="*.hdf5",
+        )
+        if path:
+            self.update_camera_calib(path)
+
+    def update_camera_calib_with_config_path(self) -> None:
+        """Pick up the calibration configured for the selected camera.
+
+        Keyed by camera and then by emission wavelength, exactly like the z
+        and spline calibrations.
+
+        A single path in place of the wavelength mapping is also accepted and
+        then serves every wavelength - one sensor read out one way needs one
+        set of maps, and repeating the same path under each wavelength is only
+        a way for them to drift apart.
+
+        Switching to a camera or wavelength the config has no entry for
+        *clears* the calibration rather than leaving the previous one in
+        place.
+        """
+        if "camera-calibrations" not in CONFIG:
+            return
+        if not hasattr(self, "camera"):
+            return
+        camera = self.camera.currentText()
+        entry = CONFIG["camera-calibrations"].get(camera)
+        if isinstance(entry, dict):
+            em_combo = self.emission_combos.get(camera)
+            if em_combo is None:
+                return
+            entry = entry.get(int(em_combo.currentText()))
+        self.update_camera_calib(entry)
+
+    def update_camera_calib(self, path: str | None) -> None:
+        """Load, or clear with ``None``, the sCMOS camera calibration.
+
+        While one is loaded the scalars it supersedes are disabled rather than
+        silently ignored: Baseline always, Sensitivity only when the
+        calibration carries a gain map. Their values are kept, so clearing the
+        calibration restores exactly what was there before.
+        """
+        if path:
+            try:
+                calibration = io.load_camera_calibration(path)
+            except Exception as error:
+                QtWidgets.QMessageBox.critical(
+                    self, "Camera calibration", str(error)
+                )
+                return
+            self.camera_calibration = calibration
+            self.camera_calibration_path = path
+            self.camera_calib_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignRight
+                | QtCore.Qt.AlignmentFlag.AlignVCenter
+            )
+            self.camera_calib_label.setText(os.path.basename(path))
+            has_gain = calibration.get("gain") is not None
+            self.camera_calib_label.setToolTip(
+                f"{path}\n\n"
+                f"{calibration.get('Height')} x {calibration.get('Width')} "
+                f"pixels, {calibration.get('Frames')} dark frames\n"
+                "median variance "
+                + format(
+                    calibration.get("Variance median (ADU^2)", float("nan")),
+                    ".2f",
+                )
+                + " ADU^2, "
+                f"{calibration.get('Hot pixels', 0)} hot pixels\n"
+                + (
+                    "gain map present: Sensitivity is superseded"
+                    if has_gain
+                    else "no gain map: the scalar Sensitivity is still used"
+                )
+            )
+        else:
+            self.camera_calibration = {}
+            self.camera_calibration_path = None
+            self.camera_calib_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignCenter
+            )
+            self.camera_calib_label.setText("-- no calibration loaded --")
+            self.camera_calib_label.setToolTip(CAMERA_CALIB_TOOLTIP)
+            has_gain = False
+
+        loaded = bool(self.camera_calibration)
+        self.baseline.setEnabled(not loaded)
+        self.baseline.setToolTip(
+            "Replaced by the per-pixel offset map." if loaded else ""
+        )
+        self.sensitivity.setEnabled(not has_gain)
+        self.sensitivity.setToolTip(
+            "Replaced by the per-pixel gain map." if has_gain else ""
+        )
+
     def load_spline_calib(self) -> None:
         """Load a cubic-spline PSF calibration from a user-selected HDF5."""
         if self.spline_calibration_path:
@@ -3229,6 +3374,8 @@ class ParametersDialog(lib.Dialog):
         self.update_z_calib_with_config_path()
         # load spline PSF calibration
         self.update_spline_calib_with_config_path()
+        # load the per-pixel sCMOS calibration
+        self.update_camera_calib_with_config_path()
 
     def update_qe(self) -> None:
         """Update QE. Note that QE is not used in the analysis, the
@@ -3251,6 +3398,7 @@ class ParametersDialog(lib.Dialog):
         self.update_qe()
         self.update_z_calib_with_config_path()
         self.update_spline_calib_with_config_path()
+        self.update_camera_calib_with_config_path()
 
     def on_mng_spinbox_changed(self, value: int) -> None:
         """Handle change to the min. net gradient spinbox."""
@@ -3988,6 +4136,26 @@ class Window(QtWidgets.QMainWindow):
         calibrate_spline_action = threed_menu.addAction("Calibrate spline PSF")
         calibrate_spline_action.triggered.connect(self.calibrate_spline)
 
+        threed_menu.addSeparator()
+        camera_calib_action = threed_menu.addAction(
+            "Characterize sCMOS camera (dark movie)"
+        )
+        camera_calib_action.setToolTip(
+            "Measure the per-pixel offset and readout variance from a dark\n"
+            "movie, and optionally the per-pixel gain from a series of\n"
+            "movies at different illumination levels."
+        )
+        camera_calib_action.triggered.connect(self.calibrate_camera)
+
+        camera_check_action = threed_menu.addAction(
+            "Check sCMOS calibration (fresh dark movie)"
+        )
+        camera_check_action.setToolTip(
+            "Test the loaded calibration against a short fresh dark movie.\n"
+            "Sensor temperature and readout mode change the maps."
+        )
+        camera_check_action.triggered.connect(self.check_camera_calibration)
+
         self.inspect_beads_action = threed_menu.addAction(
             "Inspect spline calibration beads"
         )
@@ -4037,6 +4205,171 @@ class Window(QtWidgets.QMainWindow):
         """Use the loaded movie to obtain z-calibration data for 3D
         fitting using astigmatism."""
         self.localize(calibrate_z=True)
+
+    def calibrate_camera(self) -> None:
+        """Characterize the sCMOS camera from a dark movie.
+
+        Optionally also a bright series, which is what makes a per-pixel gain
+        map possible; without it the scalar Sensitivity keeps being used.
+        The dark movie is a separate acquisition from the data, so this never
+        reuses the currently loaded movie.
+        """
+
+        movie_filter = "Movies (%s)" % " ".join(
+            "*" + extension for extension in io.MOVIE_EXTENSIONS
+        )
+        dark_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open dark movie (no light on the sensor)",
+            filter=movie_filter,
+        )
+        if not dark_path:
+            return
+        light_paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Open light movies for the gain map (optional; cancel to skip)",
+            filter=movie_filter,
+        )
+
+        try:
+            dark_movie, _ = io.load_movie(dark_path)
+            light_movies = []
+            for path in light_paths:
+                movie, _ = io.load_movie(path)
+                light_movies.append(movie)
+            total = len(dark_movie) + sum(len(m) for m in light_movies)
+        except Exception as error:
+            QtWidgets.QMessageBox.critical(
+                self, "Camera calibration", str(error)
+            )
+            return
+        progress = lib.ProgressDialog("Characterizing camera", 0, total, self)
+        progress.init()
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                calibration = scmos.calibrate_scmos(
+                    dark_movie,
+                    light_movies or None,
+                    progress_callback=progress.set_value,
+                    dark_path=dark_path,
+                    bright_paths=light_paths,
+                )
+        except Exception as error:
+            progress.close()
+            QtWidgets.QMessageBox.critical(
+                self, "Camera calibration", str(error)
+            )
+            return
+        finally:
+            progress.close()
+        if calibration is None:
+            return
+
+        base, _ = os.path.splitext(dark_path)
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save sCMOS camera calibration",
+            base + "_scmos_calib.hdf5",
+            filter="*.hdf5",
+        )
+        if not out_path:
+            return
+        calibration["Path"] = out_path
+        io.save_camera_calibration(out_path, calibration)
+        self.update_camera_calib_from_worker(out_path)
+
+        lines = [
+            f"Frames used: {calibration['Frames']}",
+            "Offset: median " f"{calibration['Offset median (ADU)']:.2f} ADU",
+            "Readout variance: median "
+            f"{calibration['Variance median (ADU^2)']:.2f}, max "
+            f"{calibration['Variance max (ADU^2)']:.1f} ADU^2",
+            f"Hot pixels: {calibration['Hot pixels']}",
+        ]
+        if calibration.get("gain") is not None:
+            lines.append(
+                "Gain: median "
+                f"{calibration['Gain median (ADU/e-)']:.3f} ADU/e- from "
+                f"{calibration['Gain levels']} illumination levels"
+            )
+        else:
+            lines.append(
+                "No gain map (no light movies given); the scalar "
+                "Sensitivity is still used."
+            )
+        for warning in caught:
+            lines.append("")
+            lines.append(str(warning.message))
+        QtWidgets.QMessageBox.information(
+            self, "Camera calibration", "\n".join(lines)
+        )
+
+    def update_camera_calib_from_worker(self, path: str) -> None:
+        """Load a freshly built calibration into the parameters dialog."""
+        self.parameters_dialog.update_camera_calib(path)
+
+    def check_camera_calibration(self) -> None:
+        """Test the loaded calibration against a short fresh dark movie."""
+
+        calibration = self.parameters_dialog.camera_calibration
+        if not calibration:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Camera calibration",
+                "Load an sCMOS camera calibration first (Photon conversion > "
+                "sCMOS noise maps).",
+            )
+            return
+        movie_filter = "Movies (%s)" % " ".join(
+            "*" + extension for extension in io.MOVIE_EXTENSIONS
+        )
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open a fresh dark movie", filter=movie_filter
+        )
+        if not path:
+            return
+        try:
+            movie, _ = io.load_movie(path)
+        except Exception as error:
+            QtWidgets.QMessageBox.critical(
+                self, "Camera calibration", str(error)
+            )
+            return
+        progress = lib.ProgressDialog(
+            "Checking calibration", 0, len(movie), self
+        )
+        progress.init()
+        try:
+            report = scmos.validate_calibration(
+                calibration, movie, progress_callback=progress.set_value
+            )
+        except Exception as error:
+            progress.close()
+            QtWidgets.QMessageBox.critical(
+                self, "Camera calibration", str(error)
+            )
+            return
+        finally:
+            progress.close()
+        if report is None:
+            return
+        verdict = (
+            "The calibration still describes this camera."
+            if report["valid"]
+            else "The camera looks "
+            + ("noisier" if report["mean p-value"] < 0.5 else "quieter")
+            + " than when it was characterized. Sensor temperature, readout "
+            "mode and bit depth all change the maps; recalibrate before "
+            "trusting the noise model."
+        )
+        QtWidgets.QMessageBox.information(
+            self,
+            "Camera calibration",
+            f"Frames tested: {report['Frames']}\n"
+            f"Mean p-value: {report['mean p-value']:.3f} "
+            "(0.5 +- 0.1 is a match)\n\n" + verdict,
+        )
 
     def calibrate_spline(self) -> None:
         """Build a cubic-spline PSF calibration from the loaded bead z-stack
@@ -6349,6 +6682,9 @@ class Window(QtWidgets.QMainWindow):
             calibrate_z,
             use_gpu,
             spline_calibration=spline_calibration,
+            camera_calibration=(
+                self.parameters_dialog.camera_calibration or None
+            ),
         )
         self.fit_worker.progressMade.connect(self.on_fit_progress)
         self.fit_worker.cutProgressMade.connect(self.on_cut_progress)
@@ -6436,6 +6772,9 @@ class Window(QtWidgets.QMainWindow):
             identifications_per_channel=ids_per_channel,
             eps=eps,
             max_it=max_it,
+            camera_calibration=(
+                self.parameters_dialog.camera_calibration or None
+            ),
         )
         self.fit_worker.linkMade.connect(self.on_link_progress)
         self.fit_worker.linkFinished.connect(self.on_link_finished)
@@ -6516,6 +6855,9 @@ class Window(QtWidgets.QMainWindow):
             link_photons=self.parameters_dialog._link_photons_enabled(),
             eps=eps,
             max_it=max_it,
+            camera_calibration=(
+                self.parameters_dialog.camera_calibration or None
+            ),
         )
         self.fit_worker.linkMade.connect(self.on_link_progress)
         self.fit_worker.linkFinished.connect(self.on_link_finished)
@@ -7342,6 +7684,7 @@ class FitWorker(QtCore.QThread):
         calibrate_z: bool,
         use_gpu: bool,
         spline_calibration: dict | None = None,
+        camera_calibration: dict | None = None,
     ) -> None:
         super().__init__()
         self.movie = movie
@@ -7354,6 +7697,7 @@ class FitWorker(QtCore.QThread):
         self.fit_z = fit_z
         self.calibrate_z = calibrate_z
         self.spline_calibration = spline_calibration
+        self.camera_calibration = camera_calibration
         self.N = len(identifications)
         self._last_cut_emit = 0
         self.method = _effective_fit_code(method, use_gpu)
@@ -7385,6 +7729,7 @@ class FitWorker(QtCore.QThread):
             max_it=self.max_it,
             mle_method="sigmaxy",
             spline_calibration=self.spline_calibration,
+            camera_calibration=self.camera_calibration,
             multiprocess=True,
             progress_callback=self.on_progress,
             abort_callback=self.isInterruptionRequested,
@@ -7424,10 +7769,21 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         use_gpu: bool | None = None,
         eps: float | None = None,
         max_it: int | None = None,
+        camera_calibration: dict | None = None,
     ) -> None:
         super().__init__()
         self.movies = movies
         self.camera_infos = camera_infos
+        # One loaded calibration, applied to every channel. Split-FOV really
+        # is one sensor; separate cameras per channel would each need their
+        # own maps, which the GUI has no way to load yet - the API
+        # (``camera_calibrations``) takes a per-channel list.
+        self.camera_calibration = camera_calibration
+        self.camera_calibrations = (
+            None
+            if camera_calibration is None
+            else [camera_calibration] * len(movies)
+        )
         self.identifications = identifications
         self.identifications_per_channel = identifications_per_channel
         self.box = box
@@ -7549,6 +7905,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     tolerance=self.eps,
                     max_iterations=self.max_it,
                     progress_callback=self.on_progress,
+                    camera_calibration=self.camera_calibration,
                 )
             elif not self.link_photons and (
                 2 <= n_channels <= localize._LINK_XYZ_MAX_CHANNELS
@@ -7567,6 +7924,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     tolerance=self.eps,
                     max_iterations=self.max_it,
                     progress_callback=self.on_progress,
+                    camera_calibrations=self.camera_calibrations,
                 )
             elif self.calibration.get("photon_ratios") is not None:
                 # Ratiometric color assignment: the calibration carries
@@ -7583,6 +7941,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     tolerance=self.eps,
                     max_iterations=self.max_it,
                     progress_callback=self.on_progress,
+                    camera_calibrations=self.camera_calibrations,
                 )
             else:
                 locs = localize.fit_spline_multichannel(
@@ -7596,6 +7955,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     tolerance=self.eps,
                     max_iterations=self.max_it,
                     progress_callback=self.on_progress,
+                    camera_calibrations=self.camera_calibrations,
                 )
         except Exception as e:
             print(f"Multichannel spline fit failed: {e}")

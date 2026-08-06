@@ -95,6 +95,7 @@ from picasso.fitting.splinefit import (
     KIND_LINK_XYZ,
     _allocate_outputs,
     _check_inputs,
+    resolve_variance,
     resolve_schedule,
 )
 from picasso.fitting.lmfit_cuda import (
@@ -305,7 +306,19 @@ def _make_accumulate_2d(eval_spline_2d):
     ``splinefit._accumulate_2d``."""
 
     @cuda.jit(device=True)
-    def accumulate(spots, index, coeff, aff, res, theta, mle, hess, grad):
+    def accumulate(
+        spots,
+        index,
+        variance,
+        use_variance,
+        coeff,
+        aff,
+        res,
+        theta,
+        mle,
+        hess,
+        grad,
+    ):
         box = spots.shape[2]
         amp = theta[0]
         x_shift = theta[1]
@@ -335,8 +348,11 @@ def _make_accumulate_2d(eval_spline_2d):
                 d1 = -amp * gx
                 d2 = -amp * gy
                 # d3 == 1 (offset), folded into the accumulation below.
+                var = 0.0
+                if use_variance:
+                    var = variance[index, 0, j, i]
                 contrib, weight, factor, ok = _estimator_terms(
-                    mle, value, data
+                    mle, value, data, var
                 )
                 if not ok:
                     return _INF, False
@@ -386,7 +402,19 @@ def _make_accumulate_3d(eval_spline_3d):
     of ``splinefit._accumulate_3d``."""
 
     @cuda.jit(device=True)
-    def accumulate(spots, index, coeff, aff, res, theta, mle, hess, grad):
+    def accumulate(
+        spots,
+        index,
+        variance,
+        use_variance,
+        coeff,
+        aff,
+        res,
+        theta,
+        mle,
+        hess,
+        grad,
+    ):
         n_channels = spots.shape[1]
         box = spots.shape[2]
         amp = theta[0]
@@ -441,8 +469,11 @@ def _make_accumulate_3d(eval_spline_3d):
                     d2 = -amp * (a01 * gx + a11 * gy)
                     d3 = -amp * gz
                     # d4 == 1 (offset).
+                    var = 0.0
+                    if use_variance:
+                        var = variance[index, ch, j, i]
                     contrib, weight, factor, ok = _estimator_terms(
-                        mle, value, data
+                        mle, value, data, var
                     )
                     if not ok:
                         return _INF, False
@@ -513,7 +544,19 @@ def _make_accumulate_link_xyz(eval_spline_3d, n_channels: int):
     n_ch = n_channels
 
     @cuda.jit(device=True)
-    def accumulate(spots, index, coeff, aff, res, theta, mle, hess, grad):
+    def accumulate(
+        spots,
+        index,
+        variance,
+        use_variance,
+        coeff,
+        aff,
+        res,
+        theta,
+        mle,
+        hess,
+        grad,
+    ):
         box = spots.shape[2]
         n_params = 3 + 2 * n_ch
         x_shift = theta[0]
@@ -564,8 +607,11 @@ def _make_accumulate_link_xyz(eval_spline_3d, n_channels: int):
                     d2 = -amp * gz
                     # d(value)/d(N_ch) = phi, d(value)/d(bg_ch) = 1; both zero
                     # for every other channel.
+                    var = 0.0
+                    if use_variance:
+                        var = variance[index, ch, j, i]
                     contrib, weight, factor, ok = _estimator_terms(
-                        mle, value, data
+                        mle, value, data, var
                     )
                     if not ok:
                         return _INF, False
@@ -710,6 +756,7 @@ def fit_spots(
     ) = None,
     abort_callback: Callable[[], bool] | None = None,
     single_precision: bool = True,
+    variance: np.ndarray | None = None,
 ) -> tuple:
     """Fit spots with a cubic-spline PSF model on the GPU.
 
@@ -737,6 +784,7 @@ def fit_spots(
     _check_inputs(
         kind, spots, coefficients, affines, residuals, initial_parameters
     )
+    variance, use_variance = resolve_variance(variance, spots.shape, ndim=4)
     tolerance, max_iterations = resolve_schedule(
         apply_seeds, tolerance, max_iterations
     )
@@ -771,9 +819,13 @@ def fit_spots(
     d_coeff = cuda.to_device(coefficients)
     d_aff = cuda.to_device(affines)
     d_seeds = cuda.to_device(z_seeds)
+    # Without a noise model the variance is a four-byte dummy, uploaded once
+    # rather than per chunk.
+    d_dummy_variance = None if use_variance else cuda.to_device(variance)
 
     bytes_per_row = (
         4 * n_channels * box * box  # spots
+        + (4 * n_channels * box * box if use_variance else 0)  # variance
         + 8 * 2 * n_channels  # residuals
         + 8 * n_params  # initial parameters
         + 8 * n_params  # fitted parameters
@@ -797,6 +849,11 @@ def fit_spots(
             stop = min(start + chunk, n_spots)
             n = stop - start
             d_spots = cuda.to_device(spots[start:stop])
+            d_variance = (
+                cuda.to_device(variance[start:stop])
+                if use_variance
+                else d_dummy_variance
+            )
             d_res = cuda.to_device(residuals[start:stop])
             d_init = cuda.to_device(initial_parameters[start:stop])
             d_thetas = cuda.device_array((n, n_params), dtype=np.float64)
@@ -806,6 +863,8 @@ def fit_spots(
             blocks = (n + threads - 1) // threads
             kernel[blocks, threads](
                 d_spots,
+                d_variance,
+                use_variance,
                 d_coeff,
                 d_aff,
                 d_res,

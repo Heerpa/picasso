@@ -56,6 +56,7 @@ def localization_precision(
     s_orth: lib.FloatArray1D,
     bg: lib.FloatArray1D,
     em: bool,
+    readout_variance: lib.FloatArray1D | float = 0.0,
 ) -> lib.FloatArray1D:
     """Theoretical localization precision of a 2D unweighted Gaussian fit.
 
@@ -78,13 +79,31 @@ def localization_precision(
     em : bool
         Whether EMCCD was used for the localization. Its stochastic
         multiplication doubles the variance.
+    readout_variance : lib.FloatArray1D or float, optional
+        Mean sCMOS readout variance over the fitting box, in photoelectrons
+        squared. Adds to the background term. Default 0.
 
     Returns
     -------
     lib.FloatArray1D
         Cramer-Rao lower bound for localization precision for each
         localization.
+
+    Notes
+    -----
+    With a per-pixel sCMOS camera calibration, ``readout_variance`` adds the
+    pixel readout noise to the background term, which is where a spatially
+    uniform noise floor enters this closed form. That is an approximation:
+    Mortensen's derivation assumes the background variance is *constant* over
+    the fitting box, so replacing ``bg`` by ``bg + mean(var)`` is exact only
+    when the variance map is flat there. With one hot pixel next to the
+    emitter it under- or over-states the precision depending on where that
+    pixel falls under the PSF. For sCMOS data with a calibration loaded,
+    prefer a maximum-likelihood method, whose Cramer-Rao bound is evaluated
+    pixel by pixel and is exact under the noise model
+    (``picasso.localize._gauss_crlb``).
     """
+    bg = bg + readout_variance
     s2 = s**2
     sa2 = s2 + 1 / 12
     sa = sa2**0.5
@@ -102,6 +121,7 @@ def sigma_uncertainty_lsq(
     sigma_orth: lib.SeriesOrFloatArray1D,
     photons: lib.SeriesOrFloatArray1D,
     bg: lib.SeriesOrFloatArray1D,
+    readout_variance: lib.SeriesOrFloatArray1D | float = 0.0,
 ) -> lib.FloatArray1D:
     """Standard error of a **least-squares** fitted sigma.
 
@@ -119,12 +139,17 @@ def sigma_uncertainty_lsq(
         Number of photons.
     bg : lib.SeriesOrFloatArray1D
         Background photons per pixel.
+    readout_variance : lib.SeriesOrFloatArray1D or float, optional
+        Mean sCMOS readout variance over the fitting box, in photoelectrons
+        squared. Adds to the background term, with the same caveat as in
+        :func:`localization_precision`. Default 0.
 
     Returns
     -------
     se_sigma : lib.FloatArray1D
         Standard error of fitted sigma values in camera pixels.
     """
+    bg = bg + readout_variance
     sa2 = sigma**2 + 1 / 12
     sa4 = sa2**2
     sa = sa2**0.5
@@ -145,6 +170,7 @@ def sigma_uncertainty_mle(
     sigma_orth: lib.SeriesOrFloatArray1D,
     photons: lib.SeriesOrFloatArray1D,
     bg: lib.SeriesOrFloatArray1D,
+    readout_variance: lib.SeriesOrFloatArray1D | float = 0.0,
 ) -> lib.FloatArray1D:
     """Standard error of a **maximum-likelihood** fitted sigma.
 
@@ -161,12 +187,17 @@ def sigma_uncertainty_mle(
         Number of photons.
     bg : lib.SeriesOrFloatArray1D
         Background photons per pixel.
+    readout_variance : lib.SeriesOrFloatArray1D or float, optional
+        Mean sCMOS readout variance over the fitting box, in photoelectrons
+        squared. Adds to the background term, with the same caveat as in
+        :func:`localization_precision`. Default 0.
 
     Returns
     -------
     se_sigma : lib.FloatArray1D
         Standard error of fitted sigma values in camera pixels.
     """
+    bg = bg + readout_variance
     sa2 = sigma**2 + 1 / 12
     tau = (2 * np.pi * sa2 * bg) / (photons)
     delta_sigma_sq = (sigma**2 / (4 * photons)) * (

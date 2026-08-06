@@ -211,15 +211,18 @@ def _poisson_terms(value, data):
 
 
 @cuda.jit(device=True, inline=True)
-def _estimator_terms(mle, value, data):
+def _estimator_terms(mle, value, data, var):
     """Per-pixel ``(chi_square, weight, factor, ok)``, flooring a low model.
 
     ``weight`` multiplies the Hessian outer product and ``factor`` the gradient,
     so a caller accumulates ``grad_k += d_k * factor`` and
     ``hess_kl += weight * d_k * d_l``. This is the one place the least-squares
-    and Poisson branches are written down; ``picasso.fitting.splinefit``
-    spells the same
-    table out three times, once per model.
+    and Poisson branches are written down for the device kernels.
+
+    ``var`` is the pixel's sCMOS readout variance in photoelectrons squared,
+    zero when no camera calibration is in use. See
+    ``picasso.fitting.splinefit._estimator_terms``, the CPU twin, for what the
+    shift by ``var`` means and why the least-squares branch is untouched by it.
 
     ``ok`` is False only for a non-finite model value under the maximum
     likelihood estimator, where the caller must abandon the fit. A merely
@@ -232,22 +235,25 @@ def _estimator_terms(mle, value, data):
     that cannot ring - see :func:`_estimator_terms_strict`.
     """
     if mle:
-        if not math.isfinite(value):
+        shifted_value = value + var
+        shifted_data = data + var
+        if not math.isfinite(shifted_value):
             return _INF, 0.0, 0.0, False
-        if value < MU_FLOOR:
+        if shifted_value < MU_FLOOR:
             # Charged to the likelihood so seeds stay comparable, but kept out
             # of the gradient and Hessian: its 1/mu weight would be enormous
             # and, through the monotone scaling vector, would damp every
             # parameter to a standstill for the rest of the fit.
-            return _floored_chi_square(data), 0.0, 0.0, True
-        chi, weight, factor = _poisson_terms(value, data)
+            return _floored_chi_square(shifted_data), 0.0, 0.0, True
+        chi, weight, factor = _poisson_terms(shifted_value, shifted_data)
         return chi, weight, factor, True
+    # Least squares: the shift cancels, so it is never formed.
     deviation = value - data
     return deviation * deviation, 1.0, -deviation, True
 
 
 @cuda.jit(device=True, inline=True)
-def _estimator_terms_strict(mle, value, data):
+def _estimator_terms_strict(mle, value, data, var):
     """:func:`_estimator_terms`, but a non-positive model value aborts the fit.
 
     For models that cannot ring negative - the Gaussians, whose value only
@@ -258,12 +264,20 @@ def _estimator_terms_strict(mle, value, data):
     converged. Gpufit aborts such a fit with ``NEG_CURVATURE_MLE`` and so does
     this; the caller reports the state and the parameters stay at the last
     accepted iterate.
+
+    Note that with a camera calibration loaded the test is on the *shifted*
+    mean ``value + var``, which is the quantity the approximation makes
+    Poisson. A slightly negative background can therefore survive on a noisy
+    pixel where it previously aborted the fit; that is correct under the model
+    and only happens when a variance map is in use.
     """
     if mle:
-        if not (math.isfinite(value) and value >= MU_FLOOR):
+        shifted_value = value + var
+        if not (math.isfinite(shifted_value) and shifted_value >= MU_FLOOR):
             return _INF, 0.0, 0.0, False
-        chi, weight, factor = _poisson_terms(value, data)
+        chi, weight, factor = _poisson_terms(shifted_value, data + var)
         return chi, weight, factor, True
+    # Least squares: the shift cancels, so it is never formed.
     deviation = value - data
     return deviation * deviation, 1.0, -deviation, True
 
@@ -366,10 +380,16 @@ def _lm_solve_step_device(hess, grad, scaling, lam, damped, delta, n, ipiv):
 def make_lm_driver(accumulate, n_params: int, z_col: int, seedable: bool):
     """Build the per-fit LM driver device function for one model.
 
-    ``accumulate(spots, index, coeff, aff, res, theta, mle, hess, grad)`` must
-    return ``(chi_square, ok)`` and fill the full symmetric ``hess`` and
-    ``grad``, exactly like the ``picasso.fitting.splinefit._accumulate_*``
-    family.
+    ``accumulate(spots, index, variance, use_variance, coeff, aff, res, theta,
+    mle, hess, grad)`` must return ``(chi_square, ok)`` and fill the full
+    symmetric ``hess`` and ``grad``, exactly like the
+    ``picasso.fitting.splinefit._accumulate_*`` family.
+
+    ``variance`` is laid out exactly like ``spots`` and holds the per-pixel
+    sCMOS readout variance in photoelectrons squared; ``use_variance`` is False
+    when no camera calibration is in use, and ``variance`` is then a
+    ``(1, 1, 1, 1)`` dummy that exists only to keep the kernel's argument types
+    stable across both states.
 
     The driver is generated rather than shared because ``cuda.local.array``
     needs a compile-time shape, so ``n_params`` has to be a closure constant.
@@ -393,6 +413,8 @@ def make_lm_driver(accumulate, n_params: int, z_col: int, seedable: bool):
     def driver(
         spots,
         index,
+        variance,
+        use_variance,
         coeff,
         aff,
         res,
@@ -460,7 +482,17 @@ def make_lm_driver(accumulate, n_params: int, z_col: int, seedable: bool):
             n_iterations = 0
 
             chi_square, ok = accumulate(
-                spots, index, coeff, aff, res, theta, mle, hess, grad
+                spots,
+                index,
+                variance,
+                use_variance,
+                coeff,
+                aff,
+                res,
+                theta,
+                mle,
+                hess,
+                grad,
             )
             if not ok:
                 # The seed itself is unusable (non-finite parameters or model).
@@ -486,7 +518,17 @@ def make_lm_driver(accumulate, n_params: int, z_col: int, seedable: bool):
                     theta_previous[p] = theta[p]
                     theta[p] += grad[p]
                 new_chi_square, ok = accumulate(
-                    spots, index, coeff, aff, res, theta, mle, hess, grad
+                    spots,
+                    index,
+                    variance,
+                    use_variance,
+                    coeff,
+                    aff,
+                    res,
+                    theta,
+                    mle,
+                    hess,
+                    grad,
                 )
                 n_iterations = iteration + 1
                 if not ok:
@@ -595,6 +637,8 @@ def make_fit_kernel(driver, cache: bool = False):
     @cuda.jit(cache=cache)
     def kernel(
         spots,
+        variance,
+        use_variance,
         coeff,
         aff,
         res,
@@ -615,6 +659,8 @@ def make_fit_kernel(driver, cache: bool = False):
         driver(
             spots,
             index,
+            variance,
+            use_variance,
             coeff,
             aff,
             res,

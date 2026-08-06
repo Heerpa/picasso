@@ -212,6 +212,50 @@ def _floored_chi_square(data: float) -> float:
 
 
 @numba.njit(nogil=True, cache=True, fastmath=_FASTMATH)
+def _estimator_terms(
+    mle: bool, value: float, data: float, var: float
+) -> tuple:
+    """Per-pixel ``(chi_square, weight, factor, ok)``, flooring a low model.
+
+    ``weight`` multiplies the Hessian outer product and ``factor`` the
+    gradient, so a caller accumulates ``grad_k += d_k * factor`` and
+    ``hess_kl += weight * d_k * d_l``. ``ok`` is False only for a non-finite
+    model value under the maximum likelihood estimator, where the caller must
+    abandon the fit; a merely non-positive value is floored instead of
+    rejected, see :data:`MU_FLOOR`.
+
+    The CPU twin of ``picasso.fitting.lmfit_cuda._estimator_terms`` and the
+    flooring counterpart of ``picasso.fitting.gaussfit._estimator_terms``,
+    which aborts instead - the Gaussian models cannot ring negative, so for
+    them the floor is harmful rather than merely unnecessary."""
+    if mle:
+        value = value + var
+        data = data + var
+        if not np.isfinite(value):
+            return np.inf, 0.0, 0.0, False
+        if value < MU_FLOOR:
+            # Below the floor the pixel is charged to the likelihood - so
+            # multi-start seeds stay comparable and invalid regions are
+            # disfavoured - but kept out of the gradient and Hessian, where its
+            # 1/mu weight would be enormous and, through the monotone scaling
+            # vector, damp every parameter to a standstill for the rest of the
+            # fit.
+            return _floored_chi_square(data), 0.0, 0.0, True
+        if data > 0.0:
+            return (
+                2.0 * ((value - data) - data * np.log(value / data)),
+                data / (value * value),
+                -(1.0 - data / value),
+                True,
+            )
+        # An empty (or clipped) pixel: Gpufit's data == 0 term.
+        return 2.0 * value, 0.0, -1.0, True
+    deviation = value - data
+    # factor == data - value.
+    return deviation * deviation, 1.0, -deviation, True
+
+
+@numba.njit(nogil=True, cache=True, fastmath=_FASTMATH)
 def _cubic(c0: float, c1: float, c2: float, c3: float, f: float) -> tuple:
     """Value and derivative of ``c0 + c1 f + c2 f^2 + c3 f^3`` (Horner)."""
     return (
@@ -476,6 +520,8 @@ def _lm_solve_step(
 def _accumulate_3d(
     spots: np.ndarray,
     index: int,
+    variance: np.ndarray,
+    use_variance: bool,
     coeff: np.ndarray,
     aff: np.ndarray,
     res: np.ndarray,
@@ -552,36 +598,15 @@ def _accumulate_3d(
                 d2 = -amp * (a01 * gx + a11 * gy)
                 d3 = -amp * gz
                 # d4 == 1 (offset), folded into the accumulation below.
-                if mle:
-                    if not np.isfinite(value):
-                        return np.inf, False
-                    if value < MU_FLOOR:
-                        # Below the floor the pixel is charged to the
-                        # likelihood - so multi-start seeds stay comparable and
-                        # invalid regions are disfavoured - but kept out of the
-                        # gradient and Hessian, where its 1/mu weight would be
-                        # enormous and, through the monotone scaling vector,
-                        # damp every parameter to a standstill for the rest of
-                        # the fit.
-                        chi_square += _floored_chi_square(data)
-                        weight = 0.0
-                        factor = 0.0
-                    elif data > 0.0:
-                        chi_square += 2.0 * (
-                            (value - data) - data * np.log(value / data)
-                        )
-                        weight = data / (value * value)
-                        factor = -(1.0 - data / value)
-                    else:
-                        # An empty (or clipped) pixel: Gpufit's data == 0 term.
-                        chi_square += 2.0 * value
-                        weight = 0.0
-                        factor = -1.0
-                else:
-                    deviation = value - data
-                    chi_square += deviation * deviation
-                    weight = 1.0
-                    factor = -deviation  # == data - value
+                var = 0.0
+                if use_variance:
+                    var = variance[index, ch, j, i]
+                contrib, weight, factor, ok = _estimator_terms(
+                    mle, value, data, var
+                )
+                if not ok:
+                    return np.inf, False
+                chi_square += contrib
                 g0 += d0 * factor
                 g1 += d1 * factor
                 g2 += d2 * factor
@@ -633,6 +658,8 @@ def _accumulate_3d(
 def _accumulate_2d(
     spots: np.ndarray,
     index: int,
+    variance: np.ndarray,
+    use_variance: bool,
     coeff: np.ndarray,
     aff: np.ndarray,
     res: np.ndarray,
@@ -675,28 +702,15 @@ def _accumulate_2d(
             d1 = -amp * gx
             d2 = -amp * gy
             # d3 == 1 (offset).
-            if mle:
-                if not np.isfinite(value):
-                    return np.inf, False
-                if value < MU_FLOOR:
-                    chi_square += _floored_chi_square(data)
-                    weight = 0.0
-                    factor = 0.0
-                elif data > 0.0:
-                    chi_square += 2.0 * (
-                        (value - data) - data * np.log(value / data)
-                    )
-                    weight = data / (value * value)
-                    factor = -(1.0 - data / value)
-                else:
-                    chi_square += 2.0 * value
-                    weight = 0.0
-                    factor = -1.0
-            else:
-                deviation = value - data
-                chi_square += deviation * deviation
-                weight = 1.0
-                factor = -deviation
+            var = 0.0
+            if use_variance:
+                var = variance[index, 0, j, i]
+            contrib, weight, factor, ok = _estimator_terms(
+                mle, value, data, var
+            )
+            if not ok:
+                return np.inf, False
+            chi_square += contrib
             g0 += d0 * factor
             g1 += d1 * factor
             g2 += d2 * factor
@@ -735,6 +749,8 @@ def _accumulate_2d(
 def _accumulate_link_xyz(
     spots: np.ndarray,
     index: int,
+    variance: np.ndarray,
+    use_variance: bool,
     coeff: np.ndarray,
     aff: np.ndarray,
     res: np.ndarray,
@@ -794,36 +810,15 @@ def _accumulate_link_xyz(
                 d2 = -amp * gz
                 # d(value)/d(N_ch) = phi, d(value)/d(bg_ch) = 1; both zero for
                 # every other channel.
-                if mle:
-                    if not np.isfinite(value):
-                        return np.inf, False
-                    if value < MU_FLOOR:
-                        # Below the floor the pixel is charged to the
-                        # likelihood - so multi-start seeds stay comparable and
-                        # invalid regions are disfavoured - but kept out of the
-                        # gradient and Hessian, where its 1/mu weight would be
-                        # enormous and, through the monotone scaling vector,
-                        # damp every parameter to a standstill for the rest of
-                        # the fit.
-                        chi_square += _floored_chi_square(data)
-                        weight = 0.0
-                        factor = 0.0
-                    elif data > 0.0:
-                        chi_square += 2.0 * (
-                            (value - data) - data * np.log(value / data)
-                        )
-                        weight = data / (value * value)
-                        factor = -(1.0 - data / value)
-                    else:
-                        # An empty (or clipped) pixel: Gpufit's data == 0 term.
-                        chi_square += 2.0 * value
-                        weight = 0.0
-                        factor = -1.0
-                else:
-                    deviation = value - data
-                    chi_square += deviation * deviation
-                    weight = 1.0
-                    factor = -deviation
+                var = 0.0
+                if use_variance:
+                    var = variance[index, ch, j, i]
+                contrib, weight, factor, ok = _estimator_terms(
+                    mle, value, data, var
+                )
+                if not ok:
+                    return np.inf, False
+                chi_square += contrib
                 grad[0] += d0 * factor
                 grad[1] += d1 * factor
                 grad[2] += d2 * factor
@@ -860,6 +855,8 @@ def _accumulate_link_xyz(
 def _fit_spline_spot(
     spots: np.ndarray,
     index: int,
+    variance: np.ndarray,
+    use_variance: bool,
     kind: int,
     coeff2d: np.ndarray,
     coeff3d: np.ndarray,
@@ -940,15 +937,45 @@ def _fit_spline_spot(
 
         if kind == KIND_2D:
             chi_square, ok = _accumulate_2d(
-                spots, index, coeff2d, aff, res, theta, mle, hess, grad
+                spots,
+                index,
+                variance,
+                use_variance,
+                coeff2d,
+                aff,
+                res,
+                theta,
+                mle,
+                hess,
+                grad,
             )
         elif kind == KIND_3D:
             chi_square, ok = _accumulate_3d(
-                spots, index, coeff3d, aff, res, theta, mle, hess, grad
+                spots,
+                index,
+                variance,
+                use_variance,
+                coeff3d,
+                aff,
+                res,
+                theta,
+                mle,
+                hess,
+                grad,
             )
         else:
             chi_square, ok = _accumulate_link_xyz(
-                spots, index, coeff3d, aff, res, theta, mle, hess, grad
+                spots,
+                index,
+                variance,
+                use_variance,
+                coeff3d,
+                aff,
+                res,
+                theta,
+                mle,
+                hess,
+                grad,
             )
         if not ok:
             # The seed itself is unusable (non-finite parameters or model).
@@ -984,15 +1011,45 @@ def _fit_spline_spot(
                 theta[p] += delta[p]
             if kind == KIND_2D:
                 new_chi_square, ok = _accumulate_2d(
-                    spots, index, coeff2d, aff, res, theta, mle, hess, grad
+                    spots,
+                    index,
+                    variance,
+                    use_variance,
+                    coeff2d,
+                    aff,
+                    res,
+                    theta,
+                    mle,
+                    hess,
+                    grad,
                 )
             elif kind == KIND_3D:
                 new_chi_square, ok = _accumulate_3d(
-                    spots, index, coeff3d, aff, res, theta, mle, hess, grad
+                    spots,
+                    index,
+                    variance,
+                    use_variance,
+                    coeff3d,
+                    aff,
+                    res,
+                    theta,
+                    mle,
+                    hess,
+                    grad,
                 )
             else:
                 new_chi_square, ok = _accumulate_link_xyz(
-                    spots, index, coeff3d, aff, res, theta, mle, hess, grad
+                    spots,
+                    index,
+                    variance,
+                    use_variance,
+                    coeff3d,
+                    aff,
+                    res,
+                    theta,
+                    mle,
+                    hess,
+                    grad,
                 )
             n_iterations = iteration + 1
             if not ok:
@@ -1103,7 +1160,42 @@ def _dummy_coefficients() -> tuple:
     return dummy_2d, dummy_3d
 
 
+def _dummy_variance(ndim: int = 4) -> np.ndarray:
+    """Stand-in for an absent sCMOS readout-variance map.
+
+    Four bytes, and the same numba type as a real variance array - float32,
+    C-contiguous, of the given rank - so a kernel compiles exactly one
+    specialization whether or not a camera calibration is in use. Passing a
+    scalar zero instead would type differently and force a second compile;
+    passing a full-size array of zeros would cost a real read per pixel per
+    iteration for nothing. The companion ``use_variance`` flag is a
+    loop-invariant boolean, so the guard costs nothing either."""
+    return np.zeros((1,) * ndim, dtype=np.float32)
+
+
+def resolve_variance(
+    variance: np.ndarray | None, expected_shape: tuple, ndim: int = 4
+) -> tuple:
+    """``(variance, use_variance)`` for a kernel argument list.
+
+    ``None`` yields the dummy of :func:`_dummy_variance` and False. Anything
+    else must match ``expected_shape`` - the variance patch is cut from the
+    same ROIs as the spots, so a mismatch is a plumbing bug, not a user
+    error."""
+    if variance is None:
+        return _dummy_variance(ndim), False
+    variance = np.ascontiguousarray(variance, dtype=np.float32)
+    if variance.shape != tuple(expected_shape):
+        raise ValueError(
+            "variance must have the same shape as spots "
+            f"{tuple(expected_shape)}, got {variance.shape}."
+        )
+    return variance, True
+
+
 def _kernel_args(
+    variance: np.ndarray,
+    use_variance: bool,
     kind: int,
     coefficients: np.ndarray,
     affines: np.ndarray,
@@ -1119,11 +1211,17 @@ def _kernel_args(
     states: np.ndarray,
     iterations: np.ndarray,
 ) -> tuple:
-    """Freeze everything :func:`_fit_spline_spot` needs after ``index``."""
+    """Freeze everything :func:`_fit_spline_spot` needs after ``index``.
+
+    ``variance``/``use_variance`` lead, so they land immediately after
+    ``index`` in the kernel signature and every
+    ``_fit_spline_spot(spots, index, *args)`` call site stays as it was."""
     dummy_2d, dummy_3d = _dummy_coefficients()
     coeff2d = coefficients if kind == KIND_2D else dummy_2d
     coeff3d = dummy_3d if kind == KIND_2D else coefficients
     return (
+        variance,
+        bool(use_variance),
         kind,
         coeff2d,
         coeff3d,
@@ -1289,6 +1387,7 @@ def fit_spots(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    variance: np.ndarray | None = None,
 ) -> tuple:
     """Fit spots with a cubic-spline PSF model on the CPU, serially.
 
@@ -1324,6 +1423,10 @@ def fit_spots(
     tolerance, max_iterations : optional
         Convergence schedule. ``None`` (the default) uses the one the GPU path
         uses for this kind of fit, see :func:`convergence_schedule`.
+    variance : np.ndarray, optional
+        Per-pixel sCMOS readout variance in photoelectrons squared, laid out
+        exactly like ``spots``. ``None`` (the default) fits the plain Poisson
+        model. See :func:`_estimator_terms`.
     progress_callback : callable, "console" or None, optional
         ``"console"`` shows a tqdm bar; a callable is invoked with the
         cumulative number of spots fitted.
@@ -1344,6 +1447,7 @@ def fit_spots(
     _check_inputs(
         kind, spots, coefficients, affines, residuals, initial_parameters
     )
+    variance, use_variance = resolve_variance(variance, spots.shape, ndim=4)
     tolerance, max_iterations = resolve_schedule(
         apply_seeds, tolerance, max_iterations
     )
@@ -1352,6 +1456,8 @@ def fit_spots(
         n_spots, initial_parameters.shape[1]
     )
     args = _kernel_args(
+        variance,
+        use_variance,
         kind,
         coefficients,
         affines,
@@ -1391,6 +1497,7 @@ def fit_spots_async(
     tolerance: float | None = None,
     max_iterations: int | None = None,
     n_threads: int | None = None,
+    variance: np.ndarray | None = None,
 ) -> AsyncFit:
     """Fit spots with a cubic-spline PSF model on several CPU threads.
 
@@ -1400,6 +1507,7 @@ def fit_spots_async(
     _check_inputs(
         kind, spots, coefficients, affines, residuals, initial_parameters
     )
+    variance, use_variance = resolve_variance(variance, spots.shape, ndim=4)
     tolerance, max_iterations = resolve_schedule(
         apply_seeds, tolerance, max_iterations
     )
@@ -1408,6 +1516,8 @@ def fit_spots_async(
         n_spots, initial_parameters.shape[1]
     )
     args = _kernel_args(
+        variance,
+        use_variance,
         kind,
         coefficients,
         affines,

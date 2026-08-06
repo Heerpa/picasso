@@ -18,6 +18,9 @@ fine.
 
 from __future__ import annotations
 
+import ast
+import pathlib
+
 import numpy as np
 import pytest
 from numba import cuda, types
@@ -44,13 +47,22 @@ class TestPtxCompilation:
         cuda.compile_ptx(
             lmfit_cuda._floored_chi_square, (types.float64,), device=True
         )
-        _, restype = cuda.compile_ptx(
+        for estimator in (
             lmfit_cuda._estimator_terms,
-            (types.boolean, types.float64, types.float64),
-            device=True,
-        )
-        # (chi_square, weight, factor, ok)
-        assert len(restype) == 4
+            lmfit_cuda._estimator_terms_strict,
+        ):
+            _, restype = cuda.compile_ptx(
+                estimator,
+                (
+                    types.boolean,
+                    types.float64,
+                    types.float64,
+                    types.float64,  # sCMOS readout variance
+                ),
+                device=True,
+            )
+            # (chi_square, weight, factor, ok)
+            assert len(restype) == 4
 
     def test_solver_compiles(self):
         cuda.compile_ptx(
@@ -219,3 +231,110 @@ class TestSolver:
         scratch = [np.empty(4, dtype=np.int32) for _ in range(3)]
         ok_cpu = splinefit._solve_gj(cpu_a, cpu_b, 4, *scratch)
         assert ok_gpu == ok_cpu is True
+
+
+# ---------------------------------------------------------------------------
+# Device-signature agreement, checked by parsing the source
+# ---------------------------------------------------------------------------
+
+
+def _nested_functiondefs(path, name):
+    """Every ``def <name>`` in ``path``, at any nesting depth."""
+    tree = ast.parse(pathlib.Path(path).read_text())
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+
+
+def _params(node):
+    return [arg.arg for arg in node.args.args]
+
+
+def _call_arg_names(node, callee):
+    """Positional argument *names* of every ``callee(...)`` call inside.
+
+    Only plain ``Name`` arguments are reported; anything else becomes None, so
+    a mismatch still shows up in the length and position comparison."""
+    out = []
+    for sub in ast.walk(node):
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Name)
+            and sub.func.id == callee
+        ):
+            out.append(
+                [a.id if isinstance(a, ast.Name) else None for a in sub.args]
+            )
+    return out
+
+
+# The one contract every device accumulator implements, and the argument list
+# the shared driver passes it.
+ACCUMULATE_PARAMS = [
+    "spots",
+    "index",
+    "variance",
+    "use_variance",
+    "coeff",
+    "aff",
+    "res",
+    "theta",
+    "mle",
+    "hess",
+    "grad",
+]
+
+_FITTING = pathlib.Path(lmfit_cuda.__file__).parent
+
+
+class TestDeviceSignaturesAgree:
+    """The GPU counterpart of the PTX tests, for machines without libNVVM.
+
+    ``make_lm_driver`` and ``make_fit_kernel`` are *shared* by
+    ``gaussfit_cuda`` and ``splinefit_cuda``, so an argument added to one side
+    and not the other is a silent positional shift on the device rather than a
+    ``TypeError`` - nothing here is type-checked at the call site. These
+    checks parse the sources, so they run anywhere, with or without a CUDA
+    toolchain.
+    """
+
+    @pytest.mark.parametrize(
+        "module", ["gaussfit_cuda.py", "splinefit_cuda.py"]
+    )
+    def test_every_accumulator_matches_the_contract(self, module):
+        accumulators = _nested_functiondefs(_FITTING / module, "accumulate")
+        assert len(accumulators) == 3, module
+        for node in accumulators:
+            assert _params(node) == ACCUMULATE_PARAMS
+
+    def test_driver_calls_accumulators_by_the_contract(self):
+        (driver,) = _nested_functiondefs(_FITTING / "lmfit_cuda.py", "driver")
+        calls = _call_arg_names(driver, "accumulate")
+        assert calls, "the driver no longer calls accumulate"
+        for args in calls:
+            assert args == ACCUMULATE_PARAMS
+
+    def test_kernel_forwards_every_argument_to_the_driver(self):
+        (kernel,) = _nested_functiondefs(_FITTING / "lmfit_cuda.py", "kernel")
+        (driver,) = _nested_functiondefs(_FITTING / "lmfit_cuda.py", "driver")
+        (forwarded,) = _call_arg_names(kernel, "driver")
+        # The kernel derives ``index`` from the thread id; everything else is
+        # passed straight through, in order.
+        assert forwarded == _params(driver)
+        assert [a for a in forwarded if a != "index"] == _params(kernel)
+
+    def test_cpu_and_gpu_estimators_take_the_same_arguments(self):
+        """The CPU twins must not drift from the device ones."""
+        import inspect
+
+        from picasso.fitting import gaussfit
+
+        expected = ["mle", "value", "data", "var"]
+        for func in (
+            splinefit._estimator_terms,
+            gaussfit._estimator_terms,
+        ):
+            got = list(inspect.signature(func.py_func).parameters)
+            assert got == expected, func
