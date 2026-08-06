@@ -25,7 +25,7 @@ import yaml
 # Headless plotting for calibrate_z which calls plt.show()
 matplotlib.use("Agg")
 
-from picasso import zfit  # noqa: E402
+from picasso import lib, zfit  # noqa: E402
 
 from tests.conftest import CALIB_3D  # noqa: E402
 
@@ -288,6 +288,83 @@ class TestZfit:
             abort_callback=lambda: True,
         )
         assert out is None and info_out is None
+
+
+class TestZfitAffineCorrections:
+    """The affine corrections a 3D calibration can carry are applied to
+    x/y after the z fit, in stored order, on every device path."""
+
+    SHIFT = [[1.0, 0.0, 3.0], [0.0, 1.0, -1.5], [0.0, 0.0, 1.0]]
+    CHROMATIC = [[1.0, 0.0, 5.0], [0.0, 1.0, 2.0], [0.0, 0.0, 1.0]]
+
+    @staticmethod
+    def _calibration(*matrices):
+        calibration = dict(CALIB_3D)
+        for kind, matrix in matrices:
+            lib.append_affine_transform(
+                calibration, {"Type": kind, "Matrix": matrix}
+            )
+        return calibration
+
+    def test_transform_shifts_x_and_y(self, locs, info):
+        plain, _ = zfit.zfit(locs, info, calibration=dict(CALIB_3D), filter=0)
+        moved, new_info = zfit.zfit(
+            locs,
+            info,
+            calibration=self._calibration(("astigmatism", self.SHIFT)),
+            filter=0,
+        )
+        np.testing.assert_allclose(
+            moved["x"].to_numpy(), plain["x"].to_numpy() + 3.0, atol=1e-3
+        )
+        np.testing.assert_allclose(
+            moved["y"].to_numpy(), plain["y"].to_numpy() - 1.5, atol=1e-3
+        )
+        # z is untouched by a lateral correction
+        np.testing.assert_allclose(
+            moved["z"].to_numpy(), plain["z"].to_numpy(), atol=1e-6
+        )
+        assert new_info[-1]["Affine corrections applied"] == ["astigmatism"]
+
+    def test_two_transforms_are_chained(self, locs, info):
+        plain, _ = zfit.zfit(locs, info, calibration=dict(CALIB_3D), filter=0)
+        moved, _ = zfit.zfit(
+            locs,
+            info,
+            calibration=self._calibration(
+                ("astigmatism", self.SHIFT), ("chromatic", self.CHROMATIC)
+            ),
+            filter=0,
+        )
+        np.testing.assert_allclose(
+            moved["x"].to_numpy(), plain["x"].to_numpy() + 8.0, atol=1e-3
+        )
+        np.testing.assert_allclose(
+            moved["y"].to_numpy(), plain["y"].to_numpy() + 0.5, atol=1e-3
+        )
+
+    @pytest.mark.slow
+    def test_multiprocess_path_applies_it_once(self, locs, info):
+        serial, _ = zfit.zfit(
+            locs,
+            info,
+            calibration=self._calibration(("astigmatism", self.SHIFT)),
+            multiprocess=False,
+            filter=0,
+        )
+        parallel, _ = zfit.zfit(
+            locs,
+            info,
+            calibration=self._calibration(("astigmatism", self.SHIFT)),
+            multiprocess=True,
+            filter=0,
+        )
+        keys = ["frame", "z"]
+        s = serial.sort_values(keys).reset_index(drop=True)
+        p = parallel.sort_values(keys).reset_index(drop=True)
+        np.testing.assert_allclose(
+            s["x"].to_numpy(), p["x"].to_numpy(), atol=1e-3
+        )
 
 
 # ---------------------------------------------------------------------------

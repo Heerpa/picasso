@@ -1103,6 +1103,7 @@ def _localize_process_file(
     max_iterations: int,
     z_params,
     spline_calibration: dict | None = None,
+    affine_transforms: list | None = None,
 ) -> None:
     """Identify, fit, save and optionally undrift one movie file.
 
@@ -1114,6 +1115,10 @@ def _localize_process_file(
     spline_calibration : dict or None
         Cubic-spline PSF calibration when the fit method is a spline method;
         else ``None``. A 3D spline fit recovers z directly (no ``zfit``).
+    affine_transforms : list or None
+        Extra lateral affine corrections (see ``--affine-calibration``),
+        applied to x/y after fitting and, for 3D astigmatism, after ``zfit``
+        applied the ones stored in the 3D calibration.
     """
     from os.path import splitext
     from .io import load_movie, save_locs
@@ -1172,6 +1177,14 @@ def _localize_process_file(
         info[-1]["Z Calibration Path"] = zpath
         print("3D fitting complete.")
         print("------------------------------------------")
+
+    if affine_transforms:
+        from . import lib
+
+        locs = lib.apply_affine_transforms(locs, affine_transforms)
+        info[-1]["Affine corrections applied"] = (
+            lib.describe_affine_transforms(affine_transforms)
+        )
 
     base, ext = splitext(path)
 
@@ -1335,6 +1348,26 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             f"{args.spline_calibration}"
         )
 
+    # Extra lateral affine corrections, applied after fitting on top of any
+    # the 3D / spline calibration carries.
+    affine_transforms = []
+    for affine_path in getattr(args, "affine_calibration", []) or []:
+        from . import lib
+        from .io import load_any_calibration
+
+        found = lib.affine_transforms(load_any_calibration(affine_path))
+        if not found:
+            raise Exception(
+                f"No affine corrections found in {affine_path}. Build one "
+                "with the 'Calibrate affine transform' dialog in "
+                "'picasso localize'."
+            )
+        affine_transforms.extend(found)
+        print(
+            f"Loaded {len(found)} affine correction(s) from {affine_path}: "
+            + ", ".join(lib.describe_affine_transforms(found))
+        )
+
     for i, path in enumerate(paths):
         _localize_process_file(
             path,
@@ -1350,6 +1383,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             max_iterations,
             z_params,
             spline_calibration=spline_calibration,
+            affine_transforms=affine_transforms,
         )
 
 
@@ -2709,6 +2743,20 @@ def main():  # noqa: C901
             "path to a cubic-spline PSF calibration (.hdf5) for the "
             "'spline', 'spline-mle', 'spline-gpu' and 'spline-mle-gpu' "
             "fit methods"
+        ),
+    )
+    localize_parser.add_argument(
+        "-ac",
+        "--affine-calibration",
+        type=str,
+        action="append",
+        default=[],
+        help=(
+            "path to a calibration file (.yaml or .hdf5) whose affine"
+            " corrections are applied to the fitted x/y, e.g. a standalone"
+            " chromatic-aberration calibration. Repeat the flag to chain"
+            " several; they are applied in the order given, after any"
+            " corrections stored in the 3D or spline calibration itself"
         ),
     )
     localize_parser.add_argument(

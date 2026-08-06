@@ -2166,3 +2166,223 @@ def sync_groups(locs: list[pd.DataFrame]) -> list[pd.DataFrame]:
         mask = locs[i]["group"].isin(common_groups)
         locs[i] = locs[i][mask].reset_index(drop=True)
     return locs
+
+
+# ---------------------------------------------------------------------------
+# Affine (x, y) corrections chained onto any calibration
+# ---------------------------------------------------------------------------
+# A calibration - Gaussian astigmatism (YAML), cubic-spline PSF (HDF5) or a
+# standalone affine calibration - may carry an ORDERED list of lateral affine
+# corrections under AFFINE_TRANSFORMS_KEY. Each entry maps the coordinates of
+# the movie being localized into a reference frame:
+#
+#   astigmatism : cylindrical-lens image -> reference (no-lens) image
+#   chromatic   : this color channel     -> reference color channel
+#
+# They compose: a 3D two-color experiment applies the astigmatism correction
+# and then the chromatic one, in the order they appear in the list.
+#
+# Single-channel only
+
+AFFINE_TRANSFORMS_KEY = "Affine transforms"
+# v0.11 wrote a single astigmatism transform under this key; still read.
+LEGACY_AFFINE_TRANSFORM_KEY = "Affine transform"
+AFFINE_TRANSFORM_TYPES = ("astigmatism", "chromatic")
+
+
+def affine_transforms(calibration: dict | list | None) -> list[dict]:
+    """The ordered affine-correction entries carried by a calibration.
+
+    Parameters
+    ----------
+    calibration : dict or list or None
+        Any calibration dictionary (Gaussian astigmatism, spline PSF or a
+        standalone affine calibration), an already-extracted list of
+        entries, or None.
+
+    Returns
+    -------
+    transforms : list of dicts
+        The entries in the order they must be applied. Empty if the
+        calibration carries none. A calibration written before the ordered
+        list existed (single ``"Affine transform"`` key) yields that one
+        entry.
+    """
+    if calibration is None:
+        return []
+    if isinstance(calibration, list):
+        return [t for t in calibration if t]
+    if not isinstance(calibration, dict):
+        # e.g. a calibration still given as a path; nothing to read
+        return []
+    transforms = calibration.get(AFFINE_TRANSFORMS_KEY)
+    if transforms:
+        return list(transforms)
+    legacy = calibration.get(LEGACY_AFFINE_TRANSFORM_KEY)
+    if legacy:
+        return [legacy]
+    return []
+
+
+def affine_matrices(calibration: dict | list | None) -> list[np.ndarray]:
+    """The ``(3, 3)`` homogeneous matrices of ``affine_transforms``, in the
+    order they must be applied. Accepts entries or bare matrices."""
+    matrices = []
+    for transform in affine_transforms(calibration):
+        if isinstance(transform, dict):
+            transform = transform["Matrix"]
+        matrix = np.asarray(transform, dtype=np.float64)
+        if matrix.shape != (3, 3):
+            raise ValueError(
+                f"Invalid affine transform of shape {matrix.shape}; "
+                "expected a (3, 3) homogeneous matrix."
+            )
+        matrices.append(matrix)
+    return matrices
+
+
+def append_affine_transform(calibration: dict, entry: dict) -> dict:
+    """Append an affine correction to ``calibration``'s ordered list.
+
+    An existing entry of the same ``"Type"`` is replaced in place (keeping
+    its position), so re-running a calibration updates it instead of
+    stacking a second copy of the same correction. A legacy single-key
+    transform is migrated into the list first.
+
+    Parameters
+    ----------
+    calibration : dict
+        Calibration to append to; modified in place. May be empty, which
+        is how a standalone affine calibration file is started.
+    entry : dict
+        The transform entry, as built by
+        ``picasso.localize.fit_affine_transform``. Must carry ``"Matrix"``
+        and ``"Type"``.
+
+    Returns
+    -------
+    calibration : dict
+        The same dictionary, with the entry appended or replaced.
+    """
+    transforms = affine_transforms(calibration)
+    calibration.pop(LEGACY_AFFINE_TRANSFORM_KEY, None)
+    kind = entry.get("Type")
+    for i, existing in enumerate(transforms):
+        if existing.get("Type") == kind:
+            transforms[i] = entry
+            break
+    else:
+        transforms.append(entry)
+    calibration[AFFINE_TRANSFORMS_KEY] = transforms
+    return calibration
+
+
+def apply_affine_transforms(
+    locs: pd.DataFrame, calibration: dict | list | None
+) -> pd.DataFrame:
+    """Map ``locs`` x/y through a calibration's affine corrections.
+
+    The transforms are applied in stored order, in camera-pixel
+    coordinates. Returns ``locs`` unchanged (and untouched) when there is
+    nothing to apply, so this is safe to call on every fit path.
+
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations with ``x`` and ``y`` columns.
+    calibration : dict or list or None
+        A calibration carrying affine corrections, a list of entries, or
+        None.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        Localizations with corrected ``x`` and ``y``. A copy, if anything
+        was applied.
+    """
+    matrices = affine_matrices(calibration)
+    if not matrices or not len(locs):
+        return locs
+    locs = locs.copy()
+    x = locs["x"].to_numpy(dtype=np.float64)
+    y = locs["y"].to_numpy(dtype=np.float64)
+    for matrix in matrices:
+        x, y = (
+            matrix[0, 0] * x + matrix[0, 1] * y + matrix[0, 2],
+            matrix[1, 0] * x + matrix[1, 1] * y + matrix[1, 2],
+        )
+    locs["x"] = x.astype(np.float32)
+    locs["y"] = y.astype(np.float32)
+    return locs
+
+
+def is_same_affine_transform(
+    a: dict | list, b: dict | list, tol: float = 1e-9
+) -> bool:
+    """Whether two affine entries hold the same matrix (within ``tol``).
+
+    Compared by matrix, not by identity or source path: the same correction
+    saved twice under different names must count as one, since applying it
+    twice would correct twice.
+    """
+    if isinstance(a, dict):
+        a = a["Matrix"]
+    if isinstance(b, dict):
+        b = b["Matrix"]
+    return bool(
+        np.allclose(
+            np.asarray(a, dtype=np.float64),
+            np.asarray(b, dtype=np.float64),
+            atol=tol,
+            rtol=0.0,
+        )
+    )
+
+
+def drop_duplicate_affine_transforms(
+    transforms: dict | list | None, applied: dict | list | None
+) -> tuple[list[dict], list[dict]]:
+    """Split ``transforms`` into the ones still to apply and the ones
+    ``applied`` already covers.
+
+    A calibration carries its own corrections and applies them itself, so an
+    extra correction loaded alongside it - typically the very same file, or a
+    standalone copy of the same transform - must not be applied a second
+    time.
+
+    Parameters
+    ----------
+    transforms : dict or list or None
+        The extra corrections, as a calibration or a list of entries.
+    applied : dict or list or None
+        Corrections the fit applies on its own, i.e. those carried by its
+        calibration.
+
+    Returns
+    -------
+    new : list of dicts
+        Entries of ``transforms`` not already in ``applied``, in order.
+    duplicates : list of dicts
+        Entries dropped because ``applied`` already covers them.
+    """
+    already = affine_transforms(applied)
+    new, duplicates = [], []
+    for transform in affine_transforms(transforms):
+        if any(is_same_affine_transform(transform, a) for a in already):
+            duplicates.append(transform)
+        else:
+            new.append(transform)
+    return new, duplicates
+
+
+def describe_affine_transforms(calibration: dict | list | None) -> list[str]:
+    """One human-readable line per affine correction, for metadata and
+    GUI labels, e.g. ``"astigmatism (25 bead pairs)"``."""
+    described = []
+    for transform in affine_transforms(calibration):
+        kind = transform.get("Type", "affine")
+        pairs = transform.get("Bead pairs")
+        described.append(
+            f"{kind} ({pairs} bead pairs)" if pairs else str(kind)
+        )
+    return described

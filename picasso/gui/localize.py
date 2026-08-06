@@ -1982,63 +1982,97 @@ class ROIDialog(lib.Dialog):
 
 
 class CalibrateAffineDialog(lib.Dialog):
-    """Select the inputs/output for affine-transform calibration
-    (astigmatism).
+    """Select the inputs/output for an affine-transform calibration.
 
-    Provides three rows: a reference bead image (no cylindrical lens),
-    a cylindrical-lens bead image, and an output 3D-calibration YAML
-    file the affine transform will be appended to.
+    The same calibration corrects two things, chosen at the top of the
+    dialog: the lateral distortion of a cylindrical lens (astigmatism) or
+    chromatic aberration between two colour channels. Below it are a
+    reference bead image, the bead image to be mapped onto it, and the
+    calibration file the transform is appended to - an existing Gaussian
+    astigmatism (YAML) or spline PSF (HDF5) calibration, or a new
+    standalone YAML holding only affine corrections (for 2D data). Several
+    transforms accumulate in one file as an ordered list and are applied
+    one after another.
     """
+
+    # transform type -> (reference label/tooltip, target label/tooltip)
+    IMAGE_LABELS = {
+        "astigmatism": (
+            "Reference image:",
+            "Image of in-focus beads WITHOUT a cylindrical lens in"
+            " the optical pathway",
+            "Cylindrical lens image:",
+            "Image of in-focus beads WITH a cylindrical lens in"
+            " the optical pathway",
+        ),
+        "chromatic": (
+            "Reference channel image:",
+            "Image of in-focus beads in the reference color channel,"
+            " i.e. the channel every other channel is mapped onto",
+            "Target channel image:",
+            "Image of the same in-focus beads in the colour channel to be"
+            " corrected",
+        ),
+    }
 
     def __init__(self, window: QtWidgets.QWidget) -> None:
         super().__init__(window)
         self.window = window
-        self.setWindowTitle("Calibrate affine transform (astigmatism)")
+        self.setWindowTitle("Calibrate affine transform")
         self.setModal(False)
 
         vbox = QtWidgets.QVBoxLayout(self)
+
+        type_row = QtWidgets.QHBoxLayout()
+        type_label = QtWidgets.QLabel("Correct:")
+        self.type_combo = QtWidgets.QComboBox()
+        self.type_combo.addItem(
+            "Astigmatism (cylindrical lens)", "astigmatism"
+        )
+        self.type_combo.addItem("Chromatic aberration", "chromatic")
+        self.type_combo.setToolTip(
+            "What the transform corrects. Both are fitted the same way,\n"
+            "from two bead images, and are stored as an ordered list in\n"
+            "the calibration file: for 3D two-colour data, calibrate both\n"
+            "into the same file and they are applied one after another."
+        )
+        self.type_combo.currentIndexChanged.connect(self._update_labels)
+        type_row.addWidget(type_label)
+        type_row.addWidget(self.type_combo)
+        type_row.addStretch(1)
+        vbox.addLayout(type_row)
+
         grid = QtWidgets.QGridLayout()
 
         rows = [
-            (
-                "Reference image:",
-                "Image of in-focus beads WITHOUT a cylindrical lens in"
-                " the optical pathway",
-                self._browse_reference,
-                self._show_reference,
-            ),
-            (
-                "Cylindrical lens image:",
-                "Image of in-focus beads WITH a cylindrical lens in"
-                " the optical pathway",
-                self._browse_cylindrical,
-                self._show_cylindrical,
-            ),
-            (
-                "Calibration:",
-                "Path to save the results to; select an"
-                " existing 3D calibration path to which the results will"
-                " be appended",
-                self._browse_calibration,
-                None,
-            ),
+            (self._browse_reference, self._show_reference),
+            (self._browse_target, self._show_target),
+            (self._browse_calibration, None),
         ]
         self.reference_edit = QtWidgets.QLineEdit()
-        self.cylindrical_edit = QtWidgets.QLineEdit()
+        self.target_edit = QtWidgets.QLineEdit()
         self.calibration_edit = QtWidgets.QLineEdit()
         edits = [
             self.reference_edit,
-            self.cylindrical_edit,
+            self.target_edit,
             self.calibration_edit,
         ]
-        for row_idx, (
-            (label_text, tooltip, slot, show_slot),
-            edit,
-        ) in enumerate(zip(rows, edits)):
-            label = QtWidgets.QLabel(label_text)
-            label.setToolTip(tooltip)
+        self.reference_label = QtWidgets.QLabel()
+        self.target_label = QtWidgets.QLabel()
+        calibration_label = QtWidgets.QLabel("Calibration:")
+        calibration_tooltip = (
+            "Where the transform is stored. Select an existing calibration\n"
+            "(a Gaussian 3D .yaml or a spline PSF .hdf5) to append it to,\n"
+            "or 'New' to start a standalone affine calibration .yaml - the\n"
+            "option for purely 2D data."
+        )
+        calibration_label.setToolTip(calibration_tooltip)
+        self.calibration_edit.setToolTip(calibration_tooltip)
+        labels = [self.reference_label, self.target_label, calibration_label]
+        for row_idx, ((slot, show_slot), edit, label) in enumerate(
+            zip(rows, edits, labels)
+        ):
             edit.setReadOnly(True)
-            edit.setToolTip(tooltip)
             edit.setMinimumWidth(400)
             button = QtWidgets.QPushButton("Browse")
             button.clicked.connect(slot)
@@ -2055,6 +2089,17 @@ class CalibrateAffineDialog(lib.Dialog):
                 )
                 show_button.clicked.connect(show_slot)
                 grid.addWidget(show_button, row_idx, 3)
+            else:
+                new_button = QtWidgets.QPushButton("New")
+                new_button.setToolTip(
+                    "Create a new standalone affine calibration file\n"
+                    "(.yaml), holding only affine corrections. Use it when\n"
+                    "there is no 3D calibration to append to, e.g. a\n"
+                    "chromatic correction for 2D data."
+                )
+                new_button.clicked.connect(self._new_calibration)
+                grid.addWidget(new_button, row_idx, 3)
+        self._update_labels()
         vbox.addLayout(grid)
 
         # If a movie is already loaded in the main window, use it as the
@@ -2073,16 +2118,33 @@ class CalibrateAffineDialog(lib.Dialog):
         self.buttons.rejected.connect(self.reject)
 
     @property
+    def transform_type(self) -> str:
+        return self.type_combo.currentData()
+
+    @property
     def reference_path(self) -> str:
         return self.reference_edit.text()
 
     @property
-    def cylindrical_path(self) -> str:
-        return self.cylindrical_edit.text()
+    def target_path(self) -> str:
+        return self.target_edit.text()
 
     @property
     def calibration_path(self) -> str:
         return self.calibration_edit.text()
+
+    def _update_labels(self) -> None:
+        """Rename the two image rows to match the selected transform
+        type; the inputs and the fit itself are the same either way."""
+        ref_text, ref_tip, target_text, target_tip = self.IMAGE_LABELS[
+            self.transform_type
+        ]
+        self.reference_label.setText(ref_text)
+        self.reference_label.setToolTip(ref_tip)
+        self.reference_edit.setToolTip(ref_tip)
+        self.target_label.setText(target_text)
+        self.target_label.setToolTip(target_tip)
+        self.target_edit.setToolTip(target_tip)
 
     def _pick_file(
         self,
@@ -2106,17 +2168,43 @@ class CalibrateAffineDialog(lib.Dialog):
             self.reference_edit, "Select reference image", IMAGE_FILTER
         )
 
-    def _browse_cylindrical(self) -> None:
-        self._pick_file(
-            self.cylindrical_edit,
-            "Select cylindrical lens image",
-            IMAGE_FILTER,
+    def _browse_target(self) -> None:
+        title = (
+            "Select cylindrical lens image"
+            if self.transform_type == "astigmatism"
+            else "Select target channel image"
         )
+        self._pick_file(self.target_edit, title, IMAGE_FILTER)
 
     def _browse_calibration(self) -> None:
         self._pick_file(
-            self.calibration_edit, "Select calibration file", "*.yaml"
+            self.calibration_edit,
+            "Select calibration file",
+            "Calibration files (*.yaml *.hdf5)",
         )
+
+    def _new_calibration(self) -> None:
+        """Pick a path for a new standalone affine calibration (.yaml).
+        Existing files are appended to, not overwritten, by the worker."""
+        current = self.calibration_edit.text()
+        directory = (
+            current
+            if current
+            else os.path.join(
+                os.path.split(self.reference_path)[0],
+                "affine_calibration.yaml",
+            )
+        )
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "New affine calibration",
+            directory=directory,
+            filter="*.yaml",
+        )
+        if path:
+            if not os.path.splitext(path)[1]:
+                path += ".yaml"
+            self.calibration_edit.setText(path)
 
     def _show(self, edit: QtWidgets.QLineEdit) -> None:
         """Load the image in ``edit`` into the main window and open the
@@ -2136,8 +2224,8 @@ class CalibrateAffineDialog(lib.Dialog):
     def _show_reference(self) -> None:
         self._show(self.reference_edit)
 
-    def _show_cylindrical(self) -> None:
-        self._show(self.cylindrical_edit)
+    def _show_target(self) -> None:
+        self._show(self.target_edit)
 
 
 class ParametersDialog(lib.Dialog):
@@ -2235,6 +2323,11 @@ class ParametersDialog(lib.Dialog):
         self.z_calibration_path = None
         self.spline_calibration = {}
         self.spline_calibration_path = None
+        # Standalone (2D) affine corrections applied after the fit; those
+        # carried by the 3D / spline calibration are applied by the fit
+        # itself (see load_affine_calib).
+        self.affine_transforms = []
+        self.affine_calibration_paths = []
         # calibration group boxes, toggled by the selected fit model; set up
         # further below
         self.z_groupbox = None
@@ -2846,6 +2939,51 @@ class ParametersDialog(lib.Dialog):
         self.link_photons_checkbox.hide()  # shown for 2-6 channel calibs
         spline_grid.addWidget(self.link_photons_checkbox, 1, 0, 1, 3)
 
+        # Lateral (x, y) affine corrections for 2D data, applied after
+        # fitting. This is how a chromatic correction is used on its own,
+        # with no 3D calibration to append it to; for 3D the correction goes
+        # into the 3D / spline calibration above, which applies it itself.
+        affine_groupbox = QtWidgets.QGroupBox("2D affine correction (x, y)")
+        affine_groupbox.setToolTip(
+            "Affine corrections applied to the fitted x/y of 2D data,\n"
+            "typically a chromatic-aberration correction. Build one with\n"
+            "3D > Calibrate affine transform and load the standalone\n"
+            "calibration here.\n\n"
+            "For 3D data, append the correction to the 3D or spline\n"
+            "calibration instead: those are applied automatically during\n"
+            "the fit and must not be loaded here as well.\n\n"
+            "Several files are applied in the order listed. Single-channel\n"
+            "data only: a multichannel (global) spline fit registers its\n"
+            "channels itself and ignores these."
+        )
+        vbox.addWidget(affine_groupbox)
+        affine_grid = QtWidgets.QGridLayout(affine_groupbox)
+        load_affine_calib = QtWidgets.QPushButton("Load 2D correction")
+        load_affine_calib.setToolTip(
+            "Load a standalone affine calibration (.yaml) to apply to this\n"
+            "2D measurement."
+        )
+        load_affine_calib.setAutoDefault(False)
+        load_affine_calib.clicked.connect(self.load_affine_calib)
+        affine_grid.addWidget(load_affine_calib, 0, 1)
+        clear_affine_calib = QtWidgets.QPushButton("Clear")
+        clear_affine_calib.setAutoDefault(False)
+        clear_affine_calib.clicked.connect(
+            lambda: self.update_affine_calib(None)
+        )
+        affine_grid.addWidget(clear_affine_calib, 0, 2)
+        self.affine_calib_label = QtWidgets.QLabel(
+            "-- no 2D correction loaded --"
+        )
+        self.affine_calib_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignCenter
+        )
+        self.affine_calib_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        affine_grid.addWidget(self.affine_calib_label, 0, 0)
+
         # show the calibration box that matches the initial fit model
         self._update_calib_group_visibility()
 
@@ -3169,6 +3307,124 @@ class ParametersDialog(lib.Dialog):
         )
         if path:
             self.update_spline_calib(path)
+
+    def load_affine_calib(self) -> None:
+        """Load one or more standalone affine calibrations to apply to this
+        2D measurement after fitting.
+
+        Any calibration file works as a carrier - only its affine
+        corrections are read - but for 3D data the correction belongs in
+        the 3D / spline calibration itself, which applies it during the
+        fit; corrections that calibration already carries are rejected
+        here. Selecting several files applies them in the order chosen.
+        """
+        if self.affine_calibration_paths:
+            dialog_directory, _ = os.path.split(
+                self.affine_calibration_paths[-1]
+            )
+        else:
+            dialog_directory = None
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Load 2D affine correction",
+            directory=dialog_directory,
+            filter="Calibration files (*.yaml *.hdf5)",
+        )
+        if paths:
+            self.update_affine_calib(paths)
+
+    def update_affine_calib(self, paths: list[str] | None) -> None:
+        """Load (or clear) the 2D affine corrections applied after fitting."""
+        if not paths:
+            self.affine_transforms = []
+            self.affine_calibration_paths = []
+            self.affine_calib_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignCenter
+            )
+            self.affine_calib_label.setText("-- no 2D correction loaded --")
+            self.affine_calib_label.setToolTip("")
+            return
+
+        transforms, loaded, empty, already = [], [], [], []
+        for path in paths:
+            try:
+                calibration = io.load_any_calibration(path)
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Load 2D affine correction",
+                    f"Could not read {os.path.basename(path)}:\n{e}",
+                )
+                continue
+            found = lib.affine_transforms(calibration)
+            if not found:
+                empty.append(os.path.basename(path))
+                continue
+            # A correction the loaded 3D / spline calibration already carries
+            # is applied by the fit itself; taking it here as well would
+            # correct the coordinates twice. This catches the common case -
+            # picking the 3D calibration file itself - at load time, while
+            # the fit-time check (see ``_extra_affine_transforms``) also
+            # catches a copy of the same transform saved elsewhere.
+            found, duplicates = lib.drop_duplicate_affine_transforms(
+                found, self._calibration_affine_transforms()
+            )
+            already.extend(duplicates)
+            if not found:
+                continue
+            transforms.extend(found)
+            loaded.append(path)
+        if empty:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Load 2D affine correction",
+                "No affine corrections found in: "
+                + ", ".join(empty)
+                + ".\nBuild one with 3D > Calibrate affine transform.",
+            )
+        if already:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Load 2D affine correction",
+                "Not loaded: "
+                + ", ".join(lib.describe_affine_transforms(already))
+                + ".\n\nThe loaded 3D / spline calibration already carries "
+                "this correction and applies it during the fit. Loading it "
+                "here as well would correct the coordinates twice.",
+            )
+        if not transforms:
+            self.update_affine_calib(None)
+            return
+        self._set_affine_state(transforms, loaded)
+
+    def _calibration_affine_transforms(self) -> list[dict]:
+        """The affine corrections the currently loaded 3D and spline
+        calibrations carry, i.e. the ones the fit applies by itself."""
+        return lib.affine_transforms(
+            self.z_calibration
+        ) + lib.affine_transforms(self.spline_calibration)
+
+    def _set_affine_state(self, transforms: list, paths: list[str]) -> None:
+        """Store already-loaded affine corrections and label them. Kept
+        apart from ``update_affine_calib`` so restoring a channel's
+        parameters does not re-read the calibration files."""
+        if not transforms:
+            self.update_affine_calib(None)
+            return
+        self.affine_transforms = transforms
+        self.affine_calibration_paths = paths
+        described = lib.describe_affine_transforms(transforms)
+        self.affine_calib_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight
+        )
+        self.affine_calib_label.setText(
+            ", ".join(t.get("Type", "affine") for t in transforms)
+        )
+        self.affine_calib_label.setToolTip(
+            "\n".join(paths)
+            + "\n\nApplied in this order after fitting:\n"
+            + "\n".join(f"{i + 1}. {d}" for i, d in enumerate(described))
+        )
 
     def update_spline_calib_with_config_path(self) -> None:
         """Retrieve the spline PSF calibration path that corresponds to the
@@ -4163,7 +4419,13 @@ class Window(QtWidgets.QMainWindow):
         calibrate_z_action.triggered.connect(self.calibrate_z)
 
         calibrate_affine_action = threed_menu.addAction(
-            "Calibrate affine transform (astigmatism)"
+            "Calibrate affine transform (astigmatism / chromatic)"
+        )
+        calibrate_affine_action.setToolTip(
+            "Fit a lateral affine correction from two bead images and\n"
+            "append it to any calibration (Gaussian, spline, or a new\n"
+            "standalone affine calibration). Several corrections stack\n"
+            "and are applied one after another."
         )
         calibrate_affine_action.triggered.connect(self.calibrate_affine)
 
@@ -4221,7 +4483,8 @@ class Window(QtWidgets.QMainWindow):
         self.localize(calibrate_z=True)
 
     def calibrate_affine(self) -> None:
-        """Open the affine-transform calibration dialog (astigmatism).
+        """Open the affine-transform calibration dialog (astigmatism or
+        chromatic aberration).
 
         The dialog is non-modal so the user can keep interacting with the
         main window and the parameters dialog (e.g. via "Show") while it
@@ -4240,13 +4503,14 @@ class Window(QtWidgets.QMainWindow):
 
     def _run_calibrate_affine(self) -> None:
         """Fit the affine transform between the two bead movies and append
-        the result to the given 3D calibration YAML. Called when the
+        the result to the selected calibration file. Called when the
         affine-transform calibration dialog is accepted."""
         dialog = self._affine_dialog
         ref_path = dialog.reference_path
-        cyl_path = dialog.cylindrical_path
+        target_path = dialog.target_path
         calib_path = dialog.calibration_path
-        if not (ref_path and cyl_path and calib_path):
+        transform_type = dialog.transform_type
+        if not (ref_path and target_path and calib_path):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Calibrate affine transform",
@@ -4277,8 +4541,9 @@ class Window(QtWidgets.QMainWindow):
 
         worker = AffineCalibrationWorker(
             ref_path=ref_path,
-            cyl_path=cyl_path,
+            target_path=target_path,
             calibration_path=calib_path,
+            transform_type=transform_type,
             box=self.parameters["Box Size"],
             minimum_ng=self.parameters["Min. Net Gradient"],
             prompt_for_path=self._prompt_for_path,
@@ -5084,6 +5349,9 @@ class Window(QtWidgets.QMainWindow):
             "z_calibration": pd.z_calibration,
             "z_calibration_path": pd.z_calibration_path,
             "z_calib_label": pd.z_calib_label.text(),
+            # per loaded movie: each can need its own correction
+            "affine_transforms": pd.affine_transforms,
+            "affine_calibration_paths": pd.affine_calibration_paths,
             "use_gpu": pd.gpu_checkbox.isChecked(),
             "temporal_median_on": pd.temporal_median_checkbox.isChecked(),
             "temporal_median": pd.temporal_median_spinbox.value(),
@@ -5142,6 +5410,11 @@ class Window(QtWidgets.QMainWindow):
         pd.z_calib_label.setText(params["z_calib_label"])
         pd.fit_z_checkbox.setEnabled(params["fit_z_enabled"])
         pd.fit_z_checkbox.setChecked(params["fit_z"])
+        # .get(): parameter sets captured before affine corrections existed
+        pd._set_affine_state(
+            params.get("affine_transforms", []),
+            params.get("affine_calibration_paths", []),
+        )
         # Saved parameter files written before the Numba CUDA port use the
         # old "gpufit" key.
         pd.gpu_checkbox.setChecked(
@@ -6639,6 +6912,9 @@ class Window(QtWidgets.QMainWindow):
             calibrate_z,
             use_gpu,
             spline_calibration=spline_calibration,
+            affine_transforms=self._extra_affine_transforms(
+                spline_calibration
+            ),
         )
         self.fit_worker.progressMade.connect(self.on_fit_progress)
         self.fit_worker.cutProgressMade.connect(self.on_cut_progress)
@@ -6659,6 +6935,17 @@ class Window(QtWidgets.QMainWindow):
         simultaneously. The first loaded channel is the reference; its
         identifications are mapped into every channel via the calibration's
         stored transforms."""
+        # Affine corrections are single-channel only: this fit registers its
+        # channels itself, so applying one on top would correct twice. Say
+        # so rather than silently ignoring what the user loaded.
+        if self.parameters_dialog.affine_transforms:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Multichannel spline fit",
+                "Affine corrections apply to single-channel data only and "
+                "are not used here: the multichannel fit registers its "
+                "channels itself, from the transforms in its calibration.",
+            )
         if calibration.get("split_fov"):
             self._start_split_fov_spline_fit(calibration, method, eps, max_it)
             return
@@ -6979,6 +7266,9 @@ class Window(QtWidgets.QMainWindow):
             self.parameters_dialog.pixelsize.value(),
             fitting_method,
             self.parameters_dialog.gpu_checkbox.isChecked(),
+            affine_transforms=self._extra_affine_transforms(
+                self.parameters_dialog.z_calibration
+            ),
         )
         self.fit_z_worker.progressMade.connect(self.on_fit_z_progress)
         self.fit_z_worker.finished.connect(self.on_fit_z_finished)
@@ -6986,6 +7276,25 @@ class Window(QtWidgets.QMainWindow):
         self._active_worker = self.fit_z_worker
         self.abort_action.setEnabled(True)
         self.fit_z_worker.start()
+
+    def _extra_affine_transforms(self, calibration: dict | None) -> list:
+        """The loaded affine corrections minus those ``calibration`` carries
+        and therefore applies itself.
+
+        The load-time check in the Parameters dialog rejects the calibration
+        file itself; this also catches a copy of the same transform saved
+        under another name, which only a comparison of the matrices finds.
+        """
+        extra, duplicates = lib.drop_duplicate_affine_transforms(
+            self.parameters_dialog.affine_transforms, calibration
+        )
+        if duplicates:
+            self.status_bar.showMessage(
+                "Skipping "
+                + ", ".join(lib.describe_affine_transforms(duplicates))
+                + ": already applied by the calibration used for fitting."
+            )
+        return extra
 
     def on_cut_progress(self, curr: int, total: int) -> None:
         """Update the status bar with the spot cutting progress."""
@@ -7635,6 +7944,7 @@ class FitWorker(QtCore.QThread):
         calibrate_z: bool,
         use_gpu: bool,
         spline_calibration: dict | None = None,
+        affine_transforms: list | None = None,
     ) -> None:
         super().__init__()
         self.movie = movie
@@ -7647,6 +7957,7 @@ class FitWorker(QtCore.QThread):
         self.fit_z = fit_z
         self.calibrate_z = calibrate_z
         self.spline_calibration = spline_calibration
+        self.affine_transforms = affine_transforms or []
         self.N = len(identifications)
         self._last_cut_emit = 0
         self.method = _effective_fit_code(method, use_gpu)
@@ -7686,6 +7997,8 @@ class FitWorker(QtCore.QThread):
         if locs is None:  # handle aborted process
             self.aborted.emit()
             return
+        if not self.fit_z:
+            locs = lib.apply_affine_transforms(locs, self.affine_transforms)
         self.progressMade.emit(self.N + 1, self.N)
         dt = time.time() - t0
         self.finished.emit(locs, dt, self.fit_z, self.calibrate_z)
@@ -7918,6 +8231,7 @@ class FitZWorker(QtCore.QThread):
         pixelsize: float,
         fitting_method: Literal["gausslq", "gaussmle"],
         gpu: bool = False,
+        affine_transforms: list | None = None,
     ) -> None:
         super().__init__()
         self.locs = locs
@@ -7927,6 +8241,7 @@ class FitZWorker(QtCore.QThread):
         self.pixelsize = pixelsize
         self.fitting_method = fitting_method
         self.gpu = gpu
+        self.affine_transforms = affine_transforms or []
 
     def on_progress(self, n_done: int) -> None:
         self.progressMade.emit(n_done, len(self.locs))
@@ -7947,6 +8262,8 @@ class FitZWorker(QtCore.QThread):
             progress_callback=self.on_progress,
             abort_callback=self.isInterruptionRequested,
         )
+        if locs is not None:
+            locs = lib.apply_affine_transforms(locs, self.affine_transforms)
         dt = time.time() - t0
         self.finished.emit(locs, dt)
 
@@ -8082,8 +8399,9 @@ class SplineCalibrationWorker(QtCore.QThread):
 
 
 class AffineCalibrationWorker(QtCore.QThread):
-    """Fit the cylindrical-lens -> reference affine transform (astigmatism)
-    in a background thread and append it to a 3D calibration YAML.
+    """Fit a target -> reference affine transform (a cylindrical-lens or a
+    chromatic-aberration correction) in a background thread and append it to
+    a calibration file.
 
     Loading the two bead movies and fitting the transform both block for
     seconds to minutes, so they run here instead of on the GUI thread.
@@ -8107,17 +8425,19 @@ class AffineCalibrationWorker(QtCore.QThread):
     def __init__(
         self,
         ref_path: str,
-        cyl_path: str,
+        target_path: str,
         calibration_path: str,
         box: int,
         minimum_ng: float,
         prompt_for_path,
         pixelsize_prompt,
+        transform_type: str = "astigmatism",
     ) -> None:
         super().__init__()
         self.ref_path = ref_path
-        self.cyl_path = cyl_path
+        self.target_path = target_path
         self.calibration_path = calibration_path
+        self.transform_type = transform_type
         self.box = box
         self.minimum_ng = minimum_ng
         # Window._prompt_for_path: path -> metadata prompt callback
@@ -8153,12 +8473,23 @@ class AffineCalibrationWorker(QtCore.QThread):
                 self.cancelled.emit()
                 return
             movie_ref, info_ref = loaded_ref
-            loaded_cyl = self._load(self.cyl_path, "cylindrical lens")
-            if loaded_cyl is None:
+            label = (
+                "cylindrical lens"
+                if self.transform_type == "astigmatism"
+                else "target channel"
+            )
+            loaded_target = self._load(self.target_path, label)
+            if loaded_target is None:
                 self.cancelled.emit()
                 return
-            movie_cyl, _ = loaded_cyl
-            calibration = io.load_calibration(self.calibration_path)
+            movie_target, _ = loaded_target
+            # An existing calibration of any kind is appended to; a path
+            # that does not exist yet starts a standalone affine
+            # calibration (the 2D case, where there is nothing to append to).
+            if os.path.exists(self.calibration_path):
+                calibration = io.load_any_calibration(self.calibration_path)
+            else:
+                calibration = {}
         except Exception as e:  # noqa: BLE001 - reported to the GUI
             self.failed.emit(f"Could not load inputs:\n{e}")
             return
@@ -8174,15 +8505,16 @@ class AffineCalibrationWorker(QtCore.QThread):
         try:
             calibration, qc = localize.fit_affine_transform(
                 movie_ref,
-                movie_cyl,
+                movie_target,
                 calibration,
                 box=self.box,
                 minimum_ng=self.minimum_ng,
                 pixelsize=pixelsize,
+                transform_type=self.transform_type,
                 ref_path=self.ref_path,
-                cyl_path=self.cyl_path,
+                target_path=self.target_path,
             )
-            io.save_calibration(self.calibration_path, calibration)
+            io.save_any_calibration(self.calibration_path, calibration)
         except Exception as e:  # noqa: BLE001 - reported to the GUI
             self.failed.emit(str(e))
             return

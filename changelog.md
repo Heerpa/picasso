@@ -29,7 +29,7 @@ Last change: 06-AUG-2026 CEST
 - Added support for MicroManager "separate image files" acquisitions (one `img_*.tif` per frame in a folder), see [Localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html#extra-features).
 - Z fitting on CUDA GPU
 - Movies now load on a background thread, so the Localize window stays responsive (and other windows are no longer blocked) while files are read; a progress dialog with a `Cancel` button is shown
-- Affine transform calibration for astigmatic imaging and chromatic abberation correction
+- Affine transform calibration for astigmatic imaging and chromatic abberation correction. A transform is fitted from two bead images and appended to any calibration (Gaussian astigmatism `.yaml`, spline PSF `.hdf5`) or saved as a standalone calibration for 2D data; several corrections stack in one ordered list and are applied to `x`/`y` one after another (e.g. cylindrical lens, then chromatic)
 - New temporal median filter for spot identification with adaptable background, see [Martens, et al, Frontiers in Bioinformatics, 2022](https://doi.org/10.3389/fbinf.2021.817254). It is applied to the identification only (spots are always fitted on the raw movie) and it changes the scale of the net gradient, so `Min. net gradient` needs re-tuning when it is switched on or off
 - Accept multiple frame bounds
 - Accept multiple rectangular ROIs

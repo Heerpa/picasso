@@ -244,6 +244,35 @@ Fitting z
 For each localization, sigma_x and sigma_y is determined. Similar to the Science paper, the following equation is used to minimize the Distance D:  ``D = (sx0.5 - wx0.5)^2 + (sy0.5 - wy0.5)^2`` with w being ``c[6]z0 +
 c[5]z1 .. + c[0]z6``.
 
+Affine corrections of x and y
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Two things distort the lateral coordinates of a measurement: a cylindrical lens inserted for astigmatic 3D imaging shifts, rotates and stretches the image relative to the unmodified light path, and chromatic aberration displaces one colour channel relative to another. Both are corrected the same way, by an affine transform fitted from two bead images and applied to ``x`` / ``y`` after fitting.
+
+Open ``3D`` > ``Calibrate affine transform (astigmatism / chromatic)`` and choose what to correct:
+
+- **Astigmatism (cylindrical lens)** — a reference image of in-focus beads *without* the cylindrical lens, and an image of the same beads *with* it.
+- **Chromatic aberration** — an image of in-focus beads in the reference color channel, and an image of the same beads in the channel to be corrected.
+
+Beads are detected with the current ``Box side length`` and ``Min. net gradient`` (use ``Show`` to tune them on either image with a live preview), refined by a 2D Gaussian fit, matched by mutual nearest neighbour, and a 6-DOF affine transform mapping the second image onto the reference is fitted by least squares. A diagnostic figure is shown and saved next to the calibration as ``<base>_affine.png``: overlays before and after the correction, and the mean per-bead cross-correlation before and after, whose peak should sit at the origin once the correction is applied.
+
+The transform is stored as one entry of an ordered ``Affine transforms`` list in the calibration file you select, which can be:
+
+- an existing Gaussian 3D calibration (``.yaml``) or spline PSF calibration (``.hdf5``) — the transform is appended to it and applied automatically whenever that calibration is used to fit, whether the fit is Gaussian astigmatism or cubic spline;
+- a standalone affine calibration (``New``, a ``.yaml`` holding only affine corrections) — for 2D data, where there is no 3D calibration to append to.
+
+Corrections accumulate: calibrating both an astigmatism and a chromatic transform into the same file stores them as a list, and they are applied one after another in that order. Re-running a calibration of the same type replaces its entry rather than adding a second copy.
+
+For **3D data there is nothing to load**: the correction lives in the 3D or spline calibration and is applied automatically whenever that calibration is used to fit.
+
+For **2D data** there is no such calibration to attach it to, so the standalone file is loaded through the ``2D affine correction (x, y)`` box in the ``Parameters`` dialog: ``Load 2D correction`` takes one or more files (applied in the order listed) and ``Clear`` drops them. The setting belongs to the loaded movie, so several movies opened side by side can each carry their own correction.
+
+A correction is never applied twice. Loading a file whose transform the currently loaded 3D or spline calibration already carries is refused by Picasso.
+
+**Affine corrections apply to single-channel data only.** They correct one movie into a reference frame, which is what a 2D or astigmatic 3D measurement of a single channel needs. The multichannel (global) spline fit is a different mechanism: it fits all channels jointly and registers them itself from the per-channel transforms in its own calibration, so a lateral correction on top of that would be applied twice. Picasso therefore refuses to append an affine transform to a multichannel spline calibration, and ignores loaded affine corrections when a multichannel fit runs.
+
+On the command line, ``picasso localize`` takes ``--affine-calibration <file>`` (repeat the flag to chain several).
+
 Incorporating calibrations in config file
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

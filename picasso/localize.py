@@ -5783,7 +5783,9 @@ def locs_from_fits_spline(
         columns["chi_square"] = np.asarray(chi_square).astype(np.float32)
     locs = pd.DataFrame(columns)
     locs.sort_values(by="frame", kind="quicksort", inplace=True)
-    return locs
+    if _spline_n_channels(calibration) > 1:
+        return locs
+    return lib.apply_affine_transforms(locs, calibration)
 
 
 def _fit2d_spline_gpu(
@@ -7092,6 +7094,7 @@ def localize(
     max_it: int | None = None,
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
+    affine_calibration: dict | list | None = None,
     threaded: bool = True,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
@@ -7151,6 +7154,14 @@ def localize(
         picks the value that suits the method.
     mle_method : Literal["sigma", "sigmaxy"], optional
         The method used for MLE fitting. Default is "sigmaxy".
+    affine_calibration : dict or list or None, optional
+        Additional lateral (x, y) affine corrections to apply after
+        fitting, e.g. a standalone chromatic-aberration calibration used
+        on its own in a 2D experiment. Either a calibration dictionary
+        carrying an ``"Affine transforms"`` list or the list itself; they
+        are applied in order. Corrections stored in ``spline_calibration``
+        are applied by the fit itself, so they must not be repeated here.
+        Default is None.
     identification_progress_callback : callable or "console" or None
         A callback for progress updates during identification. If
         "console", progress will be printed to the console. If None,
@@ -7212,6 +7223,18 @@ def localize(
         multiprocess=threaded,
         progress_callback=fit_progress_callback,
     )
+    # Standalone affine corrections (e.g. a chromatic one used without a 3D
+    # calibration); those carried by the spline calibration were already
+    # applied by the fit, so they are dropped here rather than applied twice.
+    extra, duplicates = lib.drop_duplicate_affine_transforms(
+        affine_calibration, spline_calibration
+    )
+    _warn_duplicate_affine(duplicates)
+    if extra:
+        locs = lib.apply_affine_transforms(locs, extra)
+        fit_info["Affine corrections applied"] = (
+            lib.describe_affine_transforms(extra)
+        )
     info = movie_info + [identify_info] + [fit_info]
     if return_info:
         return locs, info
@@ -7249,6 +7272,7 @@ def localize_3D(
     max_it: int | None = None,
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
+    affine_calibration: dict | list | None = None,
     multiprocess: bool = True,
     temporal_median_window: int | None = None,
     identification_progress_callback: (
@@ -7332,6 +7356,12 @@ def localize_3D(
     mle_method : Literal["sigma", "sigmaxy"], optional
         The method used for CPU MLE fitting (impose same sigma in x and
         y or not, respectively). Default is "sigmaxy".
+    affine_calibration : dict or list or None, optional
+        Lateral (x, y) affine corrections to apply on top of those the
+        fit's own calibration carries, e.g. a standalone
+        chromatic-aberration calibration combined with an astigmatism
+        transform stored in ``calibration_3d``. Applied last, in list
+        order. Default is None.
     multiprocess: bool, optional
         Whether or not to use multiprocessing. Ignored for GPU fitting.
         Default is True.
@@ -7418,6 +7448,7 @@ def localize_3D(
         max_it=max_it,
         mle_method=mle_method,
         spline_calibration=spline_calibration,
+        affine_calibration=affine_calibration,
         multiprocess=multiprocess,
         temporal_median_window=temporal_median_window,
         identification_progress_callback=identification_progress_callback,
@@ -7457,6 +7488,7 @@ def _localize_3D(
     max_it: int | None = None,
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
+    affine_calibration: dict | list | None = None,
     multiprocess: bool = True,
     temporal_median_window: int | None = None,
     identification_progress_callback: (
@@ -7493,8 +7525,12 @@ def _localize_3D(
     )
     if fitting_method.startswith("spline"):
         # The 3D cubic-spline fit already produced the z column directly, so
-        # there is no separate astigmatism z-fitting step to run.
-        return locs, info
+        # there is no separate astigmatism z-fitting step to run. The spline
+        # calibration's own affine corrections were applied by the fit, so
+        # they are not repeated here.
+        return _apply_extra_affine(
+            locs, info, affine_calibration, applied=spline_calibration
+        )
     # zfit only knows gausslq/gaussmle; map the GPU/rotated codes to the
     # corresponding CPU noise model
     fitting_method_3d = (
@@ -7509,6 +7545,50 @@ def _localize_3D(
         multiprocess=multiprocess,
         progress_callback=fit_z_progress_callback,
     )
+    return _apply_extra_affine(
+        locs, info, affine_calibration, applied=calibration_3d
+    )
+
+
+def _warn_duplicate_affine(duplicates: list) -> None:
+    """Warn that corrections the fit's own calibration already applies were
+    dropped, so they are not applied twice."""
+    if duplicates:
+        warnings.warn(
+            "Skipping "
+            + ", ".join(lib.describe_affine_transforms(duplicates))
+            + ": the calibration used for fitting already carries this "
+            "affine correction and applies it itself. Applying it again "
+            "would correct the coordinates twice.",
+            stacklevel=3,
+        )
+
+
+def _apply_extra_affine(
+    locs: pd.DataFrame,
+    info: list[dict],
+    affine_calibration: dict | list | None,
+    applied: dict | list | None = None,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Apply affine corrections that are not carried by the fit's own
+    calibration (e.g. a standalone chromatic one) and record them in the
+    metadata. Corrections ``applied`` already covers are dropped instead of
+    applied a second time. A no-op when there are none."""
+    extra, duplicates = lib.drop_duplicate_affine_transforms(
+        affine_calibration, applied
+    )
+    _warn_duplicate_affine(duplicates)
+    if not extra:
+        return locs, info
+    locs = lib.apply_affine_transforms(locs, extra)
+    info = info + [
+        {
+            "Generated by": f"Picasso: v{__version__} Affine correction",
+            "Affine corrections applied": lib.describe_affine_transforms(
+                extra
+            ),
+        }
+    ]
     return locs, info
 
 
@@ -7924,7 +8004,8 @@ def _affine_plot_alignment(
     pixelsize: float | None = None,
     save_path: str = "",
     ref_path: str = "",
-    cyl_path: str = "",
+    target_path: str = "",
+    transform_type: str = "astigmatism",
 ) -> None:
     """Four-panel QC figure: overlay before/after correction and mean
     per-bead cross-correlation before/after correction.
@@ -8039,10 +8120,11 @@ def _affine_plot_alignment(
         f"Scale X={decomp['scale_x']:.5f}  Y={decomp['scale_y']:.5f}  "
         f"Rot={decomp['rotation_deg']:.4f}°  " + trans_str
     )
-    if ref_path or cyl_path:
+    title = f"{transform_type.capitalize()}  |  " + title
+    if ref_path or target_path:
         title += (
             f"\nref: {os.path.basename(ref_path)}   "
-            f"cyl: {os.path.basename(cyl_path)}"
+            f"target: {os.path.basename(target_path)}"
         )
     fig.suptitle(title, fontsize=10, fontweight="bold")
     gs = gridspec.GridSpec(2, 2, figure=fig, wspace=0.30, hspace=0.25)
@@ -8054,7 +8136,7 @@ def _affine_plot_alignment(
         np.clip(np.stack([mov_n, ref_n, mov_n], axis=-1), 0, 1), extent=ext
     )
     ax.set_title(
-        "Overlay  BEFORE\nRef (green) | Cylindrical (magenta)",
+        "Overlay  BEFORE\nRef (green) | Target (magenta)",
         fontsize=9,
         fontweight="bold",
     )
@@ -8131,16 +8213,17 @@ def _affine_plot_alignment(
 
 def fit_affine_transform(
     movie_ref,
-    movie_cyl,
+    movie_target,
     calibration: dict,
     box: int,
     minimum_ng: float,
     pixelsize: float | None = None,
+    transform_type: str = "astigmatism",
     ref_path: str = "",
-    cyl_path: str = "",
+    target_path: str = "",
 ) -> tuple[dict, dict]:
-    """Fit the cylindrical-lens -> reference affine transform and append it
-    to ``calibration``.
+    """Fit the target -> reference affine transform and append it to
+    ``calibration``'s ordered list of affine corrections.
 
     This is the computational half of :func:`calibrate_affine_transform`.
     It touches no matplotlib state, so it is safe to call from a worker
@@ -8156,22 +8239,50 @@ def fit_affine_transform(
     Returns
     -------
     calibration : dict
-        The input calibration augmented with an "Affine transform" key.
-        Use ``io.save_calibration`` to save the result.
+        The input calibration, with the transform appended to its
+        ``"Affine transforms"`` list (an existing entry of the same type is
+        replaced). Save it with ``io.save_any_calibration``.
     qc : dict
-        Inputs for :func:`plot_affine_calibration`: the reference,
-        cylindrical and corrected images, the matched reference bead
-        positions, the decomposition, the number of pairs, the pixel size
-        and the source paths.
+        Inputs for :func:`plot_affine_calibration`: the reference, target
+        and corrected images, the matched reference bead positions, the
+        decomposition, the number of pairs, the pixel size, the transform
+        type and the source paths.
+
+    Raises
+    ------
+    ValueError
+        If ``transform_type`` is unknown, if ``calibration`` is a
+        multichannel spline calibration (affine corrections are
+        single-channel only), or if fewer than 3 bead pairs match.
     """
+    if transform_type not in lib.AFFINE_TRANSFORM_TYPES:
+        raise ValueError(
+            f"Unknown affine transform type '{transform_type}'; expected "
+            f"one of {lib.AFFINE_TRANSFORM_TYPES}."
+        )
+    if calibration.get("model") in (
+        "spline-3d-multichannel",
+        _LINK_XYZ_MODEL,
+    ):
+        raise ValueError(
+            "Affine corrections apply to single-channel data only, but "
+            f"this is a '{calibration['model']}' calibration, which "
+            "registers its channels itself. Append the transform to a "
+            "single-channel calibration, or save it as a standalone "
+            "affine calibration."
+        )
     img_ref = _movie_to_image(movie_ref)
-    img_cyl = _movie_to_image(movie_cyl)
+    img_target = _movie_to_image(movie_target)
 
     coarse_ref = _affine_detect_beads(img_ref, box, minimum_ng)
-    coarse_cyl = _affine_detect_beads(img_cyl, box, minimum_ng)
+    coarse_target = _affine_detect_beads(img_target, box, minimum_ng)
     refined_ref = _affine_refine_bead_positions(img_ref, coarse_ref, box)
-    refined_cyl = _affine_refine_bead_positions(img_cyl, coarse_cyl, box)
-    pairs_ref, pairs_cyl = _affine_match_bead_pairs(refined_ref, refined_cyl)
+    refined_target = _affine_refine_bead_positions(
+        img_target, coarse_target, box
+    )
+    pairs_ref, pairs_target = _affine_match_bead_pairs(
+        refined_ref, refined_target
+    )
 
     if len(pairs_ref) < 3:
         raise ValueError(
@@ -8180,33 +8291,40 @@ def fit_affine_transform(
             "parameters."
         )
 
-    M = _affine_estimate_2d(pairs_cyl, pairs_ref)
+    M = _affine_estimate_2d(pairs_target, pairs_ref)
     decomp = _affine_decompose(M, pixelsize)
 
+    # What the two images are called depends on what is being corrected;
+    # the fit and the way the transform is applied are identical.
+    source = (
+        "cylindrical" if transform_type == "astigmatism" else "target channel"
+    )
     affine_entry = {
+        "Type": transform_type,
         "Matrix": [[float(v) for v in row] for row in M],
-        "Direction": "cylindrical -> reference (x = col, y = row)",
+        "Direction": f"{source} -> reference (x = col, y = row)",
         "Reference image": ref_path or "N/A",
-        "Cylindrical image": cyl_path or "N/A",
+        "Target image": target_path or "N/A",
         "Bead pairs": int(len(pairs_ref)),
         "Decomposition": decomp,
     }
     if pixelsize is not None:
         affine_entry["Pixelsize (nm)"] = float(pixelsize)
-    calibration["Affine transform"] = affine_entry
+    lib.append_affine_transform(calibration, affine_entry)
 
     qc = {
         "img_ref": img_ref,
-        "img_cyl": img_cyl,
+        "img_target": img_target,
         # the warp is part of the fit's output, not of the drawing, so it
         # is computed here and only displayed by the plotting function
-        "img_cor": _affine_apply(img_cyl, M),
+        "img_cor": _affine_apply(img_target, M),
         "pairs_ref": pairs_ref,
         "decomposition": decomp,
         "n_pairs": int(len(pairs_ref)),
         "pixelsize": pixelsize,
+        "transform_type": transform_type,
         "ref_path": ref_path,
-        "cyl_path": cyl_path,
+        "target_path": target_path,
     }
     return calibration, qc
 
@@ -8221,7 +8339,7 @@ def plot_affine_calibration(qc: dict, save_path: str = "") -> None:
     """
     _affine_plot_alignment(
         qc["img_ref"],
-        qc["img_cyl"],
+        qc["img_target"],
         qc["img_cor"],
         qc["pairs_ref"],
         qc["decomposition"],
@@ -8229,41 +8347,68 @@ def plot_affine_calibration(qc: dict, save_path: str = "") -> None:
         pixelsize=qc["pixelsize"],
         save_path=save_path,
         ref_path=qc.get("ref_path", ""),
-        cyl_path=qc.get("cyl_path", ""),
+        target_path=qc.get("target_path", ""),
+        transform_type=qc.get("transform_type", "astigmatism"),
     )
 
 
 def calibrate_affine_transform(
     movie_ref,
-    movie_cyl,
+    movie_target,
     calibration: dict,
     box: int,
     minimum_ng: float,
     pixelsize: float | None = None,
+    transform_type: str = "astigmatism",
     ref_path: str = "",
-    cyl_path: str = "",
+    target_path: str = "",
     plot_path: str = "",
 ) -> dict:
-    """Fit a 6-DOF affine transform that maps the cylindrical-lens bead
-    image into the reference (no-lens) frame and append it to the given
-    3D astigmatism calibration dict.
+    """Fit a 6-DOF affine transform that maps a bead image into a
+    reference frame and append it to any calibration dict.
+
+    The same calibration serves two corrections, selected by
+    ``transform_type``:
+
+    - ``"astigmatism"``: the cylindrical-lens image is mapped into the
+      reference (no-lens) frame, undoing the lateral distortion the
+      cylindrical lens introduces.
+    - ``"chromatic"``: one colour channel is mapped into the reference
+      colour channel, correcting chromatic aberration.
+
+    Both are stored as entries of an ordered ``"Affine transforms"`` list
+    and applied to ``x``/``y`` in that order after fitting, so a 3D
+    two-colour experiment can chain the astigmatism correction and the
+    chromatic one. The list is read from whatever calibration the fit uses
+    - Gaussian astigmatism (YAML) or cubic-spline PSF (HDF5) - and an empty
+    ``calibration`` dict starts a standalone affine calibration file, which
+    is what a purely 2D chromatic correction needs.
+
+    This is a **single-channel** correction: it maps one movie into a
+    reference frame. A multichannel spline calibration registers its
+    channels itself, so appending a transform to one raises ``ValueError``.
 
     The fit is performed in pixel coordinates on a per-pixel mean of
     each movie. Bead candidates are found by Gaussian-blur + local-max,
     refined to sub-pixel accuracy by a 2D Gaussian fit, then matched
     between the two images by mutual nearest neighbour. The affine
     matrix is solved by 6-DOF linear least squares and decomposed into
-    rotation / anisotropic scale / shear via QR.  TODO: might correct this
-    paragraph
+    rotation / anisotropic scale / shear via QR.
 
     Parameters
     ----------
-    movie_ref, movie_cyl : AbstractPicassoMovie
-        In-focus bead movies without (reference) and with the
-        cylindrical lens. If a movie has multiple frames they are
+    movie_ref, movie_target : AbstractPicassoMovie
+        In-focus bead movies of the reference and of the frame to be
+        corrected: without / with the cylindrical lens for
+        ``"astigmatism"``, reference / other colour channel for
+        ``"chromatic"``. If a movie has multiple frames they are
         averaged; a single-frame movie is used as-is.
     calibration : dict
-        Existing 3D calibration; an "Affine transform" entry is appended.
+        Calibration the transform is appended to; may be a Gaussian
+        astigmatism calibration, a single-channel spline PSF calibration,
+        or ``{}`` to start a standalone affine calibration. An existing
+        entry of the same ``transform_type`` is replaced. A multichannel
+        spline calibration is rejected (see above).
     box : int
         Box size used to identify bead candidates (also sets the minimum
         distance between two detected beads). Should be an odd integer.
@@ -8273,7 +8418,11 @@ def calibrate_affine_transform(
         Camera pixel size in nm. If given, decomposition translations
         and the diagnostic plot are converted from pixels to nm. If
         None (default), values are reported in pixels. Default is None.
-    ref_path, cyl_path : str, optional
+    transform_type : {"astigmatism", "chromatic"}, optional
+        What the transform corrects; recorded in the entry and used to
+        decide which existing entry it replaces. Default is
+        "astigmatism".
+    ref_path, target_path : str, optional
         Paths to the source images, recorded in the calibration for
         traceability and shown in the diagnostic plot title. Default
         is "".
@@ -8284,8 +8433,9 @@ def calibrate_affine_transform(
     Returns
     -------
     calibration : dict
-        The input calibration augmented with an "Affine transform" key.
-        Use ``io.save_calibration`` to save the result.
+        The input calibration with the transform appended to its
+        ``"Affine transforms"`` list. Use ``io.save_any_calibration`` to
+        save the result to YAML or HDF5, whichever the calibration is.
 
     Notes
     -----
@@ -8295,13 +8445,14 @@ def calibrate_affine_transform(
     """
     calibration, qc = fit_affine_transform(
         movie_ref,
-        movie_cyl,
+        movie_target,
         calibration,
         box=box,
         minimum_ng=minimum_ng,
         pixelsize=pixelsize,
+        transform_type=transform_type,
         ref_path=ref_path,
-        cyl_path=cyl_path,
+        target_path=target_path,
     )
     plot_affine_calibration(qc, save_path=plot_path)
     return calibration

@@ -12,6 +12,7 @@ Tests for ``gausslq``, ``gaussmle`` and ``zfit`` live in their own files
 from __future__ import annotations
 
 import inspect
+import os
 import sys
 import time
 import warnings
@@ -23,7 +24,7 @@ import pytest
 from scipy.interpolate import CubicSpline
 from PyQt6 import QtWidgets
 
-from picasso import gaussmle, gausslq, io, localize, spline
+from picasso import gaussmle, gausslq, io, lib, localize, spline
 from picasso.fitting import gaussfit_cuda, splinefit
 from picasso.gui import localize as localize_gui
 
@@ -2469,6 +2470,73 @@ class TestSplineHelpers:
         for col in ("lpx", "lpy", "lpz", "photons_unc", "bg_unc"):
             assert col in locs.columns
             assert np.all(np.isfinite(locs[col])) and np.all(locs[col] > 0)
+
+    def test_locs_from_fits_spline_applies_affine_transforms(self):
+        """A spline calibration carries the same affine corrections as an
+        astigmatism one, chained in stored order."""
+        calib, _ = _gauss_spline_calibration(model="spline-3d")
+        n = 4
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(n, dtype=np.uint32),
+                "x": np.full(n, 20.0),
+                "y": np.full(n, 30.0),
+                "net_gradient": np.full(n, 1000.0),
+            }
+        )
+        theta = np.zeros((n, 5), dtype=np.float32)
+        theta[:, 0] = 5000.0
+        theta[:, 3] = -calib["z_center"] + 2.0
+        theta[:, 4] = 12.0
+
+        plain = localize.locs_from_fits_spline(ids, theta, BOX, False, calib)
+        corrected_calib = dict(calib)
+        shifts = (("astigmatism", 3.0, -1.5), ("chromatic", 5.0, 2.0))
+        for kind, dx, dy in shifts:
+            matrix = [[1.0, 0.0, dx], [0.0, 1.0, dy], [0.0, 0.0, 1.0]]
+            lib.append_affine_transform(
+                corrected_calib, {"Type": kind, "Matrix": matrix}
+            )
+        moved = localize.locs_from_fits_spline(
+            ids, theta, BOX, False, corrected_calib
+        )
+        np.testing.assert_allclose(moved["x"], plain["x"] + 8.0, atol=1e-4)
+        np.testing.assert_allclose(moved["y"], plain["y"] + 0.5, atol=1e-4)
+        np.testing.assert_allclose(moved["z"], plain["z"], atol=1e-6)
+
+    def test_multichannel_spline_ignores_affine_transforms(self):
+        """Single-channel only: a multichannel calibration that somehow
+        carries a correction must not have it applied on top of the
+        registration the joint fit already does."""
+        calib, _ = _gauss_spline_calibration(model="spline-3d-multichannel")
+        n = 3
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(n, dtype=np.uint32),
+                "x": np.full(n, 20.0),
+                "y": np.full(n, 30.0),
+                "net_gradient": np.full(n, 1000.0),
+            }
+        )
+        theta = np.zeros((n, 5), dtype=np.float32)
+        theta[:, 0] = 5000.0
+        theta[:, 3] = -calib["z_center"]
+        theta[:, 4] = 12.0
+
+        plain = localize.locs_from_fits_spline(ids, theta, BOX, False, calib)
+        with_affine = dict(calib)
+        lib.append_affine_transform(
+            with_affine,
+            {
+                "Type": "chromatic",
+                "Matrix": [[1.0, 0.0, 9.0], [0.0, 1.0, 9.0], [0.0, 0.0, 1.0]],
+            },
+        )
+        moved = localize.locs_from_fits_spline(
+            ids, theta, BOX, False, with_affine
+        )
+        np.testing.assert_allclose(moved["x"], plain["x"])
+        np.testing.assert_allclose(moved["y"], plain["y"])
 
     def test_locs_from_fits_spline_2d_has_no_z(self):
         calib, _ = _gauss_spline_calibration(model="spline-2d")
@@ -6528,7 +6596,7 @@ class TestTemporalMedianGui:
 
 
 # ---------------------------------------------------------------------------
-# Astigmatism: cylindrical-lens -> reference affine calibration
+# Affine calibration: target -> reference (astigmatism / chromatic)
 # ---------------------------------------------------------------------------
 
 
@@ -6648,13 +6716,14 @@ class TestFitAffineTransform:
         calibration, qc = localize.fit_affine_transform(
             movie_ref, movie_cyl, {}, box=BOX, minimum_ng=1000
         )
-        matrix = np.asarray(calibration["Affine transform"]["Matrix"])
+        (entry,) = lib.affine_transforms(calibration)
+        matrix = np.asarray(entry["Matrix"])
         # compare where it sends points, not the coefficients: a small
         # coefficient error far from the origin is what actually matters
         cyl_xy = _apply_homogeneous(np.linalg.inv(self.TRUTH), ref_xy)
         mapped = _apply_homogeneous(matrix, cyl_xy)
         assert np.allclose(mapped, ref_xy, atol=0.2)
-        assert calibration["Affine transform"]["Bead pairs"] == len(ref_xy)
+        assert entry["Bead pairs"] == len(ref_xy)
         assert qc["n_pairs"] == len(ref_xy)
 
     def test_calibration_entry_contents(self, bead_movies):
@@ -6668,14 +6737,15 @@ class TestFitAffineTransform:
             minimum_ng=1000,
             pixelsize=PIXELSIZE,
             ref_path="ref.tif",
-            cyl_path="cyl.tif",
+            target_path="cyl.tif",
         )
-        entry = calibration["Affine transform"]
+        (entry,) = lib.affine_transforms(calibration)
         # the existing 3D calibration is augmented, not replaced
         assert calibration["X Coefficients"] == [1, 2, 3]
+        assert entry["Type"] == "astigmatism"
         assert entry["Direction"].startswith("cylindrical -> reference")
         assert entry["Reference image"] == "ref.tif"
-        assert entry["Cylindrical image"] == "cyl.tif"
+        assert entry["Target image"] == "cyl.tif"
         assert entry["Pixelsize (nm)"] == float(PIXELSIZE)
         assert entry["Decomposition"]["rotation_deg"] == pytest.approx(
             0.46, abs=0.1
@@ -6690,7 +6760,7 @@ class TestFitAffineTransform:
         calibration, _ = localize.fit_affine_transform(
             movie_ref, movie_ref, {}, box=BOX, minimum_ng=1000
         )
-        matrix = np.asarray(calibration["Affine transform"]["Matrix"])
+        matrix = np.asarray(lib.affine_transforms(calibration)[0]["Matrix"])
         mapped = _apply_homogeneous(matrix, ref_xy)
         assert np.allclose(mapped, ref_xy, atol=0.05)
 
@@ -6708,9 +6778,22 @@ class TestFitAffineTransform:
         io.save_calibration(path, calibration)
         loaded = io.load_calibration(path)
         assert np.allclose(
-            loaded["Affine transform"]["Matrix"],
-            calibration["Affine transform"]["Matrix"],
+            lib.affine_matrices(loaded), lib.affine_matrices(calibration)
         )
+
+    def test_multichannel_calibration_is_rejected(self, bead_movies):
+        """Affine corrections are single-channel only: a multichannel
+        spline fit registers its channels itself."""
+        movie_ref, movie_target, _ = bead_movies
+        for model in ("spline-3d-multichannel", localize._LINK_XYZ_MODEL):
+            with pytest.raises(ValueError, match="single-channel"):
+                localize.fit_affine_transform(
+                    movie_ref,
+                    movie_target,
+                    {"model": model, "n_channels": 2},
+                    box=BOX,
+                    minimum_ng=1000,
+                )
 
     def test_too_few_beads_raises(self):
         movie = _affine_bead_image(np.array([[40.0, 40.0], [140.0, 140.0]]))
@@ -6731,14 +6814,15 @@ class TestFitAffineTransform:
         )
         assert set(qc) == {
             "img_ref",
-            "img_cyl",
+            "img_target",
             "img_cor",
             "pairs_ref",
             "decomposition",
             "n_pairs",
             "pixelsize",
+            "transform_type",
             "ref_path",
-            "cyl_path",
+            "target_path",
         }
         assert qc["img_cor"].shape == qc["img_ref"].shape
         assert qc["pixelsize"] == PIXELSIZE
@@ -6752,7 +6836,7 @@ class TestFitAffineTransform:
             return float((a * b).sum() / np.sqrt((a**2).sum() * (b**2).sum()))
 
         assert _corr(qc["img_ref"], qc["img_cor"]) > _corr(
-            qc["img_ref"], qc["img_cyl"]
+            qc["img_ref"], qc["img_target"]
         )
 
     def test_fit_does_not_plot(self, bead_movies, monkeypatch):
@@ -6789,27 +6873,322 @@ class TestFitAffineTransform:
             pixelsize=PIXELSIZE,
             plot_path="figure.png",
         )
-        assert "Affine transform" in calibration
+        assert len(lib.affine_transforms(calibration)) == 1
         assert drawn["save_path"] == "figure.png"
         assert drawn["qc"]["n_pairs"] == 25
 
 
-class TestAffineTransformInZFit:
-    """The fitted transform as ``zfit`` applies it to the localizations."""
+class TestCalibrateAffineDialogGUI:
+    """The calibration dialog serves both transform types and can start a
+    standalone calibration file."""
+
+    def _dialog(self):
+        window = QtWidgets.QWidget()
+        window.movie_path = ""
+        return localize_gui.CalibrateAffineDialog(window)
+
+    def test_defaults_to_astigmatism_with_lens_labels(self):
+        dialog = self._dialog()
+        assert dialog.transform_type == "astigmatism"
+        assert "Cylindrical" in dialog.target_label.text()
+
+    def test_switching_to_chromatic_relabels_the_images(self):
+        dialog = self._dialog()
+        dialog.type_combo.setCurrentIndex(1)
+        assert dialog.transform_type == "chromatic"
+        assert "channel" in dialog.target_label.text().lower()
+        assert "channel" in dialog.reference_label.text().lower()
+
+
+class TestAffineCalibrationWorkerGUI:
+    """The worker appends to an existing calibration of any format and
+    starts a new standalone one when the path does not exist yet."""
+
+    def _worker(self, tmp_path, calib_path, transform_type, monkeypatch):
+        ref_xy = _affine_bead_grid()
+        movie_ref = _affine_bead_image(ref_xy)
+        movie_target = _affine_bead_image(ref_xy + np.array([2.0, -1.0]))
+        movies = {"ref.tif": movie_ref, "target.tif": movie_target}
+
+        def fake_load_movie(path, prompt_info=None, progress=None):
+            name = os.path.basename(path)
+            return movies[name], [{"Pixelsize": PIXELSIZE}]
+
+        monkeypatch.setattr(io, "load_movie", fake_load_movie)
+        return localize_gui.AffineCalibrationWorker(
+            ref_path=str(tmp_path / "ref.tif"),
+            target_path=str(tmp_path / "target.tif"),
+            calibration_path=calib_path,
+            box=BOX,
+            minimum_ng=1000,
+            prompt_for_path=lambda path: None,
+            pixelsize_prompt=lambda: PIXELSIZE,
+            transform_type=transform_type,
+        )
+
+    def test_creates_a_standalone_chromatic_calibration(
+        self, tmp_path, monkeypatch
+    ):
+        calib_path = str(tmp_path / "chromatic.yaml")  # does not exist yet
+        worker = self._worker(tmp_path, calib_path, "chromatic", monkeypatch)
+        failures = []
+        worker.failed.connect(failures.append)
+        worker.run()
+        assert not failures
+        (entry,) = lib.affine_transforms(io.load_any_calibration(calib_path))
+        assert entry["Type"] == "chromatic"
+
+    def test_appends_to_a_spline_calibration(self, tmp_path, monkeypatch):
+        calib_path = str(tmp_path / "spline_calib.hdf5")
+        io.save_spline_calibration(
+            calib_path,
+            {
+                "coefficients": np.zeros((16, 2, 2), dtype=np.float32),
+                "model": "spline-2d",
+                "n_data": [3, 3],
+            },
+        )
+        worker = self._worker(tmp_path, calib_path, "chromatic", monkeypatch)
+        failures = []
+        worker.failed.connect(failures.append)
+        worker.run()
+        assert not failures
+        calibration = io.load_any_calibration(calib_path)
+        # the PSF itself survives alongside the new correction
+        assert calibration["model"] == "spline-2d"
+        assert len(lib.affine_transforms(calibration)) == 1
+
+
+class TestAffineDuplicateGuardsGUI:
+    """A correction the loaded calibration already carries must not be
+    taken a second time through the 2D affine correction box."""
+
+    MATRIX = [[1.0, 0.0, 4.0], [0.0, 1.0, -3.0], [0.0, 0.0, 1.0]]
+
+    def _calibration_file(self, tmp_path, name="calib.yaml"):
+        calibration = dict(CALIB_3D)
+        lib.append_affine_transform(
+            calibration,
+            {
+                "Type": "astigmatism",
+                "Matrix": self.MATRIX,
+                "Bead pairs": 20,
+            },
+        )
+        path = str(tmp_path / name)
+        io.save_any_calibration(path, calibration)
+        return path, calibration
+
+    def test_loading_the_z_calibration_again_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        path, calibration = self._calibration_file(tmp_path)
+        dialog = localize_gui.ParametersDialog(None)
+        dialog.z_calibration = calibration
+        warnings_shown = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "warning",
+            lambda *args, **kwargs: warnings_shown.append(args[2]),
+        )
+        dialog.update_affine_calib([path])
+        assert dialog.affine_transforms == []
+        assert any(
+            "would correct the coordinates twice" in w for w in warnings_shown
+        )
+
+    def test_an_unrelated_correction_still_loads(self, tmp_path, monkeypatch):
+        _, calibration = self._calibration_file(tmp_path)
+        other = {}
+        lib.append_affine_transform(
+            other,
+            {
+                "Type": "chromatic",
+                "Matrix": [[1.0, 0.0, 7.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                "Bead pairs": 8,
+            },
+        )
+        other_path = str(tmp_path / "chromatic.yaml")
+        io.save_any_calibration(other_path, other)
+        dialog = localize_gui.ParametersDialog(None)
+        dialog.z_calibration = calibration
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "warning", lambda *a, **k: None
+        )
+        dialog.update_affine_calib([other_path])
+        assert len(dialog.affine_transforms) == 1
+        assert dialog.affine_transforms[0]["Type"] == "chromatic"
+
+
+class TestChainedAffineTransforms:
+    """The ordered list of corrections that any calibration can carry."""
+
+    ASTIG = [[1.002, -0.01, 3.0], [0.009, 0.998, -1.5], [0.0, 0.0, 1.0]]
+    CHROMATIC = [[1.0, 0.0, 5.0], [0.0, 1.0, -2.0], [0.0, 0.0, 1.0]]
+
+    @staticmethod
+    def _entry(kind, matrix):
+        return {"Type": kind, "Matrix": matrix, "Bead pairs": 12}
+
+    def _both(self):
+        calibration = {}
+        lib.append_affine_transform(
+            calibration, self._entry("astigmatism", self.ASTIG)
+        )
+        lib.append_affine_transform(
+            calibration, self._entry("chromatic", self.CHROMATIC)
+        )
+        return calibration
 
     def test_locs_are_mapped_into_the_reference_frame(self):
-        matrix = [[1.002, -0.01, 3.0], [0.009, 0.998, -1.5], [0.0, 0.0, 1.0]]
+        calibration = {
+            lib.AFFINE_TRANSFORMS_KEY: [self._entry("astigmatism", self.ASTIG)]
+        }
         locs = pd.DataFrame({"x": [10.0, 100.0], "y": [20.0, 200.0]})
         expected = _apply_homogeneous(
-            np.asarray(matrix), locs[["x", "y"]].to_numpy()
+            np.asarray(self.ASTIG), locs[["x", "y"]].to_numpy()
         )
-        # mirrors the block in zfit._fit_z
-        x = locs["x"].to_numpy()
-        y = locs["y"].to_numpy()
-        moved = np.column_stack(
-            [
-                matrix[0][0] * x + matrix[0][1] * y + matrix[0][2],
-                matrix[1][0] * x + matrix[1][1] * y + matrix[1][2],
-            ]
+        moved = lib.apply_affine_transforms(locs, calibration)
+        assert np.allclose(moved[["x", "y"]].to_numpy(), expected, atol=1e-4)
+
+    def test_two_transforms_apply_in_order(self):
+        locs = pd.DataFrame({"x": [10.0, 100.0], "y": [20.0, 200.0]})
+        xy = locs[["x", "y"]].to_numpy()
+        expected = _apply_homogeneous(
+            np.asarray(self.CHROMATIC),
+            _apply_homogeneous(np.asarray(self.ASTIG), xy),
         )
-        assert np.allclose(moved, expected)
+        moved = lib.apply_affine_transforms(locs, self._both())
+        assert np.allclose(moved[["x", "y"]].to_numpy(), expected, atol=1e-4)
+        # the input frame is left alone
+        assert np.allclose(locs[["x", "y"]].to_numpy(), xy)
+
+    def test_same_type_is_replaced_not_stacked(self):
+        calibration = self._both()
+        updated = self._entry("astigmatism", np.eye(3).tolist())
+        lib.append_affine_transform(calibration, updated)
+        transforms = lib.affine_transforms(calibration)
+        assert [t["Type"] for t in transforms] == [
+            "astigmatism",
+            "chromatic",
+        ]
+        assert np.allclose(transforms[0]["Matrix"], np.eye(3))
+
+    def test_legacy_single_key_is_read_and_migrated(self):
+        legacy = {lib.LEGACY_AFFINE_TRANSFORM_KEY: {"Matrix": self.ASTIG}}
+        assert np.allclose(lib.affine_matrices(legacy)[0], self.ASTIG)
+        lib.append_affine_transform(
+            legacy, self._entry("chromatic", self.CHROMATIC)
+        )
+        assert lib.LEGACY_AFFINE_TRANSFORM_KEY not in legacy
+        assert len(lib.affine_transforms(legacy)) == 2
+
+    def test_no_transforms_is_a_no_op(self):
+        locs = pd.DataFrame({"x": [1.0], "y": [2.0]})
+        assert lib.apply_affine_transforms(locs, {}) is locs
+        assert lib.apply_affine_transforms(locs, None) is locs
+
+    def test_duplicates_of_the_calibration_are_dropped(self):
+        """A correction the fit's own calibration carries must not be
+        applied a second time as an extra."""
+        calibration = self._both()
+        # the very same file loaded again as an "extra"
+        new, duplicates = lib.drop_duplicate_affine_transforms(
+            calibration, calibration
+        )
+        assert new == []
+        assert len(duplicates) == 2
+
+    def test_duplicate_detection_compares_matrices_not_identity(self):
+        """A copy of the same transform saved under another name (and with
+        different bookkeeping) still counts as a duplicate."""
+        calibration = self._both()
+        copy = {
+            "Type": "chromatic",
+            "Matrix": [list(row) for row in self.CHROMATIC],
+            "Reference image": "somewhere_else.tif",
+            "Bead pairs": 99,
+        }
+        fresh = {
+            "Type": "chromatic",
+            "Matrix": [[1.0, 0.0, 4.0], [0.0, 1.0, -2.0], [0.0, 0.0, 1.0]],
+        }
+        new, duplicates = lib.drop_duplicate_affine_transforms(
+            [copy, fresh], calibration
+        )
+        assert new == [fresh]
+        assert duplicates == [copy]
+
+    def test_nothing_to_compare_against_keeps_everything(self):
+        calibration = self._both()
+        new, duplicates = lib.drop_duplicate_affine_transforms(
+            calibration, None
+        )
+        assert len(new) == 2 and duplicates == []
+        # a calibration still given as a path carries nothing to compare
+        new, duplicates = lib.drop_duplicate_affine_transforms(
+            calibration, "calib.yaml"
+        )
+        assert len(new) == 2 and duplicates == []
+
+    def test_localize_3d_drops_a_duplicate_of_the_z_calibration(self):
+        """The pipeline applies the 3D calibration's transform via zfit and
+        must not re-apply the same one handed in as an extra."""
+        locs = pd.DataFrame(
+            {"x": [10.0, 20.0], "y": [30.0, 40.0], "frame": [0, 1]}
+        )
+        calibration = self._both()
+        with pytest.warns(UserWarning, match="already carries"):
+            out, info = localize._apply_extra_affine(
+                locs, [], calibration, applied=calibration
+            )
+        assert out is locs  # untouched
+        assert info == []
+
+    def test_localize_3d_applies_a_genuinely_new_correction(self):
+        locs = pd.DataFrame(
+            {"x": [10.0, 20.0], "y": [30.0, 40.0], "frame": [0, 1]}
+        )
+        extra = [self._entry("chromatic", self.CHROMATIC)]
+        # the fit's own calibration carries a different correction
+        applied = {
+            lib.AFFINE_TRANSFORMS_KEY: [self._entry("astigmatism", self.ASTIG)]
+        }
+        out, info = localize._apply_extra_affine(
+            locs, [], extra, applied=applied
+        )
+        np.testing.assert_allclose(out["x"], locs["x"] + 5.0)
+        assert info[-1]["Affine corrections applied"] == [
+            "chromatic (12 bead pairs)"
+        ]
+
+    def test_chromatic_only_calibration_round_trips_as_yaml(self, tmp_path):
+        calibration = {}
+        lib.append_affine_transform(
+            calibration, self._entry("chromatic", self.CHROMATIC)
+        )
+        path = str(tmp_path / "chromatic.yaml")
+        io.save_any_calibration(path, calibration)
+        loaded = io.load_any_calibration(path)
+        assert np.allclose(
+            lib.affine_matrices(loaded), lib.affine_matrices(calibration)
+        )
+
+    def test_spline_calibration_carries_transforms(self, tmp_path):
+        calibration = {
+            "coefficients": np.zeros((16, 2, 2), dtype=np.float32),
+            "model": "spline-2d",
+            "n_data": [3, 3],
+        }
+        lib.append_affine_transform(
+            calibration, self._entry("chromatic", self.CHROMATIC)
+        )
+        path = str(tmp_path / "spline_calib.hdf5")
+        io.save_any_calibration(path, calibration)
+        loaded = io.load_any_calibration(path)
+        assert np.allclose(
+            lib.affine_matrices(loaded), [np.asarray(self.CHROMATIC)]
+        )
+        # cropping to a smaller fit box must not drop the corrections
+        cropped = localize.crop_spline_calibration(loaded, 2)
+        assert len(lib.affine_transforms(cropped)) == 1

@@ -440,6 +440,67 @@ def load_spline_calibration(path: str) -> dict:
     return calibration
 
 
+def _is_hdf5_calibration(path: str) -> bool:
+    """Whether ``path`` names an HDF5 (spline PSF) calibration rather than
+    a YAML one, by extension."""
+    return os.path.splitext(path)[1].lower() in (".hdf5", ".h5")
+
+
+def load_any_calibration(path: str) -> dict:
+    """Load a calibration of any kind: a cubic-spline PSF calibration
+    (HDF5), a Gaussian astigmatism calibration or a standalone affine
+    calibration (both YAML).
+
+    Used wherever a calibration is only handled as a carrier of affine
+    corrections (see ``picasso.lib.affine_transforms``), so no format is
+    assumed. Unlike ``load_calibration`` this does not require the
+    astigmatism polynomial coefficients to be present.
+
+    Parameters
+    ----------
+    path : str
+        Path to the calibration file.
+
+    Returns
+    -------
+    calibration : dict
+        The calibration dictionary.
+    """
+    if _is_hdf5_calibration(path):
+        return load_spline_calibration(path)
+    with open(path, "r") as calibration_file:
+        try:
+            calibration = yaml.full_load(calibration_file)
+        except yaml.composer.ComposerError:
+            raise ValueError(
+                "Invalid calibration file: expected a single-document YAML "
+                "file. This does not look like a Picasso calibration file."
+            )
+    if not isinstance(calibration, dict):
+        raise ValueError(
+            "Invalid calibration file: expected a YAML mapping. This does "
+            "not look like a Picasso calibration file."
+        )
+    return calibration
+
+
+def save_any_calibration(path: str, calibration: dict) -> None:
+    """Save a calibration loaded by ``load_any_calibration`` back to its
+    own format: HDF5 for a spline PSF calibration, YAML otherwise.
+
+    Parameters
+    ----------
+    path : str
+        Destination path; its extension selects the format.
+    calibration : dict
+        The calibration dictionary to write.
+    """
+    if _is_hdf5_calibration(path):
+        save_spline_calibration(path, calibration)
+    else:
+        save_calibration(path, calibration)
+
+
 def _readable_movie_dims(movie: AbstractPicassoMovie) -> dict:
     """Collect the movie dimensions that can be read straight from the
     file structure (frames, height, width), independent of the embedded
