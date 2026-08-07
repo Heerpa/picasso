@@ -333,6 +333,20 @@ After entering the step size, picasso will calculate the mean and the variance f
 
 The calibration coefficients are stored in the YAML file and contain the parameters of cx and cy. The first entry being c[0], the last being c[6].
 
+Reading the calibration plot
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When the calibration finishes, Picasso shows a six-panel diagnostic figure and saves it next to the calibration ``.yaml`` as a ``.png`` with the same base name. The first three panels show how well the polynomial describes the beads; the last three show how well the resulting calibration recovers a known z. Spot widths and heights are in camera pixels, z and stage positions in nm.
+
+- **Mean spot width/height vs stage position** — the measured mean ``sx`` and ``sy`` per z step with the two fitted six-degree polynomials on top. Picasso shifts the stage axis such that the two polynomial fits meet at ``z = 0``.
+- **Spot width vs spot height** — every kept localization (i.e., each bead at each z position) as a scatter, with the calibration curve through it. The cloud should follow the curve as a narrow band; a wide cloud means the beads disagree with each other (for example, field-dependent PSF or a tilted stage), and points far off the curve will be assigned a wrong z at fit time.
+- **Spot width/height vs estimated z** — similar to the first plot, however, each bead at each z position is shown.
+- **Estimated z vs stage position** — the recovered z against the known stage position, with the identity line. Points should sit on the diagonal over the whole intended z range. The range where they do is the usable depth of the calibration; beyond it the points flatten out or fold back. The vertical spread of the scatter in this plot is reflected further in "Mean z precision vs stage position", see below.
+- **Deviation to true position** — histogram of ``estimated z − stage position`` over all localizations. It should be centered on 0 and single-peaked.
+- **Mean z precision vs stage position** — the RMS deviation per z step. Note that these values are impacted by a tilted stage or field-dependent PSF! In this case, there is the data-driven range of the *real* z positions. Thus this is not necessarily the actual measure of axial localization precision.
+
+Note that these panels are computed from the calibration beads themselves, so they report how self-consistent the calibration is — not how it performs on dim single molecules, which will likely be worse.
+
 Fitting z
 ~~~~~~~~~
 
