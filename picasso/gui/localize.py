@@ -1580,7 +1580,9 @@ class CalibrateSplineDialog(lib.Dialog):
     to build a 3D (z-recovering) or 2D (single-plane) spline PSF. The box size
     and minimum net gradient are taken from the main parameters."""
 
-    def __init__(self, window: QtWidgets.QWidget) -> None:
+    def __init__(
+        self, window: QtWidgets.QWidget, multichannel: bool = False
+    ) -> None:
         super().__init__(window)
         self.window = window
         self.setWindowTitle("Spline PSF Calibration")
@@ -1658,12 +1660,14 @@ class CalibrateSplineDialog(lib.Dialog):
         grid.addWidget(self.correct_z_bias, 5, 0, 1, 2)
 
         # Multichannel (2- to 6-channel) default fit mode. Stored in the
-        # calibration
+        # calibration. Only shown for a multichannel build (several channels
+        # loaded or split-FOV mode on); meaningless for single-channel data.
         self.link_photons = QtWidgets.QCheckBox(
             "Link photon counts across channels"
         )
         self.link_photons.setToolTip(LINK_PHOTONS_TIP)
         self.link_photons.setChecked(True)
+        self.link_photons.setVisible(multichannel)
         grid.addWidget(self.link_photons, 6, 0, 1, 2)
 
         self.frames_per_step.valueChanged.connect(self._update_order_enabled)
@@ -1690,12 +1694,14 @@ class CalibrateSplineDialog(lib.Dialog):
     @staticmethod
     def getCalibrationSpecs(
         parent: QtWidgets.QWidget | None = None,
+        multichannel: bool = False,
     ) -> tuple[float, int, str, str, float, bool, bool, bool]:
         """Show the dialog and return the chosen step size, number of frames
         per step, frame order, spline model, magnification factor, whether to
         correct the z bias, whether to link photons across channels, and whether
-        it was accepted."""
-        dialog = CalibrateSplineDialog(parent)
+        it was accepted. ``multichannel`` shows the multichannel-only options
+        (link photons); they are hidden for a single-channel calibration."""
+        dialog = CalibrateSplineDialog(parent, multichannel=multichannel)
         result = dialog.exec()
         step = dialog.step.value()
         frames_per_step = dialog.frames_per_step.value()
@@ -2771,6 +2777,9 @@ class ParametersDialog(lib.Dialog):
         self.link_colors_checkbox.stateChanged.connect(
             self.on_link_colors_changed
         )
+        # shown by the window for multichannel / split-FOV data
+        # (see Window._update_multichannel_widgets)
+        self.link_colors_checkbox.hide()
         preview_row.addWidget(self.link_colors_checkbox)
         preview_row.addStretch(1)
         identification_grid.addLayout(preview_row, 6, 0)
@@ -5030,7 +5039,7 @@ class Window(QtWidgets.QMainWindow):
         )
 
         reregister_signal_action = threed_menu.addAction(
-            "Re-align channels (current signal)"
+            "Multichannel realignment (current signal)"
         )
         reregister_signal_action.triggered.connect(
             self.reregister_channels_from_signal
@@ -5403,11 +5412,34 @@ class Window(QtWidgets.QMainWindow):
             checkbox.setChecked(False)
             checkbox.blockSignals(False)
             self.view.split_fov_mode = False
+            self._update_multichannel_widgets()
             return
         self.view.split_fov_mode = bool(enabled)
         if enabled:
             self.view.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self._update_multichannel_widgets()
         self.draw_frame()
+
+    def _update_multichannel_widgets(self) -> None:
+        """Show the multichannel-only widgets only when the data actually has
+        several channels: either several movies loaded as separate channels or
+        split-FOV mode, where the drawn regions are the channels of one movie.
+
+        'Link colors' needs channels to pair spots across; the shared-settings
+        group links per-channel parameters and therefore applies to separate
+        channels only (split-FOV channels share one movie's parameters)."""
+        separate_channels = len(self.channels) > 1
+        multichannel = separate_channels or self.view.split_fov_mode
+        pdialog = self.parameters_dialog
+        pdialog.link_groupbox.setVisible(separate_channels)
+        checkbox = pdialog.link_colors_checkbox
+        if not multichannel and checkbox.isChecked():
+            # leaving it checked while hidden would keep color-coding the
+            # identification boxes with no way to turn it off
+            checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(False)
+        checkbox.setVisible(multichannel)
 
     def build_spline_calibration(self) -> None:
         """Prompt for the spline PSF calibration parameters and build the
@@ -5440,7 +5472,9 @@ class Window(QtWidgets.QMainWindow):
                 )
                 return
 
-        specs = CalibrateSplineDialog.getCalibrationSpecs(self)
+        specs = CalibrateSplineDialog.getCalibrationSpecs(
+            self, multichannel=multichannel or split_fov
+        )
         (
             step,
             frames_per_step,
@@ -5982,7 +6016,6 @@ class Window(QtWidgets.QMainWindow):
         self.channel_combo.setVisible(multichannel)
         self.previous_channel_action.setEnabled(multichannel)
         self.next_channel_action.setEnabled(multichannel)
-        self.parameters_dialog.link_groupbox.setVisible(multichannel)
         # Split-FOV (regions = channels of one movie) is incompatible with
         # separate-movie multichannel data
         checkbox = self.parameters_dialog.split_fov_checkbox
@@ -5993,6 +6026,7 @@ class Window(QtWidgets.QMainWindow):
             self.view.split_fov_mode = False
             self.draw_frame()
         checkbox.setEnabled(not multichannel)
+        self._update_multichannel_widgets()
 
     def on_channel_combo_changed(self, index: int) -> None:
         """Switch the active channel from the selector."""
