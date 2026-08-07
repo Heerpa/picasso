@@ -2708,6 +2708,38 @@ def fit2D(
     return locs, new_info
 
 
+def _initial_widths_gauss(
+    spots: lib.FloatArray3D,
+    size: int,
+    background: lib.FloatArray1D,
+) -> tuple[lib.FloatArray1D, lib.FloatArray1D]:
+    """Seed the Gaussian widths from the second moment of the spot's central
+    row and column."""
+    half = int(size / 2)
+    # float64 throughout: the moment sums photons weighted by a squared
+    # distance, which overflows a float32 accumulator on a bright spot.
+    d2 = (np.arange(size, dtype=np.float64) - half) ** 2
+    # spots is (n, y, x): the central column varies along y, the row along x.
+    profile_y = spots[:, :, half].astype(np.float64) - background[:, None]
+    profile_x = spots[:, half, :].astype(np.float64) - background[:, None]
+    np.clip(profile_y, 0.0, None, out=profile_y)
+    np.clip(profile_x, 0.0, None, out=profile_x)
+    # A non-finite profile (an inf from a gain map, say) falls through to the
+    # fallback below rather than warning here.
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        width_y = np.sqrt(profile_y @ d2 / profile_y.sum(axis=1))
+        width_x = np.sqrt(profile_x @ d2 / profile_x.sum(axis=1))
+    # An empty or single-pixel profile yields 0/0 or a zero width.
+    fallback = max(size / 5.0, 1.0)
+    width_y[~np.isfinite(width_y)] = fallback
+    width_x[~np.isfinite(width_x)] = fallback
+    np.minimum(width_y, fallback, out=width_y)
+    np.minimum(width_x, fallback, out=width_x)
+    np.clip(width_y, 0.5, size / 3.0, out=width_y)
+    np.clip(width_x, 0.5, size / 3.0, out=width_x)
+    return width_x, width_y
+
+
 def _initial_parameters_gauss(
     spots: lib.FloatArray3D,
     size: int,
@@ -2719,10 +2751,11 @@ def _initial_parameters_gauss(
     a single width is used and the layout is photons, x, y, s, bg
     (the isotropic ``GAUSS_2D`` model)."""
     center = (size / 2.0) - 0.5
-    initial_width = np.amax([size / 5.0, 1.0])
 
     spot_max = np.amax(spots, axis=(1, 2))
     spot_min = np.amin(spots, axis=(1, 2))
+
+    width_x, width_y = _initial_widths_gauss(spots, size, spot_min)
 
     if spherical:
         # GAUSS_2D: photons, x, y, s (single width), bg.
@@ -2730,7 +2763,7 @@ def _initial_parameters_gauss(
         initial_parameters[:, 0] = spot_max - spot_min
         initial_parameters[:, 1] = center
         initial_parameters[:, 2] = center
-        initial_parameters[:, 3] = initial_width
+        initial_parameters[:, 3] = 0.5 * (width_x + width_y)
         initial_parameters[:, 4] = spot_min
         return initial_parameters
 
@@ -2740,8 +2773,8 @@ def _initial_parameters_gauss(
     initial_parameters[:, 0] = spot_max - spot_min
     initial_parameters[:, 1] = center
     initial_parameters[:, 2] = center
-    initial_parameters[:, 3] = initial_width
-    initial_parameters[:, 4] = initial_width
+    initial_parameters[:, 3] = width_x
+    initial_parameters[:, 4] = width_y
     initial_parameters[:, 5] = spot_min
     if rotated:
         # With sx == sy, the rotated Gaussian is independent of the

@@ -655,13 +655,19 @@ def _fit_gauss_spot(
         )
         n_iterations = iteration + 1
         if not ok:
-            # Diverged: keep the last accepted chi-square and parameters
-            # rather than the non-finite ones, and stop.
-            state = FIT_STATE_NEG_CURVATURE_MLE
+            # The trial step left the model non-positive or non-finite. That is
+            # a property of the *step*, not of the fit: undo it, damp harder and
+            # try again, exactly as for a step that merely worsened chi-square.
+            # Aborting here would return the seed unchanged, which for a wide
+            # box shows up as sigma pinned to the seed width and integer
+            # coordinates.
             chi_square = previous_chi_square
             for p in range(n_params):
                 theta[p] = theta_previous[p]
-            break
+            lam *= _LAMBDA_UP
+            if iteration == max_iterations - 1:
+                state = FIT_STATE_NEG_CURVATURE_MLE
+            continue
         chi_square = new_chi_square
         if chi_square < previous_chi_square or previous_chi_square == 0.0:
             # Only an improving iteration refreshes the curvature the next step
