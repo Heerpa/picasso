@@ -3361,10 +3361,6 @@ def main():  # noqa: C901
         help="three-dimensional particle averaging (to be deprecated in 1.0)",
     )  # TODO: deprecate in 1.0
 
-    subparsers.add_parser(
-        "toraw", help="convert image files to raw format (GUI)"
-    )
-
     # undrift RCC
     undrift_rcc_parser = subparsers.add_parser(
         "undrift", help="correct localization coordinates for drift using RCC"
@@ -3977,7 +3973,6 @@ def main():  # noqa: C901
         cli_update_check = True
         update_thread = None
         gui_apps = [
-            "toraw",
             "localize",
             "filter",
             "render",
@@ -3994,11 +3989,7 @@ def main():  # noqa: C901
         if cli_update_check:
             update_thread = check_and_notify(cli_notify_update)
 
-        if args.command == "toraw":
-            from .gui import toraw
-
-            toraw.main()
-        elif args.command == "localize":
+        if args.command == "localize":
             if args.files:
                 _localize(args)
             else:

@@ -1,9 +1,3 @@
-$s=(New-Object -COM WScript.Shell).CreateShortcut("$PSScriptRoot/../../ToRaw.lnk")
-$s.TargetPath="pythonw"
-$s.Arguments="-m picasso toraw"
-$s.IconLocation="$PSScriptRoot/icons/toraw.ico"
-$s.Save()
-
 $s=(New-Object -COM WScript.Shell).CreateShortcut("$PSScriptRoot/../../Design.lnk")
 $s.TargetPath="pythonw"
 $s.Arguments="-m picasso design"

@@ -4,8 +4,8 @@ Every write goes to a ``tmp_path`` so nothing pollutes ``tests/data/``.
 The bundled ``locs`` and ``movie`` fixtures from ``tests/conftest.py``
 are reused for round-trip checks against real Picasso data.
 
-TIFF loading (``load_tif`` / ``TiffMap`` / ``TiffMultiMap`` / ``to_raw``)
-is covered with synthetic ``tifffile``-written stacks generated per test.
+TIFF loading (``load_tif`` / ``TiffMap`` / ``TiffMultiMap``) is covered
+with synthetic ``tifffile``-written stacks generated per test.
 
 Skipped functions (need fixtures we don't have bundled): ``load_ims*``,
 ``load_nd2``, ``load_stk``.
@@ -832,7 +832,7 @@ class TestSMAPRoundtrip:
 
 
 # ---------------------------------------------------------------------------
-# TIFF loading — TiffMap / TiffMultiMap / load_tif / to_raw
+# TIFF loading — TiffMap / TiffMultiMap / load_tif
 #
 # Picasso reads TIFFs via ``tifffile`` (see picasso.io.TiffMap). Real
 # microscopy movies store one IFD per frame, so the fixtures here are
@@ -1103,21 +1103,6 @@ class TestTiffLoading:
             np.testing.assert_array_equal(np.array(list(movie)), data)
         finally:
             movie.close()
-
-    def test_to_raw_roundtrip(self, tmp_path):
-        rng = np.random.default_rng(9)
-        data = rng.integers(0, 60000, size=(4, 8, 8), dtype="<u2")
-        base = tmp_path / "grp"
-        _write_tif_stack(str(base) + ".ome.tif", data[:2])
-        _write_tif_stack(str(base) + "_1.ome.tif", data[2:])
-
-        io.to_raw(str(base) + "*.ome.tif", verbose=False)
-
-        raw = np.fromfile(str(base) + ".ome.raw", dtype="<u2").reshape(4, 8, 8)
-        np.testing.assert_array_equal(raw, data)
-        meta = io.load_info(str(base) + ".ome.yaml")
-        assert meta[0]["Frames"] == 4
-        assert meta[0]["Byte Order"] == "<"
 
     @pytest.mark.parametrize("ext", [".btf", ".tf8", ".tf2"])
     def test_bigtiff_extensions_load_via_load_movie(self, tmp_path, ext):

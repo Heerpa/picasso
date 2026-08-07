@@ -31,7 +31,6 @@ declare -a TOOLS=(
     "SPINNA:spinna:spinna"
     "Server:server:server"
     "Nanotron:nanotron:nanotron"
-    "Toraw:toraw:toraw"
 )
 
 # -----------------------------------------------------------------------------
@@ -296,7 +295,6 @@ echo "   - Picasso Average.app"
 echo "   - Picasso SPINNA.app"
 echo "   - Picasso Server.app"
 echo "   - Picasso Nanotron.app"
-echo "   - Picasso Toraw.app"
 echo "============================================="
 
 # Delete the conda environment
