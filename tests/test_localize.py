@@ -7377,3 +7377,112 @@ class TestChainedAffineTransforms:
         # cropping to a smaller fit box must not drop the corrections
         cropped = localize.crop_spline_calibration(loaded, 2)
         assert len(lib.affine_transforms(cropped)) == 1
+
+
+class TestContrastDialog:
+    """The contrast mapping is shared by the Auto and the manual branch, so
+    unchecking Auto must freeze what is on screen rather than re-scale it on
+    the next redraw (which used to happen at the next frame)."""
+
+    class _StubWindow(QtWidgets.QMainWindow):
+        """Minimal stand-in for the Localize window: a two-frame movie with
+        very different intensity ranges, plus a draw counter."""
+
+        def __init__(self, frames):
+            super().__init__()
+            self.movie = frames
+            self.curr_frame_number = 0
+            self.draw_calls = 0
+
+        def identification_movie(self):
+            return self.movie
+
+        def draw_frame(self):
+            self.draw_calls += 1
+
+    @staticmethod
+    def _frames():
+        dim = np.linspace(100, 300, 64, dtype="float32").reshape(8, 8)
+        bright = np.linspace(100, 900, 64, dtype="float32").reshape(8, 8)
+        return np.stack([dim, bright])
+
+    def _dialog(self):
+        window = self._StubWindow(self._frames())
+        return localize_gui.ContrastDialog(window), window
+
+    def test_manual_matches_auto_for_the_same_range(self):
+        """Auto sets black/white to the frame's min/max, so rendering the
+        frame with Auto off and those same values has to be pixel-identical
+        - otherwise switching Auto off visibly changes the image."""
+        dialog, window = self._dialog()
+        try:
+            frame = window.movie[0]
+            auto = dialog.to_uint8(frame)
+            dialog.auto_checkbox.setChecked(False)
+            assert (
+                dialog.black_spinbox.value(),
+                dialog.white_spinbox.value(),
+            ) == (frame.min(), frame.max())
+            np.testing.assert_array_equal(dialog.to_uint8(frame), auto)
+            # the full range is used: black maps to 0, white to 255
+            assert dialog.to_uint8(frame).min() == 0
+            assert dialog.to_uint8(frame).max() == 255
+        finally:
+            dialog.deleteLater()
+
+    def test_manual_range_does_not_follow_the_frame(self):
+        """With Auto off a brighter frame must render brighter (clipping at
+        white), not get renormalized back to the full 0-255 range."""
+        dialog, window = self._dialog()
+        try:
+            dialog.auto_checkbox.setChecked(False)
+            dim, bright = window.movie
+            np.testing.assert_array_equal(
+                dialog.to_uint8(bright)[bright > dim.max()], 255
+            )
+            assert dialog.to_uint8(bright).mean() > dialog.to_uint8(dim).mean()
+            # Auto, in contrast, rescales every frame to the same spread
+            # (both are linear ramps; atol covers float32 rounding)
+            dialog.auto_checkbox.setChecked(True)
+            np.testing.assert_allclose(
+                dialog.to_uint8(bright).astype(int),
+                dialog.to_uint8(dim).astype(int),
+                atol=1,
+            )
+        finally:
+            dialog.deleteLater()
+
+    def test_unchecking_auto_keeps_the_values_and_redraws(self):
+        """The change has to take effect immediately: before, only the next
+        frame change triggered a redraw, which is when the user saw the
+        contrast 'adjust itself'."""
+        dialog, window = self._dialog()
+        try:
+            frame = window.movie[0]
+            window.draw_calls = 0
+            dialog.auto_checkbox.setChecked(False)
+            assert window.draw_calls == 1
+            assert (
+                dialog.black_spinbox.value(),
+                dialog.white_spinbox.value(),
+            ) == (frame.min(), frame.max())
+        finally:
+            dialog.deleteLater()
+
+    def test_typing_a_value_unchecks_auto_and_keeps_it(self):
+        """Editing a spinbox turns Auto off; that must not bounce back and
+        overwrite what was just typed."""
+        dialog, window = self._dialog()
+        try:
+            dialog.white_spinbox.setValue(500)
+            assert not dialog.auto_checkbox.isChecked()
+            assert dialog.white_spinbox.value() == 500
+        finally:
+            dialog.deleteLater()
+
+    def test_set_frame_only_retunes_the_range_when_auto_is_on(self):
+        """``Window.set_frame`` is what tracks the range per frame; with Auto
+        off it must leave the spinboxes alone."""
+        source = inspect.getsource(localize_gui.Window.set_frame)
+        assert "auto_checkbox.isChecked()" in source
+        assert "change_contrast_silently" in source
