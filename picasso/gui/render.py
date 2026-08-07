@@ -633,8 +633,14 @@ class DatasetDialog(lib.Dialog):
         # Create 3 buttons for checking, naming and closing the channel
         c = QtWidgets.QCheckBox(path)
         c.setToolTip(
-            "Tick/untick to show/hide the dataset\n"
-            "(only works if multiple datasets are loaded)."
+            "Left click to tick/untick to show/hide the dataset\n"
+            "(only works if multiple datasets are loaded).\n"
+            "Right click to display this dataset only\n"
+            "(all other datasets are hidden)."
+        )
+        c.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        c.customContextMenuRequested.connect(
+            partial(self.show_only_channel, c)
         )
         currentline = self.scroll_area.rowCount()
         t = QtWidgets.QPushButton("#")
@@ -891,6 +897,28 @@ class DatasetDialog(lib.Dialog):
             self.window.remove_locs()
         else:
             self._close_one_channel(i, render)
+
+    def show_only_channel(
+        self, check: QtWidgets.QCheckBox, position=None
+    ) -> None:
+        """Tick the given channel's checkbox and untick all others, so
+        that only one channel is displayed.
+
+        Called when right-clicking a channel's checkbox.
+
+        Parameters
+        ----------
+        check : QCheckBox
+            Checkbox of the channel to be displayed.
+        position : QPoint, optional
+            Position of the right click, ignored.
+        """
+        # block signals to update the scene only once
+        for c in self.checks:
+            c.blockSignals(True)
+            c.setChecked(c is check)
+            c.blockSignals(False)
+        self.update_viewport()
 
     def update_viewport(self) -> None:
         """Update the scene in the main window."""

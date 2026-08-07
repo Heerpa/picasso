@@ -287,6 +287,11 @@ control its title, visibility, color (or colormap), and relative intensity.
 A small horizontal gradient next to each channel previews what that channel
 will look like at intensity 0 → intensity 1.
 
+**Left click** on a channel's checkbox ticks/unticks it, i.e., shows or
+hides that channel. **Right click** on a checkbox displays that channel
+only - it is ticked and all other channels are unticked at once, which is
+convenient for quickly inspecting individual channels in multiplexed data.
+
 Each channel's *Color* dropdown is organised into three sections:
 
 * **Solid colors** — the 14 default named colors (``red``, ``cyan``,
