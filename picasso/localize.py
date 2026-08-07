@@ -48,7 +48,7 @@ from scipy.special import erf
 from tqdm import tqdm
 from sqlalchemy import create_engine
 import matplotlib.gridspec as gridspec
-from scipy.ndimage import affine_transform
+from scipy.ndimage import affine_transform, gaussian_filter
 from scipy.optimize import curve_fit
 from scipy.signal import fftconvolve
 from scipy.spatial.distance import cdist
@@ -154,6 +154,9 @@ SET_COLS = [
 ]
 # Memory budget for the cached temporal windows of TemporalMedianMovie.
 TEMPORAL_MEDIAN_CACHE_BYTES = 512 * 1024**2
+# Gaussian filter for spot identification
+GAUSSIAN_FILTER_TRUNCATE = 4.0
+GAUSSIAN_FILTER_MODE = "nearest"
 # Default bead-detection / matching parameters for `calibrate_affine_transform`.
 _AFFINE_MATCH_MAX_DIST_PX = 40.0  # max distance between matched pair
 _AFFINE_XCORR_HALF_WIDTH = 18  # half-width of bead crop for xcorr
@@ -828,6 +831,216 @@ class TemporalMedianMovie:
         self.close()
 
 
+def gaussian_filter_radius(
+    sigma: float | None, truncate: float = GAUSSIAN_FILTER_TRUNCATE
+) -> int:
+    """Half-width (in pixels) of the kernel that
+    ``scipy.ndimage.gaussian_filter`` actually uses for ``sigma``.
+
+    This is the same ``int(truncate * sd + 0.5)`` expression as
+    ``scipy.ndimage.gaussian_filter1d``, so a filtered pixel depends on
+    exactly the pixels within this distance and no further.
+
+    Parameters
+    ----------
+    sigma : float or None
+        Standard deviation of the Gaussian kernel, in pixels. None or 0
+        means no filtering.
+    truncate : float, optional
+        Kernel cut-off in units of sigma. Default is
+        ``GAUSSIAN_FILTER_TRUNCATE``.
+
+    Returns
+    -------
+    radius : int
+        Kernel half-width in pixels, 0 if no filtering takes place.
+    """
+    if not sigma or sigma <= 0:
+        return 0
+    return int(float(truncate) * float(sigma) + 0.5)
+
+
+def identification_roi_pad(
+    box: int, gaussian_filter_sigma: float | None = None
+) -> int:
+    """Number of pixels a ROI has to be grown by so that every pixel the
+    identification actually reads is validly filtered.
+
+    ``identify_in_frame`` computes gradients up to ``int(box / 2) + 1``
+    pixels outside a ROI. A Gaussian filter mixes in everything within
+    its kernel radius, so with the filter on the valid region has to
+    extend that much further still - otherwise the zeros that a
+    ``TemporalMedianMovie`` leaves outside its bounding box get smeared
+    into the very pixels those gradients are computed from.
+
+    Parameters
+    ----------
+    box : int
+        Box side length used for identification.
+    gaussian_filter_sigma : float or None, optional
+        Sigma of the spatial Gaussian filter, see
+        ``GaussianFilteredMovie``. Default is None (no filtering).
+
+    Returns
+    -------
+    pad : int
+        Padding in pixels.
+    """
+    return int(box / 2) + 1 + gaussian_filter_radius(gaussian_filter_sigma)
+
+
+class GaussianFilteredMovie:
+    """Lazily evaluated, read-only spatially Gaussian smoothed view of a
+    movie.
+
+    Frame ``t`` is ``gaussian_filter(movie[t], sigma)`` as float32.
+
+    Spot identification looks for a single local maximum per spot. A PSF
+    may break up into several local maxima, so one molecule can be
+    difficult to find.
+
+    This class is meant for spot identification only - fitting, spot
+    cutting and photon conversion must always use the raw movie, since
+    the smoothed intensities would otherwise corrupt the photon counts.
+    It deliberately does not implement the ``io.AbstractPicassoMovie``
+    interface so that accidentally handing it to ``fit2D`` trips that
+    function's input assertion instead of silently returning wrong
+    photon numbers.
+
+    Note that smoothing lowers gradient magnitudes, so the minimum net
+    gradient has to be re-tuned whenever sigma changes.
+
+    Parameters
+    ----------
+    movie : lib.IntArray3D
+        The raw movie, i.e. any object supporting ``len()`` and integer
+        indexing that returns 2D frames. May itself be a
+        ``TemporalMedianMovie``, in which case the median is subtracted
+        before smoothing.
+    sigma : float
+        Standard deviation of the Gaussian kernel, in camera pixels.
+        Must be positive; use the unwrapped movie to identify without
+        smoothing.
+    truncate : float, optional
+        Kernel cut-off in units of sigma. Default is
+        ``GAUSSIAN_FILTER_TRUNCATE``.
+    mode : str, optional
+        How the frame borders are extended, see
+        ``scipy.ndimage.gaussian_filter``. Default is
+        ``GAUSSIAN_FILTER_MODE``.
+
+    Attributes
+    ----------
+    raw : lib.IntArray3D
+        The underlying unsmoothed movie.
+    radius : int
+        Kernel half-width in pixels, see ``gaussian_filter_radius``.
+    sigma, truncate, mode : as above
+    """
+
+    # Filtering a frame is stateless (there is no cache, and scipy.ndimage
+    # is re-entrant), so reads never have to be serialized on the
+    # identification lock.
+    supports_concurrent_reads = True
+
+    def __init__(
+        self,
+        movie: lib.IntArray3D,
+        sigma: float,
+        *,
+        truncate: float = GAUSSIAN_FILTER_TRUNCATE,
+        mode: str = GAUSSIAN_FILTER_MODE,
+    ) -> None:
+        self.raw = movie
+        self.n_frames = len(movie)
+        if self.n_frames == 0:
+            raise ValueError("Cannot filter an empty movie.")
+        self.sigma = float(sigma)
+        if self.sigma <= 0:
+            raise ValueError(
+                "The Gaussian filter sigma must be positive; identify on "
+                "the unwrapped movie to not filter at all."
+            )
+        self.truncate = float(truncate)
+        self.mode = mode
+        # one read to learn the frame geometry; movies do not agree on
+        # whether they expose .shape (TiffMap does not)
+        self.frame_shape = np.asarray(movie[0]).shape
+        concurrent = getattr(
+            movie, "supports_concurrent_reads", False
+        ) or isinstance(movie, np.memmap)
+        self._read_lock = None if concurrent else threading.Lock()
+
+    @property
+    def radius(self) -> int:
+        """Half-width (in pixels) of the kernel used."""
+        return gaussian_filter_radius(self.sigma, self.truncate)
+
+    def _read_frame(self, index: int) -> np.ndarray:
+        if self._read_lock is None:
+            return np.asarray(self.raw[index])
+        with self._read_lock:
+            return np.asarray(self.raw[index])
+
+    def clear_cache(self) -> None:
+        """Do nothing; this view caches nothing. Kept so that callers can
+        treat both identification filters alike."""
+
+    def __getitem__(self, it):
+        if isinstance(it, tuple):
+            if len(it) == 1:
+                return self[it[0]]
+            return self[it[0]][tuple(it[1:])]
+        if isinstance(it, slice):
+            return np.stack(
+                [self[i] for i in range(*it.indices(self.n_frames))]
+            )
+        index = int(it)
+        if index < 0:
+            index += self.n_frames
+        if not 0 <= index < self.n_frames:
+            raise IndexError(
+                f"Frame {it} is out of range for a movie with "
+                f"{self.n_frames} frames."
+            )
+        raw = self._read_frame(index)
+        # gaussian_filter keeps the input dtype unless told otherwise, so
+        # a uint16 movie would come back rounded to integers
+        return gaussian_filter(
+            raw.astype(np.float32, copy=False),
+            self.sigma,
+            output=np.float32,
+            mode=self.mode,
+            truncate=self.truncate,
+        )
+
+    def __iter__(self):
+        for i in range(self.n_frames):
+            yield self[i]
+
+    def __len__(self) -> int:
+        return self.n_frames
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self.n_frames, *self.frame_shape)
+
+    @property
+    def dtype(self) -> np.dtype:
+        return np.dtype(np.float32)
+
+    def close(self) -> None:
+        close = getattr(self.raw, "close", None)
+        if close is not None:
+            close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
 def identify_in_frame(
     frame: lib.IntArray2D,
     minimum_ng: float,
@@ -1216,6 +1429,7 @@ def identify(
     threaded: bool = True,
     temporal_median_window: int | None = None,
     temporal_median_stride: int | None = None,
+    gaussian_filter_sigma: float | None = None,
     progress_callback: (
         Callable[[list[int]], None] | Literal["console"] | None
     ) = None,
@@ -1267,6 +1481,17 @@ def identify(
         Spacing between the frames at which the temporal median is
         evaluated, see ``TemporalMedianMovie``. None (the default) uses
         ``temporal_median_window``, which is the fastest setting.
+    gaussian_filter_sigma : float or None, optional
+        If given (and non-zero), every frame is smoothed with a Gaussian
+        of this standard deviation (in camera pixels) before identifying,
+        see ``GaussianFilteredMovie``. This merges the several local
+        maxima of a spot that is not Gaussian-shaped into one. Applied
+        after the temporal median filter, if both are used. The filter
+        applies to the identification only - the returned coordinates
+        refer to the raw movie, which is what the spots must be fitted
+        on. Note that ``minimum_ng`` has to be re-tuned when this is
+        changed, since smoothing lowers gradient magnitudes. Default is
+        None (no filtering).
     progress_callback : callable, "console" or None, optional
         A callback function to report the progress of the identification
         process. If "console", progress will be printed to the console.
@@ -1299,16 +1524,21 @@ def identify(
             "that picasso.localize.localize() will always return both "
             "the localizations and the metadata dictionary."
         )
+    roi_pad = identification_roi_pad(box, gaussian_filter_sigma)
     if temporal_median_window:
         # note that identify_async() is not wrapped: callers driving the
-        # thread pool themselves build a TemporalMedianMovie explicitly
+        # thread pool themselves build the filtered views explicitly
         movie = TemporalMedianMovie(
             movie,
             temporal_median_window,
             stride=temporal_median_stride,
             roi=roi,
-            roi_pad=int(box / 2) + 1,
+            roi_pad=roi_pad,
         )
+    # temporal median first, then smoothing: the Gaussian is meant to merge
+    # the maxima of one spot, not those of the background it sits on
+    if gaussian_filter_sigma:
+        movie = GaussianFilteredMovie(movie, gaussian_filter_sigma)
     if threaded:
         ids = _identify_threaded(
             movie,
@@ -1338,6 +1568,7 @@ def identify(
             "ROI": roi,
             "Frame Bounds": frame_bounds,
             "Temporal Median Window": int(temporal_median_window or 0),
+            "Gaussian Filter Sigma": float(gaussian_filter_sigma or 0.0),
         }
         return ids, info
     else:
@@ -5249,6 +5480,7 @@ def localize(
     affine_calibration: dict | list | None = None,
     camera_calibration: dict | None = None,
     threaded: bool = True,
+    gaussian_filter_sigma: float | None = None,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
@@ -5280,6 +5512,16 @@ def localize(
           0 or missing disables it. Fitting always uses the raw movie.
     threaded : bool, optional
         Whether to use multithreading/multiprocessing. Default is True.
+    gaussian_filter_sigma : float or None, optional
+        Standard deviation (in camera pixels) of a spatial Gaussian
+        filter applied to every frame before spot identification, see
+        ``GaussianFilteredMovie``. It merges the several local maxima of
+        a spot that is not Gaussian-shaped into one. Applied after the
+        temporal median filter, if both are used. The filter applies to
+        the identification only - the spots are always cut out of and
+        fitted on the raw movie. Note that the minimum net gradient has
+        to be re-tuned when this is changed, since smoothing lowers
+        gradient magnitudes. Default is None (no filtering).
     movie_info : list[dict], optional
         Movie metadata. If None, an empty list is used. Default is None.
     roi : tuple, optional
@@ -5363,6 +5605,7 @@ def localize(
         frame_bounds=frame_bounds,
         threaded=threaded,
         temporal_median_window=parameters.get("Temporal Median Window", 0),
+        gaussian_filter_sigma=gaussian_filter_sigma,
         progress_callback=identification_progress_callback,
     )
 
@@ -5435,6 +5678,7 @@ def localize_3D(
     camera_calibration: dict | None = None,
     multiprocess: bool = True,
     temporal_median_window: int | None = None,
+    gaussian_filter_sigma: float | None = None,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
@@ -5530,6 +5774,25 @@ def localize_3D(
     multiprocess: bool, optional
         Whether or not to use multiprocessing. Ignored for GPU fitting.
         Default is True.
+    temporal_median_window : int or None, optional
+        If given (and non-zero), a temporal median background is
+        subtracted from every frame before identifying, using a window of
+        this many frames, see ``TemporalMedianMovie``. The filter applies
+        to the identification only - the spots are always cut out of and
+        fitted on the raw movie. Note that ``minimum_ng`` has to be
+        re-tuned when this is switched on or off, since subtracting a
+        background changes the scale of the net gradient. Default is None
+        (no filtering).
+    gaussian_filter_sigma : float or None, optional
+        Standard deviation (in camera pixels) of a spatial Gaussian
+        filter applied to every frame before identifying, see
+        ``GaussianFilteredMovie``. It merges the several local maxima of
+        a spot that is not Gaussian-shaped into one. Applied after the
+        temporal median filter, if both are used. The filter applies to
+        the identification only - the spots are always cut out of and
+        fitted on the raw movie. Note that ``minimum_ng`` has to be
+        re-tuned when this is changed, since smoothing lowers gradient
+        magnitudes. Default is None (no filtering).
     progress_callbacks : callable, "console" or None, optional
         If a callable provided, it must accept one integer input (number
         of movie frames, or spots for identifying and fitting callbacks,
@@ -5617,6 +5880,7 @@ def localize_3D(
         camera_calibration=camera_calibration,
         multiprocess=multiprocess,
         temporal_median_window=temporal_median_window,
+        gaussian_filter_sigma=gaussian_filter_sigma,
         identification_progress_callback=identification_progress_callback,
         fit_progress_callback=fit_progress_callback,
         fit_z_progress_callback=fit_z_progress_callback,
@@ -5657,6 +5921,7 @@ def _localize_3D(
     affine_calibration: dict | list | None = None,
     multiprocess: bool = True,
     temporal_median_window: int | None = None,
+    gaussian_filter_sigma: float | None = None,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
@@ -5687,6 +5952,7 @@ def _localize_3D(
         spline_calibration=spline_calibration,
         camera_calibration=camera_calibration,
         threaded=multiprocess,
+        gaussian_filter_sigma=gaussian_filter_sigma,
         identification_progress_callback=identification_progress_callback,
         fit_progress_callback=fit_progress_callback,
         return_info=True,  # TODO: remove in v0.12.0
