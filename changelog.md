@@ -11,6 +11,7 @@ This update focuses mainly on (but is not limited to) the expansion of the Local
 - Improved architecture for plugins, see [here](https://picassosr.readthedocs.io/en/latest/plugins.html). Note that the plugins must now be stored in a different location.
 - Plugins can now be easily downloaded from our repository, using Plugins > Browse online plugins
 - `config.yaml` can now be stored in the `.picasso` directory and the location is easily accessible via Localize
+- Picasso: ToRaw was removed. Localize now reads multi-file OME-TIFF stacks (see below) and all other supported movie formats directly, so converting movies to `.raw` is no longer necessary. Existing `.raw` movies still load in Localize as before.
 - PyQt6 is now imported lazily across the core library: the Qt widget classes formerly in `picasso.lib` moved to the new `picasso.lib_qt` module but remain accessible under their old `lib.<name>` names, and PyQt6 is only imported on first use — so `import picasso` and headless/CLI workflows no longer require PyQt6 to be installed
 
 #### Localize
@@ -111,6 +112,7 @@ This update focuses mainly on (but is not limited to) the expansion of the Local
 - `render.render` only keyword arguments except `locs` and `info`
 - Nanotron accepts `disp_px_size` instead of `oversampling` for easier user interaction
 - Plugins location changed, see [here](https://picassosr.readthedocs.io/en/latest/plugins.html); `picasso/gui/plugins` folder removed
+- `picasso.gui.toraw`, the CLI command `picasso toraw` and the conversion functions `picasso.io.to_raw`, `picasso.io.to_raw_combined` and `picasso.io.get_movie_groups` were removed
 
 #### *Deprecation warnings:*
 - **`picasso.gausslq` and `picasso.gaussmle` are deprecated and will be removed in Picasso 1.0.**
