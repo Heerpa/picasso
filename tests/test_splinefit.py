@@ -21,7 +21,7 @@ import pytest
 from scipy.interpolate import CubicSpline
 
 from picasso import localize
-from picasso.fitting import splinefit
+from picasso.fitting import precision, splinefit
 
 BOX = 13
 NZ = 21
@@ -170,7 +170,7 @@ def _run(
     max_iterations=None,
 ):
     """Serial fit of ``spots`` with the given model."""
-    coefficients = localize._spline_coeff_reshaped(calibration)
+    coefficients = precision._spline_coeff_reshaped(calibration)
     n_spots, n_channels = spots.shape[0], spots.shape[1]
     affines = IDENTITY if affines is None else affines
     if residuals is None:
@@ -239,7 +239,7 @@ class TestSplineEvaluation:
     def test_matches_closed_form_3d(self, positions):
         x, y, z = positions
         calibration, terms = _astigmatic_calibration()
-        coefficients = localize._spline_coeff_reshaped(calibration)
+        coefficients = precision._spline_coeff_reshaped(calibration)
         phi, gx, gy, gz = _reference_model(terms, BOX, x, y, z)
         for j in range(BOX):
             for i in range(BOX):
@@ -256,7 +256,7 @@ class TestSplineEvaluation:
 
     def test_matches_closed_form_2d(self):
         calibration, terms = _flat_calibration()
-        coefficients = localize._spline_coeff_reshaped(calibration)
+        coefficients = precision._spline_coeff_reshaped(calibration)
         x, y = 0.3, -0.2
         phi, gx, gy, _ = _reference_model(terms, BOX, x, y, None)
         for j in range(BOX):
@@ -276,7 +276,7 @@ class TestSplineEvaluation:
         one position; this widens the sampling so a layout error that happens
         to be benign at a single point cannot survive."""
         calibration, terms = _astigmatic_calibration()
-        coefficients = localize._spline_coeff_reshaped(calibration)
+        coefficients = precision._spline_coeff_reshaped(calibration)
         for x, y, z in ((0.3, -0.2, 9.0), (-0.7, 1.1, 12.4)):
             phi, gx, gy, gz = _reference_model(terms, BOX, x, y, z)
             scale = max(np.max(np.abs(phi)), 1e-12)
@@ -307,7 +307,7 @@ class TestJacobian:
 
     @staticmethod
     def _check(kind, calibration, theta, affines, residuals):
-        coefficients = localize._spline_coeff_reshaped(calibration)
+        coefficients = precision._spline_coeff_reshaped(calibration)
         _, jacobian = splinefit.model_and_jacobian(
             kind, coefficients, affines, residuals, theta, BOX
         )
@@ -522,7 +522,7 @@ class TestSingleChannelFits:
         initial[0, 0] = spots.max() - spots.min()
         initial[0, 3] = -calibration["z_center"]
         initial[0, 4] = spots.min()
-        coefficients = localize._spline_coeff_reshaped(calibration)
+        coefficients = precision._spline_coeff_reshaped(calibration)
         mu = splinefit.model_and_jacobian(
             splinefit.KIND_3D,
             coefficients,
@@ -712,7 +712,7 @@ class TestNoisyBatch:
         """Poisson-noisy spots recover their parameters without bias and with a
         scatter at the theoretical limit.
 
-        The lateral scatter is compared against ``localize._spline_crlb`` for
+        The lateral scatter is compared against ``precision._spline_crlb`` for
         the matching estimator, which is a far stronger statement than any
         hand-picked tolerance: it says the fitter actually reaches the bound.
         The axial scatter is checked robustly, because a small tail of spots
@@ -720,7 +720,7 @@ class TestNoisyBatch:
         to this implementation, and the reason the multi-start exists."""
         calibration, spots, initial, xs, ys, zs = self._batch()
         n_spots = len(spots)
-        coefficients = localize._spline_coeff_reshaped(calibration)
+        coefficients = precision._spline_coeff_reshaped(calibration)
         fit = splinefit.fit_spots_async(
             splinefit.KIND_3D,
             spots,
@@ -740,7 +740,7 @@ class TestNoisyBatch:
         assert np.all(np.isfinite(chi_squares))
         assert np.all(states == splinefit.FIT_STATE_CONVERGED)
 
-        crlb = localize._spline_crlb(
+        crlb = precision._spline_crlb(
             theta.astype(np.float32), calibration, BOX, mle=mle
         )
         sigma = np.sqrt(np.nanmedian(crlb[:, :3], axis=0))
@@ -772,7 +772,7 @@ class TestNoisyBatch:
         independently and writes only its own row."""
         calibration, spots, initial, _, _, _ = self._batch(n_spots=64)
         n_spots = len(spots)
-        coefficients = localize._spline_coeff_reshaped(calibration)
+        coefficients = precision._spline_coeff_reshaped(calibration)
         args = (
             splinefit.KIND_3D,
             spots,
@@ -799,7 +799,7 @@ class TestNoisyBatch:
         fit = splinefit.fit_spots_async(
             splinefit.KIND_3D,
             spots,
-            localize._spline_coeff_reshaped(calibration),
+            precision._spline_coeff_reshaped(calibration),
             IDENTITY,
             np.zeros((n_spots, 1, 2)),
             initial,
@@ -819,7 +819,7 @@ class TestNoisyBatch:
         splinefit.fit_spots(
             splinefit.KIND_3D,
             spots,
-            localize._spline_coeff_reshaped(calibration),
+            precision._spline_coeff_reshaped(calibration),
             IDENTITY,
             np.zeros((n_spots, 1, 2)),
             initial,
@@ -838,7 +838,7 @@ class TestInputValidation:
         kwargs = {
             "kind": splinefit.KIND_3D,
             "spots": np.zeros((2, 1, BOX, BOX), np.float32),
-            "coefficients": localize._spline_coeff_reshaped(calibration),
+            "coefficients": precision._spline_coeff_reshaped(calibration),
             "affines": IDENTITY,
             "residuals": np.zeros((2, 1, 2)),
             "initial_parameters": np.zeros((2, 5)),
@@ -868,13 +868,13 @@ class TestInputValidation:
         with pytest.raises(ValueError, match="dimensions"):
             splinefit._check_inputs(
                 **self._base(
-                    coefficients=localize._spline_coeff_reshaped(calibration)
+                    coefficients=precision._spline_coeff_reshaped(calibration)
                 )
             )
 
     def test_rejects_multichannel_2d(self):
         calibration, _ = _flat_calibration()
-        coefficients = localize._spline_coeff_reshaped(calibration)
+        coefficients = precision._spline_coeff_reshaped(calibration)
         with pytest.raises(ValueError, match="no multichannel 2D"):
             splinefit._check_inputs(
                 kind=splinefit.KIND_2D,
@@ -890,7 +890,7 @@ class TestInputValidation:
         theta, chi_squares, states, iterations = splinefit.fit_spots(
             splinefit.KIND_3D,
             np.zeros((0, 1, BOX, BOX), np.float32),
-            localize._spline_coeff_reshaped(calibration),
+            precision._spline_coeff_reshaped(calibration),
             IDENTITY,
             np.zeros((1, 1, 2)),
             np.zeros((0, 5)),

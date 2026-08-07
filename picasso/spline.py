@@ -63,7 +63,7 @@ from scipy.ndimage import shift as _ndi_shift, zoom as _ndi_zoom
 from scipy.spatial import KDTree
 
 from . import io, lib, localize, __version__
-from .fitting import gaussfit, splinefit
+from .fitting import gaussfit, precision, splinefit
 
 
 def _natural_spline_operator(n: int) -> np.ndarray:
@@ -99,7 +99,7 @@ def spline_coefficients(data: np.ndarray) -> np.ndarray:
         is the layout consumed downstream: for 3D input ``(x, y, z)`` it reads
         ``(niz, niy, nix, zp, yp, xp)`` - interval indices slowest (last axis
         first), ascending polynomial powers fastest with the x power innermost
-        (see ``localize._spline_coeff_reshaped``).
+        (see ``precision._spline_coeff_reshaped``).
     """
     data = np.asarray(data, dtype=np.float64)
     ops = [_natural_spline_operator(n) for n in data.shape]
@@ -3380,7 +3380,7 @@ def _axial_precision_multichannel(
     n_channels = len(per_channel)
     link_photons = bool(calibration.get("link_photons", True))
     if not link_photons and (
-        2 <= n_channels <= localize._LINK_XYZ_MAX_CHANNELS
+        2 <= n_channels <= precision._LINK_XYZ_MAX_CHANNELS
     ):
         fit_cal = localize._as_link_xyz_calibration(calibration)
         z_col = 2

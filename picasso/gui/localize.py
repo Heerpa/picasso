@@ -38,7 +38,7 @@ from .. import (
     __version__,
     zfit,
 )
-from ..fitting import splinefit
+from ..fitting import precision, splinefit
 from PyQt6 import QtCore, QtGui, QtWidgets
 from playsound3 import playsound
 
@@ -3997,7 +3997,7 @@ class ParametersDialog(lib.Dialog):
     def _update_link_photons_visibility(self) -> None:
         """Show the 'Link photons across channels' checkbox only for a
         multichannel spline calibration with 2 to
-        ``localize._LINK_XYZ_MAX_CHANNELS`` channels - the range for which
+        ``precision._LINK_XYZ_MAX_CHANNELS`` channels - the range for which
         the photon-decoupled (link-XYZ) fit is supported."""
         # A config auto-load may call update_spline_calib during startup before
         # the fit UI (and this checkbox) is built; ignore until it exists.
@@ -4010,7 +4010,7 @@ class ParametersDialog(lib.Dialog):
         )
         is_multichannel = cal.get("model") == "spline-3d-multichannel"
         show = is_multichannel and (
-            2 <= n_channels <= localize._LINK_XYZ_MAX_CHANNELS
+            2 <= n_channels <= precision._LINK_XYZ_MAX_CHANNELS
         )
         if show:
             # default the toggle to the mode chosen when the calibration was
@@ -9113,7 +9113,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                     camera_calibration=self.camera_calibration,
                 )
             elif not self.link_photons and (
-                2 <= n_channels <= localize._LINK_XYZ_MAX_CHANNELS
+                2 <= n_channels <= precision._LINK_XYZ_MAX_CHANNELS
             ):
                 # Photon decoupling (globLoc link-XYZ): free per-channel photons
                 # and background, shared x/y/z. Supersedes the ratiometric scan.

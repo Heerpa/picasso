@@ -12,6 +12,8 @@ Adapted from: Ma, H., et al. Science Advances. 2024.
 :copyright: Copyright (c) 2016-2026 Jungmann Lab, MPI of Biochemistry
 """
 
+from __future__ import annotations
+
 from typing import Literal
 
 import numba

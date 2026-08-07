@@ -1347,11 +1347,17 @@ class TestLocalize3D:
 
 @pytest.fixture(autouse=True)
 def _keep_user_settings(monkeypatch):
-    """Never let a test write the developer's real ``~/.picasso``
-    settings: closing a Localize ``Window`` persists the dialog state
-    (last folder, box size, min. net gradient, fit model, temporal median),
-    which a test must not do to the machine it runs on."""
+    """Isolate the tests from the developer's real ``~/.picasso`` settings,
+    in both directions.
+
+    Closing a Localize ``Window`` persists the dialog state (last folder, box
+    size, min. net gradient, fit model, temporal median, Gaussian filter),
+    which a test must not do to the machine it runs on. Building one *restores*
+    that same state, so a stored value (a non-zero Gaussian sigma, say) would
+    otherwise decide what these tests see - passing on a fresh install and
+    failing on the machine of whoever last used the GUI."""
     monkeypatch.setattr(io, "save_user_settings", lambda settings: None)
+    monkeypatch.setattr(io, "load_user_settings", lambda: lib.AutoDict())
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -2007,7 +2013,7 @@ class TestLocsFromFitsGpufit:
         locs = localize.locs_from_fits_gauss(
             self._ids(1), theta, BOX, em=False, mle=True
         )
-        crlb = localize._gauss_crlb(theta, BOX, em=False)
+        crlb = precision._gauss_crlb(theta, BOX, em=False)
         np.testing.assert_allclose(locs["lpx"], np.sqrt(crlb[:, 1]), rtol=1e-6)
         np.testing.assert_allclose(locs["lpy"], np.sqrt(crlb[:, 2]), rtol=1e-6)
         np.testing.assert_allclose(
@@ -2314,8 +2320,8 @@ class TestCropSplineCalibration:
         # the coefficients both consumers read == the full calibration's central
         # lateral intervals (exact selection: no numerical error)
         off, ni = (cal_box - box) // 2, box - 1
-        full = localize._spline_coeff_reshaped(calib)
-        crop = localize._spline_coeff_reshaped(cropped)
+        full = precision._spline_coeff_reshaped(calib)
+        crop = precision._spline_coeff_reshaped(cropped)
         expected = self._central(full, off, ni, model == "spline-2d")
         assert crop.shape == expected.shape
         np.testing.assert_array_equal(crop, expected)
@@ -2355,7 +2361,7 @@ class TestCropSplineCalibration:
         # the coefficient grid matches the requested box, and stays consumable
         # by the shared reshape both the fit and the CRLB use
         assert cropped["coefficients"].shape[1:3] == (7, 7)
-        reshaped = localize._spline_coeff_reshaped(cropped)
+        reshaped = precision._spline_coeff_reshaped(cropped)
         assert reshaped.shape[2:4] == (7, 7)
 
     def test_locs_from_fits_auto_crops_smaller_box(self):
@@ -2583,10 +2589,12 @@ class TestSplineHelpers:
         reason="ImportError only raised when no CUDA device is present",
     )
     def test_fit_spots_spline_without_gpu_raises(self, synthetic_spots):
+        # an explicit use_gpu=True never silently falls back to the CPU; the
+        # default (use_gpu=None) does fit here, on whatever device exists
         spots, _ = synthetic_spots
         calib = _fake_spline_calibration(model="spline-3d")
         with pytest.raises(ImportError):
-            localize.fit_spots_spline(spots, calib)
+            localize.fit_spots_spline(spots, calib, use_gpu=True)
 
     def test_spline_kind_covers_every_model(self):
         from picasso.fitting import splinefit
@@ -2598,7 +2606,7 @@ class TestSplineHelpers:
             == splinefit.KIND_3D
         )
         assert (
-            localize._spline_kind(localize._LINK_XYZ_MODEL)
+            localize._spline_kind(precision._LINK_XYZ_MODEL)
             == splinefit.KIND_LINK_XYZ
         )
         with pytest.raises(ValueError, match="Unknown spline"):
@@ -2609,7 +2617,7 @@ class TestSplineHelpers:
         must stay a view - transposing instead would copy the whole spot stack
         (hundreds of MB for a real movie) for no reason."""
         spots = np.zeros((32, BOX, BOX), np.float32)
-        reshaped = localize._spline_channel_major(spots, 1)
+        reshaped = precision._spline_channel_major(spots, 1)
         assert reshaped.shape == (32, 1, BOX, BOX)
         assert np.shares_memory(reshaped, spots)
 
@@ -2617,11 +2625,11 @@ class TestSplineHelpers:
         spots = np.arange(2 * BOX * BOX * 3, dtype=np.float32).reshape(
             2, BOX, BOX, 3
         )
-        reshaped = localize._spline_channel_major(spots, 3)
+        reshaped = precision._spline_channel_major(spots, 3)
         assert reshaped.shape == (2, 3, BOX, BOX)
         np.testing.assert_array_equal(reshaped[0, 1], spots[0, :, :, 1])
         with pytest.raises(ValueError, match="channels"):
-            localize._spline_channel_major(spots, 2)
+            precision._spline_channel_major(spots, 2)
 
     def test_cpu_z_seeds_match_the_gpu_grid(self):
         """CPU and GPU must explore the same axial minima, or the two devices
@@ -2895,7 +2903,7 @@ class TestSplineHelpers:
             theta = np.zeros((3, 5))  # [amplitude, x, y, z, offset]
             theta[:, 0], theta[:, 3], theta[:, 4] = 500.0, -8.0, 5.0
         box = calib["box"]
-        n_channels = localize._spline_n_channels(calib)
+        n_channels = precision._spline_n_channels(calib)
         explicit = _crlb(
             theta,
             calib,
@@ -2912,7 +2920,7 @@ class TestSplineHelpers:
         calib = _fake_spline_calibration(
             model="spline-3d-multichannel", n_channels=3
         )
-        aff = localize._spline_channel_affines(calib, 3)
+        aff = precision._spline_channel_affines(calib, 3)
         np.testing.assert_array_equal(
             aff, np.tile([1.0, 0.0, 0.0, 1.0], (3, 1))
         )
@@ -2921,7 +2929,7 @@ class TestSplineHelpers:
         stripped = dict(calib)
         stripped.pop("channel_transforms")
         np.testing.assert_array_equal(
-            localize._spline_channel_affines(stripped, 3), aff
+            precision._spline_channel_affines(stripped, 3), aff
         )
 
     def test_default_n_z_starts_from_calibration_depth(self):
@@ -2974,7 +2982,7 @@ class TestSplineHelpers:
         calib = _fake_spline_calibration(model=model)
         expected = localize._default_n_z_starts(calib)
         assert expected > 1
-        n_channels = localize._spline_n_channels(calib)
+        n_channels = precision._spline_n_channels(calib)
         box = calib["box"]
         spots = np.zeros((3, box, box), np.float32)
         if model == "spline-3d-multichannel":
@@ -3096,7 +3104,7 @@ class TestSplineHelpers:
             model="spline-3d-multichannel", n_channels=n_channels
         )
         link = localize._as_link_xyz_calibration(calib)
-        assert link["model"] == localize._LINK_XYZ_MODEL
+        assert link["model"] == precision._LINK_XYZ_MODEL
         # shallow copy: the original is untouched and the (large) coefficient
         # table is shared, not duplicated
         assert calib["model"] == "spline-3d-multichannel"
@@ -3488,14 +3496,14 @@ def _synthetic_spline_3d_calibration(box=BOX, nz=41):
 def _eval_spline_psf(calib, x_shift, y_shift, z_eval=None):
     """The calibration PSF on the box grid, via the production CPU evaluator
     (``splinefit._eval_spline_3d`` / ``_eval_spline_2d`` on
-    ``localize._spline_coeff_reshaped``'s view).
+    ``precision._spline_coeff_reshaped``'s view).
 
     Returns a ``(box, box)`` image indexed ``[x-pixel, y-pixel]`` - the
     orientation of the templates these synthetic calibrations are built from
     (``template[:, :, k] = np.outer(gx, gy)``), not the ``[y, x]`` layout of
     real spot data."""
     box = calib["n_data"][0]
-    coeff = localize._spline_coeff_reshaped(calib)
+    coeff = precision._spline_coeff_reshaped(calib)
     out = np.empty((box, box))
     for i in range(box):  # i = x-pixel
         for j in range(box):  # j = y-pixel
@@ -3537,7 +3545,7 @@ class TestSplineCoefficients:
         theta = np.array(
             [[amplitude, 0.0, 0.0, -(z_focus - 5.0), offset]], np.float64
         )
-        crlb = localize._spline_crlb(theta, calib, box)[0]
+        crlb = precision._spline_crlb(theta, calib, box)[0]
         assert np.all(np.isfinite(crlb)) and np.all(crlb > 0)
 
     def test_evaluation_matches_scipy(self):
@@ -4376,15 +4384,7 @@ class TestFit2DGpu:
         )
 
 
-class TestCRLBReExports:
-    """The Cramer-Rao machinery lives in ``picasso.fitting.precision`` and is
-    re-exported by ``picasso.localize`` under its old names.
-
-    Both this module and the production call sites in ``localize`` reach it
-    through the latter, so a re-export silently dropped from that import block
-    would be an ``AttributeError`` far from its cause - or worse, a name that
-    still resolves to a stale copy."""
-
+class TestCRLBModuleBoundary:
     @pytest.mark.parametrize(
         "name",
         [
@@ -4401,8 +4401,9 @@ class TestCRLBReExports:
             "_spline_n_channels",
         ],
     )
-    def test_localize_re_exports_the_same_object(self, name):
-        assert getattr(localize, name) is getattr(precision, name)
+    def test_precision_owns_the_name(self, name):
+        assert hasattr(precision, name)
+        assert not hasattr(localize, name)
 
     def test_the_two_cuda_flags_are_independent(self):
         """``localize`` gates the fitting backends, ``precision`` the CRLB
@@ -4432,7 +4433,7 @@ class TestSplineCRLBReal:
             ],
             np.float64,
         )
-        crlb = localize._spline_crlb(thetas, calib, box)
+        crlb = precision._spline_crlb(thetas, calib, box)
         assert np.all(np.isfinite(crlb)) and np.all(crlb > 0)
 
     @pytest.mark.skipif(
@@ -4473,7 +4474,7 @@ class TestSplineCRLB:
         # assertions below take as ground truth.
         calib, splines = _gauss_spline_calibration(model="spline-3d")
         nz = calib["n_data"][2]
-        coeff = localize._spline_coeff_reshaped(calib)
+        coeff = precision._spline_coeff_reshaped(calib)
         rng = np.random.default_rng(0)
         # The evaluator is scalar (one call per pixel), so this samples fewer
         # positions than a vectorized reference could afford.
@@ -4507,7 +4508,7 @@ class TestSplineCRLB:
         # PSF carries real axial information (dPhi/dz != 0) and lpz is finite.
         amp, off, z_shift = 4000.0, 20.0, -6.0
         theta = np.array([[amp, 0.2, -0.15, z_shift, off]])
-        crlb = localize._spline_crlb(theta, calib, BOX)[0]
+        crlb = precision._spline_crlb(theta, calib, BOX)[0]
         ref = _ref_crlb(splines, BOX, amp, 0.2, -0.15, -z_shift, off)
         np.testing.assert_allclose(crlb, ref, rtol=1e-2)
         assert crlb[0] < crlb[1]  # lpx < lpy
@@ -4519,7 +4520,7 @@ class TestSplineCRLB:
         )
         amp, off = 3000.0, 15.0
         theta = np.array([[amp, 0.1, -0.1, off]])
-        crlb = localize._spline_crlb(theta, calib, BOX)[0]
+        crlb = precision._spline_crlb(theta, calib, BOX)[0]
         ref = _ref_crlb(splines, BOX, amp, 0.1, -0.1, None, off)
         np.testing.assert_allclose(crlb, ref, rtol=1e-2)
         assert crlb[0] < crlb[1]
@@ -4531,7 +4532,7 @@ class TestSplineCRLB:
         )
         amp, off, z_shift = 4000.0, 20.0, -6.0
         theta = np.array([[amp, 0.2, -0.15, z_shift, off]])
-        var = localize._spline_crlb(theta, calib, BOX, mle=False)[0]
+        var = precision._spline_crlb(theta, calib, BOX, mle=False)[0]
         ref = _ref_crlb_lsq(splines, BOX, amp, 0.2, -0.15, -z_shift, off)
         np.testing.assert_allclose(var, ref, rtol=1e-2)
         assert var[0] < var[1]  # lpx < lpy
@@ -4543,7 +4544,7 @@ class TestSplineCRLB:
         )
         amp, off = 3000.0, 15.0
         theta = np.array([[amp, 0.1, -0.1, off]])
-        var = localize._spline_crlb(theta, calib, BOX, mle=False)[0]
+        var = precision._spline_crlb(theta, calib, BOX, mle=False)[0]
         ref = _ref_crlb_lsq(splines, BOX, amp, 0.1, -0.1, None, off)
         np.testing.assert_allclose(var, ref, rtol=1e-2)
         assert var[0] < var[1]
@@ -4553,8 +4554,8 @@ class TestSplineCRLB:
         # sandwich covariance is strictly above the Cramer-Rao (MLE) bound.
         calib, _ = _gauss_spline_calibration(model="spline-2d", sx=1.0, sy=1.3)
         theta = np.array([[3000.0, 0.1, -0.1, 40.0]])
-        crlb = localize._spline_crlb(theta, calib, BOX, mle=True)[0]
-        lsq = localize._spline_crlb(theta, calib, BOX, mle=False)[0]
+        crlb = precision._spline_crlb(theta, calib, BOX, mle=True)[0]
+        lsq = precision._spline_crlb(theta, calib, BOX, mle=False)[0]
         assert np.all(np.isfinite(lsq))
         # allow tiny numerical slack, then require the x/y positions to be worse
         assert np.all(lsq >= crlb * (1 - 1e-6))
@@ -4563,7 +4564,7 @@ class TestSplineCRLB:
     def test_lsq_nan_theta_row_isolated(self):
         calib, _ = _gauss_spline_calibration(model="spline-2d")
         theta = np.array([[3000.0, 0.1, 0.0, 15.0], [np.nan, 0.0, 0.0, 10.0]])
-        var = localize._spline_crlb(theta, calib, BOX, mle=False)
+        var = precision._spline_crlb(theta, calib, BOX, mle=False)
         assert np.all(np.isfinite(var[0]))
         assert np.all(np.isnan(var[1]))
 
@@ -4574,14 +4575,14 @@ class TestSplineCRLB:
             model="spline-3d-multichannel", n_channels=2
         )
         theta = np.array([[5000.0, 0.1, -0.1, -8.0, 20.0]])
-        crlb_1 = localize._spline_crlb(theta, calib_1, BOX)[0]
-        crlb_2 = localize._spline_crlb(theta, calib_2, BOX)[0]
+        crlb_1 = precision._spline_crlb(theta, calib_1, BOX)[0]
+        crlb_2 = precision._spline_crlb(theta, calib_2, BOX)[0]
         np.testing.assert_allclose(crlb_2, crlb_1 / 2.0, rtol=1e-3)
 
     def test_nan_theta_row_isolated(self):
         calib, _ = _gauss_spline_calibration(model="spline-2d")
         theta = np.array([[3000.0, 0.1, 0.0, 15.0], [np.nan, 0.0, 0.0, 10.0]])
-        crlb = localize._spline_crlb(theta, calib, BOX)
+        crlb = precision._spline_crlb(theta, calib, BOX)
         assert np.all(np.isfinite(crlb[0]))
         assert np.all(np.isnan(crlb[1]))
 
@@ -4590,7 +4591,9 @@ class TestSplineCRLB:
         # the Fisher weight (1 / mu) finite.
         calib, _ = _gauss_spline_calibration(model="spline-2d")
         theta = np.array([[500.0, 0.0, 0.0, 0.0]])
-        assert np.all(np.isfinite(localize._spline_crlb(theta, calib, BOX)[0]))
+        assert np.all(
+            np.isfinite(precision._spline_crlb(theta, calib, BOX)[0])
+        )
 
     def test_progress_callback_and_console(self):
         calib, _ = _gauss_spline_calibration(model="spline-2d")
@@ -4601,14 +4604,16 @@ class TestSplineCRLB:
         theta[:, 1:3] = rng.uniform(-0.5, 0.5, (n, 2))
         theta[:, 3] = 15.0
         seen = []
-        localize._spline_crlb(theta, calib, BOX, progress_callback=seen.append)
+        precision._spline_crlb(
+            theta, calib, BOX, progress_callback=seen.append
+        )
         assert seen and seen[-1] == n and seen == sorted(seen)
         # the tqdm ("console") path must not raise
-        localize._spline_crlb(theta, calib, BOX, progress_callback="console")
+        precision._spline_crlb(theta, calib, BOX, progress_callback="console")
 
 
 def _crlb(theta, calibration, box, *, gpu, **kwargs):
-    """``localize._spline_crlb`` pinned to one device.
+    """``precision._spline_crlb`` pinned to one device.
 
     Production dispatch is automatic (GPU when present, CPU otherwise), so
     hiding the GPU is the only way to exercise the CPU path deliberately - and
@@ -4617,7 +4622,7 @@ def _crlb(theta, calibration, box, *, gpu, **kwargs):
     ``localize``, whose own ``CUDA_AVAILABLE`` gates the *fitting* backends."""
     with pytest.MonkeyPatch.context() as m:
         m.setattr(precision, "CUDA_AVAILABLE", gpu)
-        return localize._spline_crlb(theta, calibration, box, **kwargs)
+        return precision._spline_crlb(theta, calibration, box, **kwargs)
 
 
 def _shared_theta(n, rng, n_params=5, nz=21):
@@ -4643,7 +4648,7 @@ def _with_channel_geometry(calib, n_locs, rng):
     on a plain calibration cannot tell whether either side applies them. The
     reference channel keeps the identity and a zero residual, as the real
     pipeline does (see :func:`localize.channel_roi_residuals`)."""
-    n_channels = localize._spline_n_channels(calib)
+    n_channels = precision._spline_n_channels(calib)
     calib = dict(calib)
     calib["channel_transforms"] = [
         (
@@ -4778,8 +4783,8 @@ class TestSplineCRLBEMCCD:
         theta = _shared_theta(
             32, rng, n_params=4 if model == "spline-2d" else 5
         )
-        plain = localize._spline_crlb(theta, calib, BOX, mle=mle)
-        em = localize._spline_crlb(theta, calib, BOX, mle=mle, em=True)
+        plain = precision._spline_crlb(theta, calib, BOX, mle=mle)
+        em = precision._spline_crlb(theta, calib, BOX, mle=mle, em=True)
         np.testing.assert_allclose(em, 2.0 * plain, rtol=1e-12)
 
     @pytest.mark.parametrize("mle", [True, False])
@@ -4787,8 +4792,8 @@ class TestSplineCRLBEMCCD:
     def test_em_doubles_the_variance_link_xyz(self, n_channels, mle):
         rng = np.random.default_rng(1)
         calib, theta = _link_xyz_calib_and_theta(n_channels, 16, rng)
-        plain = localize._spline_crlb(theta, calib, BOX, mle=mle)
-        em = localize._spline_crlb(theta, calib, BOX, mle=mle, em=True)
+        plain = precision._spline_crlb(theta, calib, BOX, mle=mle)
+        em = precision._spline_crlb(theta, calib, BOX, mle=mle, em=True)
         np.testing.assert_allclose(em, 2.0 * plain, rtol=1e-12)
 
     @pytest.mark.parametrize("mle", [True, False])
@@ -4853,7 +4858,7 @@ class TestSplineCRLBGPU:
         theta = np.array([[3000.0, 0.1, -0.1, 15.0]])
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            got = localize._spline_crlb(theta, calib, BOX)
+            got = precision._spline_crlb(theta, calib, BOX)
         np.testing.assert_array_equal(got, _crlb(theta, calib, BOX, gpu=False))
 
     @pytest.mark.parametrize("model", ["spline-2d", "spline-3d"])
@@ -4940,14 +4945,14 @@ class TestSplineCRLBGPU:
         expected = _crlb(theta, calib, BOX, gpu=False)
 
         with pytest.warns(RuntimeWarning, match="falling back to the CPU"):
-            got = localize._spline_crlb(theta, calib, BOX)
+            got = precision._spline_crlb(theta, calib, BOX)
         np.testing.assert_allclose(got, expected)
 
         # warned once per process, not once per call
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             np.testing.assert_allclose(
-                localize._spline_crlb(theta, calib, BOX), expected
+                precision._spline_crlb(theta, calib, BOX), expected
             )
 
     @requires_crlb_gpu
@@ -5223,29 +5228,29 @@ def _ref_gauss_crlb(theta, box, rotated, floor=1e-3):
 
 class TestGaussCRLB:
     """Poisson Cramer-Rao lower bounds for gpufit MLE Gaussian fits
-    (localize._gauss_crlb). The analytic Fisher matrix of the point-sampled
+    (precision._gauss_crlb). The analytic Fisher matrix of the point-sampled
     Gaussian is validated against a finite-difference reference; no GPU is
     needed since the CRLB is evaluated at given parameters."""
 
     def test_crlb_matches_reference_elliptic(self):
         # sx > sy so var_x > var_y - also guards the x/y association.
         theta = np.array([[500.0, 3.2, 3.7, 1.4, 1.0, 5.0]])
-        crlb = localize._gauss_crlb(theta, BOX, em=False)[0]
+        crlb = precision._gauss_crlb(theta, BOX, em=False)[0]
         ref = _ref_gauss_crlb(theta[0], BOX, rotated=False)
         np.testing.assert_allclose(crlb, ref, rtol=1e-4)
         assert crlb[1] > crlb[2]  # var_x > var_y
 
     def test_crlb_matches_reference_rotated(self):
         theta = np.array([[800.0, 3.4, 3.1, 1.5, 0.9, 4.0, 0.6]])
-        crlb = localize._gauss_crlb(theta, BOX, em=False, rotated=True)[0]
+        crlb = precision._gauss_crlb(theta, BOX, em=False, rotated=True)[0]
         ref = _ref_gauss_crlb(theta[0], BOX, rotated=True)
         np.testing.assert_allclose(crlb, ref, rtol=1e-4)
         assert np.isfinite(crlb[6]) and crlb[6] > 0  # finite angle variance
 
     def test_em_doubles_variance(self):
         theta = np.array([[500.0, 3.2, 3.7, 1.3, 1.1, 5.0]])
-        crlb = localize._gauss_crlb(theta, BOX, em=False)[0]
-        crlb_em = localize._gauss_crlb(theta, BOX, em=True)[0]
+        crlb = precision._gauss_crlb(theta, BOX, em=False)[0]
+        crlb_em = precision._gauss_crlb(theta, BOX, em=True)[0]
         np.testing.assert_allclose(crlb_em, 2.0 * crlb, rtol=1e-10)
 
     def test_nan_theta_row_isolated(self):
@@ -5255,7 +5260,7 @@ class TestGaussCRLB:
                 [np.nan, 3.0, 3.0, 1.0, 1.0, 5.0],
             ]
         )
-        crlb = localize._gauss_crlb(theta, BOX, em=False)
+        crlb = precision._gauss_crlb(theta, BOX, em=False)
         assert np.all(np.isfinite(crlb[0]))
         assert np.all(np.isnan(crlb[1]))
 
@@ -5264,11 +5269,13 @@ class TestGaussCRLB:
         # Fisher weight (1 / mu) finite.
         theta = np.array([[300.0, 3.0, 3.0, 1.2, 1.2, 0.0]])
         assert np.all(
-            np.isfinite(localize._gauss_crlb(theta, BOX, em=False)[0])
+            np.isfinite(precision._gauss_crlb(theta, BOX, em=False)[0])
         )
 
     def test_empty_input(self):
-        assert localize._gauss_crlb(np.zeros((0, 6)), BOX, em=False).shape == (
+        assert precision._gauss_crlb(
+            np.zeros((0, 6)), BOX, em=False
+        ).shape == (
             0,
             6,
         )
@@ -5277,10 +5284,10 @@ class TestGaussCRLB:
         # More photons tighten the position (x, y) and width (sx, sy) bounds.
         # var(N) itself grows with N (absolute photon-count noise increases).
         base = [3.2, 3.7, 1.3, 1.1, 5.0]
-        dim = localize._gauss_crlb(np.array([[200.0, *base]]), BOX, em=False)[
+        dim = precision._gauss_crlb(np.array([[200.0, *base]]), BOX, em=False)[
             0
         ]
-        bright = localize._gauss_crlb(
+        bright = precision._gauss_crlb(
             np.array([[4000.0, *base]]), BOX, em=False
         )[0]
         assert np.all(bright[1:5] < dim[1:5])
@@ -5501,7 +5508,7 @@ class TestSaveableColumns:
         # Photon-decoupled (link-XYZ) multichannel spline, at the largest
         # channel count there is a fit model for - it emits the widest set of
         # per-channel columns.
-        n_channels = localize._LINK_XYZ_MAX_CHANNELS
+        n_channels = precision._LINK_XYZ_MAX_CHANNELS
         calib_mc, _ = _gauss_spline_calibration(
             model="spline-3d-multichannel", n_channels=n_channels
         )
@@ -6097,7 +6104,7 @@ class TestMultichannelWorkerRouting:
     def test_unlinked_photons_above_cap_fall_back_to_linked(self, monkeypatch):
         # no link-XYZ fit model is compiled beyond the cap, so the
         # shared-amplitude model (which takes any channel count) is used
-        n_channels = localize._LINK_XYZ_MAX_CHANNELS + 1
+        n_channels = precision._LINK_XYZ_MAX_CHANNELS + 1
         assert self._run_unlinked(n_channels, monkeypatch) == [
             ("plain", "default")
         ]
@@ -7390,7 +7397,7 @@ class TestFitAffineTransform:
         """Affine corrections are single-channel only: a multichannel
         spline fit registers its channels itself."""
         movie_ref, movie_target, _ = bead_movies
-        for model in ("spline-3d-multichannel", localize._LINK_XYZ_MODEL):
+        for model in ("spline-3d-multichannel", precision._LINK_XYZ_MODEL):
             with pytest.raises(ValueError, match="single-channel"):
                 localize.fit_affine_transform(
                     movie_ref,
@@ -8234,7 +8241,7 @@ class TestGaussCrlbVariance:
         var = np.zeros((1, box, box), dtype=np.float32)
         var[0, 1, 5] = 400.0  # y = 1, x = 5 - deliberately not symmetric
 
-        got = localize._gauss_crlb(theta, box, em=False, variance=var)
+        got = precision._gauss_crlb(theta, box, em=False, variance=var)
 
         # Reference: rebuild mu in [spot, y, x] and add the patch directly.
         grid = np.arange(box, dtype=np.float64)
@@ -8259,10 +8266,10 @@ class TestGaussCrlbVariance:
 
     def test_a_hot_pixel_widens_the_bound(self):
         theta = np.array([[500.0, 3.0, 3.0, 1.3, 1.3, 5.0]])
-        plain = localize._gauss_crlb(theta, 7, em=False)
+        plain = precision._gauss_crlb(theta, 7, em=False)
         var = np.zeros((1, 7, 7), dtype=np.float32)
         var[0, 2, 4] = 500.0
-        noisy = localize._gauss_crlb(theta, 7, em=False, variance=var)
+        noisy = precision._gauss_crlb(theta, 7, em=False, variance=var)
         assert np.all(noisy >= plain - 1e-12)
         assert noisy[0, 1] > plain[0, 1]
 
@@ -8710,7 +8717,7 @@ class TestScmosMultichannel:
             return_residuals=True,
             return_variance=True,
         )
-        major = localize._crlb_variance_channel_major(variance, 2)
+        major = precision._crlb_variance_channel_major(variance, 2)
         centre = self.BOX // 2
         assert major.shape == (1, 2, self.BOX, self.BOX)
         assert major[0, 0, centre, centre] == 111.0
@@ -8718,9 +8725,9 @@ class TestScmosMultichannel:
 
     def test_single_channel_patches_still_gain_their_axis(self):
         var = np.zeros((4, self.BOX, self.BOX), np.float32)
-        major = localize._crlb_variance_channel_major(var, 1)
+        major = precision._crlb_variance_channel_major(var, 1)
         assert major.shape == (4, 1, self.BOX, self.BOX)
-        assert localize._crlb_variance_channel_major(None, 1) is None
+        assert precision._crlb_variance_channel_major(None, 1) is None
 
     def test_the_crlb_kernels_see_a_multichannel_map(self):
         """The variance must reach the spline CRLB and widen it, per channel.
@@ -8737,7 +8744,7 @@ class TestScmosMultichannel:
         big = 1e7
 
         def crlb(variance):
-            return localize._spline_crlb(
+            return precision._spline_crlb(
                 theta,
                 calibration,
                 self.BOX,

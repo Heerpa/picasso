@@ -10,7 +10,9 @@ The PTX-compilation tests need no GPU: ``cuda.compile_ptx`` goes through
 libNVVM, which ships with the ``numba-cuda`` wheel. They are the net that
 catches ``np.isfinite`` / ``np.floor`` left in device code, which the CUDA
 *simulator* cannot catch - it runs plain Python, where the NumPy forms work
-fine.
+fine. They do need libNVVM itself, which a plain ``numba`` install (no
+``numba-cuda``, no CUDA toolkit) does not have; there they are skipped and
+``TestDeviceSignaturesAgree`` is what still runs.
 
 :authors: Rafal Kowalewski
 :copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry
@@ -31,11 +33,32 @@ requires_cuda = pytest.mark.skipif(
     not lmfit_cuda.CUDA_AVAILABLE, reason="no CUDA device"
 )
 
+
+def _libnvvm_available() -> bool:
+    """Whether ``cuda.compile_ptx`` can reach a libNVVM to compile with.
+
+    Probed rather than inferred from ``CUDA_AVAILABLE``: the two are
+    independent (the wheel ships libNVVM without a device, a toolkit-less
+    numba has a device with no libNVVM)."""
+    try:
+        from numba.cuda.cudadrv import nvvm
+
+        nvvm.NVVM()
+    except Exception:
+        return False
+    return True
+
+
+requires_nvvm = pytest.mark.skipif(
+    not _libnvvm_available(), reason="libNVVM not installed"
+)
+
 _F64_2D = types.float64[:, ::1]
 _F64_1D = types.float64[::1]
 _I32_1D = types.int32[::1]
 
 
+@requires_nvvm
 class TestPtxCompilation:
     """Every device function must compile for the real target.
 

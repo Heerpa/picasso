@@ -16,7 +16,7 @@ Smith, et al. Nature Methods, 2010.
     ``gaussmle_async``           ``fitting.gaussfit.fit_spots_async``
     ``locs_from_fits``           ``localize.locs_from_fits_gauss``
     ``sigma_uncertainty``        ``fitting.precision.sigma_uncertainty_mle``
-    (the CRLB)                   ``localize._gauss_crlb``
+    (the CRLB)                   ``fitting.precision._gauss_crlb``
     ==========================  =============================================
 
     The replacement fits with Levenberg-Marquardt rather than the Newton
@@ -53,7 +53,7 @@ _DEPRECATION_MESSAGE = (
     "fitting now lives in picasso.fitting: use "
     "picasso.fitting.gaussfit.fit_spots with mle=True, "
     "picasso.localize.locs_from_fits_gauss to build the localizations, "
-    "picasso.localize._gauss_crlb for the Cramer-Rao bound, and "
+    "picasso.fitting.precision._gauss_crlb for the Cramer-Rao bound, and "
     "picasso.fitting.precision.sigma_uncertainty_mle for the width "
     "uncertainty."
 )

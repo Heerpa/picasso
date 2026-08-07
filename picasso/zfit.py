@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.optimize import minimize_scalar
 
-from . import lib, __version__
+from . import io, lib, __version__
 from .fitting import precision
 
 plt.style.use("ggplot")
