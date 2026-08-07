@@ -733,6 +733,13 @@ class TestSaveLoadIdentifications:
     accompanying ``.yaml`` sidecar with metadata.
     """
 
+    @pytest.fixture(autouse=True)
+    def _yaml_sidecar_on(self, monkeypatch):
+        """Write the sidecar .yaml, whatever the developer's user
+        settings say: ``io._save_metadata_in_yaml`` reads
+        ``~/.picasso/settings.yaml``, where it can be turned off."""
+        monkeypatch.setattr(io, "_save_metadata_in_yaml", lambda: True)
+
     def _info(self) -> list[dict]:
         return [
             {"Width": 32, "Height": 32, "Frames": 100},
