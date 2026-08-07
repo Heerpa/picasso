@@ -47,6 +47,7 @@ CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
 DEFAULT_PARAMETERS = {
     "Box Size": 7,
     "Min. Net Gradient": 5000,
+    "Gaussian Filter Sigma": 0.0,
     "Temporal Median Window": 51,
 }
 IMAGE_FILTER = (
@@ -2488,6 +2489,10 @@ class ParametersDialog(lib.Dialog):
         astigmatism.
     gain : QtWidgets.QSpinBox
         Spin box for selecting camera EM gain.
+    gaussian_filter_spinbox : QtWidgets.QDoubleSpinBox
+        Spin box for the standard deviation (in camera pixels) of the
+        spatial Gaussian filter applied before identification. 0 disables
+        it; fitting always uses the raw movie.
     gpu_checkbox : QtWidgets.QCheckBox
         Checkbox for enabling/disabling GPU fitting. Only shown if a
         CUDA-capable GPU is available. Also selects the device for the
@@ -2535,6 +2540,7 @@ class ParametersDialog(lib.Dialog):
     """
 
     CALIB_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#d-calibration"  # noqa: E501
+    GAUSSIAN_FILTER_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#gaussian-filter"  # noqa: E501
     IDENT_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#identification-and-fitting-of-single-molecule-spots"  # noqa: E501
     ROI_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#regions-of-interest-rois"  # noqa: E501
     SPLINE_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting"  # noqa: E501
@@ -2694,6 +2700,46 @@ class ParametersDialog(lib.Dialog):
         tm_row.addStretch(1)
         identification_grid.addLayout(tm_row, 4, 0, 1, 2)
 
+        # spatial Gaussian smoothing (identification only). Sits right below
+        # the temporal median filter, in the order the two are applied.
+        gauss_row = QtWidgets.QHBoxLayout()
+        gauss_row.addWidget(lib.HelpButton(self.GAUSSIAN_FILTER_URL))
+        gaussian_tip = (
+            "Smooth every frame with a Gaussian of this standard deviation\n"
+            "(in camera pixels) before spot identification. 0 turns the\n"
+            "filter off.\n\n"
+            "Use it when spots are not Gaussian-shaped and break up into\n"
+            "several local maxima: smoothing merges them into one maximum,\n"
+            "so one spot yields one robust identification.\n\n"
+            "Only the identification uses the smoothed frames: fitting, spot\n"
+            "cutting and photon conversion always use the raw movie, so\n"
+            "photon counts and localization precisions are unaffected.\n\n"
+            "Smoothing requires re-tuning of 'Min. net gradient' with\n"
+            "'Preview' enabled after changing this value.\n\n"
+            "Note: large values merge neighboring spots into one."
+        )
+        gaussian_label = QtWidgets.QLabel("Gaussian filter sigma:")
+        gaussian_label.setToolTip(gaussian_tip)
+        gauss_row.addWidget(gaussian_label)
+        self.gaussian_filter_spinbox = QtWidgets.QDoubleSpinBox()
+        self.gaussian_filter_spinbox.setRange(0.0, 10.0)
+        self.gaussian_filter_spinbox.setDecimals(2)
+        self.gaussian_filter_spinbox.setSingleStep(0.1)
+        self.gaussian_filter_spinbox.setSuffix(" px")
+        # Qt drops the suffix at the special value, so 0 reads as "Off"
+        self.gaussian_filter_spinbox.setSpecialValueText("Off")
+        self.gaussian_filter_spinbox.setValue(
+            DEFAULT_PARAMETERS["Gaussian Filter Sigma"]
+        )
+        self.gaussian_filter_spinbox.setKeyboardTracking(False)
+        self.gaussian_filter_spinbox.setToolTip(gaussian_tip)
+        self.gaussian_filter_spinbox.valueChanged.connect(
+            self.on_gaussian_filter_changed
+        )
+        gauss_row.addWidget(self.gaussian_filter_spinbox)
+        gauss_row.addStretch(1)
+        identification_grid.addLayout(gauss_row, 5, 0, 1, 2)
+
         # preview identifications + cross-channel link color overlay
         preview_row = QtWidgets.QHBoxLayout()
         self.preview_checkbox = QtWidgets.QCheckBox("Preview")
@@ -2719,7 +2765,7 @@ class ParametersDialog(lib.Dialog):
         )
         preview_row.addWidget(self.link_colors_checkbox)
         preview_row.addStretch(1)
-        identification_grid.addLayout(preview_row, 5, 0)
+        identification_grid.addLayout(preview_row, 6, 0)
 
         # ROIs
         label = QtWidgets.QLabel("ROIs:")
@@ -2749,7 +2795,7 @@ class ParametersDialog(lib.Dialog):
         self.split_fov_checkbox.setTristate(False)
         self.split_fov_checkbox.stateChanged.connect(self.on_split_fov_changed)
         roi_label_layout.addWidget(self.split_fov_checkbox)
-        identification_grid.addLayout(roi_label_layout, 6, 0)
+        identification_grid.addLayout(roi_label_layout, 7, 0)
 
         self._updating_roi_field = False
         self.roi_dialog = None
@@ -2767,7 +2813,7 @@ class ParametersDialog(lib.Dialog):
         self.roi_edit_button = QtWidgets.QPushButton("Edit ROIs...")
         self.roi_edit_button.clicked.connect(self.on_edit_rois)
         roi_layout.addWidget(self.roi_edit_button)
-        identification_grid.addLayout(roi_layout, 6, 1)
+        identification_grid.addLayout(roi_layout, 7, 1)
 
         # min/max frames
         label = QtWidgets.QLabel("Frames (min,max):")
@@ -2777,7 +2823,7 @@ class ParametersDialog(lib.Dialog):
             "Several disjoint segments can be given as min,max pairs\n"
             "separated by semicolons, e.g. '1,100; 200,300'."
         )
-        identification_grid.addWidget(label, 7, 0)
+        identification_grid.addWidget(label, 8, 0)
         self.frames_edit = QtWidgets.QLineEdit()
         # one or more "min,max" pairs separated by semicolons, with
         # optional surrounding whitespace
@@ -2788,7 +2834,7 @@ class ParametersDialog(lib.Dialog):
         self.frames_edit.setValidator(validator)
         self.frames_edit.editingFinished.connect(self.on_frames_edit_finished)
         self.frames_edit.textChanged.connect(self.on_frames_edit_changed)
-        identification_grid.addWidget(self.frames_edit, 7, 1)
+        identification_grid.addWidget(self.frames_edit, 8, 1)
 
         # Multichannel: optionally use the same key settings for every channel.
         # Shown only when more than one channel is loaded (see the Window's
@@ -4074,6 +4120,17 @@ class ParametersDialog(lib.Dialog):
         come out solid black (filter on) or solid white (filter off).
         """
         self.temporal_median_spinbox.setEnabled(state != 0)
+        self._reset_contrast_and_refresh()
+
+    def on_gaussian_filter_changed(self, _value: float = 0.0) -> None:
+        """Refresh the display, which shows the smoothed frames whenever
+        sigma is non-zero."""
+        self._reset_contrast_and_refresh()
+
+    def _reset_contrast_and_refresh(self) -> None:
+        """Re-derive the contrast and redraw after an identification
+        filter changed, since the filtered frames live on a different
+        intensity scale than the raw ones."""
         # this dialog is built before the contrast dialog
         contrast_dialog = getattr(self.window, "contrast_dialog", None)
         if contrast_dialog is not None:
@@ -4319,8 +4376,9 @@ class ContrastDialog(lib.Dialog):
 
         Called when the intensity scale changes underneath the display:
         switching the temporal median filter on subtracts the background
-        and clips at zero, so a contrast set for the raw camera counts
-        would render the filtered frame as an empty black image.
+        and clips at zero, and smoothing lowers the peaks, so a contrast
+        set for the raw camera counts would render the filtered frame as
+        an empty black or a nearly flat image.
         """
         if getattr(self.window, "movie", None) is None:
             return
@@ -4363,8 +4421,8 @@ class ContrastDialog(lib.Dialog):
 
     def on_auto_changed(self, _state: int) -> None:
         if not self.manual_contrast_change:
-            # the displayed movie, which is the temporal median filtered
-            # view when that filter is on - not the raw camera counts.
+            # the displayed movie, which is the filtered view whenever an
+            # identification filter is on - not the raw camera counts.
             # Also on unchecking: seeding the range from the frame on
             # screen is what makes turning Auto off freeze the current
             # rendering instead of changing it.
@@ -4542,9 +4600,10 @@ class Window(QtWidgets.QMainWindow):
         # Holds the curr movie as a numpy memmap in the format
         # (frame, y, x)
         self.movie = None
-        # Cached temporal median filtered view of ``self.movie``, see
+        # Cached identification-filtered views of ``self.movie``, see
         # ``identification_movie``. Never used for fitting.
         self._temporal_movie = None
+        self._gaussian_movie = None
         # Dictionary of analysis parameters used for the last operation
         self.last_identification_info = None
         # Dataframe of identifcations with fields frame, x and y
@@ -4634,6 +4693,14 @@ class Window(QtWidgets.QMainWindow):
             bool(settings["Localize"].get("temporal_median_on", False))
         )
 
+        gaussian_sigma = settings["Localize"].get(
+            "gaussian_filter_sigma", None
+        )
+        if isinstance(gaussian_sigma, (int, float)) and gaussian_sigma >= 0:
+            self.parameters_dialog.gaussian_filter_spinbox.setValue(
+                float(gaussian_sigma)
+            )
+
         # Restore the last-used fitting model and optimizer. The model must
         # be set first, since it repopulates the optimizer combobox.
         fit_model = settings["Localize"].get("fit_model", None)
@@ -4669,6 +4736,9 @@ class Window(QtWidgets.QMainWindow):
         settings["Localize"][
             "temporal_median_on"
         ] = self.parameters_dialog.temporal_median_checkbox.isChecked()
+        settings["Localize"][
+            "gaussian_filter_sigma"
+        ] = self.parameters_dialog.gaussian_filter_spinbox.value()
         settings["Localize"][
             "fit_model"
         ] = self.parameters_dialog.fit_model.currentText()
@@ -6039,6 +6109,7 @@ class Window(QtWidgets.QMainWindow):
             "use_gpu": pd.gpu_checkbox.isChecked(),
             "temporal_median_on": pd.temporal_median_checkbox.isChecked(),
             "temporal_median": pd.temporal_median_spinbox.value(),
+            "gaussian_filter_sigma": pd.gaussian_filter_spinbox.value(),
         }
         if hasattr(pd, "camera"):
             params["camera"] = pd.camera.currentIndex()
@@ -6078,8 +6149,8 @@ class Window(QtWidgets.QMainWindow):
             pd.pixelsize.setValue(params["pixelsize"])
         pd.convergence_criterion.setValue(params["convergence"])
         pd.max_it.setValue(params["max_it"])
-        # .get() with defaults: parameter sets captured before the temporal
-        # median filter existed must still restore
+        # .get() with defaults: parameter sets captured before the
+        # identification filters existed must still restore
         pd.temporal_median_spinbox.setValue(
             params.get(
                 "temporal_median", DEFAULT_PARAMETERS["Temporal Median Window"]
@@ -6087,6 +6158,12 @@ class Window(QtWidgets.QMainWindow):
         )
         pd.temporal_median_checkbox.setChecked(
             params.get("temporal_median_on", False)
+        )
+        pd.gaussian_filter_spinbox.setValue(
+            params.get(
+                "gaussian_filter_sigma",
+                DEFAULT_PARAMETERS["Gaussian Filter Sigma"],
+            )
         )
         pd.magnification_factor.setValue(params["magnification"])
         pd.z_calibration = params["z_calibration"]
@@ -6266,6 +6343,7 @@ class Window(QtWidgets.QMainWindow):
         box = lib.get_from_metadata(info, "Box Size")
         min_ng = lib.get_from_metadata(info, "Min. Net Gradient")
         temporal_median = lib.get_from_metadata(info, "Temporal Median Window")
+        gaussian_sigma = lib.get_from_metadata(info, "Gaussian Filter Sigma")
         if box or min_ng:
             self.last_identification_info = {}
             if box is not None:
@@ -6274,7 +6352,7 @@ class Window(QtWidgets.QMainWindow):
             if min_ng is not None:
                 self.last_identification_info["Min. Net Gradient"] = min_ng
                 self.parameters_dialog.mng_slider.setValue(min_ng)
-        # restore the temporal median setting too, otherwise the loaded
+        # restore the identification filters too, otherwise the loaded
         # identifications would immediately count as outdated
         self.parameters_dialog.temporal_median_checkbox.setChecked(
             bool(temporal_median)
@@ -6283,6 +6361,9 @@ class Window(QtWidgets.QMainWindow):
             self.parameters_dialog.temporal_median_spinbox.setValue(
                 temporal_median
             )
+        self.parameters_dialog.gaussian_filter_spinbox.setValue(
+            float(gaussian_sigma or 0.0)
+        )
         self._clean_up_external_ids()
 
     def _clean_up_external_ids(self) -> None:
@@ -6383,7 +6464,7 @@ class Window(QtWidgets.QMainWindow):
         self.curr_frame_number = number
         if self.contrast_dialog.auto_checkbox.isChecked():
             # the same frame the view shows, so the auto contrast matches
-            # what is displayed when the temporal median filter is on
+            # what is displayed when an identification filter is on
             frame = self.identification_movie()[number]
             self.contrast_dialog.change_contrast_silently(
                 frame.min(), frame.max()
@@ -7178,7 +7259,8 @@ class Window(QtWidgets.QMainWindow):
     @property
     def parameters(self) -> dict:
         """Dictionary with the identification settings: box size, min.
-        net gradient and the temporal median window (0 when disabled).
+        net gradient, the temporal median window (0 when disabled) and the
+        Gaussian filter sigma (0 when disabled).
 
         Every key is compared in ``identifications_outdated`` and stored
         in ``last_identification_info``, so adding one here is enough for
@@ -7198,6 +7280,7 @@ class Window(QtWidgets.QMainWindow):
                 )
                 else 0
             ),
+            "Gaussian Filter Sigma": dialog.gaussian_filter_spinbox.value(),
         }
 
     def temporal_median_applicable(self) -> bool:
@@ -7239,36 +7322,64 @@ class Window(QtWidgets.QMainWindow):
 
     def identification_movie(self) -> lib.IntArray3D:
         """The movie the display and the identification preview run on:
-        either the raw movie or a cached temporal median filtered view of
-        it.
+        the raw movie, optionally temporal median filtered and then
+        Gaussian smoothed - built exactly the way ``localize.identify``
+        builds it, so that the preview and the batch run agree.
 
         Never used for fitting - ``FitWorker`` and ``save_spots`` always
         cut spots out of ``self.movie``.
         """
-        window = self.parameters["Temporal Median Window"]
-        if not window or self.movie is None:
+        movie = self.movie
+        if movie is None:
             self._temporal_movie = None
-            return self.movie
-        if not self.temporal_median_applicable():
-            self._temporal_movie = None
-            return self.movie
+            self._gaussian_movie = None
+            return None
+        parameters = self.parameters
+        window = parameters["Temporal Median Window"]
+        sigma = parameters["Gaussian Filter Sigma"]
         rois = self.view.rois or None
-        roi_pad = int(self.parameters["Box Size"] / 2) + 1
-        cached = self._temporal_movie
-        if (
-            cached is None
-            or cached.raw is not self.movie
-            or cached.window != min(window, len(self.movie))
-            or cached.roi != rois
-            or cached.roi_pad != roi_pad
-        ):
-            # comparing against self.movie by identity means loading a
-            # movie or switching channel invalidates this for free
-            cached = localize.TemporalMedianMovie(
-                self.movie, window, roi=rois, roi_pad=roi_pad
-            )
-            self._temporal_movie = cached
-        return cached
+        # grown by the Gaussian's kernel radius, see identification_roi_pad.
+        # Without a ROI the pad has no effect (the median covers the whole
+        # frame either way), and pinning it to 0 there keeps nudging the
+        # sigma spinbox from throwing away every cached median.
+        roi_pad = (
+            localize.identification_roi_pad(parameters["Box Size"], sigma)
+            if rois
+            else 0
+        )
+        if window and self.temporal_median_applicable():
+            cached = self._temporal_movie
+            if (
+                cached is None
+                or cached.raw is not movie
+                or cached.window != min(window, len(movie))
+                or cached.roi != rois
+                or cached.roi_pad != roi_pad
+            ):
+                # comparing against self.movie by identity means loading a
+                # movie or switching channel invalidates this for free
+                cached = localize.TemporalMedianMovie(
+                    movie, window, roi=rois, roi_pad=roi_pad
+                )
+                self._temporal_movie = cached
+            movie = cached
+        else:
+            self._temporal_movie = None
+        if sigma:
+            cached = self._gaussian_movie
+            # comparing the source by identity chains the invalidation:
+            # whenever the stage below is rebuilt (or dropped), so is this
+            if (
+                cached is None
+                or cached.raw is not movie
+                or cached.sigma != sigma
+            ):
+                cached = localize.GaussianFilteredMovie(movie, sigma)
+                self._gaussian_movie = cached
+            movie = cached
+        else:
+            self._gaussian_movie = None
+        return movie
 
     def on_parameters_changed(self) -> None:
         """Reset ``self.locs`` and draw frame."""
@@ -7458,11 +7569,12 @@ class Window(QtWidgets.QMainWindow):
                 or f"{n_identifications:,} spots"
             )
             temporal_median = parameters.get("Temporal Median Window", 0)
-            filtered = (
-                f"; Temporal median: {temporal_median}"
-                if temporal_median
-                else ""
-            )
+            gaussian_sigma = parameters.get("Gaussian Filter Sigma", 0)
+            filtered = ""
+            if temporal_median:
+                filtered += f"; Temporal median: {temporal_median}"
+            if gaussian_sigma:
+                filtered += f"; Gaussian sigma: {gaussian_sigma:g}"
             message = (
                 f"Identified {counted} in {elapsed_time:.2f}"
                 f" seconds. (Box Size: {box}; Min. Net Gradient: {mng}"
@@ -8463,8 +8575,8 @@ class Window(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "No identifications", message)
             return
         box = self.parameters["Box Size"]
-        # raw movie on purpose: spots must carry real photon counts, so
-        # the temporal median filter (an identification aid) never applies
+        # raw movie on purpose: spots must carry real photon counts, so the
+        # identification filters (a detection aid) never apply
         spots = localize.get_spots(
             self.movie, self.identifications, box, self.camera_info
         )
@@ -8590,6 +8702,9 @@ class Window(QtWidgets.QMainWindow):
             "Temporal Median Window": (
                 self.parameters["Temporal Median Window"]
             ),
+            "Gaussian Filter Sigma": (
+                self.parameters["Gaussian Filter Sigma"]
+            ),
         }
         info = self.info + [ids_info]
         io.save_identifications(path, self.identifications, info)
@@ -8712,6 +8827,7 @@ class IdentificationWorker(QtCore.QThread):
             frame_bounds=self.frame_range,
             threaded=True,
             temporal_median_window=self.parameters["Temporal Median Window"],
+            gaussian_filter_sigma=self.parameters["Gaussian Filter Sigma"],
             progress_callback=self.on_progress,
             abort_callback=self.isInterruptionRequested,
         )

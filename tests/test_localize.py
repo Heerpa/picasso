@@ -21,6 +21,7 @@ import h5py
 import numpy as np
 import pandas as pd
 import pytest
+from scipy import ndimage
 from scipy.interpolate import CubicSpline
 from PyQt6 import QtWidgets
 
@@ -6607,6 +6608,532 @@ class TestTemporalMedianGui:
             assert not dialog.temporal_median_checkbox.isChecked()
         finally:
             dialog.close()
+
+
+# ---------------------------------------------------------------------------
+# Gaussian filter (identification-only spatial smoothing)
+# ---------------------------------------------------------------------------
+
+
+def _double_lobed_movie(
+    n_frames: int = 6,
+    size: int = 32,
+    separation: int = 4,
+    psf_sigma: float = 1.0,
+    amplitude: float = 3000.0,
+    baseline: int = 100,
+) -> np.ndarray:
+    """Movie of one non-Gaussian "spot" per frame: two lobes ``separation``
+    pixels apart in x, centered on the frame.
+
+    ``_local_maxima`` suppresses maxima within ``+/- int(box / 2)`` of each
+    other, so with ``BOX = 7`` the lobes have to be more than 3 px apart to
+    both survive as maxima - which is exactly the situation this feature is
+    meant to fix.
+    """
+    yy, xx = np.mgrid[0:size, 0:size]
+    center = size // 2
+    frame = np.full((size, size), baseline, dtype=np.float64)
+    for dx in (-separation / 2, separation / 2):
+        frame += amplitude * np.exp(
+            -((yy - center) ** 2 + (xx - (center + dx)) ** 2)
+            / (2 * psf_sigma**2)
+        )
+    return np.tile(frame.astype(np.uint16), (n_frames, 1, 1))
+
+
+class TestGaussianFilter:
+    """``localize.GaussianFilteredMovie``, the kernel-radius arithmetic and
+    their use from ``identify``."""
+
+    @staticmethod
+    def _movie(n_frames=12, height=8, width=6, seed=0):
+        rng = np.random.default_rng(seed)
+        return rng.integers(
+            0, 4000, size=(n_frames, height, width), dtype=np.uint16
+        )
+
+    def test_matches_scipy_reference(self):
+        stack = self._movie()
+        filtered = localize.GaussianFilteredMovie(stack, 1.5)
+        for frame_number in range(len(stack)):
+            expected = ndimage.gaussian_filter(
+                stack[frame_number].astype(np.float32),
+                1.5,
+                mode=localize.GAUSSIAN_FILTER_MODE,
+                truncate=localize.GAUSSIAN_FILTER_TRUNCATE,
+            )
+            np.testing.assert_allclose(
+                filtered[frame_number], expected, atol=1e-5
+            )
+
+    def test_output_is_float32_not_the_input_dtype(self):
+        """``gaussian_filter`` keeps the input dtype unless told otherwise,
+        so a uint16 movie would silently come back rounded to integers."""
+        filtered = localize.GaussianFilteredMovie(self._movie(), 1.0)
+        frame = filtered[0]
+        assert frame.dtype == np.float32
+        assert filtered.dtype == np.float32
+        assert np.any(frame % 1 != 0)
+
+    def test_movie_protocol(self):
+        stack = self._movie()
+        filtered = localize.GaussianFilteredMovie(stack, 1.0)
+        assert len(filtered) == len(stack)
+        assert filtered.shape == stack.shape
+        assert filtered[-1].shape == stack.shape[1:]
+        np.testing.assert_array_equal(filtered[-1], filtered[len(stack) - 1])
+        np.testing.assert_array_equal(
+            filtered[2:5], np.stack([filtered[i] for i in (2, 3, 4)])
+        )
+        np.testing.assert_array_equal(
+            np.stack(list(iter(filtered))),
+            np.stack([filtered[i] for i in range(len(stack))]),
+        )
+        np.testing.assert_array_equal(filtered[3, 2], filtered[3][2])
+        with pytest.raises(IndexError):
+            filtered[len(stack)]
+
+    @pytest.mark.parametrize("sigma", [0, -1.0])
+    def test_rejects_non_positive_sigma(self, sigma):
+        with pytest.raises(ValueError):
+            localize.GaussianFilteredMovie(self._movie(), sigma)
+
+    def test_rejects_empty_movie(self):
+        with pytest.raises(ValueError):
+            localize.GaussianFilteredMovie(
+                np.empty((0, 4, 4), dtype=np.uint16), 1.0
+            )
+
+    def test_read_lock_follows_the_source(self):
+        """A source that is not safe for concurrent reads must be
+        serialized; one that is (or a memmap) must not be."""
+        plain = localize.GaussianFilteredMovie(
+            _CountingMovie(self._movie()), 1.0
+        )
+        assert plain._read_lock is not None
+        concurrent = localize.GaussianFilteredMovie(
+            localize.TemporalMedianMovie(self._movie(), 5), 1.0
+        )
+        assert concurrent._read_lock is None
+        assert localize.GaussianFilteredMovie.supports_concurrent_reads
+
+    def test_each_frame_is_read_once(self):
+        stack = self._movie(n_frames=10)
+        counting = _CountingMovie(stack)
+        filtered = localize.GaussianFilteredMovie(counting, 1.0)
+        counting.reads = 0  # ignore the geometry probe read in __init__
+        for frame_number in range(len(stack)):
+            filtered[frame_number]
+        assert counting.reads == len(stack)
+
+    def test_threaded_matches_serial(self, movie):
+        as_set = lambda ids: set(  # noqa: E731
+            map(tuple, ids[["frame", "y", "x"]].to_numpy())
+        )
+        common = dict(gaussian_filter_sigma=1.0, return_info=False)
+        ids_t = localize.identify(movie, MIN_NG, BOX, threaded=True, **common)
+        ids_s = localize.identify(movie, MIN_NG, BOX, threaded=False, **common)
+        assert as_set(ids_t) == as_set(ids_s)
+
+    def test_identify_argument_matches_explicit_wrapper(self, movie):
+        ids_arg, info = localize.identify(
+            movie, MIN_NG, BOX, threaded=False, gaussian_filter_sigma=1.0
+        )
+        ids_wrapped = localize.identify(
+            localize.GaussianFilteredMovie(movie, 1.0),
+            MIN_NG,
+            BOX,
+            threaded=False,
+            return_info=False,
+        )
+        pd.testing.assert_frame_equal(ids_arg, ids_wrapped)
+        assert info["Gaussian Filter Sigma"] == 1.0
+
+    def test_info_records_zero_when_disabled(self, movie):
+        _, info = localize.identify(movie, MIN_NG, BOX, threaded=False)
+        assert info["Gaussian Filter Sigma"] == 0.0
+
+    def test_fit2d_rejects_the_filtered_view(self, movie, movie_info):
+        """The class deliberately does not implement the movie interface,
+        so a filtered view reaching the fit is a loud error rather than
+        silently wrong photon numbers."""
+        ids = localize.identify(
+            movie, MIN_NG, BOX, threaded=False, return_info=False
+        )
+        with pytest.raises(AssertionError):
+            localize.fit2D(
+                movie=localize.GaussianFilteredMovie(movie, 1.0),
+                movie_info=movie_info,
+                camera_info=CAMERA_INFO,
+                identifications=ids,
+                box=BOX,
+                multiprocess=False,
+            )
+
+    # -- kernel radius / ROI padding ---------------------------------------
+
+    @pytest.mark.parametrize("sigma", [0.5, 1.0, 1.5, 2.0, 3.7])
+    def test_radius_matches_the_kernel_scipy_actually_uses(self, sigma):
+        """The ROI padding is derived from this number, so it has to be
+        the exact support of scipy's kernel, not an estimate."""
+        impulse = np.zeros(201)
+        impulse[100] = 1.0
+        smoothed = ndimage.gaussian_filter(
+            impulse,
+            sigma,
+            mode="constant",
+            truncate=localize.GAUSSIAN_FILTER_TRUNCATE,
+        )
+        support = np.nonzero(smoothed)[0]
+        assert 100 - support[0] == localize.gaussian_filter_radius(sigma)
+        assert support[-1] - 100 == localize.gaussian_filter_radius(sigma)
+
+    def test_radius_is_zero_without_a_filter(self):
+        assert localize.gaussian_filter_radius(0) == 0
+        assert localize.gaussian_filter_radius(None) == 0
+
+    def test_identification_roi_pad(self):
+        # int(box / 2) + 1, the reach of identify_in_frame
+        assert localize.identification_roi_pad(BOX) == 4
+        assert localize.identification_roi_pad(BOX, 0) == 4
+        # ... plus the kernel radius, int(4 * sigma + 0.5)
+        assert localize.identification_roi_pad(BOX, 1.0) == 8
+        assert localize.identification_roi_pad(BOX, 1.5) == 10
+
+    def test_roi_border_is_unaffected_by_the_temporal_median_zero_fill(self):
+        """A ``TemporalMedianMovie`` zeroes everything outside its padded
+        bounding box. Unless that padding accounts for the Gaussian's
+        kernel radius, those zeros are smeared into the pixels the
+        gradients of a spot on the ROI border are computed from.
+        """
+        n_frames, size, sigma = 12, 64, 1.5
+        yy, xx = np.mgrid[0:size, 0:size]
+        rng = np.random.default_rng(5)
+        movie = rng.integers(90, 110, size=(n_frames, size, size)).astype(
+            np.uint16
+        )
+        # a blinking spot sitting exactly on the ROI's right border
+        roi = ((20, 20), (32, 32))
+        for frame_number in (2, 3, 8):
+            movie[frame_number] += (
+                4000
+                * np.exp(-((yy - 26) ** 2 + (xx - 31) ** 2) / (2 * 1.2**2))
+            ).astype(np.uint16)
+
+        def gradients(**kwargs):
+            ids = localize.identify(
+                movie,
+                200,
+                BOX,
+                threaded=False,
+                temporal_median_window=5,
+                gaussian_filter_sigma=sigma,
+                return_info=False,
+                **kwargs,
+            )
+            return ids[ids["x"].between(29, 32)]["net_gradient"].to_numpy()
+
+        whole_frame = gradients()
+        with_roi = gradients(roi=[roi])
+        assert len(with_roi) and len(with_roi) == len(whole_frame)
+        np.testing.assert_allclose(with_roi, whole_frame, rtol=1e-4)
+
+        # ... and the test really does detect the bug it guards: with the
+        # pad the identification alone would need, the border gradients
+        # come out different
+        too_small = localize.GaussianFilteredMovie(
+            localize.TemporalMedianMovie(
+                movie, 5, roi=[roi], roi_pad=int(BOX / 2) + 1
+            ),
+            sigma,
+        )
+        ids = localize.identify(
+            too_small, 200, BOX, roi=[roi], threaded=False, return_info=False
+        )
+        starved = ids[ids["x"].between(29, 32)]["net_gradient"].to_numpy()
+        assert not np.allclose(starved, whole_frame, rtol=1e-4)
+
+    # -- what the feature is for -------------------------------------------
+
+    def test_double_peaked_spot_collapses_to_one_identification(self):
+        """The motivating case: a spot that is not Gaussian-shaped breaks
+        into two local maxima and is identified twice; smoothing merges
+        them into a single identification at the true center."""
+        movie = _double_lobed_movie()
+        center = movie.shape[-1] // 2
+
+        raw_ids = localize.identify(
+            movie, 500, BOX, threaded=False, return_info=False
+        )
+        assert len(raw_ids) == 2 * len(movie)
+
+        # a lower threshold, since smoothing lowers gradient magnitudes -
+        # that re-tuning is exactly what the tooltip and docs warn about
+        smoothed_ids = localize.identify(
+            movie,
+            50,
+            BOX,
+            threaded=False,
+            gaussian_filter_sigma=2.0,
+            return_info=False,
+        )
+        assert len(smoothed_ids) == len(movie)
+        assert (smoothed_ids["x"] - center).abs().max() <= 1
+        assert (smoothed_ids["y"] - center).abs().max() <= 1
+
+
+class TestGaussianFilterGui:
+    """Wiring of the Gaussian filter into Picasso: Localize.
+
+    As for the temporal median filter, the risk is stale state: every
+    place that records or compares identification settings has to know
+    about the sigma, or identifications are silently reused after it
+    changes.
+    """
+
+    _dialog = staticmethod(TestTemporalMedianGui._dialog)
+
+    def test_parameters_reports_the_sigma(self):
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        window.parameters_dialog = self._dialog()
+        try:
+            assert window.parameters["Gaussian Filter Sigma"] == 0.0
+            window.parameters_dialog.gaussian_filter_spinbox.setValue(1.5)
+            assert window.parameters["Gaussian Filter Sigma"] == 1.5
+        finally:
+            window.parameters_dialog.close()
+
+    def test_changing_the_sigma_invalidates_identifications(self):
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        window.parameters_dialog = self._dialog()
+        try:
+            window.view = type("_View", (), {"rois": []})()
+            window.frame_range = None
+            window.last_identification_info = {
+                **window.parameters,
+                "ROI": [],
+                "Frame bounds": None,
+            }
+            assert not window.identifications_outdated()
+            window.parameters_dialog.gaussian_filter_spinbox.setValue(1.5)
+            assert window.identifications_outdated()
+        finally:
+            window.parameters_dialog.close()
+
+    def test_identification_movie_composes_and_caches(self):
+        rng = np.random.default_rng(0)
+        movie = rng.integers(0, 4000, size=(20, 8, 8), dtype=np.uint16)
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        window.parameters_dialog = self._dialog()
+        dialog = window.parameters_dialog
+        try:
+            window.view = type("_View", (), {"rois": []})()
+            window.movie = movie
+            window._temporal_movie = None
+            window._gaussian_movie = None
+
+            # disabled: the raw movie is handed out untouched
+            assert window.identification_movie() is movie
+
+            dialog.gaussian_filter_spinbox.setValue(1.0)
+            smoothed = window.identification_movie()
+            assert isinstance(smoothed, localize.GaussianFilteredMovie)
+            assert smoothed.raw is movie
+            # cached, so scrubbing frames does not rebuild it
+            assert window.identification_movie() is smoothed
+
+            # both filters compose, median first
+            dialog.temporal_median_checkbox.setChecked(True)
+            dialog.temporal_median_spinbox.setValue(5)
+            composed = window.identification_movie()
+            assert isinstance(composed, localize.GaussianFilteredMovie)
+            assert isinstance(composed.raw, localize.TemporalMedianMovie)
+            assert composed.raw.raw is movie
+            assert window.identification_movie() is composed
+
+            # changing sigma rebuilds only the smoothing stage
+            median_stage = composed.raw
+            dialog.gaussian_filter_spinbox.setValue(2.0)
+            resmoothed = window.identification_movie()
+            assert resmoothed is not composed
+            assert resmoothed.raw is median_stage
+
+            # changing the window rebuilds both, via the identity chain
+            dialog.temporal_median_spinbox.setValue(7)
+            rebuilt = window.identification_movie()
+            assert rebuilt is not resmoothed
+            assert rebuilt.raw is not median_stage
+
+            # sigma back to 0 drops the smoothing stage entirely
+            dialog.gaussian_filter_spinbox.setValue(0.0)
+            median_only = window.identification_movie()
+            assert isinstance(median_only, localize.TemporalMedianMovie)
+            assert window._gaussian_movie is None
+
+            # ... and so does unloading the movie
+            window.movie = None
+            assert window.identification_movie() is None
+            assert window._temporal_movie is None
+        finally:
+            dialog.close()
+
+    def test_roi_pad_grows_with_the_sigma(self):
+        """The preview must pad the temporal median's bounding box exactly
+        as ``localize.identify`` does, or the two disagree on ROI borders.
+        """
+        rng = np.random.default_rng(1)
+        movie = rng.integers(0, 4000, size=(20, 40, 40), dtype=np.uint16)
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        window.parameters_dialog = self._dialog()
+        dialog = window.parameters_dialog
+        try:
+            rois = [((0, 0), (8, 8))]
+            window.view = type("_View", (), {"rois": rois})()
+            window.movie = movie
+            window._temporal_movie = None
+            window._gaussian_movie = None
+            dialog.temporal_median_checkbox.setChecked(True)
+            dialog.temporal_median_spinbox.setValue(5)
+            for sigma in (0.0, 1.5):
+                dialog.gaussian_filter_spinbox.setValue(sigma)
+                filtered = window.identification_movie()
+                median = (
+                    filtered.raw
+                    if isinstance(filtered, localize.GaussianFilteredMovie)
+                    else filtered
+                )
+                assert median.roi_pad == localize.identification_roi_pad(
+                    dialog.box_spinbox.value(), sigma
+                )
+
+            # without a ROI the pad is irrelevant, so changing sigma must
+            # not throw away the (expensive) cached medians
+            window.view.rois = []
+            window._temporal_movie = None
+            window._gaussian_movie = None
+            dialog.gaussian_filter_spinbox.setValue(1.0)
+            median_stage = window.identification_movie().raw
+            dialog.gaussian_filter_spinbox.setValue(2.0)
+            assert window.identification_movie().raw is median_stage
+        finally:
+            dialog.close()
+
+    def test_bead_calibration_runs_keep_the_filter(self, movie):
+        """Deliberately unlike the temporal median: smoothing does not
+        erase static beads, and defocused beads are exactly the
+        multi-peaked PSFs the filter helps with."""
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        window.parameters_dialog = self._dialog()
+        try:
+            window.parameters_dialog.gaussian_filter_spinbox.setValue(1.5)
+            window.movie = movie
+            window.view = type("_View", (), {"rois": []})()
+            window.frame_range = None
+
+            def sigma(calibrate_z, calibrate_spline):
+                worker = localize_gui.IdentificationWorker(
+                    window,
+                    fit_afterwards=False,
+                    calibrate_z=calibrate_z,
+                    calibrate_spline=calibrate_spline,
+                )
+                return worker.parameters["Gaussian Filter Sigma"]
+
+            assert sigma(False, False) == 1.5
+            assert sigma(True, False) == 1.5
+            assert sigma(False, True) == 1.5
+        finally:
+            window.parameters_dialog.close()
+
+    def test_contrast_follows_the_filter(self, movie):
+        """Smoothing lowers the peaks, so a contrast set for the raw
+        camera counts must not survive a change of sigma."""
+        window = localize_gui.Window()
+        try:
+            window.movie = movie
+            window.curr_frame_number = 40
+            dialog = window.parameters_dialog
+            contrast = window.contrast_dialog
+            # start from a known state: the dialog restores the last-used
+            # setting from the user's settings file
+            dialog.temporal_median_checkbox.setChecked(False)
+            dialog.gaussian_filter_spinbox.setValue(0.0)
+            contrast.auto_checkbox.setChecked(False)
+            contrast.change_contrast_silently(210, 300)
+
+            def displayed_range():
+                frame = window.identification_movie()[40]
+                return float(frame.min()), float(frame.max())
+
+            def contrast_range():
+                return (
+                    contrast.black_spinbox.value(),
+                    contrast.white_spinbox.value(),
+                )
+
+            for sigma in (2.0, 0.0, 1.0):
+                dialog.gaussian_filter_spinbox.setValue(sigma)
+                # the spin boxes carry no decimals, so the smoothed
+                # frame's float range lands on them rounded
+                assert contrast_range() == pytest.approx(
+                    displayed_range(), abs=1
+                )
+        finally:
+            window.close()
+
+    def test_channel_params_round_trip(self):
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        dialog = self._dialog()
+        window.parameters_dialog = dialog
+        try:
+            dialog.gaussian_filter_spinbox.setValue(2.5)
+            params = window._capture_params()
+            dialog.gaussian_filter_spinbox.setValue(0.0)
+            window._apply_params(params)
+            assert dialog.gaussian_filter_spinbox.value() == 2.5
+            # a parameter set from before this feature existed still loads
+            legacy = {
+                key: value
+                for key, value in params.items()
+                if key != "gaussian_filter_sigma"
+            }
+            window._apply_params(legacy)
+            assert dialog.gaussian_filter_spinbox.value() == (
+                localize_gui.DEFAULT_PARAMETERS["Gaussian Filter Sigma"]
+            )
+        finally:
+            dialog.close()
+
+    def test_identifications_metadata_round_trip(self, movie, tmp_path):
+        """Saving and reloading identifications must restore the sigma,
+        otherwise the loaded ones immediately count as outdated."""
+        # a real window: load_identifications redraws the frame
+        window = localize_gui.Window()
+        dialog = window.parameters_dialog
+        try:
+            window.movie = movie
+            window.curr_frame_number = 0
+            window.info = []
+            dialog.temporal_median_checkbox.setChecked(False)
+            dialog.gaussian_filter_spinbox.setValue(1.5)
+            window.identifications = localize.identify(
+                movie,
+                MIN_NG,
+                BOX,
+                threaded=False,
+                gaussian_filter_sigma=1.5,
+                return_info=False,
+            )
+            path = str(tmp_path / "ids.hdf5")
+            window.save_identifications(path)
+
+            dialog.gaussian_filter_spinbox.setValue(0.0)
+            window.load_identifications(path)
+            assert dialog.gaussian_filter_spinbox.value() == 1.5
+            assert not window.identifications_outdated()
+        finally:
+            window.close()
 
 
 # ---------------------------------------------------------------------------

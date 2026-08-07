@@ -28,6 +28,7 @@ The reconstruction parameters can be specified by adding respective arguments. I
    '-a', '--fit-method', choices=["mle", "mle-spherical", "mle-spherical-gpu", "mle-rotated-gpu", "lq", "lq-spherical", "lq-spherical-gpu", "lq-rotated", "lq-rotated-gpu", "lq-gpu", "lq-3d", "lq-gpu-3d", "mle-3d", "spline", "spline-mle", "spline-gpu", "spline-mle-gpu", "avg"], default='mle', help='fitting method'
    '-g', '--gradient', type=int, default=5000, help='minimum net gradient'
    '-tm', '--temporal-median', type=int, default=0, help='window length (frames) of the temporal median filter applied before identification, 0 to deactivate'
+   '-gf', '--gaussian-filter', type=float, default=0.0, help='sigma (camera pixels) of the spatial Gaussian filter applied before identification, 0 to deactivate'
    '-d', '--drift', type=int, default=1000, help='segmentation size for subsequent RCC, 0 to deactivate'
    '-r', '--roi', type=int, nargs=4, default=None, help='ROI (y_min, x_min, y_max, x_max) in camera pixels'
    '-fb', '--frame-bounds', type=int, nargs=2, default=None, help='frame bounds (start_frame, end_frame), 0-indexed'
@@ -41,13 +42,15 @@ The reconstruction parameters can be specified by adding respective arguments. I
    '-sf', '--suffix', type=str, default='', help='suffix to add to output files'
    '-db', '--database', action='store_true', help='add the run to the local database'
 
-Note 1: Localize will automatically try to perform an RCC drift correction on the dataset. As this will not always work with the default settings after an unsuccessful attempt, the program will continue with the next file. If the drift correction succeeds, another hdf5 file with the drift corrected locs will be created.
+Localize will automatically try to perform an RCC drift correction on the dataset. As this will not always work with the default settings after an unsuccessful attempt, the program will continue with the next file. If the drift correction succeeds, another hdf5 file with the drift corrected locs will be created.
 
-Note 2: Make sure to set the camera settings correctly; otherwise photon counts are wrong plus the MLE might have problems.
+Make sure to set the camera settings correctly; otherwise photon counts are wrong plus the MLE might have problems.
 
-Note 3: ``--temporal-median`` subtracts a rolling per-pixel median background before spots are identified, which suppresses uneven background and static structures. It affects identification only. See Martens KJA, Turkowyd B, Endesfelder U, `Raw data to results: a hands-on introduction and overview of computational analysis for single-molecule localization microscopy <https://doi.org/10.3389/fbinf.2021.817254>`_, *Frontiers in Bioinformatics* 1, 817254 (2022).
+``--temporal-median`` subtracts a rolling per-pixel median background before spots are identified, which suppresses uneven background and static structures. It affects identification only. See Martens KJA, Turkowyd B, Endesfelder U, `Raw data to results: a hands-on introduction and overview of computational analysis for single-molecule localization microscopy <https://doi.org/10.3389/fbinf.2021.817254>`_, *Frontiers in Bioinformatics* 1, 817254 (2022).
 
-Note 4: If you select one of the 3D algorithms (``lq-3d``, ``lq-gpu-3d`` or ``mle-3d``) you must supply both the magnification factor (``-mf``) and the path to the 3D calibration file (``-zc``). If either is omitted, the program will prompt you for it interactively.
+``--gaussian-filter`` smooths each frame with a Gaussian of the given standard deviation before spots are identified. Spot identification looks for a single local maximum per spot, so a PSF that is not Gaussian-shaped may break into several maxima and is detected several times; smoothing merges them into one. It affects identification only — fitting always uses the raw movie — and since smoothing lowers gradient magnitudes, ``-g`` needs re-tuning when it is changed. It can be combined with ``--temporal-median``, which is applied first.
+
+If you select one of the 3D algorithms (``lq-3d``, ``lq-gpu-3d`` or ``mle-3d``) you must supply both the magnification factor (``-mf``) and the path to the 3D calibration file (``-zc``). If either is omitted, the program will prompt you for it interactively.
 
 Example
 ^^^^^^^

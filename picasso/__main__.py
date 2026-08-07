@@ -1153,6 +1153,7 @@ def _localize_process_file(
         spline_calibration=spline_calibration,
         camera_calibration=camera_calibration,
         threaded=True,
+        gaussian_filter_sigma=args.gaussian_filter,
         identification_progress_callback="console",
         fit_progress_callback="console",
         return_info=True,
@@ -2926,6 +2927,20 @@ def main():  # noqa: C901
             " and static structures. 0 (the default) disables it. Fitting"
             " always uses the raw movie, so the minimum net gradient needs"
             " re-tuning when this is switched on"
+        ),
+    )
+    localize_parser.add_argument(
+        "-gf",
+        "--gaussian-filter",
+        type=float,
+        default=0.0,
+        help=(
+            "standard deviation (in camera pixels) of a spatial Gaussian"
+            " filter applied before spot identification; it merges the"
+            " several local maxima of a non-Gaussian spot into one, so the"
+            " spot is easier to identify. 0 (the default) disables it. "
+            "Fitting always uses the raw movie, so the minimum net gradient "
+            "needs re-tuning when this is changed"
         ),
     )
     localize_parser.add_argument(
