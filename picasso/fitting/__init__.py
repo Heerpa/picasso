@@ -23,8 +23,14 @@ module               contents
                      host-side launch bookkeeping.
 :mod:`splinefit_cuda`  GPU cubic-spline PSF fitting; interchangeable with
                      ``splinefit``.
+:mod:`gaussfit`      CPU 2D Gaussian PSF fitting (spherical, elliptical and
+                     rotated), over the same LM driver.
 :mod:`gaussfit_cuda`   GPU 2D Gaussian PSF fitting (spherical, elliptical and
                      rotated).
+:mod:`precision`     Uncertainties of the fitted parameters: the closed-form
+                     precisions and the numerically inverted Fisher matrices
+                     (Cramer-Rao bounds), on the CPU and on CUDA GPUs. Not
+                     part of the Gpufit port.
 ===================  =========================================================
 
 References

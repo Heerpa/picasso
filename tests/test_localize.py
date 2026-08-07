@@ -25,7 +25,7 @@ from scipy.interpolate import CubicSpline
 from PyQt6 import QtWidgets
 
 from picasso import gaussmle, gausslq, io, lib, localize, spline
-from picasso.fitting import gaussfit_cuda, splinefit
+from picasso.fitting import gaussfit_cuda, precision, splinefit
 from picasso.gui import localize as localize_gui
 
 from tests.conftest import BOX, CALIB_3D, CAMERA_INFO, MIN_NG, PIXELSIZE
@@ -2244,7 +2244,7 @@ def _ref_crlb(splines, box, amp, xs, ys, ze, off):
     cols += [phi, np.ones_like(phi)]
     deriv = np.stack([c.reshape(-1) for c in cols], axis=1)
     mu = (off + amp * phi).reshape(-1)
-    weight = 1.0 / np.maximum(mu, localize._SPLINE_CRLB_MU_FLOOR)
+    weight = 1.0 / np.maximum(mu, precision._SPLINE_CRLB_MU_FLOOR)
     return np.diag(np.linalg.pinv((deriv * weight[:, None]).T @ deriv))
 
 
@@ -2262,7 +2262,7 @@ def _ref_crlb_lsq(splines, box, amp, xs, ys, ze, off):
     cols += [phi, np.ones_like(phi)]
     deriv = np.stack([c.reshape(-1) for c in cols], axis=1)
     mu = np.maximum(
-        (off + amp * phi).reshape(-1), localize._SPLINE_CRLB_MU_FLOOR
+        (off + amp * phi).reshape(-1), precision._SPLINE_CRLB_MU_FLOOR
     )
     j = deriv.T @ deriv  # Σ g gᵀ (Gauss-Newton normal matrix)
     m = (deriv * mu[:, None]).T @ deriv  # Σ μ g gᵀ (sandwich meat)
@@ -4368,6 +4368,47 @@ class TestFit2DGpu:
         )
 
 
+class TestCRLBReExports:
+    """The Cramer-Rao machinery lives in ``picasso.fitting.precision`` and is
+    re-exported by ``picasso.localize`` under its old names.
+
+    Both this module and the production call sites in ``localize`` reach it
+    through the latter, so a re-export silently dropped from that import block
+    would be an ``AttributeError`` far from its cause - or worse, a name that
+    still resolves to a stale copy."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "_LINK_XYZ_MAX_CHANNELS",
+            "_LINK_XYZ_MODEL",
+            "_crlb_variance_channel_major",
+            "_gauss_crlb",
+            "_spline_channel_affines",
+            "_spline_channel_major",
+            "_spline_coeff_reshaped",
+            "_spline_crlb",
+            "_spline_crlb_residuals",
+            "_spline_link_xyz_crlb",
+            "_spline_n_channels",
+        ],
+    )
+    def test_localize_re_exports_the_same_object(self, name):
+        assert getattr(localize, name) is getattr(precision, name)
+
+    def test_the_two_cuda_flags_are_independent(self):
+        """``localize`` gates the fitting backends, ``precision`` the CRLB
+        kernels. They agree on any real machine, but they are separate module
+        globals - patching one must not move the other, which is what the
+        device-pinning helpers in this file rely on."""
+        assert localize.CUDA_AVAILABLE == precision.CUDA_AVAILABLE
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(
+                precision, "CUDA_AVAILABLE", not precision.CUDA_AVAILABLE
+            )
+            assert localize.CUDA_AVAILABLE != precision.CUDA_AVAILABLE
+
+
 class TestSplineCRLBReal:
     """The CRLB path on a real (non-separable) calibration (CPU, no GPU
     fit)."""
@@ -4387,7 +4428,7 @@ class TestSplineCRLBReal:
         assert np.all(np.isfinite(crlb)) and np.all(crlb > 0)
 
     @pytest.mark.skipif(
-        not localize.CUDA_AVAILABLE,
+        not precision.CUDA_AVAILABLE,
         reason="requires a CUDA-capable GPU (numba-cuda)",
     )
     def test_gpu_matches_cpu_on_real_coefficients(self):
@@ -4563,9 +4604,11 @@ def _crlb(theta, calibration, box, *, gpu, **kwargs):
 
     Production dispatch is automatic (GPU when present, CPU otherwise), so
     hiding the GPU is the only way to exercise the CPU path deliberately - and
-    the only way to compare the two against each other."""
+    the only way to compare the two against each other. The flag that decides
+    lives with the kernels in ``picasso.fitting.precision``, not in
+    ``localize``, whose own ``CUDA_AVAILABLE`` gates the *fitting* backends."""
     with pytest.MonkeyPatch.context() as m:
-        m.setattr(localize, "CUDA_AVAILABLE", gpu)
+        m.setattr(precision, "CUDA_AVAILABLE", gpu)
         return localize._spline_crlb(theta, calibration, box, **kwargs)
 
 
@@ -4773,7 +4816,7 @@ class TestSplineCRLBEMCCD:
 
 
 requires_crlb_gpu = pytest.mark.skipif(
-    not localize.CUDA_AVAILABLE,
+    not precision.CUDA_AVAILABLE,
     reason="requires a CUDA-capable GPU (numba-cuda)",
 )
 
@@ -4797,7 +4840,7 @@ class TestSplineCRLBGPU:
     def test_no_cuda_uses_the_cpu_silently(self, monkeypatch):
         """Without a CUDA device the CPU kernels are used, with no warning and
         no way (or need) for the caller to ask for anything else."""
-        monkeypatch.setattr(localize, "CUDA_AVAILABLE", False)
+        monkeypatch.setattr(precision, "CUDA_AVAILABLE", False)
         calib, _ = _gauss_spline_calibration(model="spline-2d")
         theta = np.array([[3000.0, 0.1, -0.1, 15.0]])
         with warnings.catch_warnings():
@@ -4812,13 +4855,22 @@ class TestSplineCRLBGPU:
         """Rows the device reports as unsolvable must come back with the CPU's
         pinv numbers, not whatever the kernel left behind. Driven through a stub
         device driver so it runs without a GPU - this fallback is the only
-        structural difference between the two paths, so it needs a test."""
-        monkeypatch.setattr(localize, "CUDA_AVAILABLE", True)
+        structural difference between the two paths, so it needs a test.
+
+        The stub takes the real driver's signature rather than swallowing the
+        extras with ``**kwargs``: a mismatch would raise, and the host catches
+        every exception from the device and quietly recomputes *everything* on
+        the CPU - which is also what this test asserts, so it would keep passing
+        while exercising the error path instead of the ``failed`` mask. The
+        ``simplefilter("error")`` below is what pins the difference: only the
+        exception path warns."""
+        monkeypatch.setattr(precision, "CUDA_AVAILABLE", True)
         calib, _ = _gauss_spline_calibration(model=model)
         rng = np.random.default_rng(5)
         n_params = 4 if model == "spline-2d" else 5
         theta = _shared_theta(9, rng, n_params=n_params)
         expected = _crlb(theta, calib, BOX, gpu=False)
+        called = []
 
         def stub(
             coeff,
@@ -4834,8 +4886,10 @@ class TestSplineCRLBGPU:
             mu_floor,
             mle,
             progress_callback=None,
+            variance=None,
         ):
-            out = localize._spline_crlb_cpu(
+            called.append(True)
+            out = precision._spline_crlb_cpu(
                 np.asarray(coeff, dtype=np.float64),
                 aff,
                 res,
@@ -4847,29 +4901,32 @@ class TestSplineCRLBGPU:
                 off,
                 finite,
                 mle,
+                variance=variance,
             )
             failed = np.zeros(len(amp), dtype=bool)
             failed[::2] = True
             out[failed] = 12345.0  # device garbage the host must discard
             return out, failed
 
-        monkeypatch.setattr(localize, "_spline_crlb_cuda", stub)
-        np.testing.assert_allclose(
-            _crlb(theta, calib, BOX, gpu=True), expected
-        )
+        monkeypatch.setattr(precision, "_spline_crlb_cuda", stub)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            got = _crlb(theta, calib, BOX, gpu=True)
+        assert called, "the device driver was never reached"
+        np.testing.assert_allclose(got, expected)
 
     def test_device_error_falls_back_and_warns_once(self, monkeypatch):
         """A device that is present but fails still returns the right numbers,
         but must not do it silently - a permanently broken GPU path would
         otherwise never be noticed. (Having no device at all is not an error
         and stays quiet; see test_no_cuda_uses_the_cpu_silently.)"""
-        monkeypatch.setattr(localize, "CUDA_AVAILABLE", True)
-        monkeypatch.setattr(localize, "_crlb_gpu_fallback_warned", False)
+        monkeypatch.setattr(precision, "CUDA_AVAILABLE", True)
+        monkeypatch.setattr(precision, "_crlb_gpu_fallback_warned", False)
 
         def boom(*args, **kwargs):
             raise RuntimeError("device on fire")
 
-        monkeypatch.setattr(localize, "_spline_crlb_cuda", boom)
+        monkeypatch.setattr(precision, "_spline_crlb_cuda", boom)
         calib, _ = _gauss_spline_calibration(model="spline-2d")
         theta = np.array([[3000.0, 0.1, -0.1, 15.0]])
         expected = _crlb(theta, calib, BOX, gpu=False)
@@ -5080,11 +5137,11 @@ class TestSplineCRLBGPU:
             # a device failure would fall back to the CPU and turn every
             # comparison below into CPU-vs-CPU, i.e. vacuously true
             "import warnings; warnings.simplefilter('error', RuntimeWarning)\n"
-            "from picasso import localize\n"
+            "from picasso.fitting import precision\n"
             "from tests.test_localize import ("
             "_gauss_spline_calibration, _shared_theta, _crlb, BOX,"
             " _link_xyz_calib_and_theta, _with_channel_geometry)\n"
-            "assert localize.CUDA_AVAILABLE, 'simulator off'\n"
+            "assert precision.CUDA_AVAILABLE, 'simulator off'\n"
             "rng = np.random.default_rng(0)\n"
             "for model in ('spline-2d', 'spline-3d'):\n"
             "    calib, _ = _gauss_spline_calibration(model=model)\n"
