@@ -404,6 +404,174 @@ class TestInputValidation:
         assert len(chi) == len(states) == len(iters) == 0
 
 
+def _poisson_spots(box, n=60, seed=3):
+    """``noisy_batch``, but at an arbitrary box size.
+
+    The widths stay in the 1.0-1.6 range whatever the box is - a real PSF is
+    set by the optics, not by how much padding the box has around it. That
+    divergence between the true width and a box-proportional seed is the whole
+    point of ``TestWideSigmaSeedDoesNotAbortTheFit``.
+    """
+    rng = np.random.default_rng(seed)
+    centre = (box - 1) / 2.0
+    yy, xx = np.mgrid[0:box, 0:box].astype(np.float64)
+    spots = np.empty((n, box, box), np.float32)
+    for k in range(n):
+        cx = centre + rng.uniform(-0.6, 0.6)
+        cy = centre + rng.uniform(-0.6, 0.6)
+        sx, sy = rng.uniform(1.0, 1.6), rng.uniform(1.0, 1.6)
+        amp, bg = rng.uniform(300, 1500), rng.uniform(5, 30)
+        mu = (
+            amp
+            * np.exp(-0.5 * (((xx - cx) / sx) ** 2 + ((yy - cy) / sy) ** 2))
+            + bg
+        )
+        spots[k] = rng.poisson(mu)
+    return spots
+
+
+class TestWideSigmaSeedDoesNotAbortTheFit:
+    """A too-wide width seed must not end the fit with ``NEG_CURVATURE_MLE``.
+
+    The regression: the driver used to treat a *trial* step whose model went
+    non-positive as terminal, as Gpufit's ``LMFitCPP::calc_chi_square`` does.
+    Seeded several times wider than the true PSF, the first (undamped) step
+    overshoots and drives the background below zero - so the fit aborted on
+    iteration 1, rolled the parameters back and wrote *the seed* out as the
+    result: sigma pinned to the seed width, x and y at the exact box centre.
+
+    Every other test in this module runs at ``BOX = 7``, where the seed lands
+    within 0.4 px of the truth and the first step never overshoots, so none of
+    them could see it. These parametrize the box - the axis the bug lives on -
+    and drive the width seed directly.
+    """
+
+    BOXES = [7, 13, 23, 31]
+
+    @pytest.mark.parametrize("width_seed", [2.0, 3.0, 4.0, 5.0])
+    def test_a_wide_seed_is_damped_back_not_abandoned(self, width_seed):
+        """The bug in isolation: one knob, the seeded sigma.
+
+        The spots and every other seed parameter are held fixed, so a failure
+        here can only be the width. The true widths are ~1.0-1.6 px, so even
+        the mildest case here starts well over the truth - enough for the
+        first, undamped step to overshoot the background below zero.
+        """
+        spots = _poisson_spots(31, n=40)
+        seed = localize._initial_parameters_gauss(spots, 31).astype(np.float64)
+        seed[:, 3] = seed[:, 4] = width_seed
+        fitted, _, states, iterations = gaussfit.fit_spots(
+            gaussfit.ELLIPTIC,
+            spots,
+            seed,
+            mle=True,
+            max_iterations=200,
+            tolerance=1e-8,
+        )
+        aborted = states == splinefit.FIT_STATE_NEG_CURVATURE_MLE
+        assert not aborted.any(), (
+            f"{aborted.sum()}/{len(spots)} fits abandoned at a {width_seed} px "
+            "width seed"
+        )
+        # Recovered, not merely alive: the fit walked back to the true width.
+        assert np.median(fitted[:, 3]) < 2.0
+        assert (iterations > 1).all()
+
+    def test_an_extreme_seed_costs_iterations_but_still_arrives(self):
+        """Where the recovery stops being free.
+
+        At 8 px in a 31 px box the model is nearly flat, so amplitude and
+        background are strongly correlated and the damped walk back is slow -
+        a median of a few hundred iterations rather than the usual ten. It
+        still *arrives*, which is the point: the old driver called this
+        situation fatal on iteration 1 and returned the seed. This is also why
+        the width seed itself is worth getting right
+        (``localize._initial_widths_gauss``) - correctness here is bought with
+        an iteration budget no production run would grant.
+        """
+        spots = _poisson_spots(31, n=40)
+        seed = localize._initial_parameters_gauss(spots, 31).astype(np.float64)
+        seed[:, 3] = seed[:, 4] = 8.0
+        fitted, _, states, _ = gaussfit.fit_spots(
+            gaussfit.ELLIPTIC,
+            spots,
+            seed,
+            mle=True,
+            max_iterations=3000,
+            tolerance=1e-8,
+        )
+        converged = states == splinefit.FIT_STATE_CONVERGED
+        assert converged.sum() >= 0.9 * len(spots)
+        assert np.median(fitted[converged, 3]) < 2.0
+
+    @pytest.mark.parametrize("box", BOXES)
+    @pytest.mark.parametrize("model", MODELS)
+    def test_the_production_seed_survives_every_box_size(self, box, model):
+        """``size / 5`` is the seed the GUI actually uses, and on a wide box
+        it is exactly the too-wide seed above."""
+        spots = _poisson_spots(box)
+        kwargs = {
+            gaussfit.SPHERICAL: dict(spherical=True),
+            gaussfit.ELLIPTIC: {},
+            gaussfit.ROTATED: dict(rotated=True),
+        }[model]
+        seed = localize._initial_parameters_gauss(spots, box, **kwargs).astype(
+            np.float64
+        )
+        _, _, states, _ = gaussfit.fit_spots(
+            model, spots, seed, mle=True, max_iterations=200, tolerance=1e-8
+        )
+        aborted = (states == splinefit.FIT_STATE_NEG_CURVATURE_MLE).sum()
+        assert aborted == 0, f"{aborted}/{len(spots)} fits abandoned"
+
+    @pytest.mark.parametrize("box", BOXES)
+    def test_the_seed_is_never_echoed_as_the_result(self, box):
+        """The downstream signature, asserted directly.
+
+        A fit that aborts on its first step returns its own starting point.
+        That is worse than inaccurate, it is silent: the localizations look
+        plausible until you notice every width is identical and every
+        coordinate is a whole pixel.
+        """
+        spots = _poisson_spots(box)
+        seed = localize._initial_parameters_gauss(spots, box).astype(
+            np.float64
+        )
+        fitted, _, _, iterations = gaussfit.fit_spots(
+            gaussfit.ELLIPTIC,
+            spots,
+            seed,
+            mle=True,
+            max_iterations=200,
+            tolerance=1e-8,
+        )
+        untouched = np.all(np.isclose(fitted, seed), axis=1)
+        assert not untouched.any()
+        assert (iterations > 1).all()
+        assert not np.allclose(fitted[:, 1], (box - 1) / 2.0)
+        assert np.abs(fitted[:, 1] - np.round(fitted[:, 1])).max() > 0.05
+
+    def test_the_retry_still_costs_an_iteration(self):
+        """The retry must stay bounded by ``max_iterations``.
+
+        Turning the abort into a retry would spin forever on a fit that can
+        never take a valid step, if a rejected attempt were free.
+        """
+        spots = _poisson_spots(23, n=20)
+        seed = localize._initial_parameters_gauss(spots, 23).astype(np.float64)
+        seed[:, 3] = seed[:, 4] = 8.0
+        for budget in (1, 2, 5):
+            _, _, _, iterations = gaussfit.fit_spots(
+                gaussfit.ELLIPTIC,
+                spots,
+                seed,
+                mle=True,
+                max_iterations=budget,
+                tolerance=1e-12,
+            )
+            assert iterations.max() <= budget
+
+
 class TestNonPositiveModelIsAbandoned:
     """A Gaussian cannot ring negative: the model only goes non-positive when
     the *background* does. Flooring such a pixel (as the spline models do)

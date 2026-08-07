@@ -25,7 +25,7 @@ import yaml
 # Headless plotting for calibrate_z which calls plt.show()
 matplotlib.use("Agg")
 
-from picasso import lib, zfit  # noqa: E402
+from picasso import io, lib, zfit  # noqa: E402
 
 from tests.conftest import CALIB_3D  # noqa: E402
 
@@ -653,6 +653,30 @@ class TestCalibrateZ:
         assert loaded["Y Coefficients"] == calib["Y Coefficients"]
         assert loaded["Number of frames"] == calib["Number of frames"]
         assert loaded["Step size in nm"] == calib["Step size in nm"]
+
+    def test_saves_calibration_via_io_module(
+        self, bead_stack, monkeypatch, tmp_path
+    ):
+        """Regression test: ``calibrate_z`` writes the calibration through
+        ``picasso.io.save_calibration``, which must be imported in
+        ``zfit`` (a missing ``from . import io`` used to raise NameError
+        as soon as a ``path`` was given)."""
+        monkeypatch.setattr("matplotlib.pyplot.show", lambda *a, **k: None)
+        assert zfit.io is io  # the module-level import is present
+
+        locs, info, d = bead_stack
+        out_path = tmp_path / "calib.yaml"
+        calib = zfit.calibrate_z(
+            locs, info, d, magnification_factor=0.79, path=str(out_path)
+        )
+        assert out_path.exists()
+        assert out_path.stat().st_size > 0
+        # the file is readable back through io and holds the full dict
+        loaded = io.load_calibration(str(out_path))
+        assert loaded  # non-empty calibration was written
+        assert loaded == calib
+        assert len(loaded["X Coefficients"]) == 7
+        assert len(loaded["Y Coefficients"]) == 7
 
 
 class TestCalibrateZFrameBounds:

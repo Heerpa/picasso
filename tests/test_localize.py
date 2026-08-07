@@ -1845,25 +1845,55 @@ class TestInitialParametersGpufit:
         assert init.shape == (2, 6)
         assert init.dtype == np.float32
         center = box / 2.0 - 0.5  # 3.0
-        width = max(box / 5.0, 1.0)  # 1.4
         # amplitude = max - min
         np.testing.assert_allclose(init[:, 0], [100.0, 50.0])
         # x, y seeded at the geometric box center
         np.testing.assert_allclose(init[:, 1], center)
         np.testing.assert_allclose(init[:, 2], center)
-        # both widths seeded equal
-        np.testing.assert_allclose(init[:, 3], width)
-        np.testing.assert_allclose(init[:, 4], width)
+        # Spot 0's bright pixel sits on the central row and column, so its
+        # second moment about them is zero and the width lands on the
+        # numerical floor. Spot 1's peak is at (2, 4), off both centre lines,
+        # so those profiles are empty (0/0) and it falls back to box / 5.
+        np.testing.assert_allclose(init[:, 3], [0.5, 1.4])
+        np.testing.assert_allclose(init[:, 4], [0.5, 1.4])
         # background = per-spot minimum
         np.testing.assert_allclose(init[:, 5], [3.0, 7.0])
 
     def test_width_floor_for_small_box(self):
-        # box / 5 < 1 -> the width floor of 1.0 kicks in.
+        # A flat spot carries no signal at all: the moment is 0/0, so the seed
+        # falls back to max(box / 5, 1.0) and is then capped by it.
         box = 4
         spots = np.ones((1, box, box), dtype=np.float32)
         init = localize._initial_parameters_gauss(spots, box)
         np.testing.assert_allclose(init[:, 3], 1.0)
         np.testing.assert_allclose(init[:, 4], 1.0)
+
+    def test_the_width_seed_tracks_the_spot_not_the_box(self):
+        """The moment seed is what keeps a wide box from starting the fit at a
+        blob several times too fat - see
+        ``test_gaussfit.TestWideSigmaSeedDoesNotAbortTheFit``."""
+        truth = 1.4
+        seeds = {}
+        for box in (13, 23, 31):
+            centre = (box - 1) / 2.0
+            yy, xx = np.mgrid[0:box, 0:box].astype(np.float64)
+            mu = (
+                500.0
+                * np.exp(
+                    -0.5
+                    * (((xx - centre) ** 2 + (yy - centre) ** 2) / truth**2)
+                )
+                + 10.0
+            )
+            init = localize._initial_parameters_gauss(
+                mu[None].astype(np.float32), box
+            )
+            seeds[box] = init[0, 3]
+            # Never wider than the old fixed seed, and close to the truth.
+            assert seeds[box] <= max(box / 5.0, 1.0)
+            assert abs(seeds[box] - truth) < 0.5
+        # The old seed tripled from box 13 to 31; this one barely moves.
+        assert abs(seeds[31] - seeds[13]) < 0.3
 
     def test_rotated_breaks_width_symmetry(self):
         # The rotated model gets a 7th (angle) parameter, and the two widths
@@ -1874,9 +1904,10 @@ class TestInitialParametersGpufit:
         spots[:, 3, 3] = 100.0
         init = localize._initial_parameters_gauss(spots, box, rotated=True)
         assert init.shape == (3, 7)
-        width = max(box / 5.0, 1.0)
-        np.testing.assert_allclose(init[:, 3], width * 1.1)
-        np.testing.assert_allclose(init[:, 4], width * 0.9)
+        # A single bright pixel gives a zero second moment, so the widths sit
+        # on the floor before the asymmetry nudge is applied.
+        np.testing.assert_allclose(init[:, 3], 0.5 * 1.1)
+        np.testing.assert_allclose(init[:, 4], 0.5 * 0.9)
         assert (init[:, 3] != init[:, 4]).all()
         np.testing.assert_allclose(init[:, 6], 0.0)
 
@@ -1894,11 +1925,11 @@ class TestInitialParametersGpufit:
         assert init.shape == (2, 5)
         assert init.dtype == np.float32
         center = box / 2.0 - 0.5
-        width = max(box / 5.0, 1.0)
         np.testing.assert_allclose(init[:, 0], [100.0, 50.0])  # amplitude
         np.testing.assert_allclose(init[:, 1], center)  # x
         np.testing.assert_allclose(init[:, 2], center)  # y
-        np.testing.assert_allclose(init[:, 3], width)  # single width
+        # As above: spot 0 on the centre lines, spot 1 off them.
+        np.testing.assert_allclose(init[:, 3], [0.5, 1.4])  # single width
         np.testing.assert_allclose(init[:, 4], [3.0, 7.0])  # background
 
 
