@@ -105,8 +105,9 @@ As a final check for overfitting (i.e., too many assigned molecules), G5M automa
 
 If the outcome of G5M seems unsatisfactory, please check the following:
 
-- Make sure that ``group`` column is present in the localization file and contains the correct information (i.e., from DBSCAN clustering, not from picking localizations);
+- Make sure that ``group`` column is present in the localization file and contains the correct information (i.e., from DBSCAN clustering, not from picking localizations). ``group_input`` can also be used;
 - Make sure that the loc. precision values (columns ``lpx``, ``lpy``, ``lpz``) are correct, comparing NeNA and median loc. precision is a reasonable proxy (without fiducial markers); the most common issue is a miscalibrated camera, leading to incorrect photon counts and thus incorrect loc. precisions;
+- Consider using a more accurate fitting model, such as spline fitting; we found that switching to it with optional increase in max. sigma can be very beneficial
 - Another reason why the loc. precision values can be off is due to the small box size in the localization step; especially in 3D astigmatic imaging, single-emitter images can be quite large, potentially exceeding the user-defined box size; in such cases, we recommend increasing the box size in the localization step and rerunning the analysis;
 - Inspect if the localizations were preprocessed as described above;
 - Rerun the analysis without postprocessing (filtering) and redo it manually, since some steps may be too stringent, such as ``p_val`` or ``n_events`` (latter especially for short acquisition times);
