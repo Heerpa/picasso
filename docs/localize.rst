@@ -25,8 +25,8 @@ Fitting can run on a CUDA-capable GPU (see `GPU fitting`_ below). The kernels ar
 - ``NDTiffStack`` with extension ``.tif``,
 - BigTIFF, with extensions ``.tif``, ``.btf``, ``.tf8`` or ``.tf2``,
 - Zeiss ``.lsm``,
-- Zeiss ``.czi`` (requires ``pip install picassosr[czi]``, Python ≥ 3.12),
-- Leica ``.lif`` (requires ``pip install picassosr[lif]``, Python ≥ 3.12),
+- Zeiss ``.czi`` (requires ``pip install picassosr[czi]``, Python ≥ 3.12; available in the one-click installer),
+- Leica ``.lif`` (requires ``pip install picassosr[lif]``, Python ≥ 3.12; available in the one-click installer),
 - ``.raw``,
 - ``.ims`` (supported only on Windows),
 - ``.nd2``,
@@ -128,7 +128,7 @@ Picasso implements the pixel-dependent noise model of Huang et al. (`Nat. Method
 Measuring the maps
 ~~~~~~~~~~~~~~~~~~
 
-Select ``Calibration`` > ``Characterize sCMOS camera (dark movie)``, or using command window/terminal run::
+Select ``Calibration`` > ``Characterize sCMOS camera (dark movie)``, which opens a dialog collecting the dark movie, any bright movies and the output file in one place, or using command window/terminal run::
 
     picasso camera-calibrate dark.raw -l light_01.raw -l light_02.raw ... -o mycam_scmos_calib.hdf5
 
@@ -139,6 +139,8 @@ Two acquisitions feed it:
 
 The maps are stored raw and camera-native — offset in ADU, variance in ADU², gain in ADU per photoelectron — in a single HDF5 file, so a calibration does not depend on any Picasso setting.
 
+Alongside the ``.hdf5`` Picasso writes a ``*_maps.png`` showing each map next to its histogram, as in Supplementary Fig. 1 of Huang et al., from both the GUI and the command line.
+
 Make sure the camera's offset is high enough that readout noise never drives a pixel below zero ADU. That is what the offset is engineered for, but with an unusually noisy pixel and a low offset the raw counts can clip or wrap, and the measured variance for that pixel then becomes meaningless.
 
 Using the maps
@@ -148,7 +150,7 @@ In the ``Photon conversion`` group of the ``Parameters`` dialog, load the file n
 
     picasso localize movie.raw -a mle -cm mycam_scmos_calib.hdf5
 
-While a calibration is loaded, the ``Baseline`` spinbox is disabled — the per-pixel offset map replaces it — and so is ``Sensitivity`` if the calibration carries a gain map. The path and a summary of the maps are recorded in the ``_locs.yaml`` metadata.
+While a calibration is loaded, the scalars it supersedes are set to the maps' own medians and disabled: ``Baseline`` to the median offset, ``Sensitivity`` to the reciprocal of the median gain if the calibration carries a gain map, and ``EM gain`` to 1. Clearing the calibration restores the previous values. Only the maps are used in the fit; the medians are shown because those numbers still go into the localization metadata. The calibration path and a summary of the maps are recorded there too.
 
 A calibration can also be selected automatically through a ``camera-calibrations`` section in ``config.yaml``, keyed by camera and then by emission wavelength exactly like ``z-calibrations`` and ``spline-calibrations`` (see *Camera Config* below)::
 

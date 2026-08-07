@@ -523,3 +523,98 @@ def validate_calibration(
             float((p_values > 0.95).mean()) if p_values.size else float("nan")
         ),
     }
+
+
+def _plot_map(figure, ax, values, key, title, unit) -> None:
+    """One map panel, on a color scale that shows the sensor rather than
+    its outliers."""
+    if key == "variance":
+        vmin, vmax = 0.0, float(np.percentile(values, 99.5))
+    else:
+        vmin = float(np.percentile(values, 0.5))
+        vmax = float(np.percentile(values, 99.5))
+    if not vmax > vmin:
+        # A uniform map (a simulation, or a hand-made calibration) collapses
+        # every percentile onto the same value.
+        vmin, vmax = float(values.min()), float(values.max())
+        if not vmax > vmin:
+            vmin, vmax = vmin - 0.5, vmax + 0.5
+    image = ax.imshow(
+        values, cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest"
+    )
+    ax.set_title(f"{title} map")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    figure.colorbar(image, ax=ax, label=unit, fraction=0.046)
+
+
+def _plot_histogram(ax, values, title, unit) -> None:
+    """One histogram panel, on a log count axis so the tail stays visible."""
+    flat = values.ravel()
+    lower, upper = float(flat.min()), float(np.percentile(flat, 99.9))
+    if not upper > lower:
+        upper = float(flat.max())
+    if not upper > lower:
+        upper = lower + 1.0
+    ax.hist(flat, bins=100, range=(lower, upper), color="k")
+    ax.set_yscale("log")
+    ax.set_xlabel(f"{title} ({unit})")
+    ax.set_ylabel("Pixels")
+    ax.set_title(f"{title} distribution")
+
+
+def plot_path(calibration_path: str) -> str:
+    """Where the diagnostic plot of a calibration file belongs."""
+    base, _ = os.path.splitext(calibration_path)
+    return base + "_maps.png"
+
+
+def save_calibration_plot(calibration: dict, path: str) -> str:
+    """Write the maps and their histograms to a PNG, as Supplementary Fig. 1
+    of Huang et al. (2013).
+
+    Maps and histograms answer different questions and both are worth having.
+    The map shows *structure* - the column stripes of the per-column
+    amplifiers in the gain, a bright corner in the offset, a cluster of hot
+    pixels - which a histogram averages away. The histogram shows the
+    *distribution*, in particular the tail of high-variance pixels the noise
+    model exists for, which a map on a linear colour scale cannot resolve
+    against its own outliers.
+
+    Parameters
+    ----------
+    calibration : dict
+        A calibration as returned by :func:`calibrate_scmos` or
+        ``io.load_camera_calibration``.
+    path : str
+        Where to write the PNG. Use :func:`plot_path` to derive it from the
+        calibration's own path.
+
+    Returns
+    -------
+    str
+        ``path``, for convenience when reporting where it went.
+    """
+    # Imported here, and through the non-interactive Agg backend, so that
+    # importing this module costs nothing and so that writing the file never
+    # depends on a display being available - this runs from the CLI too.
+    import matplotlib
+
+    matplotlib.use("Agg", force=False)
+    from matplotlib.figure import Figure
+
+    panels = [
+        ("variance", "Readout variance", "ADU$^2$"),
+        ("offset", "Offset", "ADU"),
+    ]
+    if calibration.get("gain") is not None:
+        panels.append(("gain", "Gain", "ADU/e$^-$"))
+
+    figure = Figure(figsize=(9, 3 * len(panels)), tight_layout=True)
+    axes = figure.subplots(len(panels), 2, squeeze=False)
+    for row, (key, title, unit) in enumerate(panels):
+        values = np.asarray(calibration[key], dtype=np.float64)
+        _plot_map(figure, axes[row, 0], values, key, title, unit)
+        _plot_histogram(axes[row, 1], values, title, unit)
+    figure.savefig(path, dpi=150)
+    return path

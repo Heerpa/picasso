@@ -23,6 +23,8 @@ rather than shapes:
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 
@@ -271,3 +273,70 @@ class TestValidateCalibration:
             )
             is None
         )
+
+
+class TestCalibrationPlot:
+    """The diagnostic PNG written alongside a calibration."""
+
+    @staticmethod
+    def _calibration(rng, *, gain=True, uniform=False):
+        shape = (16, 16)
+        if uniform:
+            calibration = {
+                "offset": np.full(shape, 100.0, np.float32),
+                "variance": np.full(shape, 4.0, np.float32),
+            }
+            if gain:
+                calibration["gain"] = np.full(shape, 2.0, np.float32)
+            return calibration
+        variance = rng.lognormal(1.0, 0.8, shape)
+        variance[0, 0] = 2500.0  # a hot pixel
+        calibration = {
+            "offset": rng.normal(100, 2, shape).astype(np.float32),
+            "variance": variance.astype(np.float32),
+        }
+        if gain:
+            calibration["gain"] = rng.normal(2.13, 0.1, shape).astype(
+                np.float32
+            )
+        return calibration
+
+    def test_plot_path_sits_next_to_the_calibration(self):
+        assert (
+            scmos.plot_path("/data/mycam_scmos_calib.hdf5")
+            == "/data/mycam_scmos_calib_maps.png"
+        )
+
+    def test_writes_a_png(self, tmp_path):
+        rng = np.random.default_rng(0)
+        path = str(tmp_path / "calib_maps.png")
+        returned = scmos.save_calibration_plot(self._calibration(rng), path)
+        assert returned == path
+        # A PNG, not an empty file or another format.
+        with open(path, "rb") as file:
+            assert file.read(8) == b"\x89PNG\r\n\x1a\n"
+
+    def test_writes_a_png_without_a_gain_map(self, tmp_path):
+        rng = np.random.default_rng(1)
+        path = str(tmp_path / "nogain_maps.png")
+        scmos.save_calibration_plot(self._calibration(rng, gain=False), path)
+        assert os.path.getsize(path) > 0
+
+    def test_a_uniform_map_does_not_break_the_scaling(self, tmp_path):
+        """A simulated or hand-made calibration can be perfectly uniform, and
+        then every percentile coincides."""
+        path = str(tmp_path / "uniform_maps.png")
+        scmos.save_calibration_plot(
+            self._calibration(None, uniform=True), path
+        )
+        assert os.path.getsize(path) > 0
+
+    def test_a_real_calibration_round_trips_through_the_plot(
+        self, scmos_maps_factory, dark_movie_factory, tmp_path
+    ):
+        """What ``calibrate_scmos`` returns must be plottable as it is."""
+        maps = scmos_maps_factory(height=16, width=16, seed=7)
+        calib = scmos.calibrate_scmos(dark_movie_factory(maps, 200, seed=8))
+        path = str(tmp_path / "real_maps.png")
+        scmos.save_calibration_plot(calib, path)
+        assert os.path.getsize(path) > 0

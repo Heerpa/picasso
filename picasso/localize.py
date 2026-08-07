@@ -1969,6 +1969,41 @@ def _clip_for_mle(
     return np.maximum(spots, -variance)
 
 
+def camera_calibration_info(camera_calibration: dict | None) -> dict:
+    """Provenance of an sCMOS camera calibration, for the saved metadata.
+
+    Every caller that fits with a calibration must record this, or a
+    localization file carries no trace of the noise model that produced it and
+    two runs become indistinguishable after the fact. It lives here, rather
+    than inline in ``fit2D``, because Picasso Localize rebuilds its own
+    metadata when saving instead of using what ``fit2D`` returns, and the two
+    must not drift apart.
+
+    Returns an empty dict when there is no calibration, so callers can
+    ``update()`` unconditionally.
+    """
+    if not camera_calibration:
+        return {}
+    info = {
+        "Camera calibration path": camera_calibration.get("Path", "N/A"),
+        "Camera calibration frames": camera_calibration.get("Frames"),
+        "Camera offset source": "per-pixel map",
+        "Camera gain source": (
+            "per-pixel map"
+            if camera_calibration.get("gain") is not None
+            else "Sensitivity (scalar)"
+        ),
+    }
+    for key in (
+        "Offset median (ADU)",
+        "Variance median (ADU^2)",
+        "Hot pixels",
+    ):
+        if key in camera_calibration:
+            info[f"Camera calibration {key}"] = camera_calibration[key]
+    return info
+
+
 def _seed_spots(
     spots: lib.FloatArray3D, variance: lib.FloatArray3D | None
 ) -> lib.FloatArray3D:
@@ -2441,31 +2476,7 @@ def fit2D(
         localize_info["Convergence criterion"] = tolerance
         localize_info["Max iterations"] = max_iterations
         localize_info["Axial seeds"] = n_z_starts if apply_seeds else 1
-    if camera_calibration is not None:
-        # Only the provenance, never the maps: they are sensor-sized arrays and
-        # this dict is written to the YAML sidecar verbatim.
-        localize_info["Camera noise model"] = "Huang et al. 2013 sCMOS"
-        localize_info["Camera calibration path"] = camera_calibration.get(
-            "Path", "N/A"
-        )
-        localize_info["Camera calibration frames"] = camera_calibration.get(
-            "Frames"
-        )
-        localize_info["Camera offset source"] = "per-pixel map"
-        localize_info["Camera gain source"] = (
-            "per-pixel map"
-            if camera_calibration.get("gain") is not None
-            else "Sensitivity (scalar)"
-        )
-        for key in (
-            "Offset median (ADU)",
-            "Variance median (ADU^2)",
-            "Hot pixels",
-        ):
-            if key in camera_calibration:
-                localize_info[f"Camera calibration {key}"] = (
-                    camera_calibration[key]
-                )
+    localize_info.update(camera_calibration_info(camera_calibration))
     new_info = localize_info | camera_info
     return locs, new_info
 

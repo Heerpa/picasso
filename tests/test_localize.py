@@ -7522,3 +7522,283 @@ class TestCameraCalibrationConfigLookup:
         assert "update_camera_calib_with_config_path" in body
         assert "update_spline_calib_with_config_path" in body
         assert "update_z_calib_with_config_path" in body
+
+
+class TestCameraCalibrationProvenance:
+    """A saved file must say whether the noise model was used.
+
+    ``fit2D`` records this, but Picasso Localize throws away the info
+    ``fit2D`` returns and rebuilds its own when saving, so the GUI path needs
+    its own assertion - without one, a GUI run silently saved localizations
+    that gave no hint a calibration had been applied.
+    """
+
+    @staticmethod
+    def _calibration(gain=True):
+        calibration = {
+            "offset": np.full((8, 8), 500.0, np.float32),
+            "variance": np.full((8, 8), 4.0, np.float32),
+            "model": "scmos-noise",
+            "Path": "/data/cam_scmos_calib.hdf5",
+            "Frames": 20000,
+            "Offset median (ADU)": 500.0,
+            "Variance median (ADU^2)": 4.0,
+            "Hot pixels": 7,
+        }
+        if gain:
+            calibration["gain"] = np.full((8, 8), 2.0, np.float32)
+        return calibration
+
+    def test_is_empty_without_a_calibration(self):
+        assert localize.camera_calibration_info(None) == {}
+        assert localize.camera_calibration_info({}) == {}
+
+    def test_records_the_provenance_but_never_the_maps(self):
+        info = localize.camera_calibration_info(self._calibration())
+        assert info["Camera noise model"] == "Huang et al. 2013 sCMOS"
+        assert info["Camera calibration path"] == "/data/cam_scmos_calib.hdf5"
+        assert info["Camera calibration frames"] == 20000
+        assert info["Camera gain source"] == "per-pixel map"
+        assert info["Camera calibration Hot pixels"] == 7
+        # The maps are sensor-sized and this dict is dumped to YAML verbatim.
+        assert not any(
+            isinstance(value, np.ndarray) for value in info.values()
+        )
+
+    def test_names_the_scalar_when_there_is_no_gain_map(self):
+        info = localize.camera_calibration_info(self._calibration(gain=False))
+        assert info["Camera gain source"] == "Sensitivity (scalar)"
+
+    def test_the_gui_save_path_records_it(self, tmp_path, monkeypatch):
+        """Regression: a GUI run used to save localizations that gave no hint
+        a calibration had been applied, because ``Window.save_locs`` rebuilds
+        the metadata from the dialog and ``FitWorker`` discards what
+        ``fit2D`` returns."""
+        path = str(tmp_path / "c_scmos_calib.hdf5")
+        io.save_camera_calibration(path, self._calibration())
+
+        window = localize_gui.Window()
+        saved = {}
+        monkeypatch.setattr(
+            localize_gui.io,
+            "save_locs",
+            lambda p, locs, info: saved.update(info=info),
+        )
+        try:
+            window.parameters_dialog.update_camera_calib(path)
+            window.locs = pd.DataFrame({"frame": [0], "x": [1.0], "y": [2.0]})
+            window.info = [{"Frames": 1}]
+            window.last_identification_info = {"Box Size": 7}
+            monkeypatch.setattr(window, "select_locs_columns", lambda: None)
+
+            window.save_locs(str(tmp_path / "locs.hdf5"))
+
+            info = saved["info"][-1]
+            assert info["Camera noise model"] == "Huang et al. 2013 sCMOS"
+            assert info["Camera calibration path"] == path
+            assert info["Camera gain source"] == "per-pixel map"
+        finally:
+            window.close()
+
+    def test_the_gui_save_path_stays_silent_without_one(
+        self, tmp_path, monkeypatch
+    ):
+        window = localize_gui.Window()
+        saved = {}
+        monkeypatch.setattr(
+            localize_gui.io,
+            "save_locs",
+            lambda p, locs, info: saved.update(info=info),
+        )
+        try:
+            window.locs = pd.DataFrame({"frame": [0], "x": [1.0], "y": [2.0]})
+            window.info = [{"Frames": 1}]
+            window.last_identification_info = {"Box Size": 7}
+            monkeypatch.setattr(window, "select_locs_columns", lambda: None)
+
+            window.save_locs(str(tmp_path / "locs.hdf5"))
+
+            assert "Camera noise model" not in saved["info"][-1]
+        finally:
+            window.close()
+
+
+class TestCameraCalibrationScalars:
+    """A loaded calibration supersedes Baseline, Sensitivity and EM gain.
+
+    Freezing them is not enough: a disabled spinbox reading 100.0 while the
+    maps say 498.7 misinforms, and the value is saved to the ``.yaml`` as the
+    camera information the run used.
+    """
+
+    @staticmethod
+    def _dialog():
+        class _StubWindow(QtWidgets.QMainWindow):
+            movie = None
+
+            def draw_frame(self):
+                pass
+
+        return localize_gui.ParametersDialog(_StubWindow())
+
+    @staticmethod
+    def _calibration_file(tmp_path, name, *, offset=498.7, gain=None):
+        path = str(tmp_path / name)
+        calibration = {
+            "offset": np.full((8, 8), offset, np.float32),
+            "variance": np.full((8, 8), 4.0, np.float32),
+            "model": "scmos-noise",
+        }
+        if gain is not None:
+            calibration["gain"] = np.full((8, 8), gain, np.float32)
+        io.save_camera_calibration(path, calibration)
+        return path
+
+    def test_offset_median_becomes_the_baseline(self, tmp_path):
+        path = self._calibration_file(tmp_path, "a_scmos_calib.hdf5")
+        dialog = self._dialog()
+        try:
+            dialog.baseline.setValue(100.0)
+            dialog.update_camera_calib(path)
+            assert dialog.baseline.value() == pytest.approx(498.7, abs=0.05)
+            assert not dialog.baseline.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_sensitivity_is_the_reciprocal_of_the_median_gain(self, tmp_path):
+        """Picasso's Sensitivity is electrons per count; the calibration
+        measures counts per electron."""
+        path = self._calibration_file(tmp_path, "b_scmos_calib.hdf5", gain=2.0)
+        dialog = self._dialog()
+        try:
+            dialog.update_camera_calib(path)
+            assert dialog.sensitivity.value() == pytest.approx(0.5, abs=1e-4)
+            assert not dialog.sensitivity.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_sensitivity_is_untouched_without_a_gain_map(self, tmp_path):
+        path = self._calibration_file(tmp_path, "c_scmos_calib.hdf5")
+        dialog = self._dialog()
+        try:
+            dialog.sensitivity.setValue(0.47)
+            dialog.update_camera_calib(path)
+            assert dialog.sensitivity.value() == pytest.approx(0.47)
+            assert dialog.sensitivity.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_em_gain_is_pinned_to_one(self, tmp_path):
+        """An sCMOS sensor has no multiplication stage, and a value above 1
+        would apply the EMCCD excess-noise factor on top of the readout
+        noise."""
+        path = self._calibration_file(tmp_path, "d_scmos_calib.hdf5")
+        dialog = self._dialog()
+        try:
+            dialog.gain.setValue(300)
+            dialog.update_camera_calib(path)
+            assert dialog.gain.value() == 1
+            assert not dialog.gain.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_clearing_restores_the_previous_scalars(self, tmp_path):
+        path = self._calibration_file(tmp_path, "e_scmos_calib.hdf5", gain=2.0)
+        dialog = self._dialog()
+        try:
+            dialog.gain.setValue(300)
+            dialog.baseline.setValue(100.0)
+            dialog.sensitivity.setValue(0.47)
+            dialog.update_camera_calib(path)
+            dialog.update_camera_calib(None)
+            assert dialog.gain.value() == 300
+            assert dialog.baseline.value() == pytest.approx(100.0)
+            assert dialog.sensitivity.value() == pytest.approx(0.47)
+            assert dialog.gain.isEnabled()
+            assert dialog.baseline.isEnabled()
+            assert dialog.sensitivity.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_loading_a_second_calibration_keeps_the_original_restore_point(
+        self, tmp_path
+    ):
+        first = self._calibration_file(tmp_path, "f1_scmos_calib.hdf5")
+        second = self._calibration_file(
+            tmp_path, "f2_scmos_calib.hdf5", offset=203.0
+        )
+        dialog = self._dialog()
+        try:
+            dialog.baseline.setValue(100.0)
+            dialog.update_camera_calib(first)
+            dialog.update_camera_calib(second)
+            assert dialog.baseline.value() == pytest.approx(203.0, abs=0.05)
+            dialog.update_camera_calib(None)
+            assert dialog.baseline.value() == pytest.approx(100.0)
+        finally:
+            dialog.close()
+
+    def test_a_superseded_scalar_records_the_config_value_for_later(
+        self, tmp_path
+    ):
+        """The camera config keeps writing Baseline on every camera change.
+        That write must not land on the frozen spinbox, but it must not be
+        lost either - otherwise clearing restores a scalar belonging to
+        whichever camera happened to be selected when the maps were loaded.
+        """
+        path = self._calibration_file(tmp_path, "g_scmos_calib.hdf5")
+        dialog = self._dialog()
+        try:
+            dialog.baseline.setValue(100.0)
+            dialog.update_camera_calib(path)
+            dialog.set_photon_scalar("baseline", 42.0)
+            # Not on the widget, which shows the map's median ...
+            assert dialog.baseline.value() == pytest.approx(498.7, abs=0.05)
+            # ... but it is what Clear restores.
+            dialog.update_camera_calib(None)
+            assert dialog.baseline.value() == pytest.approx(42.0)
+        finally:
+            dialog.close()
+
+    def test_a_scalar_still_in_force_is_written_through(self, tmp_path):
+        path = self._calibration_file(tmp_path, "h_scmos_calib.hdf5")
+        dialog = self._dialog()
+        try:
+            dialog.update_camera_calib(path)  # no gain map
+            dialog.set_photon_scalar("sensitivity", 0.26)
+            assert dialog.sensitivity.value() == pytest.approx(0.26)
+            dialog.update_camera_calib(None)
+            assert dialog.sensitivity.value() == pytest.approx(0.26)
+        finally:
+            dialog.close()
+
+
+class TestCameraCalibrationDialogs:
+    """The dialog that collects the inputs of a characterization."""
+
+    def test_ok_needs_a_dark_movie_and_an_output(self, tmp_path):
+        dialog = localize_gui.CameraCalibrationDialog(None)
+        try:
+            ok = dialog.buttons.button(
+                QtWidgets.QDialogButtonBox.StandardButton.Ok
+            )
+            assert not ok.isEnabled()
+            dialog.dark_edit.setText(str(tmp_path / "dark.raw"))
+            assert not ok.isEnabled()
+            dialog.out_edit.setText(str(tmp_path / "calib.hdf5"))
+            assert ok.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_bright_movies_are_optional_and_deduplicated(self):
+        dialog = localize_gui.CameraCalibrationDialog(None)
+        try:
+            assert dialog.bright_paths() == []
+            dialog.bright_list.addItem("/a.raw")
+            dialog.bright_list.addItem("/b.raw")
+            assert dialog.bright_paths() == ["/a.raw", "/b.raw"]
+            dialog.bright_list.item(0).setSelected(True)
+            dialog.remove_bright()
+            assert dialog.bright_paths() == ["/b.raw"]
+        finally:
+            dialog.close()

@@ -1447,6 +1447,15 @@ def _camera_calibrate(args: argparse.Namespace) -> None:
                 "unresponsive pixel(s) took the chip median"
             )
     print(f"Saved to {out_path}")
+    # A dead column, a bright corner or a cluster of hot pixels shows in the
+    # maps and in nothing else, so they are written out alongside.
+    try:
+        plot_path = scmos.save_calibration_plot(
+            calibration, scmos.plot_path(out_path)
+        )
+        print(f"Maps and histograms: {plot_path}")
+    except Exception as error:
+        print(f"The diagnostic plot could not be saved: {error}")
     print("Use it with: picasso localize <movie> -cm " f"{out_path} -a mle")
 
 
