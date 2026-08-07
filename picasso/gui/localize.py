@@ -3886,6 +3886,7 @@ class ContrastDialog(lib.Dialog):
         self.auto_checkbox.stateChanged.connect(self.on_auto_changed)
         grid.addWidget(self.auto_checkbox, 2, 0, 1, 2)
         self.silent_contrast_change = False
+        self.manual_contrast_change = False
 
     def change_contrast_silently(self, black: int, white: int) -> None:
         """Change the contrast values without emitting signals."""
@@ -3909,15 +3910,45 @@ class ContrastDialog(lib.Dialog):
         ]
         self.change_contrast_silently(frame.min(), frame.max())
 
+    def to_uint8(self, frame: np.ndarray) -> np.ndarray:
+        """Map ``frame`` onto the 0-255 display range.
+
+        Auto spans the frame's own min-max; otherwise the black-white range
+        set in this dialog. Both use the same mapping, so switching Auto off
+        (which leaves the spinboxes at the values ``set_frame`` derived from
+        the current frame) does not change how the frame looks.
+        """
+        frame = frame.astype("float32")
+        if self.auto_checkbox.isChecked():
+            black = float(frame.min())
+            white = float(frame.max())
+        else:
+            black = float(self.black_spinbox.value())
+            white = float(self.white_spinbox.value())
+        frame -= black
+        frame /= max(white - black, 1e-12)
+        frame *= 255.0
+        return np.clip(frame, 0, 255).astype("uint8")
+
     def on_contrast_changed(self, value: int) -> None:
         if not self.silent_contrast_change:
-            self.auto_checkbox.setChecked(False)
+            # editing a value implies manual contrast; flagged so that
+            # unchecking Auto here does not re-derive (and thereby discard)
+            # the value that was just typed
+            self.manual_contrast_change = True
+            try:
+                self.auto_checkbox.setChecked(False)
+            finally:
+                self.manual_contrast_change = False
             self.window.draw_frame()
 
-    def on_auto_changed(self, state: int) -> None:
-        if state:
+    def on_auto_changed(self, _state: int) -> None:
+        if not self.manual_contrast_change:
             # the displayed movie, which is the temporal median filtered
-            # view when that filter is on - not the raw camera counts
+            # view when that filter is on - not the raw camera counts.
+            # Also on unchecking: seeding the range from the frame on
+            # screen is what makes turning Auto off freeze the current
+            # rendering instead of changing it.
             self.reset_to_frame()
             self.window.draw_frame()
 
@@ -5791,19 +5822,7 @@ class Window(QtWidgets.QMainWindow):
             # show what the identification sees, so that the contrast and
             # the preview boxes agree with the min. net gradient being set
             frame = self.identification_movie()[self.curr_frame_number]
-            frame = frame.astype("float32")
-            if self.contrast_dialog.auto_checkbox.isChecked():
-                frame -= frame.min()
-                frame /= max(float(frame.max()), 1e-12)
-            else:
-                frame -= self.contrast_dialog.black_spinbox.value()
-                frame /= max(
-                    float(self.contrast_dialog.white_spinbox.value()), 1e-12
-                )
-            frame *= 255.0
-            frame = np.maximum(frame, 0)
-            frame = np.minimum(frame, 255)
-            frame = frame.astype("uint8")
+            frame = self.contrast_dialog.to_uint8(frame)
             height, width = frame.shape
             image = QtGui.QImage(
                 frame.data,
