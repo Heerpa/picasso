@@ -410,6 +410,11 @@ class DatasetDialog(lib.Dialog):
         List of QPushButtons to close each channel
     colordisp_all : list
         List of QLabels showing the color selected for each channel.
+    colorpickers : list
+        List of QPushButtons opening a color dialog for each channel.
+    colorpreviews : list
+        List of QWidgets holding the gradient preview and the color
+        picker button of each channel.
     colorselection : list
         List of QComboBoxes specifying the color displayed for each
         channel.
@@ -447,6 +452,8 @@ class DatasetDialog(lib.Dialog):
         self.closebuttons = []
         self.colorselection = []
         self.colordisp_all = []
+        self.colorpickers = []
+        self.colorpreviews = []
         self.intensitysettings = []
         # Per-channel resolved LUTs (each shape (256, 3) float32) and
         # caches for the built-in and user-defined cmap LUTs.
@@ -551,6 +558,8 @@ class DatasetDialog(lib.Dialog):
         self.closebuttons = []
         self.colorselection = []
         self.colordisp_all = []
+        self.colorpickers = []
+        self.colorpreviews = []
         self.intensitysettings = []
         files_label = QtWidgets.QLabel("Files")
         files_label.setToolTip("Names of the loaded datasets.")
@@ -696,6 +705,30 @@ class DatasetDialog(lib.Dialog):
         colordisp.setPixmap(_gradient_pixmap(initial_lut))
         self.colordisp_all.append(colordisp)
 
+        # create the color picker button (writes a hex code into the
+        # combobox above), shown next to the gradient preview
+        picker = QtWidgets.QPushButton("...")
+        picker.setToolTip(
+            "Pick a solid color for this dataset from a color dialog.\n"
+            "The chosen color is entered as a hexadecimal code."
+        )
+        picker.setAutoDefault(False)
+        picker.setFixedWidth(28)
+        picker.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        picker.setObjectName(str(currentline))
+        picker.clicked.connect(
+            partial(self.select_channel_color, t.objectName())
+        )
+        self.colorpickers.append(picker)
+
+        # container holding the gradient preview and the picker button
+        preview_widget = QtWidgets.QWidget()
+        preview_layout = QtWidgets.QHBoxLayout(preview_widget)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.addWidget(colordisp)
+        preview_layout.addWidget(picker)
+        self.colorpreviews.append(preview_widget)
+
         # create the relative intensity widget
         intensity = QtWidgets.QDoubleSpinBox(self)
         intensity.setToolTip("Set the relative intensity for this dataset.")
@@ -709,7 +742,7 @@ class DatasetDialog(lib.Dialog):
         self.scroll_area.addWidget(c, currentline, 0)
         self.scroll_area.addWidget(t, currentline, 1)
         self.scroll_area.addWidget(colordrop, currentline, 2)
-        self.scroll_area.addWidget(colordisp, currentline, 3)
+        self.scroll_area.addWidget(preview_widget, currentline, 3)
         self.scroll_area.addWidget(intensity, currentline, 4)
         self.scroll_area.addWidget(p, currentline, 5)
 
@@ -766,7 +799,8 @@ class DatasetDialog(lib.Dialog):
         self.scroll_area.removeWidget(self.checks[i])
         self.scroll_area.removeWidget(self.title[i])
         self.scroll_area.removeWidget(self.colorselection[i])
-        self.scroll_area.removeWidget(self.colordisp_all[i])
+        self.scroll_area.removeWidget(self.colorpreviews[i])
+        self.colorpreviews[i].setParent(None)
         self.scroll_area.removeWidget(self.intensitysettings[i])
         self.scroll_area.removeWidget(self.closebuttons[i])
 
@@ -775,6 +809,8 @@ class DatasetDialog(lib.Dialog):
         del self.title[i]
         del self.colorselection[i]
         del self.colordisp_all[i]
+        del self.colorpickers[i]
+        del self.colorpreviews[i]
         del self.intensitysettings[i]
         del self.closebuttons[i]
         del self._channel_luts[i]
@@ -877,6 +913,40 @@ class DatasetDialog(lib.Dialog):
             chosen.blueF(),
         )
         self._update_background_swatch()
+        self.update_viewport()
+
+    def select_channel_color(self, button_name: str) -> None:
+        """Open a color picker for one channel and write the chosen
+        color into its combobox as a hexadecimal code."""
+        n = None
+        for j in range(len(self.title)):
+            if button_name == self.title[j].objectName():
+                n = j
+                break
+        if n is None:
+            return
+
+        if self.auto_colors.isChecked():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Automatic coloring",
+                "Untick 'Automatic coloring' to set colors manually.",
+            )
+            return
+
+        initial = QtGui.QColor.fromRgbF(*self.legend_color(n), 1.0)
+        chosen = QtWidgets.QColorDialog.getColor(
+            initial, self, f"Pick color for {self.checks[n].text()}"
+        )
+        if not chosen.isValid():
+            return
+
+        hexcode = f"#{chosen.red():02X}{chosen.green():02X}{chosen.blue():02X}"
+        combo = self.colorselection[n]
+        combo.blockSignals(True)
+        combo.setCurrentText(hexcode)
+        combo.blockSignals(False)
+        self.set_color(n)
         self.update_viewport()
 
     def _update_background_swatch(self) -> None:

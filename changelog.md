@@ -63,9 +63,10 @@ This update focuses mainly on (but is not limited to) the expansion of the Local
 - Faster AIM through smarter implementation
 - Faster and more memory efficient (especially for large datasets) SMLM clusterer + progress bar added
 - Progress bar for finding cluster centers
-- SMAP i/o, see "Other improvements" below
+- SMAP localization file reading, see "Other improvements" below
 - Rotation dialog allows for rotations around the localizations or the world (see [3D documentation](https://picassosr.readthedocs.io/en/latest/render.html#d-rotation-window))
 - Background color for multichannel data can be adjusted
+- Files dialog allows for better color selection of individual channels
 - "Apply to all sequentially" available for drift correction algorithms, including drift from an external file
 - "Apply to all sequentially" available in Apply expression to localizations
 - G5M now supports 3D localizations fit with the experimental spline PSF, not only astigmatism.
