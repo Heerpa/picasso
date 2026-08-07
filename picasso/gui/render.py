@@ -650,6 +650,7 @@ class DatasetDialog(lib.Dialog):
         self.checks.append(c)
         self.checks[-1].setChecked(True)
         self.checks[-1].stateChanged.connect(self.update_viewport)
+        self.checks[-1].stateChanged.connect(self.update_rotation_window)
 
         self.title.append(t)
         self.title[-1].setAutoDefault(False)
@@ -915,12 +916,25 @@ class DatasetDialog(lib.Dialog):
             c.setChecked(c is check)
             c.blockSignals(False)
         self.update_viewport()
+        self.update_rotation_window()
 
     def update_viewport(self) -> None:
         """Update the scene in the main window."""
         if self.auto_display.isChecked():
             if self.window.view.viewport:
                 self.window.view.update_scene()
+
+    def update_rotation_window(self) -> None:
+        """Update the scene in the rotation window, if it is open, so
+        that (un)ticking channels here is reflected there too."""
+        if not self.auto_display.isChecked():
+            return
+        window_rot = getattr(self.window, "window_rot", None)
+        if window_rot is None or not window_rot.isVisible():
+            return
+        view_rot = window_rot.view_rot
+        if view_rot.locs and getattr(view_rot, "viewport", None):
+            view_rot.update_scene()
 
     def select_background_color(self) -> None:
         """Open a color picker to choose the multichannel background

@@ -70,6 +70,7 @@ This update focuses mainly on (but is not limited to) the expansion of the Local
 - Rotation dialog allows for rotations around the localizations or the world (see [3D documentation](https://picassosr.readthedocs.io/en/latest/render.html#d-rotation-window))
 - Background color for multichannel data can be adjusted
 - Files dialog allows for better color selection of individual channels
+- Changes to the displayed channel selection (Files dialog) affect the 3D rotation window immediately
 - Right clicking a channel's checkbox in the Files dialog displays that channel only (all other channels are hidden)
 - "Apply to all sequentially" available for drift correction algorithms, including drift from an external file
 - "Apply to all sequentially" available in Apply expression to localizations
