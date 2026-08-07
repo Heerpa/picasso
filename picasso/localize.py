@@ -1827,18 +1827,215 @@ def _cut_spots(
         return spots
 
 
+def _cut_map(
+    image: lib.FloatArray2D, ids: pd.DataFrame, box: int
+) -> lib.FloatArray3D:
+    """Cut ``(box, box)`` patches out of a full-frame map, one per spot.
+
+    The geometry is that of :func:`_cut_spots_numba_into`
+    (``image[yc - r : yc + r + 1, xc - r : xc + r + 1]``), so a patch lines up
+    pixel for pixel with the corresponding spot. A camera map has no frame
+    axis, so this is a plain fancy-index rather than another ``_cut_spots``
+    backend.
+    """
+    r = box // 2
+    offsets = np.arange(box)
+    rows = ids["y"].to_numpy()[:, None] - r + offsets  # (k, box)
+    cols = ids["x"].to_numpy()[:, None] - r + offsets  # (k, box)
+    return np.ascontiguousarray(
+        image[rows[:, :, None], cols[:, None, :]], dtype=np.float32
+    )
+
+
+def _sensitivity(
+    camera_info: dict, gain_patch: lib.FloatArray3D | None
+) -> float | lib.FloatArray3D:
+    """Counts-to-photoelectrons factor, scalar or per pixel.
+
+    Picasso's ``Sensitivity`` is electrons per A/D count, i.e. the reciprocal
+    of the amplification gain ``g`` a camera calibration measures in ADU per
+    photoelectron (Huang et al. 2013, Supplementary Note Section 2.3)."""
+    if gain_patch is None:
+        return camera_info["Sensitivity"]
+    return 1.0 / gain_patch
+
+
 def _to_photons(
-    spots: lib.FloatArray3D, camera_info: dict
+    spots: lib.FloatArray3D,
+    camera_info: dict,
+    offset: lib.FloatArray3D | None = None,
+    gain_patch: lib.FloatArray3D | None = None,
 ) -> lib.FloatArray3D:
     """Convert the cut spots to photon counts based on camera
-    information."""
+    information.
+
+    ``offset`` and ``gain_patch`` are per-spot ``(k, box, box)`` patches of an
+    sCMOS camera calibration; each overrides the corresponding scalar
+    (``Baseline``, ``Sensitivity``) where it is given.
+    """
     spots = np.float32(spots)
-    baseline = camera_info["Baseline"]
-    sensitivity = camera_info["Sensitivity"]
+    baseline = camera_info["Baseline"] if offset is None else offset
+    sensitivity = _sensitivity(camera_info, gain_patch)
     gain = camera_info["Gain"]
     # since v0.6.0: remove quantum efficiency to better reflect precision
     # qe = camera_info["Qe"]
     return (spots - baseline) * sensitivity / (gain)
+
+
+def _variance_to_photons(
+    variance: lib.FloatArray3D,
+    camera_info: dict,
+    gain_patch: lib.FloatArray3D | None = None,
+) -> lib.FloatArray3D:
+    """Convert a readout variance from ADU squared to photoelectrons squared.
+
+    :func:`_to_photons` scales counts by ``Sensitivity / Gain``, so a variance
+    scales by its square. This is Huang et al.'s ``var / g^2``, the quantity
+    the noise model adds to both the data and the model mean.
+    """
+    sensitivity = _sensitivity(camera_info, gain_patch)
+    gain = camera_info["Gain"]
+    return np.float32(variance) * (sensitivity / gain) ** 2
+
+
+def _validate_camera_calibration(
+    camera_calibration: dict | None, movie, camera_info: dict
+) -> None:
+    """Check a camera calibration against the movie it will be applied to.
+
+    The maps are indexed with the identifications' absolute frame coordinates,
+    so a calibration recorded with a different camera ROI or binning would
+    silently read the wrong pixels. Checked once, before any spot is cut.
+    """
+    if camera_calibration is None:
+        return
+    for name in ("offset", "variance"):
+        if camera_calibration.get(name) is None:
+            raise ValueError(
+                f"Invalid camera calibration: missing the '{name}' map. Build "
+                "one with picasso.scmos.calibrate_scmos or load it with "
+                "picasso.io.load_camera_calibration."
+            )
+    dims = io._readable_movie_dims(movie)
+    height, width = dims.get("Height"), dims.get("Width")
+    if height is None or width is None:
+        shape = getattr(movie, "shape", None)
+        if shape is not None and len(shape) == 3:
+            height, width = int(shape[1]), int(shape[2])
+    map_shape = np.shape(camera_calibration["offset"])
+    if height is not None and width is not None:
+        if map_shape != (height, width):
+            raise ValueError(
+                f"The camera calibration was computed on {map_shape[0]}x"
+                f"{map_shape[1]} frames but this movie is {height}x{width}. "
+                "Compute the offset/variance maps from a dark movie acquired "
+                "with the same camera ROI and binning."
+            )
+    if (
+        camera_calibration.get("gain") is not None
+        and camera_info.get("Gain", 1) > 1
+    ):
+        warnings.warn(
+            "A per-pixel camera calibration was supplied together with an EM "
+            "gain > 1. The sCMOS noise model of Huang et al. (2013) assumes a "
+            "non-multiplying sensor; the EMCCD excess-noise factor of 2 is "
+            "still applied to every uncertainty, which double-counts the "
+            "noise. Set the EM gain to 1 for an sCMOS camera.",
+            RuntimeWarning,
+        )
+
+
+def _mean_readout_variance(
+    variance: lib.FloatArray3D | None,
+) -> lib.FloatArray1D | float:
+    """Per-spot mean readout variance, for the closed-form precisions.
+
+    The Mortensen-family formulas describe a spatially uniform background, so
+    a per-pixel map can only enter them through its mean over the fitting box.
+    Returns 0.0 when there is no calibration, which leaves those formulas
+    exactly as they were."""
+    if variance is None:
+        return 0.0
+    return variance.reshape(len(variance), -1).mean(axis=1)
+
+
+def _clip_for_mle(
+    spots: lib.FloatArray3D, variance: lib.FloatArray3D | None
+) -> lib.FloatArray3D:
+    """Floor the data where the Poisson likelihood is defined.
+
+    Camera offset subtraction pushes dim pixels below zero, and a Poisson
+    likelihood is undefined there. Without a noise model the floor is zero, as
+    it has always been. With one, the likelihood is evaluated on the *shifted*
+    data ``d + var``, so the floor moves to ``-var``: clipping at zero instead
+    would discard exactly the negative excursions readout noise creates, and
+    bias the fitted background upward on the noisiest pixels - the opposite of
+    what the noise model is for.
+    """
+    if variance is None:
+        return np.maximum(spots, 0)
+    return np.maximum(spots, -variance)
+
+
+def camera_calibration_info(camera_calibration: dict | None) -> dict:
+    """Provenance of an sCMOS camera calibration, for the saved metadata.
+
+    Every caller that fits with a calibration must record this, or a
+    localization file carries no trace of the noise model that produced it and
+    two runs become indistinguishable after the fact. It lives here, rather
+    than inline in ``fit2D``, because Picasso Localize rebuilds its own
+    metadata when saving instead of using what ``fit2D`` returns, and the two
+    must not drift apart.
+
+    Returns an empty dict when there is no calibration, so callers can
+    ``update()`` unconditionally.
+    """
+    if not camera_calibration:
+        return {}
+    info = {
+        "Camera calibration path": camera_calibration.get("Path", "N/A"),
+        "Camera calibration frames": camera_calibration.get("Frames"),
+        "Camera offset source": "per-pixel map",
+        "Camera gain source": (
+            "per-pixel map"
+            if camera_calibration.get("gain") is not None
+            else "Sensitivity (scalar)"
+        ),
+    }
+    for key in (
+        "Offset median (ADU)",
+        "Variance median (ADU^2)",
+        "Hot pixels",
+    ):
+        if key in camera_calibration:
+            info[f"Camera calibration {key}"] = camera_calibration[key]
+    return info
+
+
+def _seed_spots(
+    spots: lib.FloatArray3D, variance: lib.FloatArray3D | None
+) -> lib.FloatArray3D:
+    """Spots to estimate the initial fit parameters from.
+
+    The seeds take the background from the dimmest pixel of the ROI and the
+    amplitude from the brightest minus the dimmest. That is fine on data
+    floored at zero, but :func:`_clip_for_mle` floors at ``-var``, so on a
+    noisy pixel the dimmest value can be tens of photons *below* zero. Seeding
+    a background there makes the model mean negative across the whole ROI, the
+    likelihood is then floored everywhere, the first Hessian is singular and
+    the fit aborts - which cost about a third of all spots on a sensor with
+    realistic hot pixels.
+
+    The seed is only a starting point, and a negative background is never a
+    sensible one, so it is estimated from the zero-floored data. The fit
+    itself still runs on the ``-var`` floored data, where the shifted Poisson
+    likelihood is defined. This also keeps the seed identical with and without
+    a calibration, so any difference between the two fits comes from the noise
+    model rather than from where they started.
+    """
+    if variance is None:
+        return spots
+    return np.maximum(spots, 0)
 
 
 def get_spots(
@@ -1847,7 +2044,9 @@ def get_spots(
     box: int,
     camera_info: dict,
     progress_callback: Callable[[int], None] | None = None,
-) -> lib.FloatArray3D:
+    camera_calibration: dict | None = None,
+    return_variance: bool = False,
+) -> lib.FloatArray3D | tuple[lib.FloatArray3D, lib.FloatArray3D | None]:
     """Extract the spots from a movie based on the identified positions
     and convert camera signal to photon counts.
 
@@ -1868,17 +2067,43 @@ def get_spots(
         If a callable is provided, it is called with the cumulative
         number of spots cut so far, allowing the cutting progress to be
         tracked. Default is None.
+    camera_calibration : dict or None, optional
+        Per-pixel sCMOS camera calibration from ``picasso.scmos``. Its
+        ``offset`` map replaces the scalar ``Baseline`` and, if present, its
+        ``gain`` map replaces the scalar ``Sensitivity``. Default is None.
+    return_variance : bool, optional
+        Also return the per-spot readout variance in photoelectrons squared,
+        cut from the same ROIs as the spots. None when no calibration was
+        given. Default is False.
 
     Returns
     -------
     spots : lib.FloatArray3D
         A 3D numpy array containing the extracted spots, with shape
         (k, box, box), where k is the number of spots identified.
+    variance : lib.FloatArray3D or None
+        Only if ``return_variance``.
     """
     spots = _cut_spots(
         movie, identifications, box, progress_callback=progress_callback
     )
-    return _to_photons(spots, camera_info)
+    offset = gain_patch = variance = None
+    if camera_calibration is not None:
+        offset = _cut_map(camera_calibration["offset"], identifications, box)
+        if camera_calibration.get("gain") is not None:
+            gain_patch = _cut_map(
+                camera_calibration["gain"], identifications, box
+            )
+        if return_variance:
+            variance = _variance_to_photons(
+                _cut_map(camera_calibration["variance"], identifications, box),
+                camera_info,
+                gain_patch,
+            )
+    spots = _to_photons(spots, camera_info, offset, gain_patch)
+    if return_variance:
+        return spots, variance
+    return spots
 
 
 def locs_from_fits(
@@ -1981,6 +2206,7 @@ def fit2D(
     max_it: int | None = None,
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
+    camera_calibration: dict | None = None,
     multiprocess: bool = True,
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
@@ -2052,6 +2278,20 @@ def fit2D(
         otherwise. For a 3D spline calibration the resulting localizations
         contain the fitted ``z`` directly (no separate z-fitting step is
         needed). Default is None.
+    camera_calibration : dict or None, optional
+        Per-pixel sCMOS camera calibration (see
+        ``io.load_camera_calibration`` and ``scmos.calibrate_scmos``),
+        holding the maps "offset" (ADU), "variance" (ADU^2) and,
+        optionally, "gain" (ADU/e-). The maps must match the full frame
+        shape of ``movie``. When given, they replace the scalar
+        "Baseline" (and, if a gain map is present, "Sensitivity") of
+        ``camera_info``, and the per-pixel readout variance enters the
+        noise model of Huang et al., Nat. Methods 10:653 (2013): every
+        MLE fit and every uncertainty estimate ("lpx", "lpy", CRLB) then
+        de-emphasises noisy pixels. Least-squares fits are unaffected by
+        the variance term itself (the shift cancels), but their
+        uncertainties do grow on noisy pixels; prefer an MLE method for
+        sCMOS data. Default is None.
     multiprocess: bool, optional
         Whether or not to use multiprocessing. Ignored for GPU fitting.
         Default is True.
@@ -2121,12 +2361,27 @@ def fit2D(
         )
         camera_info["Pixelsize"] = 130
 
-    spots = get_spots(
+    # ``camera_info`` is merged verbatim into the saved YAML at the end, so an
+    # array in it would be dumped element by element into every sidecar. The
+    # per-pixel maps travel as ``camera_calibration`` precisely so that cannot
+    # happen. Checked here rather than at the merge so the message arrives
+    # before _to_photons turns it into an opaque broadcast error.
+    for _key, _value in camera_info.items():
+        if isinstance(_value, np.ndarray):
+            raise ValueError(
+                f"camera_info['{_key}'] is an array. Per-pixel camera maps "
+                "belong in the camera_calibration argument, not in "
+                "camera_info, which is written to the metadata file as-is."
+            )
+    _validate_camera_calibration(camera_calibration, movie, camera_info)
+    spots, variance = get_spots(
         movie,
         identifications,
         box,
         camera_info,
         progress_callback=cut_progress_callback,
+        camera_calibration=camera_calibration,
+        return_variance=True,
     )
     em = camera_info["Gain"] > 1
     gauss_flags = parse_gauss_code(fitting_method)
@@ -2143,6 +2398,7 @@ def fit2D(
             progress_callback=(
                 None if gauss_flags["use_gpu"] else progress_callback
             ),
+            variance=variance,
             **gauss_flags,
         )
     elif fitting_method in ("spline-gpu", "spline-mle-gpu"):
@@ -2162,6 +2418,7 @@ def fit2D(
             progress_callback=progress_callback,
             tolerance=eps,
             max_iterations=max_it,
+            variance=variance,
         )
     elif fitting_method in ("spline", "spline-mle"):
         # The CPU cubic-spline fit (picasso.fitting.splinefit). Unlike the
@@ -2180,6 +2437,7 @@ def fit2D(
             multiprocess=multiprocess,
             progress_callback=progress_callback,
             abort_callback=abort_callback,
+            variance=variance,
         )
     elif fitting_method == "avg":
         locs = _fit2d_avg(
@@ -2190,6 +2448,7 @@ def fit2D(
             multiprocess,
             progress_callback,
             abort_callback,
+            variance=variance,
         )
     # updated metadata
     localize_info = {
@@ -2225,6 +2484,7 @@ def fit2D(
         localize_info["Convergence criterion"] = tolerance
         localize_info["Max iterations"] = max_iterations
         localize_info["Axial seeds"] = n_z_starts if apply_seeds else 1
+    localize_info.update(camera_calibration_info(camera_calibration))
     new_info = localize_info | camera_info
     return locs, new_info
 
@@ -2399,6 +2659,7 @@ def fit_spots_gauss(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    variance: lib.FloatArray3D | None = None,
 ) -> (
     lib.FloatArray2D
     | tuple[
@@ -2437,6 +2698,12 @@ def fit_spots_gauss(
         ``None`` uses the method's own schedule, see :func:`gauss_schedule`.
     progress_callback : callable, "console" or None, optional
         Reported per spot on the CPU; the GPU fit is one launch per chunk.
+    variance : lib.FloatArray3D, optional
+        Per-pixel sCMOS readout variance in photoelectrons squared, laid out
+        exactly like ``spots`` (from ``get_spots(..., return_variance=True)``).
+        Applies Huang et al.'s noise model to the maximum-likelihood
+        estimator; least squares is unaffected by construction. Default is
+        None.
 
     Returns
     -------
@@ -2459,10 +2726,13 @@ def fit_spots_gauss(
         mle, use_gpu, tolerance, max_iterations
     )
     if mle:
-        spots = np.maximum(spots, 0)
+        spots = _clip_for_mle(spots, variance)
     size = spots.shape[1]
     initial_parameters = _initial_parameters_gauss(
-        spots, size, rotated=rotated, spherical=spherical
+        _seed_spots(spots, variance) if mle else spots,
+        size,
+        rotated=rotated,
+        spherical=spherical,
     ).astype(np.float64)
 
     backend = gaussfit_cuda if use_gpu else gaussfit
@@ -2474,6 +2744,7 @@ def fit_spots_gauss(
         tolerance=tolerance,
         max_iterations=max_iterations,
         progress_callback=progress_callback,
+        variance=variance,
     )
     parameters = parameters.astype(np.float32)
     chi_squares = chi_squares.astype(np.float32)
@@ -2517,6 +2788,7 @@ def fit_spots_gauss_gpu(
     return_stats: bool = False,
     tolerance: float | None = None,
     max_iterations: int | None = None,
+    variance: lib.FloatArray3D | None = None,
 ) -> (
     lib.FloatArray2D
     | tuple[
@@ -2541,6 +2813,7 @@ def fit_spots_gauss_gpu(
         return_stats=return_stats,
         tolerance=tolerance,
         max_iterations=max_iterations,
+        variance=variance,
     )
 
 
@@ -2549,6 +2822,7 @@ def _gauss_crlb(
     box: int,
     em: bool,
     rotated: bool = False,
+    variance: lib.FloatArray3D | None = None,
 ) -> lib.FloatArray2D:
     """Poisson Cramer-Rao lower bound for MLE Gaussian fits.
 
@@ -2584,6 +2858,11 @@ def _gauss_crlb(
     rotated : bool, optional
         If True, ``theta`` carries the seventh (angle) column and the CRLB
         includes it. Default False.
+    variance : lib.FloatArray3D, optional
+        ``(n_locs, box, box)`` per-pixel sCMOS readout variance in
+        photoelectrons squared, indexed ``[spot, y, x]`` like the spots. The
+        Fisher weight becomes ``1 / (mu + var)``, which is exactly Eq. 3.6 of
+        Huang et al. (2013). Default None.
 
     Returns
     -------
@@ -2651,6 +2930,12 @@ def _gauss_crlb(
         g = np.stack(grads, axis=1)  # (m, n_params, box, box)
 
         mu = np.maximum(s + theta[sl, 5][:, None, None], _GAUSS_CRLB_MU_FLOOR)
+        if variance is not None:
+            # This kernel builds its per-pixel tensors as [spot, x, y] - dx
+            # varies along axis 1, dy along axis 2 - while a variance patch is
+            # [spot, y, x], like the spots it was cut alongside. Transpose, or
+            # the noise lands on the transposed pixel and nothing complains.
+            mu = mu + np.transpose(variance[sl], (0, 2, 1))
         gw = g / mu[:, None, :, :]
         fisher = np.einsum("mpij,mqij->mpq", gw, g)  # (m, n_params, n_params)
 
@@ -2682,6 +2967,7 @@ def locs_from_fits_gauss(
     iterations: lib.FloatArray1D | None = None,
     spherical: bool = False,
     chi_square: lib.FloatArray1D | None = None,
+    variance: lib.FloatArray3D | None = None,
 ) -> pd.DataFrame:
     """Convert the fit results from a Gaussian fit into a data frame of
     localizations.
@@ -2753,16 +3039,29 @@ def locs_from_fits_gauss(
         # Poisson Cramer-Rao bound from the Fisher information of the
         # point-sampled Gaussian model the fitters optimize. Columns of ``crlb``
         # follow ``theta``: [photons, x, y, sx, sy, bg, (angle)].
-        crlb = _gauss_crlb(theta, box, em, rotated=rotated)
+        crlb = _gauss_crlb(theta, box, em, rotated=rotated, variance=variance)
         with np.errstate(invalid="ignore"):
             lpx = np.sqrt(crlb[:, 1])
             lpy = np.sqrt(crlb[:, 2])
     else:
+        # The closed form has no per-pixel notion, so the readout noise enters
+        # as its mean over the box; see precision.localization_precision.
+        readout = _mean_readout_variance(variance)
         lpx = precision.localization_precision(
-            theta[:, 0], theta[:, 3], theta[:, 4], theta[:, 5], em=em
+            theta[:, 0],
+            theta[:, 3],
+            theta[:, 4],
+            theta[:, 5],
+            em=em,
+            readout_variance=readout,
         )
         lpy = precision.localization_precision(
-            theta[:, 0], theta[:, 4], theta[:, 3], theta[:, 5], em=em
+            theta[:, 0],
+            theta[:, 4],
+            theta[:, 3],
+            theta[:, 5],
+            em=em,
+            readout_variance=readout,
         )
     columns = {
         "frame": identifications["frame"].astype(np.uint32),
@@ -2849,6 +3148,7 @@ def _fit2d_gauss(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    variance: lib.FloatArray3D | None = None,
 ) -> pd.DataFrame:
     """Fit 2D Gaussians with least squares or, if ``mle``, maximum
     likelihood, on the CPU or the GPU. If ``rotated``, a rotated elliptical
@@ -2866,6 +3166,7 @@ def _fit2d_gauss(
         tolerance=tolerance,
         max_iterations=max_iterations,
         progress_callback=progress_callback,
+        variance=variance,
     )
     locs = locs_from_fits_gauss(
         identifications,
@@ -2877,6 +3178,7 @@ def _fit2d_gauss(
         iterations=iterations,
         spherical=spherical,
         chi_square=chi_square,
+        variance=variance,
     )
     return locs
 
@@ -3154,6 +3456,7 @@ def _run_splinefit(
     ) = None,
     abort_callback: Callable[[], bool] | None = None,
     use_gpu: bool = False,
+    variance: lib.FloatArray3D | None = None,
 ) -> tuple | None:
     """Low-level spline fit: unpack the calibration and run the kernels.
 
@@ -3189,12 +3492,22 @@ def _run_splinefit(
     kind = _spline_kind(model)
     n_channels = _spline_n_channels(calibration)
     if mle:
-        # A Poisson likelihood is undefined for negative counts; camera offset
-        # subtraction can push dim pixels below zero. Same clip as on the GPU.
-        spots = np.maximum(spots, 0)
+        # A Poisson likelihood is undefined for negative counts. Same clip as
+        # on the GPU; see :func:`_clip_for_mle`.
+        spots = _clip_for_mle(spots, variance)
     fit_data = _spline_channel_major(spots, n_channels)
+    # The variance rides through the same reshape, so it stays aligned with
+    # the spots pixel for pixel on both devices.
+    fit_variance = (
+        None
+        if variance is None
+        else _spline_channel_major(variance, n_channels)
+    )
     initial = np.ascontiguousarray(
-        _initial_parameters_spline(spots, calibration), dtype=np.float64
+        _initial_parameters_spline(
+            _seed_spots(spots, variance) if mle else spots, calibration
+        ),
+        dtype=np.float64,
     )
     coefficients = _spline_coeff_reshaped(calibration)
     affines = _spline_channel_affines(calibration, n_channels)
@@ -3220,6 +3533,7 @@ def _run_splinefit(
         "mle": mle,
         "tolerance": tolerance,
         "max_iterations": max_iterations,
+        "variance": fit_variance,
     }
     aborted = callable(abort_callback) and abort_callback()
     if aborted:
@@ -3308,6 +3622,7 @@ def fit_spots_splinefit(
     ) = None,
     abort_callback: Callable[[], bool] | None = None,
     use_gpu: bool = False,
+    variance: lib.FloatArray3D | None = None,
 ) -> np.ndarray | tuple | None:
     """Fit multiple spots with a cubic-spline PSF model using the numba kernels.
 
@@ -3337,6 +3652,7 @@ def fit_spots_splinefit(
         progress_callback=progress_callback,
         abort_callback=abort_callback,
         use_gpu=use_gpu,
+        variance=variance,
     )
     if result is None:
         return None
@@ -3363,6 +3679,7 @@ def _fit_splinefit_multistart(
     use_gpu: bool = False,
     tolerance: float | None = None,
     max_iterations: int | None = None,
+    variance: lib.FloatArray3D | None = None,
 ) -> tuple:
     """Axial multi-start with the numba kernels, on either device.
 
@@ -3383,6 +3700,7 @@ def _fit_splinefit_multistart(
         tolerance=tolerance,
         max_iterations=max_iterations,
         use_gpu=use_gpu,
+        variance=variance,
     )
     finite = np.isfinite(theta).all(axis=1) & np.isfinite(chi_squares)
     converged = finite & (
@@ -3420,6 +3738,7 @@ def fit_spots_spline(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    variance: lib.FloatArray3D | None = None,
 ) -> np.ndarray | tuple | None:
     """Fit spots with a cubic-spline PSF model on the available device.
 
@@ -3440,6 +3759,7 @@ def fit_spots_spline(
         max_iterations=max_iterations,
         progress_callback=progress_callback,
         use_gpu=_spline_use_gpu(use_gpu),
+        variance=variance,
     )
 
 
@@ -3452,6 +3772,7 @@ def _fit_spline_multistart(
     use_gpu: bool | None = None,
     tolerance: float | None = None,
     max_iterations: int | None = None,
+    variance: lib.FloatArray3D | None = None,
 ) -> tuple:
     """Axial multi-start on whichever device is available.
 
@@ -3483,6 +3804,8 @@ def _spline_infomats_3d(
     finite,
     mu_floor,
     mle,
+    var,
+    use_var,
     bread,
     meat,
 ):
@@ -3619,6 +3942,13 @@ def _spline_infomats_3d(
                                 gy += cf * pzv * dyv * pxv
                                 gz += cf * dzv * pyv * pxv
                     mu = o + a * phi
+                    # Huang et al.'s sCMOS shift: a pixel's readout
+                    # variance adds to the model mean, so the Fisher
+                    # weight becomes 1/(mu + var) and the least-
+                    # squares sandwich meat becomes the true pixel
+                    # variance.
+                    if use_var:
+                        mu += var[m, ch, j, i]
                     if mu < mu_floor:
                         mu = mu_floor
                     # bread weight wa (1/μ Fisher, else 1) and meat weight wb
@@ -3709,6 +4039,8 @@ def _spline_infomats_2d(
     finite,
     mu_floor,
     mle,
+    var,
+    use_var,
     bread,
     meat,
 ):
@@ -3787,6 +4119,13 @@ def _spline_infomats_2d(
                             gx += cf * pyv * dxv
                             gy += cf * dyv * pxv
                     mu = o + a * phi
+                    # Huang et al.'s sCMOS shift: a pixel's readout
+                    # variance adds to the model mean, so the Fisher
+                    # weight becomes 1/(mu + var) and the least-
+                    # squares sandwich meat becomes the true pixel
+                    # variance.
+                    if use_var:
+                        mu += var[m, ch, j, i]
                     if mu < mu_floor:
                         mu = mu_floor
                     if mle:
@@ -3853,6 +4192,8 @@ def _spline_infomats_link_xyz_3d(
     finite,
     mu_floor,
     mle,
+    var,
+    use_var,
     bread,
     meat,
 ):
@@ -3978,6 +4319,13 @@ def _spline_infomats_link_xyz_3d(
                                 gy += cf * pzv * dyv * pxv
                                 gz += cf * dzv * pyv * pxv
                     mu = bgc + nc * phi
+                    # Huang et al.'s sCMOS shift: a pixel's readout
+                    # variance adds to the model mean, so the Fisher
+                    # weight becomes 1/(mu + var) and the least-
+                    # squares sandwich meat becomes the true pixel
+                    # variance.
+                    if use_var:
+                        mu += var[m, ch, j, i]
                     if mu < mu_floor:
                         mu = mu_floor
                     if mle:
@@ -4155,6 +4503,8 @@ def _spline_crlb_3d_kernel(
     finite,
     mu_floor,
     mle,
+    var,
+    use_var,
     crlb,
     status,
 ) -> None:
@@ -4282,6 +4632,13 @@ def _spline_crlb_3d_kernel(
                             gy += cf * pzv * dyv * pxv
                             gz += cf * dzv * pyv * pxv
                 mu = o + a * phi
+                # Huang et al.'s sCMOS shift: a pixel's readout
+                # variance adds to the model mean, so the Fisher
+                # weight becomes 1/(mu + var) and the least-
+                # squares sandwich meat becomes the true pixel
+                # variance.
+                if use_var:
+                    mu += var[m, ch, j, i]
                 if mu < mu_floor:
                     mu = mu_floor
                 # bread weight wa (1/μ Fisher, else 1) and meat weight wb
@@ -4381,6 +4738,8 @@ def _spline_crlb_2d_kernel(
     finite,
     mu_floor,
     mle,
+    var,
+    use_var,
     crlb,
     status,
 ) -> None:
@@ -4458,6 +4817,13 @@ def _spline_crlb_2d_kernel(
                         gx += cf * pyv * dxv
                         gy += cf * dyv * pxv
                 mu = o + a * phi
+                # Huang et al.'s sCMOS shift: a pixel's readout
+                # variance adds to the model mean, so the Fisher
+                # weight becomes 1/(mu + var) and the least-
+                # squares sandwich meat becomes the true pixel
+                # variance.
+                if use_var:
+                    mu += var[m, ch, j, i]
                 if mu < mu_floor:
                     mu = mu_floor
                 if mle:
@@ -4533,6 +4899,8 @@ def _spline_crlb_link_xyz_kernel(
     finite,
     mu_floor,
     mle,
+    var,
+    use_var,
     crlb,
     status,
 ) -> None:
@@ -4664,6 +5032,13 @@ def _spline_crlb_link_xyz_kernel(
                             gy += cf * pzv * dyv * pxv
                             gz += cf * dzv * pyv * pxv
                 mu = bgc + nc * phi
+                # Huang et al.'s sCMOS shift: a pixel's readout
+                # variance adds to the model mean, so the Fisher
+                # weight becomes 1/(mu + var) and the least-
+                # squares sandwich meat becomes the true pixel
+                # variance.
+                if use_var:
+                    mu += var[m, ch, j, i]
                 if mu < mu_floor:
                     mu = mu_floor
                 if mle:
@@ -4782,6 +5157,7 @@ def _spline_crlb_cuda(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    variance: lib.FloatArray4D | None = None,
 ) -> tuple[lib.FloatArray2D, np.ndarray]:
     """Covariance diagonal of the shared-amplitude spline models on the GPU.
 
@@ -4819,6 +5195,15 @@ def _spline_crlb_cuda(
     res = np.ascontiguousarray(res, dtype=np.float64)
     n_channels = coeff.shape[0]
 
+    # The variance patches are the same for every chunk, so upload once. With
+    # no calibration this is a four-byte dummy that only exists to keep the
+    # kernel's argument types stable.
+    use_variance = variance is not None
+    d_variance = cuda.to_device(
+        np.ascontiguousarray(variance, dtype=np.float32)
+        if use_variance
+        else np.zeros((1, 1, 1, 1), dtype=np.float32)
+    )
     d_coeff = cuda.to_device(np.ascontiguousarray(coeff))
     # constant over the whole run, so uploaded once
     d_aff = cuda.to_device(aff)
@@ -4866,6 +5251,8 @@ def _spline_crlb_cuda(
                 d_finite,
                 mu_floor,
                 mle,
+                d_variance,
+                use_variance,
                 d_crlb,
                 d_status,
             )
@@ -4880,6 +5267,8 @@ def _spline_crlb_cuda(
                 d_finite,
                 mu_floor,
                 mle,
+                d_variance,
+                use_variance,
                 d_crlb,
                 d_status,
             )
@@ -4910,6 +5299,7 @@ def _spline_link_xyz_crlb_cuda(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    variance: lib.FloatArray4D | None = None,
 ) -> tuple[lib.FloatArray2D, np.ndarray]:
     """Covariance diagonal of the photon-decoupled (link-XYZ) spline model on
     the GPU. Array-in / array-out counterpart of
@@ -4938,6 +5328,15 @@ def _spline_link_xyz_crlb_cuda(
     aff = np.ascontiguousarray(aff, dtype=np.float64)
     res = np.ascontiguousarray(res, dtype=np.float64)
 
+    # The variance patches are the same for every chunk, so upload once. With
+    # no calibration this is a four-byte dummy that only exists to keep the
+    # kernel's argument types stable.
+    use_variance = variance is not None
+    d_variance = cuda.to_device(
+        np.ascontiguousarray(variance, dtype=np.float32)
+        if use_variance
+        else np.zeros((1, 1, 1, 1), dtype=np.float32)
+    )
     d_coeff = cuda.to_device(np.ascontiguousarray(coeff))
     # constant over the whole run, so uploaded once
     d_aff = cuda.to_device(aff)
@@ -4982,6 +5381,8 @@ def _spline_link_xyz_crlb_cuda(
             d_finite,
             mu_floor,
             mle,
+            d_variance,
+            use_variance,
             d_crlb,
             d_status,
         )
@@ -5011,6 +5412,7 @@ def _spline_link_xyz_crlb_cpu(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    variance: lib.FloatArray4D | None = None,
 ) -> lib.FloatArray2D:
     """CPU (numba) parameter variances for the photon-decoupled (link-XYZ)
     model. The numerical core of :func:`_spline_link_xyz_crlb`, split out so it
@@ -5056,6 +5458,8 @@ def _spline_link_xyz_crlb_cpu(
             finite[sl],
             _SPLINE_CRLB_MU_FLOOR,
             mle,
+            _crlb_variance_chunk(variance, sl),
+            variance is not None,
             bread,
             meat,
         )
@@ -5078,6 +5482,7 @@ def _spline_link_xyz_crlb(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    variance: lib.FloatArray4D | None = None,
 ) -> lib.FloatArray2D:
     """CRLB / least-squares variances for the photon-decoupled (link-XYZ) fit.
 
@@ -5091,6 +5496,7 @@ def _spline_link_xyz_crlb(
     theta = np.asarray(theta, dtype=np.float64)
     n_locs = len(theta)
     n_channels = _spline_n_channels(calibration)
+    variance = _crlb_variance_channel_major(variance, n_channels)
 
     x_shift = np.ascontiguousarray(theta[:, 0])
     y_shift = np.ascontiguousarray(theta[:, 1])
@@ -5122,6 +5528,7 @@ def _spline_link_xyz_crlb(
                 finite,
                 _SPLINE_CRLB_MU_FLOOR,
                 mle,
+                variance=variance,
                 progress_callback=progress_callback,
             )
         except Exception as exc:
@@ -5145,6 +5552,7 @@ def _spline_link_xyz_crlb(
                     bg[failed],
                     finite[failed],
                     mle,
+                    variance=(None if variance is None else variance[failed]),
                 )
     if crlb is None:
         crlb = _spline_link_xyz_crlb_cpu(
@@ -5159,6 +5567,7 @@ def _spline_link_xyz_crlb(
             bg,
             finite,
             mle,
+            variance=variance,
             progress_callback=progress_callback,
         )
     if em:
@@ -5185,6 +5594,36 @@ def _spline_channel_affines(calibration: dict, n_channels: int) -> np.ndarray:
             lin = np.asarray(t, dtype=np.float64)[:, :2]
             aff[c] = (lin[0, 0], lin[0, 1], lin[1, 0], lin[1, 1])
     return aff
+
+
+def _crlb_variance_channel_major(
+    variance: np.ndarray | None, n_channels: int
+) -> np.ndarray | None:
+    """Normalize a readout-variance patch array for the CRLB kernels.
+
+    They index ``var[m, ch, j, i]``, so the patches arrive in the same Picasso
+    layout the spots do - ``(k, box, box)`` single-channel from ``get_spots``,
+    or channel-*last* ``(k, box, box, n_channels)`` from
+    :func:`get_spots_multichannel` - and go through the very same reordering.
+    Special-casing the 4D form here instead would leave a multichannel patch
+    channel-last while the kernel indexes it channel-major, which silently
+    reads another channel's noise."""
+    if variance is None:
+        return None
+    return _spline_channel_major(np.asarray(variance), n_channels)
+
+
+def _crlb_variance_chunk(
+    variance: lib.FloatArray4D | None, sl: slice
+) -> lib.FloatArray4D:
+    """A chunk of the readout-variance patches for a CRLB kernel.
+
+    The kernels index ``var[m, ch, j, i]`` unconditionally, so a stand-in of
+    the right rank has to exist even when there is no calibration - numba
+    types an array by its rank, and a scalar would not compile."""
+    if variance is None:
+        return np.zeros((1, 1, 1, 1), dtype=np.float32)
+    return np.ascontiguousarray(variance[sl], dtype=np.float32)
 
 
 def _spline_crlb_residuals(
@@ -5292,6 +5731,7 @@ def _spline_crlb_cpu(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    variance: lib.FloatArray4D | None = None,
 ) -> lib.FloatArray2D:
     """CPU (numba) parameter variances for the shared-amplitude spline models.
 
@@ -5342,6 +5782,8 @@ def _spline_crlb_cpu(
                 finite[sl],
                 _SPLINE_CRLB_MU_FLOOR,
                 mle,
+                _crlb_variance_chunk(variance, sl),
+                variance is not None,
                 bread[sl],
                 meat[sl],
             )
@@ -5356,6 +5798,8 @@ def _spline_crlb_cpu(
                 finite[sl],
                 _SPLINE_CRLB_MU_FLOOR,
                 mle,
+                _crlb_variance_chunk(variance, sl),
+                variance is not None,
                 bread[sl],
                 meat[sl],
             )
@@ -5384,6 +5828,7 @@ def _spline_crlb(
         Callable[[int], None] | Literal["console"] | None
     ) = None,
     residuals: np.ndarray | None = None,
+    variance: lib.FloatArray4D | None = None,
 ) -> lib.FloatArray2D:
     """Parameter-variance estimates for spline-fitted localizations.
 
@@ -5459,6 +5904,7 @@ def _spline_crlb(
             mle=mle,
             em=em,
             progress_callback=progress_callback,
+            variance=variance,
         )
     is_3d = model != "spline-2d"
 
@@ -5477,6 +5923,7 @@ def _spline_crlb(
     # same per-channel geometry as the fit (affine + ROI residual), so
     # the reported precision belongs to the model actually fitted
     n_channels = _spline_n_channels(calibration)
+    variance = _crlb_variance_channel_major(variance, n_channels)
     aff = _spline_channel_affines(calibration, n_channels)
     res = _spline_crlb_residuals(residuals, n_locs, n_channels)
 
@@ -5498,6 +5945,7 @@ def _spline_crlb(
                 finite,
                 _SPLINE_CRLB_MU_FLOOR,
                 mle,
+                variance=variance,
                 progress_callback=progress_callback,
             )
         except Exception as exc:
@@ -5521,6 +5969,7 @@ def _spline_crlb(
                     offset[failed],
                     finite[failed],
                     mle,
+                    variance=(None if variance is None else variance[failed]),
                 )
     if crlb is None:
         crlb = _spline_crlb_cpu(
@@ -5535,6 +5984,7 @@ def _spline_crlb(
             offset,
             finite,
             mle,
+            variance=variance,
             progress_callback=progress_callback,
         )
     if em:
@@ -5558,6 +6008,7 @@ def _locs_from_fits_spline_link_xyz(
     ) = None,
     residuals: np.ndarray | None = None,
     chi_square: lib.FloatArray1D | None = None,
+    variance: lib.FloatArray4D | None = None,
 ) -> pd.DataFrame:
     """Localizations from a photon-decoupled (link-XYZ) multichannel spline fit.
 
@@ -5569,6 +6020,7 @@ def _locs_from_fits_spline_link_xyz(
     ratio provides; the shares sum to 1). ``calibration`` is assumed already
     cropped to ``box``."""
     n_channels = _spline_n_channels(calibration)
+    variance = _crlb_variance_channel_major(variance, n_channels)
     oversampling = float(calibration.get("oversampling", 1.0))
     box_offset = int(box / 2)
     center = (box - 1) / 2.0
@@ -5600,6 +6052,7 @@ def _locs_from_fits_spline_link_xyz(
         em=em,
         progress_callback=progress_callback,
         residuals=residuals,
+        variance=variance,
     )  # variances [x, y, z, N_0.., bg_0..]
     var_amp = crlb[:, 3 : 3 + n_channels]
     var_bg = crlb[:, 3 + n_channels : 3 + 2 * n_channels]
@@ -5671,6 +6124,7 @@ def locs_from_fits_spline(
     ) = None,
     residuals: np.ndarray | None = None,
     chi_square: lib.FloatArray1D | None = None,
+    variance: lib.FloatArray4D | None = None,
 ) -> pd.DataFrame:
     """Convert spline fit results into a localizations data frame.
 
@@ -5706,6 +6160,7 @@ def locs_from_fits_spline(
             progress_callback=progress_callback,
             residuals=residuals,
             chi_square=chi_square,
+            variance=variance,
         )
     is_3d = model != "spline-2d"
     box_offset = int(box / 2)
@@ -5739,6 +6194,7 @@ def locs_from_fits_spline(
         em=em,
         progress_callback=progress_callback,
         residuals=residuals,
+        variance=variance,
     )
     amp_var, off_var = crlb[:, -2], crlb[:, -1]
     with np.errstate(invalid="ignore"):
@@ -5801,6 +6257,7 @@ def _fit2d_spline_gpu(
     n_z_starts: int | None = None,
     tolerance: float | None = None,
     max_iterations: int | None = None,
+    variance: lib.FloatArray3D | None = None,
 ) -> pd.DataFrame:
     """Fit an experimentally measured cubic-spline PSF on the GPU. For a 3D
     calibration the localizations contain the fitted ``z`` directly. See
@@ -5819,6 +6276,7 @@ def _fit2d_spline_gpu(
         tolerance=tolerance,
         max_iterations=max_iterations,
         use_gpu=True,
+        variance=variance,
     )
     locs = locs_from_fits_spline(
         identifications,
@@ -5831,6 +6289,7 @@ def _fit2d_spline_gpu(
         iterations=iterations,
         progress_callback=progress_callback,
         chi_square=chi_square,
+        variance=variance,
     )
     return locs
 
@@ -5850,6 +6309,7 @@ def _fit2d_spline_cpu(
         Callable[[int], None] | Literal["console"] | None
     ) = None,
     abort_callback: Callable[[], bool] | None = None,
+    variance: lib.FloatArray3D | None = None,
 ) -> pd.DataFrame | None:
     """Fit an experimentally measured cubic-spline PSF on the CPU. For a 3D
     calibration the localizations contain the fitted ``z`` directly. See
@@ -5874,6 +6334,7 @@ def _fit2d_spline_cpu(
         multiprocess=multiprocess,
         progress_callback=progress_callback,
         abort_callback=abort_callback,
+        variance=variance,
     )
     if result is None:
         return None
@@ -5891,6 +6352,7 @@ def _fit2d_spline_cpu(
             "console" if progress_callback == "console" else None
         ),
         chi_square=chi_square,
+        variance=variance,
     )
 
 
@@ -6250,7 +6712,9 @@ def get_spots_multichannel(
     transforms: list,
     progress_callback: Callable[[int], None] | None = None,
     return_residuals: bool = False,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    camera_calibrations: list[dict | None] | None = None,
+    return_variance: bool = False,
+) -> np.ndarray | tuple[np.ndarray, ...]:
     """Extract channel-stacked spots for multichannel spline fitting.
 
     For each identification (given in the reference channel's coordinates),
@@ -6280,6 +6744,14 @@ def get_spots_multichannel(
         part discarded when each channel's box is snapped to an integer pixel.
         The fit models need these to evaluate the spline where the data
         actually is; see :func:`channel_roi_residuals`. Default False.
+    camera_calibrations : list of dict or None, optional
+        One per-pixel sCMOS camera calibration per channel, or None for no
+        calibration at all. Individual entries may be None when only some
+        channels are on a characterized camera. Default None.
+    return_variance : bool, optional
+        Also return the per-spot readout variance in photoelectrons squared,
+        channel-stacked exactly like ``spots``. None when no calibration was
+        given. Default False.
 
     Returns
     -------
@@ -6288,12 +6760,21 @@ def get_spots_multichannel(
     residuals : np.ndarray
         Only if ``return_residuals``. ``(n_spots, n_channels, 2)`` in ``[x,
         y]`` order; channel 0 is exactly zero.
+    variance : np.ndarray or None
+        Only if ``return_variance``. Same shape as ``spots``.
     """
     n_channels = len(movies)
     if not (len(camera_infos) == len(transforms) == n_channels):
         raise ValueError(
             "movies, camera_infos and transforms must have the same length "
             "(one per channel)."
+        )
+    if camera_calibrations is None:
+        camera_calibrations = [None] * n_channels
+    elif len(camera_calibrations) != n_channels:
+        raise ValueError(
+            "camera_calibrations must have one entry per channel "
+            f"({n_channels}), got {len(camera_calibrations)}."
         )
     ref_xy = np.column_stack(
         [
@@ -6302,6 +6783,7 @@ def get_spots_multichannel(
         ]
     )
     channel_spots = []
+    channel_variance = []
     residuals = np.zeros((len(ref_xy), n_channels, 2), dtype=np.float32)
     for c in range(n_channels):
         if c == 0:
@@ -6318,18 +6800,37 @@ def get_spots_multichannel(
             residuals[:, c, :] = (mapped - rounded).astype(np.float32)
             ids_c["x"] = rounded[:, 0].astype(np.int64)
             ids_c["y"] = rounded[:, 1].astype(np.int64)
-        spots_c = get_spots(
+        # ``ids_c`` carries this channel's *rounded* box origins, so cutting
+        # the calibration maps from it here - rather than from the reference
+        # identifications - is what keeps a channel's variance patch aligned
+        # with the spot it accompanies.
+        spots_c, variance_c = get_spots(
             movies[c],
             ids_c,
             box,
             camera_infos[c],
             progress_callback=progress_callback if c == 0 else None,
+            camera_calibration=camera_calibrations[c],
+            return_variance=True,
         )
         channel_spots.append(spots_c)
+        if variance_c is None:
+            # A channel on an uncharacterized camera keeps the plain Poisson
+            # model, which is what a zero readout variance means.
+            variance_c = np.zeros_like(spots_c)
+        channel_variance.append(variance_c)
     spots = np.stack(channel_spots, axis=-1)
+    variance = (
+        np.stack(channel_variance, axis=-1)
+        if any(c is not None for c in camera_calibrations)
+        else None
+    )
+    result = (spots,)
     if return_residuals:
-        return spots, residuals
-    return spots
+        result += (residuals,)
+    if return_variance:
+        result += (variance,)
+    return result[0] if len(result) == 1 else result
 
 
 def channel_roi_residuals(
@@ -6396,6 +6897,7 @@ def fit_spline_multichannel(
     use_gpu: bool | None = None,
     tolerance: float | None = None,
     max_iterations: int | None = None,
+    camera_calibrations: list[dict | None] | None = None,
 ) -> pd.DataFrame:
     """Fit a multichannel cubic-spline PSF across several registered channels.
 
@@ -6441,6 +6943,13 @@ def fit_spline_multichannel(
         :func:`channel_roi_residuals` for why this matters and by how much. Set
         False to reproduce results from before this correction, or to A/B the
         two on the same data.
+    camera_calibrations : list of dict or None, optional
+        One per-pixel sCMOS camera calibration per channel (from
+        ``picasso.scmos`` or ``io.load_camera_calibration``), or None for none
+        at all; individual entries may be None when only some channels sit on
+        a characterized camera. Each channel's maps are cut at that channel's
+        own mapped, rounded box origin, so a calibration follows its channel
+        through the affine registration. Default None.
     """
     if calibration.get("model") != "spline-3d-multichannel":
         raise ValueError(
@@ -6458,7 +6967,7 @@ def fit_spline_multichannel(
     identifications = multichannel_inbounds_ids(
         identifications, box, movies, transforms
     )
-    spots, residuals = get_spots_multichannel(
+    spots, residuals, variance = get_spots_multichannel(
         movies,
         identifications,
         box,
@@ -6466,6 +6975,8 @@ def fit_spline_multichannel(
         transforms,
         progress_callback=progress_callback,
         return_residuals=True,
+        camera_calibrations=camera_calibrations,
+        return_variance=True,
     )
     theta, log_likelihood, iterations, chi_square = fit_spots_spline(
         spots,
@@ -6478,6 +6989,7 @@ def fit_spline_multichannel(
         tolerance=tolerance,
         max_iterations=max_iterations,
         progress_callback=progress_callback,
+        variance=variance,
     )
     em = camera_infos[0].get("Gain", 1) > 1
     return locs_from_fits_spline(
@@ -6492,6 +7004,7 @@ def fit_spline_multichannel(
         progress_callback=progress_callback,
         residuals=residuals if apply_roi_residuals else None,
         chi_square=chi_square,
+        variance=variance,
     )
 
 
@@ -6558,6 +7071,7 @@ def fit_spline_multichannel_ratiometric(
     use_gpu: bool | None = None,
     tolerance: float | None = None,
     max_iterations: int | None = None,
+    camera_calibrations: list[dict | None] | None = None,
 ) -> pd.DataFrame:
     """Ratiometric multichannel spline fit with photon-ratio color assignment.
 
@@ -6586,6 +7100,13 @@ def fit_spline_multichannel_ratiometric(
 
     ``apply_roi_residuals`` (default True) is as in
     :func:`fit_spline_multichannel`.
+    camera_calibrations : list of dict or None, optional
+        One per-pixel sCMOS camera calibration per channel (from
+        ``picasso.scmos`` or ``io.load_camera_calibration``), or None for none
+        at all; individual entries may be None when only some channels sit on
+        a characterized camera. Each channel's maps are cut at that channel's
+        own mapped, rounded box origin, so a calibration follows its channel
+        through the affine registration. Default None.
     """
     if calibration.get("model") != "spline-3d-multichannel":
         raise ValueError(
@@ -6616,7 +7137,7 @@ def fit_spline_multichannel_ratiometric(
     identifications = multichannel_inbounds_ids(
         identifications, box, movies, transforms
     )
-    spots, roi_residuals = get_spots_multichannel(
+    spots, roi_residuals, variance = get_spots_multichannel(
         movies,
         identifications,
         box,
@@ -6624,6 +7145,8 @@ def fit_spline_multichannel_ratiometric(
         transforms,
         progress_callback=progress_callback,
         return_residuals=True,
+        camera_calibrations=camera_calibrations,
+        return_variance=True,
     )
     if not apply_roi_residuals:
         roi_residuals = None
@@ -6657,6 +7180,7 @@ def fit_spline_multichannel_ratiometric(
             tolerance=tolerance,
             max_iterations=max_iterations,
             use_gpu=use_gpu,
+            variance=variance,
         )
         thetas.append(params)
         chis.append(np.asarray(chi_squares))
@@ -6701,6 +7225,7 @@ def fit_spline_multichannel_ratiometric(
             # under MLE this chi-square is a likelihood, and the frequent
             # negative-curvature exits make it unreliable anyway (see above).
             chi_square=(None if mle else chis[k][rows]),
+            variance=(None if variance is None else variance[rows]),
         )
         amp = pd.Series(np.asarray(theta_k[:, 0]), index=ids_k.index)
         ps = _photon_scales(calib_k, n_channels)
@@ -6886,6 +7411,7 @@ def fit_spline_split_fov(
     use_gpu: bool | None = None,
     tolerance: float | None = None,
     max_iterations: int | None = None,
+    camera_calibration: dict | None = None,
 ) -> pd.DataFrame:
     """Fit a split-FOV multichannel spline PSF from a *single* movie whose
     rectangular sub-regions are the channels.
@@ -6922,6 +7448,11 @@ def fit_spline_split_fov(
 
     Remaining parameters are as in the underlying multichannel fitters. The
     localizations are in the reference region's coordinates.
+    camera_calibration : dict or None, optional
+        A per-pixel sCMOS camera calibration for the (single) camera. All
+        split-FOV regions are read from one sensor and the maps are indexed by
+        absolute frame coordinates, so the same full-frame calibration serves
+        every region. Default None.
     """
     fit_regions, reference, transforms = split_fov_fit_geometry(
         calibration, regions
@@ -6941,6 +7472,14 @@ def fit_spline_split_fov(
 
     movies = [movie] * n_channels
     camera_infos = [camera_info] * n_channels
+    # Split-FOV is one physical camera, so every region reads the same maps;
+    # _cut_map indexes them with absolute frame coordinates, which is exactly
+    # what makes one full-frame calibration serve all regions.
+    camera_calibrations = (
+        None
+        if camera_calibration is None
+        else [camera_calibration] * n_channels
+    )
 
     if not link_photons and 2 <= n_channels <= _LINK_XYZ_MAX_CHANNELS:
         return fit_spline_multichannel(
@@ -6957,6 +7496,7 @@ def fit_spline_split_fov(
             use_gpu=use_gpu,
             tolerance=tolerance,
             max_iterations=max_iterations,
+            camera_calibrations=camera_calibrations,
         )
     if (
         photon_ratios is not None
@@ -6976,6 +7516,7 @@ def fit_spline_split_fov(
             use_gpu=use_gpu,
             tolerance=tolerance,
             max_iterations=max_iterations,
+            camera_calibrations=camera_calibrations,
         )
     return fit_spline_multichannel(
         movies,
@@ -6991,6 +7532,7 @@ def fit_spline_split_fov(
         use_gpu=use_gpu,
         tolerance=tolerance,
         max_iterations=max_iterations,
+        camera_calibrations=camera_calibrations,
     )
 
 
@@ -7004,6 +7546,7 @@ def _fit2d_avg(
         Callable[[int], None] | Literal["console"] | None
     ) = None,
     abort_callback: Callable[[], bool] | None = None,
+    variance: lib.FloatArray3D | None = None,
 ) -> pd.DataFrame | None:
     """Take localizations at the average value of the spots, see
     ``fit_2D`` for more details."""
@@ -7022,6 +7565,7 @@ def _fit2d_avg(
         theta,
         box,
         em,
+        readout_variance=_mean_readout_variance(variance),
     )
     return locs
 
@@ -7095,6 +7639,7 @@ def localize(
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
     affine_calibration: dict | list | None = None,
+    camera_calibration: dict | None = None,
     threaded: bool = True,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
@@ -7162,6 +7707,11 @@ def localize(
         are applied in order. Corrections stored in ``spline_calibration``
         are applied by the fit itself, so they must not be repeated here.
         Default is None.
+    camera_calibration : dict or None, optional
+        A per-pixel sCMOS camera calibration for the (single) camera. All
+        split-FOV regions are read from one sensor and the maps are indexed by
+        absolute frame coordinates, so the same full-frame calibration serves
+        every region. Default None.
     identification_progress_callback : callable or "console" or None
         A callback for progress updates during identification. If
         "console", progress will be printed to the console. If None,
@@ -7220,6 +7770,7 @@ def localize(
         max_it=max_it,
         mle_method=mle_method,
         spline_calibration=spline_calibration,
+        camera_calibration=camera_calibration,
         multiprocess=threaded,
         progress_callback=fit_progress_callback,
     )
@@ -7273,6 +7824,7 @@ def localize_3D(
     mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
     affine_calibration: dict | list | None = None,
+    camera_calibration: dict | None = None,
     multiprocess: bool = True,
     temporal_median_window: int | None = None,
     identification_progress_callback: (
@@ -7362,6 +7914,11 @@ def localize_3D(
         chromatic-aberration calibration combined with an astigmatism
         transform stored in ``calibration_3d``. Applied last, in list
         order. Default is None.
+    camera_calibration : dict or None, optional
+        A per-pixel sCMOS camera calibration for the (single) camera. All
+        split-FOV regions are read from one sensor and the maps are indexed by
+        absolute frame coordinates, so the same full-frame calibration serves
+        every region. Default None.
     multiprocess: bool, optional
         Whether or not to use multiprocessing. Ignored for GPU fitting.
         Default is True.
@@ -7449,6 +8006,7 @@ def localize_3D(
         mle_method=mle_method,
         spline_calibration=spline_calibration,
         affine_calibration=affine_calibration,
+        camera_calibration=camera_calibration,
         multiprocess=multiprocess,
         temporal_median_window=temporal_median_window,
         identification_progress_callback=identification_progress_callback,
@@ -7500,6 +8058,7 @@ def _localize_3D(
     fit_z_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    camera_calibration: dict | None = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """Internal function for `localize_3D`, assumes validated inputs."""
     locs, info = localize(
@@ -7518,6 +8077,7 @@ def _localize_3D(
         max_it=max_it,
         mle_method=mle_method,
         spline_calibration=spline_calibration,
+        camera_calibration=camera_calibration,
         threaded=multiprocess,
         identification_progress_callback=identification_progress_callback,
         fit_progress_callback=fit_progress_callback,

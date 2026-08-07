@@ -501,6 +501,88 @@ def save_any_calibration(path: str, calibration: dict) -> None:
         save_calibration(path, calibration)
 
 
+# Map names of an sCMOS camera calibration. ``gain`` is optional: it needs a
+# bright illumination series, while ``offset`` and ``variance`` come from the
+# dark movie alone. See ``picasso.scmos``.
+_CAMERA_CALIBRATION_MAPS = ("offset", "variance", "gain")
+
+
+def save_camera_calibration(path: str, calibration: dict) -> None:
+    """Save a per-pixel sCMOS camera calibration to an HDF5 file.
+
+    Stored exactly like a spline PSF calibration - the large arrays as
+    datasets, everything else as a JSON string in the ``metadata`` file
+    attribute - because it has the same shape of problem: sensor-sized maps
+    that do not belong in a YAML sidecar.
+
+    Parameters
+    ----------
+    path : str
+        Destination HDF5 path (conventionally ``*_scmos_calib.hdf5``).
+    calibration : dict
+        From ``picasso.scmos.calibrate_scmos``. Must contain the ``offset``
+        (ADU) and ``variance`` (ADU squared) maps and may contain ``gain``
+        (ADU per photoelectron); every other key must be JSON-serializable
+        (numpy scalars/arrays are coerced automatically).
+    """
+    for name in ("offset", "variance"):
+        if name not in calibration:
+            raise ValueError(
+                f"Invalid camera calibration: missing '{name}' map."
+            )
+    metadata = {
+        key: value
+        for key, value in calibration.items()
+        if key not in _CAMERA_CALIBRATION_MAPS
+    }
+    with h5py.File(path, "w") as f:
+        for name in _CAMERA_CALIBRATION_MAPS:
+            if calibration.get(name) is not None:
+                f.create_dataset(
+                    name,
+                    data=np.ascontiguousarray(
+                        calibration[name], dtype=np.float32
+                    ),
+                )
+        f.attrs["metadata"] = json.dumps(metadata, default=_json_default)
+
+
+def load_camera_calibration(path: str) -> dict:
+    """Load a per-pixel sCMOS camera calibration saved by
+    :func:`save_camera_calibration`.
+
+    Parameters
+    ----------
+    path : str
+        Path to the camera calibration HDF5 file.
+
+    Returns
+    -------
+    calibration : dict
+        The calibration dictionary, with ``offset`` and ``variance`` (and
+        ``gain``, if the file has one) restored as float32 numpy arrays
+        alongside the metadata. ``Path`` is set to ``path``, so a calibration
+        that has been moved still reports where it was actually loaded from.
+    """
+    with h5py.File(path, "r") as f:
+        if (
+            "offset" not in f
+            or "variance" not in f
+            or "metadata" not in f.attrs
+        ):
+            raise ValueError(
+                "Invalid camera calibration file: expected 'offset' and "
+                "'variance' datasets and a 'metadata' attribute. This does "
+                "not look like a Picasso sCMOS camera calibration."
+            )
+        calibration = json.loads(f.attrs["metadata"])
+        for name in _CAMERA_CALIBRATION_MAPS:
+            if name in f:
+                calibration[name] = f[name][:].astype(np.float32)
+    calibration["Path"] = path
+    return calibration
+
+
 def _readable_movie_dims(movie: AbstractPicassoMovie) -> dict:
     """Collect the movie dimensions that can be read straight from the
     file structure (frames, height, width), independent of the embedded

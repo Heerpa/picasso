@@ -982,10 +982,43 @@ def nena(
         return p_single + p_short
 
     area = np.trapezoid(dnfl, bin_centers)
-    median_lp = np.mean([np.median(locs["lpx"]), np.median(locs["lpy"])])
-    p0 = [0.8 * area, median_lp, 0.1 * area, 2 * median_lp, median_lp]
+    # nanmedian: a single non-converged fit carries NaN in lpx/lpy, and a NaN
+    # in p0 makes curve_fit reject the initial guess as out of bounds.
+    median_lp = np.mean([np.nanmedian(locs["lpx"]), np.nanmedian(locs["lpy"])])
+    peak = bin_centers[np.argmax(dnfl)]
+    starts = [
+        [0.8 * area, median_lp, 0.1 * area, 2 * median_lp, median_lp],
+        [
+            0.8 * area,
+            peak / np.sqrt(2),
+            0.1 * area,
+            0.7 * bin_centers[-1],
+            0.3 * bin_centers[-1],
+        ],
+        [0.8 * area, median_lp, 0.1 * area, 0.5 * bin_centers[-1], median_lp],
+    ]
     bounds = ([0, 0, 0, 0, 0], [np.inf, np.inf, np.inf, np.inf, np.inf])
-    popt, _ = curve_fit(func, bin_centers, dnfl, p0=p0, bounds=bounds)
+    popt = None
+    best = np.inf
+    errors = []
+    for p0 in starts:
+        if not np.all(np.isfinite(p0)):
+            continue
+        try:
+            candidate, _ = curve_fit(
+                func, bin_centers, dnfl, p0=p0, bounds=bounds
+            )
+        except (RuntimeError, ValueError) as error:
+            errors.append(error)
+            continue
+        residual = np.sum((func(bin_centers, *candidate) - dnfl) ** 2)
+        if residual < best:
+            best, popt = residual, candidate
+    if popt is None:
+        raise RuntimeError(
+            "NeNA could not be fitted to the next-frame neighbor distance "
+            f"histogram. Errors: {errors}"
+        )
     s = popt[1]  # NeNA
     result = {
         "d": bin_centers,  # distances probed

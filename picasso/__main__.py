@@ -1103,6 +1103,7 @@ def _localize_process_file(
     max_iterations: int,
     z_params,
     spline_calibration: dict | None = None,
+    camera_calibration: dict | None = None,
     affine_transforms: list | None = None,
 ) -> None:
     """Identify, fit, save and optionally undrift one movie file.
@@ -1150,6 +1151,7 @@ def _localize_process_file(
         eps=convergence if convergence > 0 else None,
         max_it=max_iterations if max_iterations > 0 else None,
         spline_calibration=spline_calibration,
+        camera_calibration=camera_calibration,
         threaded=True,
         identification_progress_callback="console",
         fit_progress_callback="console",
@@ -1368,6 +1370,24 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             + ", ".join(lib.describe_affine_transforms(found))
         )
 
+    camera_calibration = None
+    if args.camera_calibration:
+        from .io import load_camera_calibration
+
+        camera_calibration = load_camera_calibration(args.camera_calibration)
+        gain_note = (
+            "offset, variance and gain"
+            if camera_calibration.get("gain") is not None
+            else "offset and variance"
+        )
+        print(
+            f"Loaded sCMOS camera calibration ({gain_note} maps, "
+            f"{camera_calibration.get('Height')}x"
+            f"{camera_calibration.get('Width')} pixels, "
+            f"{camera_calibration.get('Frames')} dark frames) from "
+            f"{args.camera_calibration}"
+        )
+
     for i, path in enumerate(paths):
         _localize_process_file(
             path,
@@ -1384,6 +1404,125 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             z_params,
             spline_calibration=spline_calibration,
             affine_transforms=affine_transforms,
+            camera_calibration=camera_calibration,
+        )
+
+
+def _camera_calibrate(args: argparse.Namespace) -> None:
+    """Characterize an sCMOS camera from a dark movie (and optional light)."""
+    from os.path import splitext
+    from . import scmos
+    from .io import load_movie, save_camera_calibration
+
+    picasso_logo()
+    print("sCMOS camera calibration")
+    print("------------------------------------------")
+
+    dark_movie, _ = load_movie(args.dark)
+    print(f"Dark movie: {args.dark} ({len(dark_movie)} frames)")
+    bright_movies, bright_paths = [], []
+    for path in args.light or []:
+        movie, _ = load_movie(path)
+        bright_movies.append(movie)
+        bright_paths.append(path)
+        print(f"Light movie: {path} ({len(movie)} frames)")
+    if not bright_movies:
+        print(
+            "No light movies given, so no gain map: the scalar Sensitivity "
+            "is used for the counts-to-photons conversion. Pass -l/--light "
+            "several times, at different illumination levels, to measure the "
+            "per-pixel gain as well."
+        )
+
+    calibration = scmos.calibrate_scmos(
+        dark_movie,
+        bright_movies or None,
+        progress_callback="console",
+        dark_path=args.dark,
+        bright_paths=bright_paths,
+    )
+
+    out_path = args.output
+    if not out_path:
+        base, _ = splitext(args.dark)
+        out_path = base + "_scmos_calib.hdf5"
+    calibration["Path"] = out_path
+    save_camera_calibration(out_path, calibration)
+
+    print("------------------------------------------")
+    print(f"Frames used:       {calibration['Frames']}")
+    print(
+        f"Offset (ADU):      median "
+        f"{calibration['Offset median (ADU)']:.2f}, range "
+        f"{calibration['Offset min (ADU)']:.2f} - "
+        f"{calibration['Offset max (ADU)']:.2f}"
+    )
+    print(
+        f"Variance (ADU^2):  median "
+        f"{calibration['Variance median (ADU^2)']:.2f}, 99.9th pct "
+        f"{calibration['Variance 99.9 percentile (ADU^2)']:.1f}, max "
+        f"{calibration['Variance max (ADU^2)']:.1f}"
+    )
+    print(
+        f"Hot pixels:        {calibration['Hot pixels']} above "
+        f"{calibration['Hot pixel threshold (ADU^2)']:.1f} ADU^2"
+    )
+    if calibration.get("gain") is not None:
+        print(
+            f"Gain (ADU/e-):     median "
+            f"{calibration['Gain median (ADU/e-)']:.3f}, range "
+            f"{calibration['Gain min (ADU/e-)']:.3f} - "
+            f"{calibration['Gain max (ADU/e-)']:.3f} "
+            f"({calibration['Gain levels']} illumination levels)"
+        )
+        if calibration["Gain fallback pixels"]:
+            print(
+                f"                   {calibration['Gain fallback pixels']} "
+                "unresponsive pixel(s) took the chip median"
+            )
+    print(f"Saved to {out_path}")
+    # A dead column, a bright corner or a cluster of hot pixels shows in the
+    # maps and in nothing else, so they are written out alongside.
+    try:
+        plot_path = scmos.save_calibration_plot(
+            calibration, scmos.plot_path(out_path)
+        )
+        print(f"Maps and histograms: {plot_path}")
+    except Exception as error:
+        print(f"The diagnostic plot could not be saved: {error}")
+    print("Use it with: picasso localize <movie> -cm " f"{out_path} -a mle")
+
+
+def _camera_validate(args: argparse.Namespace) -> None:
+    """Check a camera calibration against a short, fresh dark movie."""
+    from . import scmos
+    from .io import load_camera_calibration, load_movie
+
+    picasso_logo()
+    print("sCMOS camera calibration check")
+    print("------------------------------------------")
+
+    calibration = load_camera_calibration(args.calibration)
+    test_movie, _ = load_movie(args.movie)
+    report = scmos.validate_calibration(
+        calibration, test_movie, progress_callback="console"
+    )
+
+    print(f"Frames tested:     {report['Frames']}")
+    print(f"Pixels tested:     {report['Pixels tested']}")
+    print(f"Mean p-value:      {report['mean p-value']:.3f} (want 0.5 +- 0.1)")
+    print(
+        f"Tails:             {100 * report['fraction p < 0.05']:.1f}% below "
+        f"0.05, {100 * report['fraction p > 0.95']:.1f}% above 0.95"
+    )
+    if report["valid"]:
+        print("The calibration still describes this camera.")
+    else:
+        direction = "noisier" if report["mean p-value"] < 0.5 else "quieter"
+        print(
+            f"The camera looks {direction} than when it was characterized. "
+            "Sensor temperature, readout mode and bit depth all change the "
+            "maps; recalibrate before trusting the noise model."
         )
 
 
@@ -2760,6 +2899,19 @@ def main():  # noqa: C901
         ),
     )
     localize_parser.add_argument(
+        "-cm",
+        "--camera-calibration",
+        type=str,
+        default="",
+        help=(
+            "path to a per-pixel sCMOS camera calibration (.hdf5) from "
+            "'picasso camera-calibrate'. Its offset map replaces --baseline "
+            "and, if it has one, its gain map replaces --sensitivity; "
+            "maximum-likelihood fits then use the sCMOS noise model of "
+            "Huang et al. Nature Methods, 2013."
+        ),
+    )
+    localize_parser.add_argument(
         "-g", "--gradient", type=int, default=5000, help="minimum net gradient"
     )
     localize_parser.add_argument(
@@ -2893,6 +3045,55 @@ def main():  # noqa: C901
 
     # spline-calibrate: build a cubic-spline PSF calibration from a bead
     # z-stack movie for later use with the 'spline' fit methods.
+    camera_calib_parser = subparsers.add_parser(
+        "camera-calibrate",
+        help=(
+            "characterize an sCMOS camera: per-pixel offset, readout "
+            "variance and (optionally) gain maps"
+        ),
+    )
+    camera_calib_parser.add_argument(
+        "dark",
+        help=(
+            "dark movie: frames recorded with no light on the sensor. Huang "
+            "et al. (2013) used 60,000; fewer than 10,000 warns"
+        ),
+    )
+    camera_calib_parser.add_argument(
+        "-l",
+        "--light",
+        type=str,
+        action="append",
+        help=(
+            "movie at a quasi-uniform illumination level, same camera "
+            "settings as the dark movie; repeat for several levels (the "
+            "paper used 15, spanning 20-200 photons per pixel) to measure "
+            "the per-pixel gain. Omit for offset and variance only"
+        ),
+    )
+    camera_calib_parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default="",
+        help=(
+            "output calibration path (.hdf5); default alongside the dark "
+            "movie"
+        ),
+    )
+
+    camera_check_parser = subparsers.add_parser(
+        "camera-validate",
+        help="check an sCMOS calibration against a fresh dark movie",
+    )
+    camera_check_parser.add_argument(
+        "calibration", help="camera calibration (.hdf5)"
+    )
+    camera_check_parser.add_argument(
+        "movie",
+        help="short fresh dark movie; about 1,000 frames is plenty",
+    )
+
     spline_calib_parser = subparsers.add_parser(
         "spline-calibrate",
         help="build a cubic-spline PSF calibration from a bead z-stack",
@@ -3804,6 +4005,10 @@ def main():  # noqa: C901
                 from picasso.gui import localize
 
                 localize.main()
+        elif args.command == "camera-calibrate":
+            _camera_calibrate(args)
+        elif args.command == "camera-validate":
+            _camera_validate(args)
         elif args.command == "spline-calibrate":
             _spline_calibrate(args)
         elif args.command == "filter":

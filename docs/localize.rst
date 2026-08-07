@@ -25,8 +25,8 @@ Fitting can run on a CUDA-capable GPU (see `GPU fitting`_ below). The kernels ar
 - ``NDTiffStack`` with extension ``.tif``,
 - BigTIFF, with extensions ``.tif``, ``.btf``, ``.tf8`` or ``.tf2``,
 - Zeiss ``.lsm``,
-- Zeiss ``.czi`` (requires ``pip install picassosr[czi]``, Python ≥ 3.12),
-- Leica ``.lif`` (requires ``pip install picassosr[lif]``, Python ≥ 3.12),
+- Zeiss ``.czi`` (requires ``pip install picassosr[czi]``, Python ≥ 3.12; available in the one-click installer),
+- Leica ``.lif`` (requires ``pip install picassosr[lif]``, Python ≥ 3.12; available in the one-click installer),
 - ``.raw``,
 - ``.ims`` (supported only on Windows),
 - ``.nd2``,
@@ -64,7 +64,7 @@ Identification and fitting of single-molecule spots
 4. In the ``Identification`` group, set the ``Box side length`` to the rounded integer value of 6 × σ + 1, where σ is the standard deviation of the PSF. In an optimized microscope setup, σ is one pixel, and the respective ``Box side length`` should be set to 7. The value of ``Min. net gradient`` specifies a minimum threshold above which spots should be considered for fitting. The net gradient value of a spot is roughly proportional to its intensity, independent of its local background. By checking ``Preview``, the spots identified with the current settings will be marked in the displayed frame. Adjust ``Min. net gradient`` to a value at which only spots are detected (no background).
 5. (Optional) Tick ``Temporal median filter`` in the ``Identification`` group to subtract a rolling per-pixel background before spots are identified; see *Temporal median filter* below.
 6. (Optional) Restrict the analysis to one or more regions of interest (ROIs) instead of the whole frame; see *Regions of interest (ROIs)* below.
-7. In the ``Photon conversion`` group, adjust ``EM Gain``, ``Baseline``, ``Sensitivity`` and ``Quantum Efficiency`` according to your camera specifications and the experimental conditions. Set ``EM Gain`` to 1 for conventional output amplification. ``Baseline`` is the average dark camera count. ``Sensitivity`` is the conversion factor (electrons per analog-to-digital (A/D) count). ``Quantum Efficiency`` is not used since version 0.6.0 and is kept for backward compatibility only. These parameters are critical to converting camera counts to photons correctly. The quality of the upcoming maximum likelihood fit strongly depends on a Poisson photon noise model, and thus on the absolute photon count. For simulated data, generated with ``Picasso: Simulate``, set the parameters as follows: ``EM Gain`` = 1, ``Baseline`` = 0, ``Sensitivity`` = 1.
+7. In the ``Photon conversion`` group, adjust ``EM Gain``, ``Baseline``, ``Sensitivity`` and ``Quantum Efficiency`` according to your camera specifications and the experimental conditions. Set ``EM Gain`` to 1 for conventional output amplification. ``Baseline`` is the average dark camera count. ``Sensitivity`` is the conversion factor (electrons per analog-to-digital (A/D) count). ``Quantum Efficiency`` is not used since version 0.6.0 and is kept for backward compatibility only. These parameters are critical to converting camera counts to photons correctly. The quality of the upcoming maximum likelihood fit strongly depends on a Poisson photon noise model, and thus on the absolute photon count. For simulated data, generated with ``Picasso: Simulate``, set the parameters as follows: ``EM Gain`` = 1, ``Baseline`` = 0, ``Sensitivity`` = 1. If you use an sCMOS camera, consider loading a per-pixel camera calibration instead of relying on the two scalars; see *sCMOS camera calibration* below.
 8. From the menu bar, select ``Analyze`` > ``Localize (Identify & Fit)`` to start spot identification and fitting in all movie frames. The status of this computation is displayed in the window's status bar. After completion, the fit results will be saved in a new file in the same folder as the movie, in which the filename is the base name of the movie file with the extension ``_locs.hdf5``. Furthermore, information about the movie and analysis procedure will be saved in an accompanying file with the extension ``_locs.yaml``; this file can be inspected using a text editor.
 
 Temporal median filter
@@ -117,6 +117,86 @@ Extra features
 When more than one channel is loaded (by either of the two actions above), a channel selector appears below the image so you can switch between channels; identification, fitting and saving then operate on the currently active channel.
 
 Loading runs in the background, so the window stays responsive while the files are read, and a progress dialog with a ``Cancel`` button is shown. Cancelling stops before the next file begins (a file already being read is finished first). This also applies to opening a single movie. Because the load no longer blocks the interface, large or multi-file datasets can be opened without freezing Picasso.
+
+sCMOS camera calibration
+------------------------
+
+An sCMOS sensor has no single readout characteristic. Every pixel has its own offset, amplification gain and readout noise variance, and those variances range from a few to several thousand ADU² on the same chip. Fitting such data with one scalar ``Baseline`` and one scalar ``Sensitivity`` loses both precision and accuracy.
+
+Picasso implements the pixel-dependent noise model of Huang et al. (`Nat. Methods 10, 653-658, 2013 <https://doi.org/10.1038/nmeth.2488>`_). Given per-pixel maps, the readout variance ``var_k`` (converted to photoelectrons²) is added to both the measured value and the model mean, which makes the sum approximately Poisson again and lets the established maximum-likelihood machinery carry over unchanged.
+
+Measuring the maps
+~~~~~~~~~~~~~~~~~~
+
+Select ``Calibration`` > ``Characterize sCMOS camera (dark movie)``, which opens a dialog collecting the dark movie, any bright movies and the output file in one place, or using command window/terminal run::
+
+    picasso camera-calibrate dark.raw -l light_01.raw -l light_02.raw ... -o mycam_scmos_calib.hdf5
+
+Two acquisitions feed it:
+
+- A **dark movie** — frames recorded with no light reaching the sensor (cap on the camera head, or a dark room). Its temporal mean per pixel is the offset map, its temporal variance the readout-variance map. This is the only required input. Huang et al. used 60,000 frames; the relative uncertainty of a variance estimate is ``sqrt(2 / (M - 1))``, so 1,000 frames give about 4.5 %, 10,000 about 1.4 % and 60,000 about 0.6 %. Picasso warns below 10,000 frames and refuses below 100.
+- Optionally a **bright series** — several movies at different quasi-uniform illumination levels, taken with exactly the same camera settings. A pixel's output mean is ``g·u + o`` and its output variance ``g²·u + var``, so the pair ``(mean − o, variance − var)`` traces a photon-transfer curve whose slope is that pixel's gain. Huang et al. used 15 levels of 20,000 frames spanning roughly 20 to 200 photons per pixel. Without a bright series there is no gain map and the scalar ``Sensitivity`` keeps being used.
+
+The maps are stored raw and camera-native — offset in ADU, variance in ADU², gain in ADU per photoelectron — in a single HDF5 file, so a calibration does not depend on any Picasso setting.
+
+Alongside the ``.hdf5`` Picasso writes a ``*_maps.png`` showing each map next to its histogram, as in Supplementary Fig. 1 of Huang et al., from both the GUI and the command line.
+
+Make sure the camera's offset is high enough that readout noise never drives a pixel below zero ADU. That is what the offset is engineered for, but with an unusually noisy pixel and a low offset the raw counts can clip or wrap, and the measured variance for that pixel then becomes meaningless.
+
+Using the maps
+~~~~~~~~~~~~~~
+
+In the ``Photon conversion`` group of the ``Parameters`` dialog, load the file next to ``sCMOS noise maps``, or pass it on the command line::
+
+    picasso localize movie.raw -a mle -cm mycam_scmos_calib.hdf5
+
+While a calibration is loaded, the scalars it supersedes are set to the maps' own medians and disabled: ``Baseline`` to the median offset, ``Sensitivity`` to the reciprocal of the median gain if the calibration carries a gain map, and ``EM gain`` to 1. Clearing the calibration restores the previous values. Only the maps are used in the fit; the medians are shown because those numbers still go into the localization metadata. The calibration path and a summary of the maps are recorded there too.
+
+A calibration can also be selected automatically through a ``camera-calibrations`` section in ``config.yaml``, keyed by camera and then by emission wavelength exactly like ``z-calibrations`` and ``spline-calibrations`` (see *Camera Config* below)::
+
+    camera-calibrations:
+      HamamatsuHam_DCAM:
+        525: C:/path/to/your_scmos_calib_525.hdf5
+        595: C:/path/to/your_scmos_calib_595.hdf5
+
+If one set of maps covers every wavelength, give the camera a single path instead of the mapping and it is used for all of them::
+
+    camera-calibrations:
+      HamamatsuHam_DCAM: C:/path/to/your_scmos_calib.hdf5
+
+What it changes, per fitting method
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- **Maximum likelihood** (``MLE`` with any PSF model) is where the noise model does its work. The likelihood becomes the one Huang et al. derive, the reported ``lpx`` / ``lpy`` become the sCMOS Cramér-Rao bound, and the goodness-of-fit statistic becomes their ``LLR_sCMOS``.
+- **Least squares** is mathematically *unaffected* by the variance map. Its reported uncertainty does grow, because readout noise is a genuine part of the residual scatter and pretending otherwise makes the error bars optimistic. If the calibration carries offset or gain maps, the least-squares fit does move slightly — but through the improved counts-to-photons conversion, not through the noise model.
+
+**For sCMOS data, prefer a maximum-likelihood method.** Its Cramér-Rao bound is evaluated pixel by pixel and is exact under the model, whereas the closed-form precision used by the least-squares methods assumes a spatially uniform background and can only take the *mean* readout variance over the fitting box.
+
+Two further caveats:
+
+- Set ``EM Gain`` to 1. An sCMOS sensor does not multiply, and combining an EM gain with a camera calibration applies the EMCCD excess-noise factor on top of the readout variance, double-counting the noise. Picasso warns if you do.
+- The reported ``log_likelihood`` is evaluated on the shifted data, so its values are not comparable between runs with and without a calibration.
+
+Checking a calibration
+~~~~~~~~~~~~~~~~~~~~~~
+
+The maps drift with the sensor: Huang et al. report that switching their camera from fan to liquid cooling, a change of about 30 K, was enough to invalidate a calibration. Bit depth, readout rate and any selectable gain setting change them outright.
+
+``Calibration`` > ``Check sCMOS calibration (fresh dark movie)``, or ``picasso camera-validate mycam_scmos_calib.hdf5 fresh_dark.raw``, tests a stored calibration against a short fresh dark movie — about 1,000 frames is plenty. If the camera still behaves as characterized, the per-pixel p-values are uniform and their mean sits at 0.5; a mean outside 0.5 ± 0.1 means the camera has drifted and should be re-characterized.
+
+Multichannel and split field of view
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The multichannel spline workflows take one calibration **per channel**, through the ``camera_calibrations`` argument of ``localize.fit_spline_multichannel``, ``fit_spline_multichannel_ratiometric`` and ``get_spots_multichannel``. Entries may individually be ``None`` when only some channels sit on a characterized camera; such a channel keeps the plain Poisson model.
+
+Each channel's maps are cut at *that channel's* mapped and rounded box origin, the same origin its spot is cut at, so a calibration follows its channel through the affine registration. This matters as soon as the channels are registered more than a pixel apart: reading a non-reference channel's noise at the reference position would sample the wrong pixels.
+
+Split field of view is one physical sensor whose sub-regions are the channels, so ``localize.fit_spline_split_fov`` takes a single ``camera_calibration`` and applies the same full-frame maps to every region — the maps are indexed by absolute frame coordinates, so each region reads its own pixels without further bookkeeping.
+
+Still using the scalars
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Spline PSF calibration from a bead z-stack converts its bead spots with the scalar camera parameters. This is harmless in practice, because calibration beads are bright enough that readout noise is negligible against their shot noise.
 
 Camera Config
 -------------

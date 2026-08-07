@@ -141,3 +141,13 @@ spline-calibrations: # This information is used to automatically set the experim
     525: C:/path/to/your_spline_calib_525nm_another_camera.hdf5
     595: C:/path/to/your_spline_calib_595nm_another_camera.hdf5
     700: C:/path/to/your_spline_calib_700nm_another_camera.hdf5
+camera-calibrations: # Per-pixel sCMOS offset/variance/gain maps (Huang et al. 2013)
+  HamamatsuHam_DCAM:
+    525: C:/path/to/your_scmos_calib_525.hdf5
+    595: C:/path/to/your_scmos_calib_595.hdf5
+    700: C:/path/to/your_scmos_calib_700.hdf5
+  Andor Zyla 4.2 Plus:
+    525: C:/path/to/your_scmos_calib_another_camera_525.hdf5
+    595: C:/path/to/your_scmos_calib_another_camera_595.hdf5
+    700: C:/path/to/your_scmos_calib_another_camera_700.hdf5
+  

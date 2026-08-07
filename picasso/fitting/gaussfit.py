@@ -64,6 +64,7 @@ from picasso.fitting.splinefit import (  # noqa: F401  (re-exported)
     _allocate_outputs,
     _lm_solve_step,
     n_workers,
+    resolve_variance,
 )
 
 # Model identifiers. Defined here and imported by ``gaussfit_cuda`` so the two
@@ -92,29 +93,43 @@ MAX_ITERATIONS_LSQ_CPU = 200
 
 
 @numba.njit(nogil=True, cache=True, fastmath=_FASTMATH)
-def _estimator_terms(mle: bool, value: float, data: float) -> tuple:
+def _estimator_terms(
+    mle: bool, value: float, data: float, var: float
+) -> tuple:
     """Per-pixel ``(chi_square, weight, factor, ok)``.
 
     ``weight`` multiplies the Hessian outer product and ``factor`` the gradient,
     so a caller accumulates ``grad_k += d_k * factor`` and
     ``hess_kl += weight * d_k * d_l``.
 
-    ``ok`` is False when a maximum-likelihood fit's model value is not finite
-    **or not positive**: the fit is abandoned rather than floored. See the
-    module docstring, and ``picasso.fitting.splinefit.MU_FLOOR`` for why the
-    spline models do the opposite."""
+    ``var`` is the pixel's sCMOS readout variance in photoelectrons squared,
+    and zero when no camera calibration is in use. See
+    ``picasso.fitting.splinefit._estimator_terms`` for the shift it produces
+    and why least squares is untouched by it.
+
+    ``ok`` is False when a maximum-likelihood fit's *shifted* model value is
+    not finite **or not positive**: the fit is abandoned rather than floored.
+    See the module docstring, and ``picasso.fitting.splinefit.MU_FLOOR`` for
+    why the spline models do the opposite."""
     if mle:
-        if not (np.isfinite(value) and value > 0.0):
+        shifted_value = value + var
+        shifted_data = data + var
+        if not (np.isfinite(shifted_value) and shifted_value > 0.0):
             return np.inf, 0.0, 0.0, False
-        if data > 0.0:
+        if shifted_data > 0.0:
             return (
-                2.0 * ((value - data) - data * np.log(value / data)),
-                data / (value * value),
-                -(1.0 - data / value),
+                2.0
+                * (
+                    (shifted_value - shifted_data)
+                    - shifted_data * np.log(shifted_value / shifted_data)
+                ),
+                shifted_data / (shifted_value * shifted_value),
+                -(1.0 - shifted_data / shifted_value),
                 True,
             )
         # An empty (or clipped) pixel: Gpufit's data == 0 term.
-        return 2.0 * value, 0.0, -1.0, True
+        return 2.0 * shifted_value, 0.0, -1.0, True
+    # Least squares: the shift cancels, so it is never formed.
     deviation = value - data
     return deviation * deviation, 1.0, -deviation, True
 
@@ -134,6 +149,8 @@ def _estimator_terms(mle: bool, value: float, data: float) -> tuple:
 def _accumulate_spherical(
     spots: np.ndarray,
     index: int,
+    variance: np.ndarray,
+    use_variance: bool,
     theta: np.ndarray,
     mle: bool,
     hess: np.ndarray,
@@ -177,7 +194,12 @@ def _accumulate_spherical(
             d2 = amp * ex * dy * inv_s2
             d3 = amp * ex * (dx * dx + dy * dy) * inv_s3
             # d4 == 1 (offset).
-            contrib, weight, factor, ok = _estimator_terms(mle, value, data)
+            var = 0.0
+            if use_variance:
+                var = variance[index, j, i]
+            contrib, weight, factor, ok = _estimator_terms(
+                mle, value, data, var
+            )
             if not ok:
                 return np.inf, False
             chi_square += contrib
@@ -232,6 +254,8 @@ def _accumulate_spherical(
 def _accumulate_elliptic(
     spots: np.ndarray,
     index: int,
+    variance: np.ndarray,
+    use_variance: bool,
     theta: np.ndarray,
     mle: bool,
     hess: np.ndarray,
@@ -281,7 +305,12 @@ def _accumulate_elliptic(
             d3 = amp * ex * dx * dx * inv_sx3
             d4 = amp * ex * dy * dy * inv_sy3
             # d5 == 1 (offset).
-            contrib, weight, factor, ok = _estimator_terms(mle, value, data)
+            var = 0.0
+            if use_variance:
+                var = variance[index, j, i]
+            contrib, weight, factor, ok = _estimator_terms(
+                mle, value, data, var
+            )
             if not ok:
                 return np.inf, False
             chi_square += contrib
@@ -351,6 +380,8 @@ def _accumulate_elliptic(
 def _accumulate_rotated(
     spots: np.ndarray,
     index: int,
+    variance: np.ndarray,
+    use_variance: bool,
     theta: np.ndarray,
     mle: bool,
     hess: np.ndarray,
@@ -416,7 +447,12 @@ def _accumulate_rotated(
             d4 = amp * argb * argb * inv_sy3 * ex
             # d5 == 1 (offset).
             d6 = amp * arga * argb * (inv_sx2 - inv_sy2) * ex
-            contrib, weight, factor, ok = _estimator_terms(mle, value, data)
+            var = 0.0
+            if use_variance:
+                var = variance[index, j, i]
+            contrib, weight, factor, ok = _estimator_terms(
+                mle, value, data, var
+            )
             if not ok:
                 return np.inf, False
             chi_square += contrib
@@ -509,6 +545,8 @@ def _accumulate(
     model: int,
     spots: np.ndarray,
     index: int,
+    variance: np.ndarray,
+    use_variance: bool,
     theta: np.ndarray,
     mle: bool,
     hess: np.ndarray,
@@ -516,16 +554,24 @@ def _accumulate(
 ) -> tuple:
     """Dispatch to the accumulator of ``model``."""
     if model == SPHERICAL:
-        return _accumulate_spherical(spots, index, theta, mle, hess, grad)
+        return _accumulate_spherical(
+            spots, index, variance, use_variance, theta, mle, hess, grad
+        )
     if model == ELLIPTIC:
-        return _accumulate_elliptic(spots, index, theta, mle, hess, grad)
-    return _accumulate_rotated(spots, index, theta, mle, hess, grad)
+        return _accumulate_elliptic(
+            spots, index, variance, use_variance, theta, mle, hess, grad
+        )
+    return _accumulate_rotated(
+        spots, index, variance, use_variance, theta, mle, hess, grad
+    )
 
 
 @numba.njit(nogil=True, cache=True, fastmath=_FASTMATH)
 def _fit_gauss_spot(
     spots: np.ndarray,
     index: int,
+    variance: np.ndarray,
+    use_variance: bool,
     model: int,
     init: np.ndarray,
     mle: bool,
@@ -569,7 +615,9 @@ def _fit_gauss_spot(
     lam = _LAMBDA_INITIAL
     n_iterations = 0
 
-    chi_square, ok = _accumulate(model, spots, index, theta, mle, hess, grad)
+    chi_square, ok = _accumulate(
+        model, spots, index, variance, use_variance, theta, mle, hess, grad
+    )
     if not ok:
         # The seed itself is unusable (non-finite or non-positive model).
         state = FIT_STATE_NEG_CURVATURE_MLE
@@ -603,7 +651,7 @@ def _fit_gauss_spot(
             theta_previous[p] = theta[p]
             theta[p] += delta[p]
         new_chi_square, ok = _accumulate(
-            model, spots, index, theta, mle, hess, grad
+            model, spots, index, variance, use_variance, theta, mle, hess, grad
         )
         n_iterations = iteration + 1
         if not ok:
@@ -680,6 +728,7 @@ def _prepare(
     initial_parameters: np.ndarray,
     tolerance: float | None,
     max_iterations: int | None,
+    variance: np.ndarray | None = None,
 ) -> tuple:
     """Validate and normalize the inputs both entry points share."""
     if model not in _N_PARAMS:
@@ -704,9 +753,12 @@ def _prepare(
     initial_parameters = np.ascontiguousarray(
         initial_parameters, dtype=np.float64
     )
+    variance, use_variance = resolve_variance(variance, spots.shape, ndim=3)
     outputs = _allocate_outputs(len(spots), n_params)
     return (
         spots,
+        variance,
+        use_variance,
         initial_parameters,
         float(tolerance),
         int(max_iterations),
@@ -715,6 +767,8 @@ def _prepare(
 
 
 def _kernel_args(
+    variance: np.ndarray,
+    use_variance: bool,
     model: int,
     initial_parameters: np.ndarray,
     mle: bool,
@@ -722,9 +776,15 @@ def _kernel_args(
     max_iterations: int,
     outputs: tuple,
 ) -> tuple:
-    """Freeze everything :func:`_fit_gauss_spot` needs after ``index``."""
+    """Freeze everything :func:`_fit_gauss_spot` needs after ``index``.
+
+    ``variance``/``use_variance`` lead, so they land immediately after
+    ``index`` in the kernel signature and every ``_fit_gauss_spot(spots, index,
+    *args)`` call site stays as it was."""
     thetas, chi_squares, states, iterations = outputs
     return (
+        variance,
+        bool(use_variance),
         int(model),
         initial_parameters,
         bool(mle),
@@ -747,6 +807,7 @@ def fit_spots(
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    variance: np.ndarray | None = None,
 ) -> tuple:
     """Fit spots with a 2D Gaussian model on the CPU, serially.
 
@@ -777,11 +838,26 @@ def fit_spots(
         Using Gpufit's state codes (see
         ``picasso.fitting.splinefit.FIT_STATE_CONVERGED``).
     """
-    spots, initial_parameters, tolerance, max_iterations, outputs = _prepare(
-        model, spots, initial_parameters, tolerance, max_iterations
+    (
+        spots,
+        variance,
+        use_variance,
+        initial_parameters,
+        tolerance,
+        max_iterations,
+        outputs,
+    ) = _prepare(
+        model, spots, initial_parameters, tolerance, max_iterations, variance
     )
     args = _kernel_args(
-        model, initial_parameters, mle, tolerance, max_iterations, outputs
+        variance,
+        use_variance,
+        model,
+        initial_parameters,
+        mle,
+        tolerance,
+        max_iterations,
+        outputs,
     )
     use_tqdm = progress_callback == "console"
     index_range = range(len(spots))
@@ -816,6 +892,7 @@ def fit_spots_async(
     tolerance: float | None = None,
     max_iterations: int | None = None,
     n_threads: int | None = None,
+    variance: np.ndarray | None = None,
 ) -> AsyncFit:
     """Fit spots with a 2D Gaussian model on several CPU threads.
 
@@ -828,11 +905,26 @@ def fit_spots_async(
     the ``gausslq.fit_spots_parallel`` it replaces, which forked up to 60
     worker processes and pickled the spots into each of them.
     """
-    spots, initial_parameters, tolerance, max_iterations, outputs = _prepare(
-        model, spots, initial_parameters, tolerance, max_iterations
+    (
+        spots,
+        variance,
+        use_variance,
+        initial_parameters,
+        tolerance,
+        max_iterations,
+        outputs,
+    ) = _prepare(
+        model, spots, initial_parameters, tolerance, max_iterations, variance
     )
     args = _kernel_args(
-        model, initial_parameters, mle, tolerance, max_iterations, outputs
+        variance,
+        use_variance,
+        model,
+        initial_parameters,
+        mle,
+        tolerance,
+        max_iterations,
+        outputs,
     )
     n_spots = len(spots)
     if n_threads is None:

@@ -298,6 +298,92 @@ class TestLoadCalibration:
 
 
 # ---------------------------------------------------------------------------
+# save/load_camera_calibration — the per-pixel sCMOS maps
+# ---------------------------------------------------------------------------
+
+
+class TestCameraCalibrationRoundtrip:
+    @staticmethod
+    def _calibration(with_gain=True):
+        rng = np.random.default_rng(0)
+        calibration = {
+            "offset": rng.normal(100.0, 2.0, (6, 5)).astype(np.float32),
+            "variance": rng.gamma(4.0, 0.5, (6, 5)).astype(np.float32),
+            "model": "scmos-noise",
+            "Height": 6,
+            "Width": 5,
+            "Frames": 20000,
+            "Light movies": ["a.raw", "b.raw"],
+            "Variance median (ADU^2)": 2.0,
+        }
+        if with_gain:
+            calibration["gain"] = rng.normal(2.13, 0.1, (6, 5)).astype(
+                np.float32
+            )
+        return calibration
+
+    @pytest.mark.parametrize("with_gain", [True, False])
+    def test_arrays_survive_bit_exactly(self, tmp_path, with_gain):
+        calibration = self._calibration(with_gain)
+        path = str(tmp_path / "cam_scmos_calib.hdf5")
+        io.save_camera_calibration(path, calibration)
+        out = io.load_camera_calibration(path)
+
+        for name in ("offset", "variance") + (("gain",) if with_gain else ()):
+            assert out[name].dtype == np.float32
+            np.testing.assert_array_equal(out[name], calibration[name])
+        assert ("gain" in out) is with_gain
+
+    def test_metadata_survives(self, tmp_path):
+        calibration = self._calibration()
+        path = str(tmp_path / "cam_scmos_calib.hdf5")
+        io.save_camera_calibration(path, calibration)
+        out = io.load_camera_calibration(path)
+        assert out["model"] == "scmos-noise"
+        assert out["Frames"] == 20000
+        assert out["Light movies"] == ["a.raw", "b.raw"]
+        assert out["Variance median (ADU^2)"] == 2.0
+
+    def test_load_records_where_it_came_from(self, tmp_path):
+        """``Path`` is set on load, so a moved file still reports its home."""
+        path = str(tmp_path / "cam_scmos_calib.hdf5")
+        io.save_camera_calibration(path, self._calibration())
+        assert io.load_camera_calibration(path)["Path"] == path
+
+    def test_save_rejects_a_calibration_without_maps(self, tmp_path):
+        with pytest.raises(ValueError, match="missing 'variance' map"):
+            io.save_camera_calibration(
+                str(tmp_path / "x.hdf5"), {"offset": np.zeros((2, 2))}
+            )
+
+    def test_load_rejects_a_spline_calibration(self, tmp_path):
+        """The two calibrations share a container format, not a schema."""
+        path = str(tmp_path / "spline_calib.hdf5")
+        io.save_spline_calibration(
+            path, {"coefficients": np.zeros((1, 1, 1, 4, 4)), "model": "2d"}
+        )
+        with pytest.raises(ValueError, match="sCMOS camera calibration"):
+            io.load_camera_calibration(path)
+
+    def test_roundtrips_a_real_calibration(
+        self, tmp_path, scmos_maps, dark_movie_factory
+    ):
+        """End to end from ``scmos.calibrate_scmos``, metadata included."""
+        from picasso import scmos
+
+        frames = dark_movie_factory(scmos_maps, 20_000, seed=8)
+        calibration = scmos.calibrate_scmos(frames, dark_path="dark.raw")
+        path = str(tmp_path / "real_scmos_calib.hdf5")
+        io.save_camera_calibration(path, calibration)
+        out = io.load_camera_calibration(path)
+
+        np.testing.assert_array_equal(out["offset"], calibration["offset"])
+        np.testing.assert_array_equal(out["variance"], calibration["variance"])
+        assert out["Dark movie"] == "dark.raw"
+        assert out["Hot pixels"] == calibration["Hot pixels"]
+
+
+# ---------------------------------------------------------------------------
 # load_picks — write minimal synthetic YAMLs and load them back
 # ---------------------------------------------------------------------------
 

@@ -5026,7 +5026,20 @@ class InfoDialog(lib.Dialog):
                 image2 = Image.fromarray(self.frc_result["images"][1])
                 image2.save(f"{base}_2{ext}")
             res_nm = self.frc_result["resolution"]
-            self.frc_resolution.setText(f"{res_nm:.2f} nm")
+            if res_nm is None:
+                # The FRC curve never crosses the 1/7 threshold, e.g. when the
+                # viewport holds too few localizations to resolve anything.
+                self.frc_resolution.setText("n/a")
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "FRC resolution",
+                    "The FRC curve does not cross the 1/7 threshold, so no "
+                    "resolution can be given. Try a larger viewport or more "
+                    "localizations. Check that your NeNA value seems "
+                    "reasonable - FRC pixel size is taken from NeNA",
+                )
+            else:
+                self.frc_resolution.setText(f"{res_nm:.2f} nm")
 
     def calculate_nena_lp(self) -> None:
         """Calculate NeNA precision in a given channel."""

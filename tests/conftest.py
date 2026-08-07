@@ -22,7 +22,6 @@ import pytest
 
 from picasso import io
 
-
 # ---------------------------------------------------------------------------
 # Loaded test data (shared across files to avoid repeated I/O)
 # ---------------------------------------------------------------------------
@@ -443,3 +442,74 @@ def picasso_movie_factory():
     As ``picasso_movie``, but for tests that build their own synthetic movie
     (with known ground truth) rather than using the bundled .raw."""
     return _MemmapPicassoMovie
+
+
+# ---------------------------------------------------------------------------
+# sCMOS camera calibration (per-pixel offset / variance / gain)
+# ---------------------------------------------------------------------------
+
+
+def _make_scmos_maps(
+    height=16, width=16, n_hot=3, gain=2.13, seed=0
+) -> dict[str, np.ndarray]:
+    """Ground-truth per-pixel maps resembling a real sCMOS sensor.
+
+    Values follow Huang et al. (2013), Supplementary Fig. 1, measured on a
+    Hamamatsu ORCA Flash 4.0: an offset around 100 ADU, a readout variance of
+    a couple of ADU squared with a sparse tail of very noisy pixels, and a
+    gain of roughly 2 ADU per photoelectron with column-wise structure.
+    """
+    rng = np.random.default_rng(seed)
+    offset = 100.0 + rng.normal(0.0, 1.5, (height, width))
+    variance = rng.gamma(shape=4.0, scale=0.5, size=(height, width)) + 0.5
+    # The hot tail is what the whole noise model exists for, so it is placed
+    # deterministically rather than left to chance at this map size.
+    flat = rng.choice(height * width, size=n_hot, replace=False)
+    variance.flat[flat] = np.array([40.0, 220.0, 900.0])[:n_hot]
+    # Column-wise amplifiers: gain varies mostly along x, weakly along y.
+    columns = gain + rng.normal(0.0, 0.12, (1, width))
+    gains = np.repeat(columns, height, axis=0) + rng.normal(
+        0.0, 0.02, (height, width)
+    )
+    return {
+        "offset": offset,
+        "variance": variance,
+        "gain": np.abs(gains),
+        "hot_pixels": flat[:n_hot],
+    }
+
+
+@pytest.fixture(scope="session")
+def scmos_maps():
+    """Ground-truth per-pixel offset / variance / gain maps."""
+    return _make_scmos_maps()
+
+
+@pytest.fixture(scope="session")
+def scmos_maps_factory():
+    """Build ground-truth per-pixel maps at an arbitrary size."""
+    return _make_scmos_maps
+
+
+@pytest.fixture(scope="session")
+def dark_movie_factory():
+    """Build a dark movie consistent with a set of ground-truth maps.
+
+    ``camera_output`` also serves the bright case: pass a photon level and it
+    adds Poisson shot noise amplified by the gain, which is exactly the
+    photon-transfer-curve model the gain calibration inverts.
+    """
+
+    def camera_output(maps, n_frames, photons=0.0, seed=0, dtype=np.float64):
+        rng = np.random.default_rng(seed)
+        shape = maps["offset"].shape
+        frames = maps["offset"] + rng.normal(
+            0.0, np.sqrt(maps["variance"]), (n_frames, *shape)
+        )
+        if photons:
+            frames = frames + maps["gain"] * rng.poisson(
+                photons, (n_frames, *shape)
+            )
+        return frames.astype(dtype)
+
+    return camera_output

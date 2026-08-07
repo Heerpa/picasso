@@ -3036,15 +3036,20 @@ class TestSplineHelpers:
                 "net_gradient": np.ones(n_spots),
             }
         )
-        monkeypatch.setattr(
-            localize,
-            "get_spots_multichannel",
-            lambda *a, **kw: (
-                (spots, np.zeros((n_spots, 2, 2), np.float32))
-                if kw.get("return_residuals")
-                else spots
-            ),
-        )
+
+        def fake_get_spots(*args, **kwargs):
+            """Mirror the real return contract, including ``return_variance``.
+
+            No camera calibration is passed here, so the variance is None -
+            the plain Poisson model, which is what this test is about."""
+            out = (spots,)
+            if kwargs.get("return_residuals"):
+                out += (np.zeros((n_spots, 2, 2), np.float32),)
+            if kwargs.get("return_variance"):
+                out += (None,)
+            return out[0] if len(out) == 1 else out
+
+        monkeypatch.setattr(localize, "get_spots_multichannel", fake_get_spots)
         monkeypatch.setattr(
             localize, "multichannel_inbounds_ids", lambda i, *a, **kw: i
         )
@@ -7486,3 +7491,1275 @@ class TestContrastDialog:
         source = inspect.getsource(localize_gui.Window.set_frame)
         assert "auto_checkbox.isChecked()" in source
         assert "change_contrast_silently" in source
+
+
+# ---------------------------------------------------------------------------
+# sCMOS per-pixel noise model (Huang et al. 2013)
+# ---------------------------------------------------------------------------
+
+
+class TestCutMap:
+    """``_cut_map`` is load-bearing: every map patch is cut by it."""
+
+    def test_matches_cut_spots_exactly(self):
+        """Tile a map across frames, then ``_cut_spots`` must reproduce it.
+
+        This is the only check that the map patch and the spot it accompanies
+        describe the same pixels. An off-by-one here would put a hot pixel's
+        variance on its neighbour, silently.
+        """
+        rng = np.random.default_rng(0)
+        image = rng.normal(100.0, 5.0, (32, 30)).astype(np.float32)
+        movie = np.broadcast_to(image, (4, 32, 30)).copy()
+        ids = pd.DataFrame(
+            {
+                "frame": [0, 1, 2, 3, 0],
+                "x": [10, 20, 5, 25, 15],
+                "y": [12, 8, 20, 16, 4],
+            }
+        )
+        spots = localize._cut_spots(movie, ids, BOX)
+        patches = localize._cut_map(image, ids, BOX)
+        np.testing.assert_array_equal(patches, spots.astype(np.float32))
+
+    def test_places_a_unique_pixel_where_it_belongs(self):
+        image = np.zeros((20, 20), dtype=np.float32)
+        image[9, 13] = 1.0
+        ids = pd.DataFrame({"frame": [0], "x": [11], "y": [10]})
+        patch = localize._cut_map(image, ids, 7)
+        # box-local: y = 9 - (10 - 3) = 2, x = 13 - (11 - 3) = 5
+        assert patch[0, 2, 5] == 1.0
+        assert patch.sum() == 1.0
+
+
+class TestPhotonConversionWithMaps:
+    def test_a_constant_offset_map_equals_the_scalar_baseline(self):
+        rng = np.random.default_rng(1)
+        spots = rng.normal(500.0, 20.0, (5, BOX, BOX)).astype(np.float32)
+        info = {"Baseline": 100.0, "Sensitivity": 0.47, "Gain": 1}
+        flat = np.full_like(spots, 100.0)
+        np.testing.assert_allclose(
+            localize._to_photons(spots, info, offset=flat),
+            localize._to_photons(spots, info),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_a_gain_map_overrides_the_scalar_sensitivity(self):
+        rng = np.random.default_rng(2)
+        spots = rng.normal(500.0, 20.0, (5, BOX, BOX)).astype(np.float32)
+        info = {"Baseline": 100.0, "Sensitivity": 0.5, "Gain": 1}
+        gain = np.full_like(spots, 2.0)  # sensitivity = 1 / 2.0 = 0.5
+        np.testing.assert_allclose(
+            localize._to_photons(spots, info, gain_patch=gain),
+            localize._to_photons(spots, info),
+            rtol=1e-6,
+        )
+
+    def test_variance_converts_by_the_squared_factor(self):
+        """``var / g^2`` in the paper's notation, ``var * S^2`` in Picasso's."""
+        info = {"Baseline": 100.0, "Sensitivity": 0.47, "Gain": 1}
+        var_adu = np.full((3, BOX, BOX), 900.0, dtype=np.float32)
+        got = localize._variance_to_photons(var_adu, info)
+        np.testing.assert_allclose(got, 900.0 * 0.47**2, rtol=1e-6)
+
+        gain = np.full((3, BOX, BOX), 2.13, dtype=np.float32)
+        got = localize._variance_to_photons(var_adu, info, gain_patch=gain)
+        np.testing.assert_allclose(got, 900.0 / 2.13**2, rtol=1e-6)
+
+
+class TestClipForMle:
+    def test_floors_at_zero_without_a_map(self):
+        spots = np.array([[[-5.0, 3.0]]], dtype=np.float32)
+        np.testing.assert_array_equal(
+            localize._clip_for_mle(spots, None), [[[0.0, 3.0]]]
+        )
+
+    def test_floors_at_minus_variance_with_a_map(self):
+        """``d + var >= 0`` is the condition; clipping at 0 instead would
+        discard exactly the negative excursions readout noise creates."""
+        spots = np.array([[[-5.0, -20.0]]], dtype=np.float32)
+        var = np.array([[[10.0, 4.0]]], dtype=np.float32)
+        np.testing.assert_array_equal(
+            localize._clip_for_mle(spots, var), [[[-5.0, -4.0]]]
+        )
+
+
+class TestSeedSpots:
+    """The ``-var`` floor must not leak into the initial parameters."""
+
+    def test_is_a_no_op_without_a_map(self):
+        spots = np.array([[[-5.0, 3.0]]], dtype=np.float32)
+        assert localize._seed_spots(spots, None) is spots
+
+    def test_floors_at_zero_with_a_map(self):
+        spots = np.array([[[-5.0, 3.0]]], dtype=np.float32)
+        var = np.array([[[10.0, 1.0]]], dtype=np.float32)
+        np.testing.assert_array_equal(
+            localize._seed_spots(spots, var), [[[0.0, 3.0]]]
+        )
+
+    def test_mle_survives_a_deeply_negative_hot_pixel(self):
+        """Regression: seeding the background from a ``-var`` floored pixel
+        makes the model mean negative over the whole ROI, so the likelihood
+        is floored everywhere, the first Hessian is singular and the fit
+        aborts with NaN parameters.
+        """
+        box = 7
+        rng = np.random.default_rng(0)
+        grid = np.arange(box, dtype=np.float64)
+        dx = grid[None, :] - 3.0
+        dy = grid[:, None] - 3.0
+        mu = (
+            300.0
+            / (2 * np.pi * 1.3**2)
+            * np.exp(-0.5 * (dx**2 + dy**2) / 1.3**2)
+            + 5.0
+        )
+        spots = rng.poisson(mu, (32, box, box)).astype(np.float32)
+        var = np.full((32, box, box), 1.0, dtype=np.float32)
+        # One hot corner pixel, far from the emitter, with a large negative
+        # excursion - exactly what a 2,000 ADU^2 pixel produces.
+        var[:, 0, 0] = 400.0
+        spots[:, 0, 0] = -80.0
+
+        theta = localize.fit_spots_gauss(
+            localize._clip_for_mle(spots, var), mle=True, variance=var
+        )
+
+        assert np.isfinite(theta).all()
+        assert np.abs(theta[:, 1] - 3.0).max() < 1.0
+
+
+class TestGaussCrlbVariance:
+    def test_respects_the_transposed_axis_order(self):
+        """``_gauss_crlb`` builds ``[spot, x, y]``; a patch is ``[spot, y, x]``.
+
+        A single asymmetric hot pixel is the only way to see the difference:
+        with a symmetric map, a transpose is invisible.
+        """
+        theta = np.array([[500.0, 3.0, 3.0, 1.2, 1.6, 5.0]])
+        box = 7
+        var = np.zeros((1, box, box), dtype=np.float32)
+        var[0, 1, 5] = 400.0  # y = 1, x = 5 - deliberately not symmetric
+
+        got = localize._gauss_crlb(theta, box, em=False, variance=var)
+
+        # Reference: rebuild mu in [spot, y, x] and add the patch directly.
+        grid = np.arange(box, dtype=np.float64)
+        dy = grid[:, None] - theta[0, 2]
+        dx = grid[None, :] - theta[0, 1]
+        sx, sy, n = theta[0, 3], theta[0, 4], theta[0, 0]
+        e = np.exp(-0.5 * (dx**2 / sx**2 + dy**2 / sy**2))
+        sig = n / (2 * np.pi * sx * sy) * e
+        grads = [
+            sig / n,
+            sig * dx / sx**2,
+            sig * dy / sy**2,
+            sig * (dx**2 / sx**3 - 1.0 / sx),
+            sig * (dy**2 / sy**3 - 1.0 / sy),
+            np.ones_like(sig),
+        ]
+        mu = sig + theta[0, 5] + var[0]
+        g = np.stack(grads)
+        fisher = np.einsum("pij,qij,ij->pq", g, g, 1.0 / mu)
+        expected = np.diagonal(np.linalg.pinv(fisher))
+        np.testing.assert_allclose(got[0], expected, rtol=1e-8)
+
+    def test_a_hot_pixel_widens_the_bound(self):
+        theta = np.array([[500.0, 3.0, 3.0, 1.3, 1.3, 5.0]])
+        plain = localize._gauss_crlb(theta, 7, em=False)
+        var = np.zeros((1, 7, 7), dtype=np.float32)
+        var[0, 2, 4] = 500.0
+        noisy = localize._gauss_crlb(theta, 7, em=False, variance=var)
+        assert np.all(noisy >= plain - 1e-12)
+        assert noisy[0, 1] > plain[0, 1]
+
+
+@pytest.fixture(scope="module")
+def scmos_scene():
+    """A synthetic sCMOS camera, its calibration, and a single-emitter movie.
+
+    Conditions follow the paper's own simulations - 200 photons per molecule,
+    5 background photons per pixel - with one very noisy pixel inside the
+    fitting box but off-centre and off-axis, so a bias shows up in x and
+    cannot be mistaken for a symmetric artifact.
+    """
+    from picasso import scmos
+
+    rng = np.random.default_rng(11)
+    h = w = 40
+    offset = 100.0 + rng.normal(0, 1.0, (h, w))
+    variance = rng.gamma(4.0, 0.4, (h, w)) + 0.4
+    variance[18, 22] = 2000.0
+    gain = np.full((h, w), 2.13)
+
+    dark = offset + rng.normal(0, np.sqrt(variance), (20_000, h, w))
+    calibration = scmos.calibrate_scmos(dark)
+
+    n_frames = 3000
+    x0, y0, sigma, photons, bg = 20.0, 18.0, 1.3, 200.0, 5.0
+    yy, xx = np.mgrid[0:h, 0:w]
+    mu = (
+        photons
+        / (2 * np.pi * sigma**2)
+        * np.exp(-0.5 * (((xx - x0) ** 2 + (yy - y0) ** 2) / sigma**2))
+        + bg
+    )
+    adu = (
+        gain * rng.poisson(mu, (n_frames, h, w))
+        + offset
+        + rng.normal(0, np.sqrt(variance), (n_frames, h, w))
+    )
+    identifications = pd.DataFrame(
+        {
+            "frame": np.arange(n_frames),
+            "x": np.full(n_frames, 20),
+            "y": np.full(n_frames, 18),
+            "net_gradient": np.full(n_frames, 1e4, np.float32),
+        }
+    )
+    camera_info = {
+        "Baseline": float(np.median(offset)),
+        "Sensitivity": 1 / 2.13,
+        "Gain": 1,
+        "Qe": 1.0,
+        "Pixelsize": 130,
+    }
+    return {
+        "movie": adu.astype(np.float32),
+        "info": [{"Frames": n_frames, "Height": h, "Width": w}],
+        "identifications": identifications,
+        "camera_info": camera_info,
+        "calibration": calibration,
+        "truth": (x0, y0),
+    }
+
+
+class TestScmosFit2DIntegration:
+    """The whole feature, end to end through ``fit2D``."""
+
+    @staticmethod
+    def _fit(scene, picasso_movie_factory, method, calibration):
+        movie = picasso_movie_factory(scene["movie"], scene["info"])
+        locs, info = localize.fit2D(
+            movie,
+            [{}],
+            dict(scene["camera_info"]),
+            scene["identifications"],
+            BOX,
+            fitting_method=method,
+            camera_calibration=calibration,
+        )
+        ok = np.isfinite(locs["x"]) & np.isfinite(locs["lpx"])
+        return locs[ok], info
+
+    def test_mle_bias_from_a_hot_pixel_is_removed(
+        self, scmos_scene, picasso_movie_factory
+    ):
+        x0, _ = scmos_scene["truth"]
+        plain, _ = self._fit(
+            scmos_scene, picasso_movie_factory, "gaussmle", None
+        )
+        modelled, _ = self._fit(
+            scmos_scene,
+            picasso_movie_factory,
+            "gaussmle",
+            scmos_scene["calibration"],
+        )
+        bias_plain = abs(plain["x"].mean() - x0)
+        bias_model = abs(modelled["x"].mean() - x0)
+        sem = plain["x"].std() / np.sqrt(len(plain))
+
+        # The test is only meaningful if the conventional fit is measurably
+        # biased in the first place.
+        assert bias_plain > 3 * sem
+        assert bias_model < bias_plain / 3
+        # ... and the precision must not be paid for it.
+        assert modelled["x"].std() < plain["x"].std()
+
+    def test_mle_precision_estimate_becomes_honest(
+        self, scmos_scene, picasso_movie_factory
+    ):
+        """The conventional CRLB ignores readout noise and is optimistic;
+        CRLB_sCMOS is attained. This is Fig. 1c,d of the paper."""
+        plain, _ = self._fit(
+            scmos_scene, picasso_movie_factory, "gaussmle", None
+        )
+        modelled, _ = self._fit(
+            scmos_scene,
+            picasso_movie_factory,
+            "gaussmle",
+            scmos_scene["calibration"],
+        )
+        ratio_plain = plain["x"].std() / plain["lpx"].mean()
+        ratio_model = modelled["x"].std() / modelled["lpx"].mean()
+        assert ratio_plain > 1.3
+        assert 0.85 < ratio_model < 1.15
+
+    def test_lsq_uncertainty_grows_but_the_fit_barely_moves(
+        self, scmos_scene, picasso_movie_factory
+    ):
+        """Least squares does not use the noise model in its objective.
+
+        Its reported uncertainty does grow, because the readout noise is a
+        real contribution to the residual scatter. The fit itself changes only
+        through the per-pixel offset and gain maps replacing the two scalars -
+        the variance term cancels out of a least-squares objective exactly
+        (asserted at the kernel level in ``test_gaussfit``).
+        """
+        plain, _ = self._fit(
+            scmos_scene, picasso_movie_factory, "gausslq", None
+        )
+        modelled, _ = self._fit(
+            scmos_scene,
+            picasso_movie_factory,
+            "gausslq",
+            scmos_scene["calibration"],
+        )
+        assert modelled["lpx"].mean() > plain["lpx"].mean()
+        assert modelled["x"].std() == pytest.approx(plain["x"].std(), rel=0.05)
+
+    def test_metadata_records_provenance_not_arrays(
+        self, scmos_scene, picasso_movie_factory
+    ):
+        _, info = self._fit(
+            scmos_scene,
+            picasso_movie_factory,
+            "gaussmle",
+            scmos_scene["calibration"],
+        )
+        assert info["Camera noise model"] == "Huang et al. 2013 sCMOS"
+        assert info["Camera offset source"] == "per-pixel map"
+        assert info["Camera calibration frames"] == 20_000
+        # Nothing sensor-sized may reach the YAML sidecar.
+        assert not any(
+            isinstance(value, np.ndarray) for value in info.values()
+        )
+
+    def test_rejects_a_calibration_of_the_wrong_size(
+        self, scmos_scene, picasso_movie_factory
+    ):
+        wrong = dict(scmos_scene["calibration"])
+        wrong["offset"] = np.zeros((8, 8), dtype=np.float32)
+        wrong["variance"] = np.ones((8, 8), dtype=np.float32)
+        with pytest.raises(ValueError, match="same camera ROI"):
+            self._fit(scmos_scene, picasso_movie_factory, "gaussmle", wrong)
+
+    def test_warns_when_an_em_gain_is_combined_with_a_map(
+        self, scmos_scene, picasso_movie_factory
+    ):
+        scene = dict(scmos_scene)
+        scene["camera_info"] = dict(scmos_scene["camera_info"], Gain=100)
+        calibration = dict(scmos_scene["calibration"])
+        calibration["gain"] = np.full_like(calibration["offset"], 2.13)
+        with pytest.warns(RuntimeWarning, match="double-counts"):
+            self._fit(scene, picasso_movie_factory, "gaussmle", calibration)
+
+    def test_camera_info_with_an_array_is_refused(
+        self, scmos_scene, picasso_movie_factory
+    ):
+        scene = dict(scmos_scene)
+        scene["camera_info"] = dict(
+            scmos_scene["camera_info"], Baseline=np.zeros((40, 40))
+        )
+        with pytest.raises(ValueError, match="camera_calibration argument"):
+            self._fit(scene, picasso_movie_factory, "gaussmle", None)
+
+
+class TestScmosSplineIntegration:
+    """The spline models, through ``fit2D``, with a camera calibration."""
+
+    @pytest.fixture(scope="class")
+    def scene(self):
+        from picasso import scmos
+        from tests.test_splinefit import _flat_calibration, _reference_model
+        import tests.test_splinefit as ts
+
+        psf_calibration, terms = _flat_calibration()
+        cal_box = ts.BOX
+        phi = _reference_model(terms, cal_box, 0.0, 0.0, 0.0)[0]
+        half = cal_box // 2
+
+        rng = np.random.default_rng(3)
+        h = w = 40
+        offset = 100.0 + rng.normal(0, 1.0, (h, w))
+        variance = rng.gamma(4.0, 0.4, (h, w)) + 0.4
+        gain = np.full((h, w), 2.13)
+        cy, cx = 18, 20
+        variance[cy, cx + 2] = 1500.0
+        dark = offset + rng.normal(0, np.sqrt(variance), (20_000, h, w))
+        calibration = scmos.calibrate_scmos(dark)
+
+        n_frames = 1500
+        mu = np.full((h, w), 5.0)
+        mu[cy - half : cy + half + 1, cx - half : cx + half + 1] += 250.0 * phi
+        adu = (
+            gain * rng.poisson(mu, (n_frames, h, w))
+            + offset
+            + rng.normal(0, np.sqrt(variance), (n_frames, h, w))
+        )
+        identifications = pd.DataFrame(
+            {
+                "frame": np.arange(n_frames),
+                "x": np.full(n_frames, cx),
+                "y": np.full(n_frames, cy),
+                "net_gradient": np.full(n_frames, 1e4, np.float32),
+            }
+        )
+        return {
+            "movie": adu.astype(np.float32),
+            "info": [{"Frames": n_frames, "Height": h, "Width": w}],
+            "identifications": identifications,
+            "psf_calibration": psf_calibration,
+            "calibration": calibration,
+            "camera_info": {
+                "Baseline": float(np.median(offset)),
+                "Sensitivity": 1 / 2.13,
+                "Gain": 1,
+                "Qe": 1.0,
+                "Pixelsize": 130,
+            },
+            "x0": float(cx),
+        }
+
+    @staticmethod
+    def _fit(scene, picasso_movie_factory, method, calibration):
+        movie = picasso_movie_factory(scene["movie"], scene["info"])
+        locs, _ = localize.fit2D(
+            movie,
+            [{}],
+            dict(scene["camera_info"]),
+            scene["identifications"],
+            7,
+            fitting_method=method,
+            spline_calibration=scene["psf_calibration"],
+            camera_calibration=calibration,
+        )
+        return locs[np.isfinite(locs["x"]) & np.isfinite(locs["lpx"])]
+
+    def test_mle_crlb_becomes_honest(self, scene, picasso_movie_factory):
+        plain = self._fit(scene, picasso_movie_factory, "spline-mle", None)
+        modelled = self._fit(
+            scene, picasso_movie_factory, "spline-mle", scene["calibration"]
+        )
+        assert plain["x"].std() / plain["lpx"].mean() > 1.15
+        ratio = modelled["x"].std() / modelled["lpx"].mean()
+        assert 0.85 < ratio < 1.15
+        assert modelled["x"].std() < plain["x"].std()
+
+    def test_lsq_fit_is_stable_but_its_uncertainty_grows(
+        self, scene, picasso_movie_factory
+    ):
+        """The Huber-sandwich meat is the true pixel variance, ``mu + var``.
+
+        So a least-squares spline fit lands in the same place but stops
+        under-reporting its own scatter.
+        """
+        plain = self._fit(scene, picasso_movie_factory, "spline", None)
+        modelled = self._fit(
+            scene, picasso_movie_factory, "spline", scene["calibration"]
+        )
+        assert modelled["x"].std() == pytest.approx(plain["x"].std(), rel=0.05)
+        assert modelled["lpx"].mean() > plain["lpx"].mean()
+
+
+class TestScmosMultichannel:
+    """Per-channel calibrations must follow their channel's registration.
+
+    ``get_spots_multichannel`` maps each detection through that channel's
+    affine and snaps the box to an integer pixel. A camera map has to be cut
+    at *that* origin, not at the reference channel's - otherwise every
+    non-reference channel's noise is read from the wrong place, off by however
+    far the channels are registered apart.
+    """
+
+    BOX = 7
+    H = W = 40
+
+    @classmethod
+    def _scene(cls, shift=(6, 4), n_channels=2):
+        """Two channels whose variance maps carry a unique marker each.
+
+        The markers sit exactly where each channel's box centre will land, so
+        a correctly cut patch puts them both at the centre pixel.
+        """
+        cx, cy = 20, 18
+        dx, dy = shift
+        variance = [np.zeros((cls.H, cls.W), np.float32) for _ in range(2)]
+        variance[0][cy, cx] = 111.0
+        variance[1][cy + dy, cx + dx] = 222.0
+        calibrations = [
+            {
+                "offset": np.full((cls.H, cls.W), 100.0, np.float32),
+                "variance": variance[c],
+            }
+            for c in range(n_channels)
+        ]
+        movies = [
+            np.full((3, cls.H, cls.W), 500, np.uint16)
+            for _ in range(n_channels)
+        ]
+        camera_infos = [
+            {"Baseline": 100.0, "Sensitivity": 1.0, "Gain": 1}
+        ] * n_channels
+        transforms = [
+            np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            np.array([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]]),
+        ][:n_channels]
+        identifications = pd.DataFrame(
+            {
+                "frame": [0],
+                "x": [cx],
+                "y": [cy],
+                "net_gradient": np.float32([1e4]),
+            }
+        )
+        return movies, camera_infos, transforms, identifications, calibrations
+
+    def test_each_channel_reads_its_own_map_at_its_own_origin(self):
+        movies, cams, transforms, ids, calibs = self._scene()
+        _, _, variance = localize.get_spots_multichannel(
+            movies,
+            ids,
+            self.BOX,
+            cams,
+            transforms,
+            camera_calibrations=calibs,
+            return_residuals=True,
+            return_variance=True,
+        )
+        centre = self.BOX // 2
+        assert variance.shape == (1, self.BOX, self.BOX, 2)
+        assert variance[0, centre, centre, 0] == 111.0
+        assert variance[0, centre, centre, 1] == 222.0
+        # Nothing leaks between channels.
+        assert variance[..., 0].sum() == 111.0
+        assert variance[..., 1].sum() == 222.0
+
+    def test_the_reference_position_would_miss_the_shifted_map(self):
+        """Guards the whole point: cutting at the reference origin is wrong.
+
+        If this ever stops holding, the test above has become vacuous because
+        the channels are no longer actually offset.
+        """
+        _, _, _, ids, calibs = self._scene()
+        naive = localize._cut_map(calibs[1]["variance"], ids, self.BOX)
+        assert naive.sum() == 0.0
+
+    def test_a_channel_without_a_calibration_gets_zero_variance(self):
+        """Zero variance is exactly the plain Poisson model for that channel."""
+        movies, cams, transforms, ids, calibs = self._scene()
+        _, _, variance = localize.get_spots_multichannel(
+            movies,
+            ids,
+            self.BOX,
+            cams,
+            transforms,
+            camera_calibrations=[calibs[0], None],
+            return_residuals=True,
+            return_variance=True,
+        )
+        assert variance[..., 0].sum() == 111.0
+        assert variance[..., 1].sum() == 0.0
+
+    def test_no_calibrations_at_all_yields_none(self):
+        movies, cams, transforms, ids, _ = self._scene()
+        _, _, variance = localize.get_spots_multichannel(
+            movies,
+            ids,
+            self.BOX,
+            cams,
+            transforms,
+            return_residuals=True,
+            return_variance=True,
+        )
+        assert variance is None
+
+    def test_the_legacy_return_shape_is_unchanged(self):
+        """Existing callers ask for spots (+ residuals) and must keep getting
+        exactly that tuple."""
+        movies, cams, transforms, ids, _ = self._scene()
+        spots = localize.get_spots_multichannel(
+            movies, ids, self.BOX, cams, transforms
+        )
+        assert isinstance(spots, np.ndarray)
+        pair = localize.get_spots_multichannel(
+            movies, ids, self.BOX, cams, transforms, return_residuals=True
+        )
+        assert len(pair) == 2
+
+    def test_rejects_a_wrong_number_of_calibrations(self):
+        movies, cams, transforms, ids, calibs = self._scene()
+        with pytest.raises(ValueError, match="one entry per channel"):
+            localize.get_spots_multichannel(
+                movies,
+                ids,
+                self.BOX,
+                cams,
+                transforms,
+                camera_calibrations=calibs[:1],
+            )
+
+    def test_channel_major_reordering_keeps_channels_apart(self):
+        """The CRLB kernels index ``var[m, ch, j, i]``.
+
+        Picasso stacks multichannel patches channel-*last*, so the reordering
+        has to happen for the variance exactly as it does for the spots. Left
+        undone, a kernel reads another channel's readout noise.
+        """
+        movies, cams, transforms, ids, calibs = self._scene()
+        _, _, variance = localize.get_spots_multichannel(
+            movies,
+            ids,
+            self.BOX,
+            cams,
+            transforms,
+            camera_calibrations=calibs,
+            return_residuals=True,
+            return_variance=True,
+        )
+        major = localize._crlb_variance_channel_major(variance, 2)
+        centre = self.BOX // 2
+        assert major.shape == (1, 2, self.BOX, self.BOX)
+        assert major[0, 0, centre, centre] == 111.0
+        assert major[0, 1, centre, centre] == 222.0
+
+    def test_single_channel_patches_still_gain_their_axis(self):
+        var = np.zeros((4, self.BOX, self.BOX), np.float32)
+        major = localize._crlb_variance_channel_major(var, 1)
+        assert major.shape == (4, 1, self.BOX, self.BOX)
+        assert localize._crlb_variance_channel_major(None, 1) is None
+
+    def test_the_crlb_kernels_see_a_multichannel_map(self):
+        """The variance must reach the spline CRLB and widen it, per channel.
+
+        The fake calibration's coefficients put ``mu`` around 1e5, so the
+        variance is deliberately large here: this pins the *plumbing* (does it
+        arrive, and in the right channel plane), not a physical magnitude.
+        """
+        calibration = _fake_spline_calibration(
+            model="spline-3d-multichannel", box=self.BOX, n_channels=2
+        )
+        theta = np.array([[500.0, 0.1, -0.2, 0.0, 8.0]])
+        residuals = np.zeros((1, 2, 2))
+        big = 1e7
+
+        def crlb(variance):
+            return localize._spline_crlb(
+                theta,
+                calibration,
+                self.BOX,
+                mle=True,
+                residuals=residuals,
+                variance=variance,
+            )
+
+        base = crlb(None)
+        hot_ch1 = np.zeros((1, self.BOX, self.BOX, 2), np.float32)
+        hot_ch1[0, 2, 4, 1] = big
+        hot_ch0 = np.zeros((1, self.BOX, self.BOX, 2), np.float32)
+        hot_ch0[0, 2, 4, 0] = big
+
+        widened = crlb(hot_ch1)
+        assert (widened != base).any()
+        assert np.all(widened[0] >= base[0] - 1e-9)
+        # Putting the same noise on the other channel is a different problem.
+        # The two fake channels' coefficients differ by about one part in 1e5,
+        # so the gap is small - but it must not be zero, which is what a
+        # collapsed channel axis would give.
+        assert crlb(hot_ch0)[0, -1] != widened[0, -1]
+
+    @pytest.mark.parametrize("mle", [False, True])
+    def test_the_multichannel_fitters_accept_a_calibration(self, mle):
+        """End to end through the public entry points.
+
+        The fake calibration cannot recover ground truth, so this asserts that
+        the calibration flows all the way through and changes the answer -
+        the numbers themselves are pinned by the single-channel integration
+        tests, which use a real PSF.
+        """
+        calibration = _fake_spline_calibration(
+            model="spline-3d-multichannel", box=self.BOX, n_channels=2
+        )
+        dx, dy = 6, 4
+        calibration["channel_transforms"] = [
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]],
+        ]
+        rng = np.random.default_rng(4)
+        n_frames = 20
+        cx, cy = 20, 18
+        movies = [
+            rng.poisson(300, (n_frames, self.H, self.W)).astype(np.uint16)
+            for _ in range(2)
+        ]
+        camera_infos = [
+            {
+                "Baseline": 100.0,
+                "Sensitivity": 1.0,
+                "Gain": 1,
+                "Pixelsize": PIXELSIZE,
+            }
+        ] * 2
+        identifications = pd.DataFrame(
+            {
+                "frame": np.arange(n_frames),
+                "x": np.full(n_frames, cx),
+                "y": np.full(n_frames, cy),
+                "net_gradient": np.full(n_frames, 1e4, np.float32),
+            }
+        )
+        calibrations = []
+        for c in range(2):
+            variance = np.full((self.H, self.W), 1.0, np.float32)
+            if c == 1:
+                variance[cy + dy, cx + dx + 2] = 2000.0
+            calibrations.append(
+                {
+                    "offset": np.full((self.H, self.W), 100.0, np.float32),
+                    "variance": variance,
+                }
+            )
+
+        plain = localize.fit_spline_multichannel(
+            movies,
+            camera_infos,
+            identifications,
+            self.BOX,
+            calibration,
+            mle=mle,
+            use_gpu=False,
+        )
+        modelled = localize.fit_spline_multichannel(
+            movies,
+            camera_infos,
+            identifications,
+            self.BOX,
+            calibration,
+            mle=mle,
+            use_gpu=False,
+            camera_calibrations=calibrations,
+        )
+        assert len(plain) == len(modelled) == n_frames
+        assert np.isfinite(modelled["lpx"]).any()
+
+    def test_the_ratiometric_fitter_accepts_a_calibration(self):
+        calibration = _fake_spline_calibration(
+            model="spline-3d-multichannel", box=self.BOX, n_channels=2
+        )
+        rng = np.random.default_rng(5)
+        n_frames = 12
+        movies = [
+            rng.poisson(300, (n_frames, self.H, self.W)).astype(np.uint16)
+            for _ in range(2)
+        ]
+        camera_infos = [
+            {
+                "Baseline": 100.0,
+                "Sensitivity": 1.0,
+                "Gain": 1,
+                "Pixelsize": PIXELSIZE,
+            }
+        ] * 2
+        identifications = pd.DataFrame(
+            {
+                "frame": np.arange(n_frames),
+                "x": np.full(n_frames, 20),
+                "y": np.full(n_frames, 18),
+                "net_gradient": np.full(n_frames, 1e4, np.float32),
+            }
+        )
+        calibrations = [
+            {
+                "offset": np.full((self.H, self.W), 100.0, np.float32),
+                "variance": np.full((self.H, self.W), 2.0, np.float32),
+            }
+        ] * 2
+        locs = localize.fit_spline_multichannel_ratiometric(
+            movies,
+            camera_infos,
+            identifications,
+            self.BOX,
+            calibration,
+            photon_ratios=np.array([[0.5, 0.5], [0.8, 0.2]]),
+            mle=False,
+            use_gpu=False,
+            camera_calibrations=calibrations,
+        )
+        assert len(locs) == n_frames
+        assert "color" in locs.columns
+
+    def test_split_fov_serves_every_region_from_one_calibration(self):
+        """Split-FOV is one physical sensor, so one full-frame map suffices.
+
+        ``_cut_map`` indexes with absolute frame coordinates, so a region's
+        box reads that region's own pixels out of the same map without any
+        per-region bookkeeping.
+        """
+        calibration = _fake_spline_calibration(
+            model="spline-3d-multichannel", box=self.BOX, n_channels=2
+        )
+        calibration["split_fov"] = True
+        calibration["regions"] = [((0, 0), (40, 20)), ((0, 20), (40, 40))]
+        calibration["channel_transforms"] = [
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [[1.0, 0.0, 20.0], [0.0, 1.0, 0.0]],
+        ]
+        rng = np.random.default_rng(6)
+        n_frames = 12
+        movie = rng.poisson(300, (n_frames, self.H, self.W)).astype(np.uint16)
+        camera_info = {
+            "Baseline": 100.0,
+            "Sensitivity": 1.0,
+            "Gain": 1,
+            "Pixelsize": PIXELSIZE,
+        }
+        identifications = pd.DataFrame(
+            {
+                "frame": np.arange(n_frames),
+                "x": np.full(n_frames, 8),
+                "y": np.full(n_frames, 18),
+                "net_gradient": np.full(n_frames, 1e4, np.float32),
+            }
+        )
+        calibration_maps = {
+            "offset": np.full((self.H, self.W), 100.0, np.float32),
+            "variance": np.full((self.H, self.W), 2.0, np.float32),
+        }
+        locs = localize.fit_spline_split_fov(
+            movie,
+            camera_info,
+            identifications,
+            self.BOX,
+            calibration,
+            mle=False,
+            use_gpu=False,
+            camera_calibration=calibration_maps,
+        )
+        assert len(locs) == n_frames
+        assert np.isfinite(locs["lpx"]).all()
+
+
+class TestCameraCalibrationConfigLookup:
+    """``camera-calibrations`` in ``config.yaml``, keyed camera -> wavelength.
+
+    The same shape as ``z-calibrations`` and ``spline-calibrations``, because
+    channels are often recorded in different camera ROIs or readout modes and
+    those need different maps.
+    """
+
+    @staticmethod
+    def _dialog():
+        class _StubWindow(QtWidgets.QMainWindow):
+            movie = None
+
+            def draw_frame(self):
+                pass
+
+        return localize_gui.ParametersDialog(_StubWindow())
+
+    @staticmethod
+    def _calibration_file(tmp_path, name, variance):
+        path = str(tmp_path / name)
+        io.save_camera_calibration(
+            path,
+            {
+                "offset": np.full((8, 8), 100.0, np.float32),
+                "variance": np.full((8, 8), variance, np.float32),
+                "model": "scmos-noise",
+            },
+        )
+        return path
+
+    def _drive(self, dialog, monkeypatch, config, camera, wavelength):
+        """Point the dialog at ``config`` and run the lookup.
+
+        ``camera`` / ``emission_combos`` only exist once the camera-config UI
+        has been built from a real ``config.yaml``, so they are stubbed here -
+        the lookup itself is what is under test."""
+
+        class _Combo:
+            def __init__(self, text):
+                self._text = str(text)
+
+            def currentText(self):
+                return self._text
+
+        monkeypatch.setattr(localize_gui, "CONFIG", config)
+        monkeypatch.setattr(dialog, "camera", _Combo(camera), raising=False)
+        monkeypatch.setattr(
+            dialog,
+            "emission_combos",
+            {camera: _Combo(wavelength)},
+            raising=False,
+        )
+        dialog.update_camera_calib_with_config_path()
+
+    def test_picks_the_file_for_the_selected_wavelength(
+        self, tmp_path, monkeypatch
+    ):
+        green = self._calibration_file(tmp_path, "g_scmos_calib.hdf5", 2.0)
+        red = self._calibration_file(tmp_path, "r_scmos_calib.hdf5", 9.0)
+        config = {"camera-calibrations": {"Cam": {525: green, 595: red}}}
+        dialog = self._dialog()
+        try:
+            self._drive(dialog, monkeypatch, config, "Cam", 525)
+            assert dialog.camera_calibration_path == green
+            assert dialog.camera_calibration["variance"][0, 0] == 2.0
+
+            # Switching the emission must switch the maps.
+            self._drive(dialog, monkeypatch, config, "Cam", 595)
+            assert dialog.camera_calibration_path == red
+            assert dialog.camera_calibration["variance"][0, 0] == 9.0
+        finally:
+            dialog.close()
+
+    def test_a_bare_path_serves_every_wavelength(self, tmp_path, monkeypatch):
+        """One sensor read out one way needs one set of maps; repeating the
+        path under every wavelength is only a way for them to drift apart."""
+        shared = self._calibration_file(tmp_path, "s_scmos_calib.hdf5", 3.0)
+        config = {"camera-calibrations": {"Cam": shared}}
+        dialog = self._dialog()
+        try:
+            for wavelength in (525, 595, 700):
+                self._drive(dialog, monkeypatch, config, "Cam", wavelength)
+                assert dialog.camera_calibration_path == shared
+        finally:
+            dialog.close()
+
+    def test_an_unconfigured_wavelength_clears_the_calibration(
+        self, tmp_path, monkeypatch
+    ):
+        """Leaving the previous maps loaded would apply them to a channel
+        they were not measured for."""
+        green = self._calibration_file(tmp_path, "g2_scmos_calib.hdf5", 2.0)
+        config = {"camera-calibrations": {"Cam": {525: green}}}
+        dialog = self._dialog()
+        try:
+            self._drive(dialog, monkeypatch, config, "Cam", 525)
+            assert dialog.camera_calibration_path == green
+
+            self._drive(dialog, monkeypatch, config, "Cam", 595)
+            assert dialog.camera_calibration_path is None
+            assert dialog.camera_calibration == {}
+            # ... and the superseded scalar becomes editable again.
+            assert dialog.baseline.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_an_unconfigured_camera_clears_the_calibration(
+        self, tmp_path, monkeypatch
+    ):
+        green = self._calibration_file(tmp_path, "g3_scmos_calib.hdf5", 2.0)
+        config = {"camera-calibrations": {"Cam": {525: green}}}
+        dialog = self._dialog()
+        try:
+            self._drive(dialog, monkeypatch, config, "Cam", 525)
+            assert dialog.camera_calibration_path == green
+            self._drive(dialog, monkeypatch, config, "Other", 525)
+            assert dialog.camera_calibration_path is None
+        finally:
+            dialog.close()
+
+    def test_no_config_section_leaves_a_manual_load_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """Without the section the lookup must not touch anything."""
+        manual = self._calibration_file(tmp_path, "m_scmos_calib.hdf5", 5.0)
+        dialog = self._dialog()
+        try:
+            dialog.update_camera_calib(manual)
+            self._drive(dialog, monkeypatch, {}, "Cam", 525)
+            assert dialog.camera_calibration_path == manual
+        finally:
+            dialog.close()
+
+    def test_the_emission_handler_runs_the_lookup(self):
+        """Changing the wavelength must re-run it, as for z and spline."""
+        body = inspect.getsource(
+            localize_gui.ParametersDialog.on_emission_changed
+        )
+        assert "update_camera_calib_with_config_path" in body
+        assert "update_spline_calib_with_config_path" in body
+        assert "update_z_calib_with_config_path" in body
+
+
+class TestCameraCalibrationProvenance:
+    """A saved file must say whether the noise model was used.
+
+    ``fit2D`` records this, but Picasso Localize throws away the info
+    ``fit2D`` returns and rebuilds its own when saving, so the GUI path needs
+    its own assertion - without one, a GUI run silently saved localizations
+    that gave no hint a calibration had been applied.
+    """
+
+    @staticmethod
+    def _calibration(gain=True):
+        calibration = {
+            "offset": np.full((8, 8), 500.0, np.float32),
+            "variance": np.full((8, 8), 4.0, np.float32),
+            "model": "scmos-noise",
+            "Path": "/data/cam_scmos_calib.hdf5",
+            "Frames": 20000,
+            "Offset median (ADU)": 500.0,
+            "Variance median (ADU^2)": 4.0,
+            "Hot pixels": 7,
+        }
+        if gain:
+            calibration["gain"] = np.full((8, 8), 2.0, np.float32)
+        return calibration
+
+    def test_is_empty_without_a_calibration(self):
+        assert localize.camera_calibration_info(None) == {}
+        assert localize.camera_calibration_info({}) == {}
+
+    def test_records_the_provenance_but_never_the_maps(self):
+        info = localize.camera_calibration_info(self._calibration())
+        assert info["Camera noise model"] == "Huang et al. 2013 sCMOS"
+        assert info["Camera calibration path"] == "/data/cam_scmos_calib.hdf5"
+        assert info["Camera calibration frames"] == 20000
+        assert info["Camera gain source"] == "per-pixel map"
+        assert info["Camera calibration Hot pixels"] == 7
+        # The maps are sensor-sized and this dict is dumped to YAML verbatim.
+        assert not any(
+            isinstance(value, np.ndarray) for value in info.values()
+        )
+
+    def test_names_the_scalar_when_there_is_no_gain_map(self):
+        info = localize.camera_calibration_info(self._calibration(gain=False))
+        assert info["Camera gain source"] == "Sensitivity (scalar)"
+
+    def test_the_gui_save_path_records_it(self, tmp_path, monkeypatch):
+        """Regression: a GUI run used to save localizations that gave no hint
+        a calibration had been applied, because ``Window.save_locs`` rebuilds
+        the metadata from the dialog and ``FitWorker`` discards what
+        ``fit2D`` returns."""
+        path = str(tmp_path / "c_scmos_calib.hdf5")
+        io.save_camera_calibration(path, self._calibration())
+
+        window = localize_gui.Window()
+        saved = {}
+        monkeypatch.setattr(
+            localize_gui.io,
+            "save_locs",
+            lambda p, locs, info: saved.update(info=info),
+        )
+        try:
+            window.parameters_dialog.update_camera_calib(path)
+            window.locs = pd.DataFrame({"frame": [0], "x": [1.0], "y": [2.0]})
+            window.info = [{"Frames": 1}]
+            window.last_identification_info = {"Box Size": 7}
+            monkeypatch.setattr(window, "select_locs_columns", lambda: None)
+
+            window.save_locs(str(tmp_path / "locs.hdf5"))
+
+            info = saved["info"][-1]
+            assert info["Camera noise model"] == "Huang et al. 2013 sCMOS"
+            assert info["Camera calibration path"] == path
+            assert info["Camera gain source"] == "per-pixel map"
+        finally:
+            window.close()
+
+    def test_the_gui_save_path_stays_silent_without_one(
+        self, tmp_path, monkeypatch
+    ):
+        window = localize_gui.Window()
+        saved = {}
+        monkeypatch.setattr(
+            localize_gui.io,
+            "save_locs",
+            lambda p, locs, info: saved.update(info=info),
+        )
+        try:
+            window.locs = pd.DataFrame({"frame": [0], "x": [1.0], "y": [2.0]})
+            window.info = [{"Frames": 1}]
+            window.last_identification_info = {"Box Size": 7}
+            monkeypatch.setattr(window, "select_locs_columns", lambda: None)
+
+            window.save_locs(str(tmp_path / "locs.hdf5"))
+
+            assert "Camera noise model" not in saved["info"][-1]
+        finally:
+            window.close()
+
+
+class TestCameraCalibrationScalars:
+    """A loaded calibration supersedes Baseline, Sensitivity and EM gain.
+
+    Freezing them is not enough: a disabled spinbox reading 100.0 while the
+    maps say 498.7 misinforms, and the value is saved to the ``.yaml`` as the
+    camera information the run used.
+    """
+
+    @staticmethod
+    def _dialog():
+        class _StubWindow(QtWidgets.QMainWindow):
+            movie = None
+
+            def draw_frame(self):
+                pass
+
+        return localize_gui.ParametersDialog(_StubWindow())
+
+    @staticmethod
+    def _calibration_file(tmp_path, name, *, offset=498.7, gain=None):
+        path = str(tmp_path / name)
+        calibration = {
+            "offset": np.full((8, 8), offset, np.float32),
+            "variance": np.full((8, 8), 4.0, np.float32),
+            "model": "scmos-noise",
+        }
+        if gain is not None:
+            calibration["gain"] = np.full((8, 8), gain, np.float32)
+        io.save_camera_calibration(path, calibration)
+        return path
+
+    def test_offset_median_becomes_the_baseline(self, tmp_path):
+        path = self._calibration_file(tmp_path, "a_scmos_calib.hdf5")
+        dialog = self._dialog()
+        try:
+            dialog.baseline.setValue(100.0)
+            dialog.update_camera_calib(path)
+            assert dialog.baseline.value() == pytest.approx(498.7, abs=0.05)
+            assert not dialog.baseline.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_sensitivity_is_the_reciprocal_of_the_median_gain(self, tmp_path):
+        """Picasso's Sensitivity is electrons per count; the calibration
+        measures counts per electron."""
+        path = self._calibration_file(tmp_path, "b_scmos_calib.hdf5", gain=2.0)
+        dialog = self._dialog()
+        try:
+            dialog.update_camera_calib(path)
+            assert dialog.sensitivity.value() == pytest.approx(0.5, abs=1e-4)
+            assert not dialog.sensitivity.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_sensitivity_is_untouched_without_a_gain_map(self, tmp_path):
+        path = self._calibration_file(tmp_path, "c_scmos_calib.hdf5")
+        dialog = self._dialog()
+        try:
+            dialog.sensitivity.setValue(0.47)
+            dialog.update_camera_calib(path)
+            assert dialog.sensitivity.value() == pytest.approx(0.47)
+            assert dialog.sensitivity.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_em_gain_is_pinned_to_one(self, tmp_path):
+        """An sCMOS sensor has no multiplication stage, and a value above 1
+        would apply the EMCCD excess-noise factor on top of the readout
+        noise."""
+        path = self._calibration_file(tmp_path, "d_scmos_calib.hdf5")
+        dialog = self._dialog()
+        try:
+            dialog.gain.setValue(300)
+            dialog.update_camera_calib(path)
+            assert dialog.gain.value() == 1
+            assert not dialog.gain.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_clearing_restores_the_previous_scalars(self, tmp_path):
+        path = self._calibration_file(tmp_path, "e_scmos_calib.hdf5", gain=2.0)
+        dialog = self._dialog()
+        try:
+            dialog.gain.setValue(300)
+            dialog.baseline.setValue(100.0)
+            dialog.sensitivity.setValue(0.47)
+            dialog.update_camera_calib(path)
+            dialog.update_camera_calib(None)
+            assert dialog.gain.value() == 300
+            assert dialog.baseline.value() == pytest.approx(100.0)
+            assert dialog.sensitivity.value() == pytest.approx(0.47)
+            assert dialog.gain.isEnabled()
+            assert dialog.baseline.isEnabled()
+            assert dialog.sensitivity.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_loading_a_second_calibration_keeps_the_original_restore_point(
+        self, tmp_path
+    ):
+        first = self._calibration_file(tmp_path, "f1_scmos_calib.hdf5")
+        second = self._calibration_file(
+            tmp_path, "f2_scmos_calib.hdf5", offset=203.0
+        )
+        dialog = self._dialog()
+        try:
+            dialog.baseline.setValue(100.0)
+            dialog.update_camera_calib(first)
+            dialog.update_camera_calib(second)
+            assert dialog.baseline.value() == pytest.approx(203.0, abs=0.05)
+            dialog.update_camera_calib(None)
+            assert dialog.baseline.value() == pytest.approx(100.0)
+        finally:
+            dialog.close()
+
+    def test_a_superseded_scalar_records_the_config_value_for_later(
+        self, tmp_path
+    ):
+        """The camera config keeps writing Baseline on every camera change.
+        That write must not land on the frozen spinbox, but it must not be
+        lost either - otherwise clearing restores a scalar belonging to
+        whichever camera happened to be selected when the maps were loaded.
+        """
+        path = self._calibration_file(tmp_path, "g_scmos_calib.hdf5")
+        dialog = self._dialog()
+        try:
+            dialog.baseline.setValue(100.0)
+            dialog.update_camera_calib(path)
+            dialog.set_photon_scalar("baseline", 42.0)
+            # Not on the widget, which shows the map's median ...
+            assert dialog.baseline.value() == pytest.approx(498.7, abs=0.05)
+            # ... but it is what Clear restores.
+            dialog.update_camera_calib(None)
+            assert dialog.baseline.value() == pytest.approx(42.0)
+        finally:
+            dialog.close()
+
+    def test_a_scalar_still_in_force_is_written_through(self, tmp_path):
+        path = self._calibration_file(tmp_path, "h_scmos_calib.hdf5")
+        dialog = self._dialog()
+        try:
+            dialog.update_camera_calib(path)  # no gain map
+            dialog.set_photon_scalar("sensitivity", 0.26)
+            assert dialog.sensitivity.value() == pytest.approx(0.26)
+            dialog.update_camera_calib(None)
+            assert dialog.sensitivity.value() == pytest.approx(0.26)
+        finally:
+            dialog.close()
+
+
+class TestCameraCalibrationDialogs:
+    """The dialog that collects the inputs of a characterization."""
+
+    def test_ok_needs_a_dark_movie_and_an_output(self, tmp_path):
+        dialog = localize_gui.CameraCalibrationDialog(None)
+        try:
+            ok = dialog.buttons.button(
+                QtWidgets.QDialogButtonBox.StandardButton.Ok
+            )
+            assert not ok.isEnabled()
+            dialog.dark_edit.setText(str(tmp_path / "dark.raw"))
+            assert not ok.isEnabled()
+            dialog.out_edit.setText(str(tmp_path / "calib.hdf5"))
+            assert ok.isEnabled()
+        finally:
+            dialog.close()
+
+    def test_bright_movies_are_optional_and_deduplicated(self):
+        dialog = localize_gui.CameraCalibrationDialog(None)
+        try:
+            assert dialog.bright_paths() == []
+            dialog.bright_list.addItem("/a.raw")
+            dialog.bright_list.addItem("/b.raw")
+            assert dialog.bright_paths() == ["/a.raw", "/b.raw"]
+            dialog.bright_list.item(0).setSelected(True)
+            dialog.remove_bright()
+            assert dialog.bright_paths() == ["/b.raw"]
+        finally:
+            dialog.close()

@@ -18,6 +18,7 @@ This update focuses mainly on (but is not limited to) the expansion of the Local
 - New fitting model: **Experimental PSF (cubic spline)** — fits an experimentally measured PSF (a cubic-spline model built from a bead z-stack), via the new `picasso.fitting.splinefit_cuda` module on the GPU or `picasso.fitting.splinefit` on the CPU. The spline coefficients of the calibration are computed in pure Python (NumPy/SciPy) on the CPU. In single-channel data, the bead alignment follows the workflow from [Li, et al, Nature Methods, 2018](https://www.nature.com/articles/nmeth.4661). See the [experimental PSF (cubic-spline) fitting documentation](https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting) for details. *Note this is an experimental feature, do let us know if you find any bugs/unexpected behavior*
 - Multichannel spline PSF fitting (a shared-amplitude 3D spline model, e.g. biplane); additionally a new model was added for uncoupled photons with up to 6 channels. The global (multichannel) fitting follows globLoc, see [Li, et al, Nature Communications, 2022](https://doi.org/10.1038/s41467-022-30719-4)
 - New fitting algorithms supported: 2D rotated Gaussian, 2D spherical Gaussian
+- **sCMOS pixel-dependent noise model.** Picasso can now use a per-pixel camera calibration — offset, readout variance and, optionally, amplification gain — instead of the scalar `Baseline` and `Sensitivity`, and applies the noise model of [Huang et al., Nat. Methods 10, 653-658 (2013)](https://doi.org/10.1038/nmeth.2488) to MLE fitting. See the [Localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html) for the acquisition protocol and the per-method behaviour.
 - **`picasso.gausslq` and `picasso.gaussmle` are deprecated and the whole modules will be removed in Picasso 1.0**, so that all fitting lives in the `picasso.fitting` subpackage. Every public name in them now raises a `DeprecationWarning` naming its replacement:
   - the fitters (`fit_spot`, `fit_spots`, `fit_spots_parallel`, `gaussmle`, `gaussmle_async`) → `picasso.fitting.gaussfit.fit_spots` / `fit_spots_async`
   - `fit_spots_gauss_gpu` → `picasso.fitting.gaussfit_cuda.fit_spots`
@@ -77,6 +78,7 @@ This update focuses mainly on (but is not limited to) the expansion of the Local
 - Test clusterer with a constrast bar
 - Select localizations in the center of the binding event added. See [Steen et al., Nature Methods 21, 1755-1762 (2024)](https://doi.org/10.1038/s41592-024-02374-8), Extended Data Fig. 1f
 - Removed the switch to no blur method while panning
+- Improved robustness of NeNA calculation by trying out 3 starting positions for the fit
 - Fixed `picasso.g5m` bootstrap SEM (`bootstrap_check=True`) raising `AssertionError` for spline 3D data, because the resampling model was rebuilt without carrying over the fit mode
 - Fixed `picasso.g5m.sum_G5Ms` raising `TypeError` for a list of 2D models, because a calibration was passed to `G5M_2D`, which does not accept one
 - Fixed removed plugins menu after removing all localizations

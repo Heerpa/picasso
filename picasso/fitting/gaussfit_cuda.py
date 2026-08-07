@@ -47,7 +47,7 @@ from numba import cuda
 from tqdm import tqdm
 
 from picasso.fitting import lmfit_cuda
-from picasso.fitting.splinefit import _allocate_outputs
+from picasso.fitting.splinefit import _allocate_outputs, resolve_variance
 
 # Everything that defines *what model this is* and *where a fit stops* comes
 # from the CPU twin, so the two devices cannot drift apart - the same
@@ -75,7 +75,19 @@ def _make_accumulate_spherical(ftype):
     half = ftype(0.5)
 
     @cuda.jit(device=True)
-    def accumulate(spots, index, coeff, aff, res, theta, mle, hess, grad):
+    def accumulate(
+        spots,
+        index,
+        variance,
+        use_variance,
+        coeff,
+        aff,
+        res,
+        theta,
+        mle,
+        hess,
+        grad,
+    ):
         box = spots.shape[2]
         amp = theta[0]
         cx = theta[1]
@@ -113,8 +125,11 @@ def _make_accumulate_spherical(ftype):
                 d2 = amp * ex * dy * inv_s2
                 d3 = amp * ex * (dx * dx + dy * dy) * inv_s3
                 # d4 == 1 (offset).
+                var = 0.0
+                if use_variance:
+                    var = variance[index, 0, j, i]
                 contrib, weight, factor, ok = _estimator_terms_strict(
-                    mle, value, data
+                    mle, value, data, var
                 )
                 if not ok:
                     return _INF, False
@@ -173,7 +188,19 @@ def _make_accumulate_elliptic(ftype):
     half = ftype(0.5)
 
     @cuda.jit(device=True)
-    def accumulate(spots, index, coeff, aff, res, theta, mle, hess, grad):
+    def accumulate(
+        spots,
+        index,
+        variance,
+        use_variance,
+        coeff,
+        aff,
+        res,
+        theta,
+        mle,
+        hess,
+        grad,
+    ):
         box = spots.shape[2]
         amp = theta[0]
         cx = theta[1]
@@ -217,8 +244,11 @@ def _make_accumulate_elliptic(ftype):
                 d3 = amp * ex * dx * dx * inv_sx3
                 d4 = amp * ex * dy * dy * inv_sy3
                 # d5 == 1 (offset).
+                var = 0.0
+                if use_variance:
+                    var = variance[index, 0, j, i]
                 contrib, weight, factor, ok = _estimator_terms_strict(
-                    mle, value, data
+                    mle, value, data, var
                 )
                 if not ok:
                     return _INF, False
@@ -296,7 +326,19 @@ def _make_accumulate_rotated(ftype):
     half = ftype(0.5)
 
     @cuda.jit(device=True)
-    def accumulate(spots, index, coeff, aff, res, theta, mle, hess, grad):
+    def accumulate(
+        spots,
+        index,
+        variance,
+        use_variance,
+        coeff,
+        aff,
+        res,
+        theta,
+        mle,
+        hess,
+        grad,
+    ):
         box = spots.shape[2]
         amp = theta[0]
         cx = theta[1]
@@ -355,8 +397,11 @@ def _make_accumulate_rotated(ftype):
                 d4 = amp * argb * argb * inv_sy3 * ex
                 # d5 == 1 (offset).
                 d6 = amp * arga * argb * (inv_sx2 - inv_sy2) * ex
+                var = 0.0
+                if use_variance:
+                    var = variance[index, 0, j, i]
                 contrib, weight, factor, ok = _estimator_terms_strict(
-                    mle, value, data
+                    mle, value, data, var
                 )
                 if not ok:
                     return _INF, False
@@ -481,6 +526,7 @@ def fit_spots(
     ) = None,
     abort_callback: Callable[[], bool] | None = None,
     single_precision: bool = True,
+    variance: np.ndarray | None = None,
 ) -> tuple:
     """Fit spots with a 2D Gaussian model on the GPU.
 
@@ -499,6 +545,10 @@ def fit_spots(
         ``None`` uses :data:`TOLERANCE` / :data:`MAX_ITERATIONS`.
     progress_callback, abort_callback, single_precision
         As :func:`picasso.fitting.splinefit_cuda.fit_spots`.
+    variance : np.ndarray, optional
+        ``(n_spots, box, box)`` per-pixel sCMOS readout variance in
+        photoelectrons squared, laid out exactly like ``spots``. ``None``
+        (the default) fits the plain Poisson model.
 
     Returns
     -------
@@ -535,6 +585,13 @@ def fit_spots(
     spots = np.ascontiguousarray(spots, dtype=np.float32).reshape(
         n_spots, 1, box, box
     )
+    # The variance patch is cut from the same ROIs and rides along in exactly
+    # the same layout, so the same free reshape applies.
+    variance, use_variance = resolve_variance(
+        variance, (n_spots, box, box), ndim=4
+    )
+    if use_variance:
+        variance = variance.reshape(n_spots, 1, box, box)
     initial_parameters = np.ascontiguousarray(
         initial_parameters, dtype=np.float64
     )
@@ -546,8 +603,13 @@ def fit_spots(
     d_unused_coeff = cuda.to_device(np.zeros((1, 1, 1, 4, 4)))
     d_unused_aff = cuda.to_device(np.zeros((1, 4)))
     d_seeds = cuda.to_device(np.zeros(1))
+    # Without a noise model the variance is a four-byte dummy, uploaded once
+    # rather than per chunk.
+    d_dummy_variance = None if use_variance else cuda.to_device(variance)
 
     bytes_per_row = 4 * box * box + 8 * (2 * n_params + 2) + 16
+    if use_variance:
+        bytes_per_row += 4 * box * box
     chunk = min(n_spots, lmfit_cuda.chunk_rows(bytes_per_row, max_iterations))
 
     use_tqdm = progress_callback == "console"
@@ -562,6 +624,11 @@ def fit_spots(
             stop = min(start + chunk, n_spots)
             n = stop - start
             d_spots = cuda.to_device(spots[start:stop])
+            d_variance = (
+                cuda.to_device(variance[start:stop])
+                if use_variance
+                else d_dummy_variance
+            )
             d_init = cuda.to_device(initial_parameters[start:stop])
             d_res = cuda.to_device(np.zeros((n, 1, 2)))
             d_thetas = cuda.device_array((n, n_params), dtype=np.float64)
@@ -571,6 +638,8 @@ def fit_spots(
             blocks = (n + CUDA_THREADS - 1) // CUDA_THREADS
             kernel[blocks, CUDA_THREADS](
                 d_spots,
+                d_variance,
+                use_variance,
                 d_unused_coeff,
                 d_unused_aff,
                 d_res,
