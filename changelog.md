@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 06-AUG-2026 CEST
+Last change: 07-AUG-2026 CEST
 
 ## 0.11.0
 
@@ -55,6 +55,7 @@ This update focuses mainly on (but is not limited to) the expansion of the Local
 - Fixed a gap of roughly one box size in the identified spots along the borders between adjacent (e.g. overlapping) ROIs
 - Fixed handling abortions during identification
 - Fixed zooming in Localize with scale bar + better appearance on Windows
+- Fixed reading of the movies from the network storage after interuption
 
 #### Render
 - Rendering rotated Gaussians

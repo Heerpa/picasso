@@ -2292,7 +2292,105 @@ def _mm_metadata_from_tifffile(tif: "tifffile.TiffFile") -> dict:
     return out
 
 
-class TiffMap:
+class _PerThreadFileHandles:
+    """Per-thread binary file handles for offset-based frame reading.
+
+    A single shared handle forces every concurrent reader to serialize on
+    one file position (seek + read is stateful), so on network storage the
+    per-frame round-trips cannot overlap. Giving each thread its own handle
+    lets the OS / network stack keep several reads in flight at once, which
+    hides per-frame latency.
+
+    Users must call :meth:`_init_handles` in ``__init__`` (after ``self.path``
+    is set) and :meth:`_close_handles` in ``close``
+
+    To put it simply, this architecture allows for reading the movie from
+    the network storage even if the access to the latter is interupted.
+    """
+
+    def _init_handles(self) -> None:
+        self._local = threading.local()
+        self._open_handles = []
+        self._handles_lock = threading.Lock()
+
+    def _handle(self):
+        """Return this thread's private binary file handle, opening one on
+        first use."""
+        handle = getattr(self._local, "file", None)
+        if handle is None:
+            handle = open(self.path, "rb")
+            self._local.file = handle
+            with self._handles_lock:
+                self._open_handles.append(handle)
+        return handle
+
+    def _drop_handle(self) -> None:
+        """Discard this thread's handle so the next read opens a fresh one."""
+        handle = getattr(self._local, "file", None)
+        if handle is None:
+            return
+        self._local.file = None
+        with self._handles_lock:
+            try:
+                self._open_handles.remove(handle)
+            except ValueError:
+                pass
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+    def _read_into_at(self, offset: int, array: np.ndarray) -> None:
+        """Fill ``array`` with the bytes at ``offset``, retrying once on a
+        fresh handle.
+
+        Handles are cached for the lifetime of the movie, so a handle can go
+        stale long after it was opened - a network share that dropped its
+        session, an external drive that reconnected. Windows reports those as
+        a bare ``OSError: [Errno 22] Invalid argument`` (its CRT maps every
+        Win32 error it has no entry for onto ``EINVAL``), and without a retry
+        the stale handle would keep failing for the rest of the session.
+
+        A handle closed underneath us (``ValueError: seek of closed file``)
+        is retried the same way.
+
+        A short read is an error too: ``readinto`` fills only part of a
+        freshly allocated (uninitialized) array and returns quietly, which
+        would hand uninitialized memory back as image data."""
+        view = memoryview(array).cast("B")
+        for attempt in (0, 1):
+            try:
+                handle = self._handle()
+                handle.seek(offset)
+                n_read = 0
+                while n_read < len(view):
+                    n = handle.readinto(view[n_read:])
+                    if not n:  # end of file: the read is short
+                        break
+                    n_read += n
+            except (OSError, ValueError):
+                # Assume the handle went bad; retry once on a new one.
+                self._drop_handle()
+                if attempt:
+                    raise
+                continue
+            if n_read < len(view):
+                raise OSError(
+                    f"Truncated read from {self.path}: expected "
+                    f"{len(view)} bytes at offset {offset}, got {n_read}. "
+                    "The file may be incomplete or still being written."
+                )
+            return
+
+    def _close_handles(self) -> None:
+        with self._handles_lock:
+            for handle in self._open_handles:
+                handle.close()
+            self._open_handles = []
+        self._local = threading.local()
+
+
+class TiffMap(_PerThreadFileHandles):
     """Read a single TIFF file and provide array-like access to its frames.
 
     Backed by :mod:`tifffile`, which robustly parses classic TIFF,
@@ -2404,35 +2502,16 @@ class TiffMap:
             self._pages = self._tif.pages
             self._offsets, self.n_frames = self._build_offsets(progress)
 
-        # Per-thread binary handles for the fast offset-based read path.
-        # A single shared handle forces every concurrent reader to
-        # serialize on one file position (seek + read is stateful), so on
-        # network storage the per-frame round-trips cannot overlap. Giving
-        # each thread its own handle lets the OS / network stack keep
-        # several reads in flight at once, which hides per-frame latency.
-        # The lock only guards the slow tifffile-decode fallback used for
-        # compressed / tiled pages, which is not reentrant.
-        self._local = threading.local()
-        self._open_handles = []
-        self._handles_lock = threading.Lock()
+        # Per-thread binary handles for the fast offset-based read path
+        # (see _PerThreadFileHandles). The decode lock only guards the slow
+        # tifffile-decode fallback used for compressed / tiled pages, which
+        # is not reentrant.
+        self._init_handles()
         self._decode_lock = threading.Lock()
 
     # Read frames concurrently without the shared identify lock; each
     # thread uses its own file handle (see ``_handle``).
     supports_concurrent_reads = True
-
-    def _handle(self):
-        """Return this thread's private binary file handle, opening one
-        on first use. Per-thread handles let concurrent ``get_frame``
-        calls issue overlapping seek + read requests instead of
-        contending on a single shared file position."""
-        handle = getattr(self._local, "file", None)
-        if handle is None:
-            handle = open(self.path, "rb")
-            self._local.file = handle
-            with self._handles_lock:
-                self._open_handles.append(handle)
-        return handle
 
     def _imagej_contiguous_count(self, page0) -> int | None:
         """Return the plane count of an ImageJ contiguous stack, else None.
@@ -2652,14 +2731,12 @@ class TiffMap:
             # Fast path: pure seek + read on this thread's own handle, no
             # tifffile access and no shared lock, so reads from different
             # threads overlap instead of serializing.
-            handle = self._handle()
-            handle.seek(self._offsets[index])
             # ``np.fromfile`` rejects a Python file object on some
             # numpy/Windows builds ("expected str, bytes or os.PathLike
             # object, not BufferedReader"); read into a preallocated
             # array instead, which works with any binary handle.
             frame = np.empty(self.frame_size, dtype=self._tif_dtype)
-            handle.readinto(frame)
+            self._read_into_at(self._offsets[index], frame)
             frame = frame.reshape(self.frame_shape)
         else:
             # Compressed / tiled / multi-strip pages: let tifffile decode
@@ -2672,10 +2749,7 @@ class TiffMap:
         return frame.astype(self.dtype, copy=False)
 
     def close(self) -> None:
-        with self._handles_lock:
-            for handle in self._open_handles:
-                handle.close()
-            self._open_handles = []
+        self._close_handles()
         self._tif.close()
 
     def tofile(self, file_handle, byte_order=None):
@@ -2686,7 +2760,7 @@ class TiffMap:
             image.tofile(file_handle)
 
 
-class STKMovie(AbstractPicassoMovie):
+class STKMovie(AbstractPicassoMovie, _PerThreadFileHandles):
     """Read MetaMorph STK files and provide array-like access to frames.
 
     STK files are TIFF-based with a single IFD; additional frames are
@@ -2739,29 +2813,13 @@ class STKMovie(AbstractPicassoMovie):
         self.frame_shape = (self.height, self.width)
         self.shape = (self.n_frames, self.height, self.width)
 
-        # Per-thread binary handles for lazy frame reading. A shared
-        # handle would serialize concurrent reads on one file position;
-        # a private handle per thread lets reads overlap, which hides
-        # per-frame latency on network storage. See ``TiffMap._handle``.
-        self._local = threading.local()
-        self._open_handles = []
-        self._handles_lock = threading.Lock()
+        # Per-thread binary handles for lazy frame reading; see
+        # _PerThreadFileHandles.
+        self._init_handles()
 
     # Read frames concurrently without the shared identify lock; each
     # thread uses its own file handle (see ``_handle``).
     supports_concurrent_reads = True
-
-    def _handle(self):
-        """Return this thread's private binary file handle, opening one
-        on first use, so concurrent ``get_frame`` calls do not contend
-        on a single shared file position."""
-        handle = getattr(self._local, "file", None)
-        if handle is None:
-            handle = open(self.path, "rb")
-            self._local.file = handle
-            with self._handles_lock:
-                self._open_handles.append(handle)
-        return handle
 
     # ------------------------------------------------------------------
     # AbstractPicassoMovie interface
@@ -2863,24 +2921,19 @@ class STKMovie(AbstractPicassoMovie):
                 f"{self.n_frames} frames."
             )
         offset = self._first_data_offset + index * self._frame_bytes
-        handle = self._handle()
-        handle.seek(offset)
         # ``np.fromfile`` rejects a Python file object on some
         # numpy/Windows builds ("expected str, bytes or os.PathLike
         # object, not BufferedReader"); read into a preallocated array
         # instead, which works with any binary handle.
         frame = np.empty(self.height * self.width, dtype=self._tif_dtype)
-        handle.readinto(frame)
+        self._read_into_at(offset, frame)
         frame = frame.reshape(self.frame_shape)
         if self._byte_order == ">":
             frame = frame.byteswap().view(self._dtype)
         return frame
 
     def close(self) -> None:
-        with self._handles_lock:
-            for handle in self._open_handles:
-                handle.close()
-            self._open_handles = []
+        self._close_handles()
 
     def tofile(self, file_handle, byte_order=None):
         do_byteswap = byte_order != self._byte_order
