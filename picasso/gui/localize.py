@@ -195,17 +195,23 @@ FIT_MODELS = {
 
 MODEL_TOOLTIP = (
     "Model fit to each identified spot:\n\n"
-    "2D elliptical Gaussian: Gaussian with independent widths in x and y."
-    " Standard choice for 2D data and required for 3D via astigmatism.\n\n"
-    "2D rotated elliptical Gaussian: as above, plus a fitted rotation angle"
-    " of the ellipse. Useful for tilted/anisotropic PSFs.\n\n"
-    "2D spherical Gaussian: Gaussian with one common width for x and y.\n\n"
-    "Experimental PSF (cubic spline): fits a cubic spline interpolation of"
-    " a measured 3D PSF (requires a spline calibration file). Most accurate"
-    " model and yields z directly, also for aberrated PSFs. Runs on the CPU;"
-    " tick Use GPU to run it on the GPU instead (much faster).\n\n"
-    "Average of ROI: reports the spot's center of mass and integrated "
-    "intensity in the fit box."
+    "2D elliptical Gaussian:\n"
+    "Gaussian with independent widths in x and y.\n"
+    "Standard choice for 2D data and required for 3D via astigmatism.\n\n"
+    "2D rotated elliptical Gaussian:\n"
+    "As above, plus a fitted rotation angle of the ellipse.\n"
+    "Useful for tilted/anisotropic PSFs.\n\n"
+    "2D spherical Gaussian:\n"
+    "Gaussian with one common width for x and y.\n\n"
+    "Experimental PSF (cubic spline):\n"
+    "Fits a cubic spline interpolation of a measured 3D PSF\n"
+    "(requires a spline calibration file).\n"
+    "Most accurate model and yields z directly, also for aberrated PSFs.\n"
+    "Runs on the CPU; tick Use GPU to run it on the GPU instead\n"
+    "(much faster).\n\n"
+    "Average of ROI:\n"
+    "Reports the spot's center of mass and integrated intensity\n"
+    "in the fit box."
 )
 
 CAMERA_CALIB_TOOLTIP = (
@@ -224,12 +230,14 @@ CAMERA_CALIB_TOOLTIP = (
 
 OPTIMIZER_TOOLTIP = (
     "Optimizer used to fit the model to data:\n\n"
-    "Least squares: minimizes the squared residuals between model and"
-    " data. Fast and robust, but assumes Gaussian noise, so it is slightly"
-    " biased for the Poisson (shot) noise of low-photon spots.\n\n"
-    "MLE: maximum likelihood estimation with a Poisson noise model."
-    " Statistically optimal (precision close to the Cramer-Rao lower"
-    " bound) and the better choice for dim spots."
+    "Least squares:\n"
+    "Minimizes the squared residuals between model and data.\n"
+    "Fast and robust, but assumes Gaussian noise, so it is slightly\n"
+    "biased for the Poisson (shot) noise of low-photon spots.\n\n"
+    "MLE:\n"
+    "Maximum likelihood estimation with a Poisson noise model.\n"
+    "Statistically optimal (precision close to the Cramer-Rao lower\n"
+    "bound) and the better choice for dim spots."
 )
 
 
