@@ -320,6 +320,8 @@ class ApplyDialog(lib.Dialog):
         layout.addWidget(channel_label, 0, 1)
         self.channel = QtWidgets.QComboBox()
         self.channel.addItems(self.window.view.locs_paths)
+        if len(self.window.view.locs_paths) > 1:
+            self.channel.addItem("Apply to all sequentially")
         layout.addWidget(self.channel, 0, 2)
         self.channel.currentIndexChanged.connect(self.update_vars)
         vars_label = QtWidgets.QLabel("Variables:")
@@ -346,14 +348,6 @@ class ApplyDialog(lib.Dialog):
         layout.addWidget(exp_label, 2, 1)
         self.cmd = QtWidgets.QLineEdit()
         layout.addWidget(self.cmd, 2, 2)
-        # Apply to all channels sequentially
-        self.apply_to_all = QtWidgets.QCheckBox("Apply to all channels")
-        self.apply_to_all.setToolTip(
-            "Apply the expression to every channel sequentially,\n"
-            "ignoring the channel selected above."
-        )
-        self.apply_to_all.toggled.connect(self.channel.setDisabled)
-        layout.addWidget(self.apply_to_all, 3, 2)
         # OK and Cancel buttons
         self.buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
@@ -368,24 +362,26 @@ class ApplyDialog(lib.Dialog):
     @staticmethod
     def getCmd(
         parent: QtWidgets.QWidget | None = None,
-    ) -> tuple[str, int, bool, bool]:
+    ) -> tuple[str, int, bool]:
         """Obtain the expression as a string and the channel to be
-        manipulated."""
+        manipulated. The channel index equals the number of loaded
+        channels if the expression is to be applied to all channels
+        sequentially."""
         dialog = ApplyDialog(parent)
         result = dialog.exec()
         cmd = dialog.cmd.text()
         channel = dialog.channel.currentIndex()
-        all_channels = dialog.apply_to_all.isChecked()
         return (
             cmd,
             channel,
             result == QtWidgets.QDialog.DialogCode.Accepted,
-            all_channels,
         )
 
     def update_vars(self, index: int) -> None:
         """Update the variables that can be manipulated and show them in
         self.label."""
+        if index >= len(self.window.view.locs):  # apply to all sequentially
+            index = 0
         vars = self.window.view.locs[index].columns.to_list()
         self.label.setText(str(vars))
 
@@ -13287,9 +13283,9 @@ class Window(QtWidgets.QMainWindow):
 
     def open_apply_dialog(self) -> None:
         """Load expression and apply it to locs."""
-        cmd, channel, ok, all_channels = ApplyDialog.getCmd(self)
+        cmd, channel, ok = ApplyDialog.getCmd(self)
         if ok:
-            if all_channels:
+            if channel == len(self.view.locs_paths):  # all sequentially
                 channels = range(len(self.view.locs_paths))
             else:
                 channels = [channel]
