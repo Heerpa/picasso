@@ -3611,14 +3611,10 @@ def _synthetic_spline_2d_calibration(box=13, sigma=1.4):
     return calib, 100.0, 10.0
 
 
-@pytest.mark.skipif(
-    not localize.CUDA_AVAILABLE,
-    reason="CUDA GPU not available",
-)
-class TestSplineGpufit:
-    """End-to-end spline fitting. The fit itself runs on the CUDA GPU; the
-    calibration is built on the CPU. Skipped in the typical (GPU-less) test
-    environment.
+class TestSplineFit:
+    """End-to-end spline fitting. ``fit_spots_spline`` picks whatever device is
+    available (``use_gpu=None``), so this runs on the CPU in a GPU-less
+    environment and on the GPU otherwise.
 
     Spline theta is ``[amplitude, x_shift, y_shift, z_shift, offset]`` for 3D
     and ``[amplitude, x_shift, y_shift, offset]`` for 2D. The exact x/y and z
@@ -5680,10 +5676,6 @@ class TestSplinePerChannelPhotonScale:
         )
 
 
-@pytest.mark.skipif(
-    not localize.CUDA_AVAILABLE,
-    reason="CUDA GPU not available",
-)
 class TestSplineRatiometric:
     """End-to-end ratiometric color assignment on a real PSF,
     stacked into two identical channels. The two channels differ only by a
@@ -5719,7 +5711,7 @@ class TestSplineRatiometric:
                 calib["coefficients"], r
             )
             params, chi, _states, _n_it = localize._run_splinefit(
-                spots, ck, mle=False, use_gpu=True
+                spots, ck, mle=False, use_gpu=localize.CUDA_AVAILABLE
             )
             fin = np.isfinite(params).all(1) & np.isfinite(chi)
             scores[k] = np.where(fin, chi, np.inf)
@@ -5900,10 +5892,6 @@ class TestFitSplineSplitFovValidation:
             localize.fit_spline_split_fov(movie, CAMERA_INFO, ids, BOX, calib)
 
 
-@pytest.mark.skipif(
-    not localize.CUDA_AVAILABLE,
-    reason="CUDA GPU not available",
-)
 class TestFitSplineSplitFov:
     """End-to-end split-FOV fit on a single movie built + calibrated from the
     same beads (model matches, so the fit recovers the bead positions)."""
