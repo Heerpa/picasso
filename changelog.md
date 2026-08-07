@@ -72,6 +72,7 @@ Last change: 06-AUG-2026 CEST
 - Updated G5M documentation - drift correction importance
 - Test clusterer with a constrast bar
 - Select localizations in the center of the binding event added. See [Steen et al., Nature Methods 21, 1755-1762 (2024)](https://doi.org/10.1038/s41592-024-02374-8), Extended Data Fig. 1f
+- Improved robustness of NeNA calculation by trying out 3 starting positions for the fit
 - Fixed `picasso.g5m` bootstrap SEM (`bootstrap_check=True`) raising `AssertionError` for spline 3D data, because the resampling model was rebuilt without carrying over the fit mode
 - Fixed `picasso.g5m.sum_G5Ms` raising `TypeError` for a list of 2D models, because a calibration was passed to `G5M_2D`, which does not accept one
 - Fixed removed plugins menu after removing all localizations
