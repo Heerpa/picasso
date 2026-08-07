@@ -12,6 +12,7 @@ General purpose library for handling input and output of files.
 from __future__ import annotations
 
 import abc
+import datetime
 import glob
 import logging
 import re
@@ -365,11 +366,16 @@ def load_calibration(path: str) -> dict:
 
 
 def _json_default(obj):
-    """Coerce numpy scalars/arrays into JSON-serializable Python objects."""
+    """Coerce values that JSON cannot represent into JSON-serializable
+    Python objects."""
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     if isinstance(obj, np.generic):
         return obj.item()
+    if isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
+        return obj.isoformat()
+    if isinstance(obj, (set, frozenset)):
+        return list(obj)
     raise TypeError(
         f"Object of type {type(obj).__name__} is not JSON serializable"
     )
@@ -1158,16 +1164,19 @@ def load_info(
     info = _load_info_from_hdf5(path)
     if info is not None:
         return info
-    # Neither the sidecar file nor embedded metadata was found.
-    print(f"\nAn error occured. Could not find metadata file:\n{filename}")
+    # Neither the sidecar file nor embedded metadata was found. Files
+    # written before Picasso v0.11 carry no embedded metadata, so their
+    # .yaml is the only copy.
+    message = (
+        f"Could not find metadata for:\n{path}\nNeither the metadata "
+        f"file:\n{filename}\nnor metadata embedded in the file itself "
+        "could be read."
+    )
+    print(f"\nAn error occured. {message}")
     if qt_parent is not None:
         from PyQt6 import QtWidgets
 
-        QtWidgets.QMessageBox.critical(
-            qt_parent,
-            "An error occured",
-            f"Could not find metadata file:\n{filename}",
-        )
+        QtWidgets.QMessageBox.critical(qt_parent, "An error occured", message)
     raise NoMetadataFileError(filename)
 
 
@@ -1418,7 +1427,7 @@ def _save_metadata_in_yaml() -> bool:
     return bool(settings["Save metadata in .yaml"])
 
 
-def _write_metadata_dataset(hdf_file: h5py.File, info: list[dict]) -> None:
+def _write_metadata_dataset(hdf_file: h5py.File, info: list[dict]) -> bool:
     """Embed metadata in an open HDF5 file as a JSON string dataset at
     ``/metadata``.
 
@@ -1428,8 +1437,26 @@ def _write_metadata_dataset(hdf_file: h5py.File, info: list[dict]) -> None:
         An HDF5 file opened in write mode.
     info : list of dict
         Metadata to embed.
+
+    Returns
+    -------
+    bool
+        True if the metadata was embedded. False if it could not be
+        serialized to JSON, in which case the callers must fall back to
+        writing the sidecar ``.yaml`` so that the file stays readable.
     """
-    hdf_file.create_dataset("metadata", data=json.dumps(list(info)))
+    try:
+        payload = json.dumps(list(info), default=_json_default)
+    except (TypeError, ValueError) as e:
+        warnings.warn(
+            "Could not embed the metadata in the HDF5 file "
+            f"({type(e).__name__}: {e}). Writing the .yaml metadata file "
+            "instead; keep it next to the .hdf5 file.",
+            stacklevel=3,
+        )
+        return False
+    hdf_file.create_dataset("metadata", data=payload)
+    return True
 
 
 def _load_info_from_hdf5(path: str) -> list[dict] | None:
@@ -1448,18 +1475,39 @@ def _load_info_from_hdf5(path: str) -> list[dict] | None:
         does not contain a ``/metadata`` dataset.
     """
     try:
-        with h5py.File(path, "r") as hdf_file:
-            if "metadata" not in hdf_file:
-                return None
-            raw = hdf_file["metadata"][()]
-    except (OSError, KeyError):
+        raw = _read_metadata_dataset(path)
+    except OSError:
+        # HDF5 files on network storage can fail to open with the default
+        # file locking; the dataset itself is fine, so retry unlocked.
+        try:
+            raw = _read_metadata_dataset(path, locking=False)
+        except (OSError, KeyError):
+            return None
+    except KeyError:
+        return None
+    if raw is None:
         return None
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
     try:
-        return list(json.loads(raw))
-    except (ValueError, TypeError):
+        info = list(json.loads(raw))
+    except (ValueError, TypeError) as e:
+        warnings.warn(
+            f"The metadata embedded in {path} could not be read "
+            f"({type(e).__name__}: {e})."
+        )
         return None
+    return info
+
+
+def _read_metadata_dataset(path: str, **kwargs) -> bytes | str | None:
+    """Return the raw contents of the ``/metadata`` dataset of an HDF5
+    file, or None if the file does not have one. ``kwargs`` are passed on
+    to ``h5py.File``."""
+    with h5py.File(path, "r", **kwargs) as hdf_file:
+        if "metadata" not in hdf_file:
+            return None
+        return hdf_file["metadata"][()]
 
 
 class AbstractPicassoMovie(abc.ABC):
@@ -3674,8 +3722,8 @@ def save_datasets(path: str, info: dict, **kwargs) -> None:
         for key, val in kwargs.items():
             rec_locs = val.to_records(index=False)
             locs_file.create_dataset(key, data=rec_locs)
-        _write_metadata_dataset(locs_file, info)
-    if _save_metadata_in_yaml():
+        embedded = _write_metadata_dataset(locs_file, info)
+    if _save_metadata_in_yaml() or not embedded:
         base, ext = os.path.splitext(path)
         info_path = base + ".yaml"
         save_info(info_path, info)
@@ -3700,8 +3748,8 @@ def save_locs(path: str, locs: pd.DataFrame, info: list[dict]) -> None:
     rec_locs = locs.to_records(index=False)
     with h5py.File(path, "w") as locs_file:
         locs_file.create_dataset("locs", data=rec_locs)
-        _write_metadata_dataset(locs_file, info)
-    if _save_metadata_in_yaml():
+        embedded = _write_metadata_dataset(locs_file, info)
+    if _save_metadata_in_yaml() or not embedded:
         base, ext = os.path.splitext(path)
         info_path = base + ".yaml"
         save_info(info_path, info)
@@ -3782,8 +3830,8 @@ def save_identifications(
     rec_ids = identifications.to_records(index=False)
     with h5py.File(path, "w") as ids_file:
         ids_file.create_dataset("identifications", data=rec_ids)
-        _write_metadata_dataset(ids_file, info)
-    if _save_metadata_in_yaml():
+        embedded = _write_metadata_dataset(ids_file, info)
+    if _save_metadata_in_yaml() or not embedded:
         base, ext = os.path.splitext(path)
         info_path = base + ".yaml"
         save_info(info_path, info)
