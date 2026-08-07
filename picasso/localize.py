@@ -1969,6 +1969,32 @@ def _clip_for_mle(
     return np.maximum(spots, -variance)
 
 
+def _seed_spots(
+    spots: lib.FloatArray3D, variance: lib.FloatArray3D | None
+) -> lib.FloatArray3D:
+    """Spots to estimate the initial fit parameters from.
+
+    The seeds take the background from the dimmest pixel of the ROI and the
+    amplitude from the brightest minus the dimmest. That is fine on data
+    floored at zero, but :func:`_clip_for_mle` floors at ``-var``, so on a
+    noisy pixel the dimmest value can be tens of photons *below* zero. Seeding
+    a background there makes the model mean negative across the whole ROI, the
+    likelihood is then floored everywhere, the first Hessian is singular and
+    the fit aborts - which cost about a third of all spots on a sensor with
+    realistic hot pixels.
+
+    The seed is only a starting point, and a negative background is never a
+    sensible one, so it is estimated from the zero-floored data. The fit
+    itself still runs on the ``-var`` floored data, where the shifted Poisson
+    likelihood is defined. This also keeps the seed identical with and without
+    a calibration, so any difference between the two fits comes from the noise
+    model rather than from where they started.
+    """
+    if variance is None:
+        return spots
+    return np.maximum(spots, 0)
+
+
 def get_spots(
     movie: lib.IntArray3D,
     identifications: pd.DataFrame,
@@ -2684,7 +2710,10 @@ def fit_spots_gauss(
         spots = _clip_for_mle(spots, variance)
     size = spots.shape[1]
     initial_parameters = _initial_parameters_gauss(
-        spots, size, rotated=rotated, spherical=spherical
+        _seed_spots(spots, variance) if mle else spots,
+        size,
+        rotated=rotated,
+        spherical=spherical,
     ).astype(np.float64)
 
     backend = gaussfit_cuda if use_gpu else gaussfit
@@ -3456,7 +3485,10 @@ def _run_splinefit(
         else _spline_channel_major(variance, n_channels)
     )
     initial = np.ascontiguousarray(
-        _initial_parameters_spline(spots, calibration), dtype=np.float64
+        _initial_parameters_spline(
+            _seed_spots(spots, variance) if mle else spots, calibration
+        ),
+        dtype=np.float64,
     )
     coefficients = _spline_coeff_reshaped(calibration)
     affines = _spline_channel_affines(calibration, n_channels)

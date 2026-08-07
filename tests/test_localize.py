@@ -6624,6 +6624,52 @@ class TestClipForMle:
         )
 
 
+class TestSeedSpots:
+    """The ``-var`` floor must not leak into the initial parameters."""
+
+    def test_is_a_no_op_without_a_map(self):
+        spots = np.array([[[-5.0, 3.0]]], dtype=np.float32)
+        assert localize._seed_spots(spots, None) is spots
+
+    def test_floors_at_zero_with_a_map(self):
+        spots = np.array([[[-5.0, 3.0]]], dtype=np.float32)
+        var = np.array([[[10.0, 1.0]]], dtype=np.float32)
+        np.testing.assert_array_equal(
+            localize._seed_spots(spots, var), [[[0.0, 3.0]]]
+        )
+
+    def test_mle_survives_a_deeply_negative_hot_pixel(self):
+        """Regression: seeding the background from a ``-var`` floored pixel
+        makes the model mean negative over the whole ROI, so the likelihood
+        is floored everywhere, the first Hessian is singular and the fit
+        aborts with NaN parameters.
+        """
+        box = 7
+        rng = np.random.default_rng(0)
+        grid = np.arange(box, dtype=np.float64)
+        dx = grid[None, :] - 3.0
+        dy = grid[:, None] - 3.0
+        mu = (
+            300.0
+            / (2 * np.pi * 1.3**2)
+            * np.exp(-0.5 * (dx**2 + dy**2) / 1.3**2)
+            + 5.0
+        )
+        spots = rng.poisson(mu, (32, box, box)).astype(np.float32)
+        var = np.full((32, box, box), 1.0, dtype=np.float32)
+        # One hot corner pixel, far from the emitter, with a large negative
+        # excursion - exactly what a 2,000 ADU^2 pixel produces.
+        var[:, 0, 0] = 400.0
+        spots[:, 0, 0] = -80.0
+
+        theta = localize.fit_spots_gauss(
+            localize._clip_for_mle(spots, var), mle=True, variance=var
+        )
+
+        assert np.isfinite(theta).all()
+        assert np.abs(theta[:, 1] - 3.0).max() < 1.0
+
+
 class TestGaussCrlbVariance:
     def test_respects_the_transposed_axis_order(self):
         """``_gauss_crlb`` builds ``[spot, x, y]``; a patch is ``[spot, y, x]``.
