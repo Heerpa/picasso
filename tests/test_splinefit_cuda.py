@@ -34,7 +34,12 @@ import pytest
 from numba import cuda
 
 from picasso import localize
-from picasso.fitting import lmfit_cuda, splinefit, splinefit_cuda
+from picasso.fitting import (
+    lmfit_cuda,
+    precision,
+    splinefit,
+    splinefit_cuda,
+)
 
 from tests.test_splinefit import (
     BOX,
@@ -120,7 +125,7 @@ def _case(kind, n_channels=1):
 
 
 def _args(kind, calibration, spots, initial, affines, seeds=None):
-    coefficients = localize._spline_coeff_reshaped(calibration)
+    coefficients = precision._spline_coeff_reshaped(calibration)
     n_spots, n_channels = spots.shape[0], spots.shape[1]
     residuals = np.zeros((max(n_spots, 1), n_channels, 2))
     apply_seeds = seeds is not None
@@ -220,7 +225,7 @@ class TestSplineEvaluation:
 
     def test_matches_the_closed_form(self):
         calibration, terms = _astigmatic_calibration()
-        coefficients = localize._spline_coeff_reshaped(calibration)
+        coefficients = precision._spline_coeff_reshaped(calibration)
         z_native = 6.0
         got = self._evaluate(coefficients, BOX, DX, DY, z_native)
         want = _reference_model(terms, BOX, DX, DY, z_native)
@@ -239,7 +244,7 @@ class TestSplineEvaluation:
         spelled out per pixel here; getting it wrong is how an x/y swap slips
         through. Both run in double precision, hence the tight tolerance."""
         calibration, _ = _astigmatic_calibration()
-        coefficients = localize._spline_coeff_reshaped(calibration)
+        coefficients = precision._spline_coeff_reshaped(calibration)
         z_native = 6.0
         got = self._evaluate(coefficients, BOX, DX, DY, z_native)
         for j in range(BOX):
@@ -590,6 +595,6 @@ class TestInputValidation:
             _args(splinefit.KIND_2D, calibration2d, spots, initial, affines)
         )
         calibration3d, _ = _astigmatic_calibration()
-        args[2] = localize._spline_coeff_reshaped(calibration3d)
+        args[2] = precision._spline_coeff_reshaped(calibration3d)
         with pytest.raises(ValueError, match="dimensions"):
             splinefit_cuda.fit_spots(*args)

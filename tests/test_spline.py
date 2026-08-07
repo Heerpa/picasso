@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 
 from picasso import localize, spline
+from picasso.fitting import precision
 
 from tests.conftest import BOX, CAMERA_INFO
 
@@ -824,7 +825,7 @@ class TestCalibrateSpline:
         assert list(calib["n_data"]) == [BOX, BOX, movie.shape[0]]
         # the saved calibration loads and can drive the fitter
         loaded = io.load_spline_calibration(path)
-        coefficients = localize._spline_coeff_reshaped(loaded)
+        coefficients = precision._spline_coeff_reshaped(loaded)
         assert coefficients.ndim == 7  # (C, niz, niy, nix, 4, 4, 4)
 
     def test_calibrate_spline_2d(self):
@@ -1038,7 +1039,7 @@ class TestCalibrateSplineMultichannel:
         assert len(calib["channel_transforms"]) == 2
         # round-trips and drives the multichannel fitter
         loaded = io.load_spline_calibration(path)
-        coefficients = localize._spline_coeff_reshaped(loaded)
+        coefficients = precision._spline_coeff_reshaped(loaded)
         assert coefficients.shape[0] == 2  # one coefficient block per channel
         # co-focal channels: both planes at the same focus
         np.testing.assert_allclose(

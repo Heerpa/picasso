@@ -118,7 +118,7 @@ FIT_STATE_NEG_CURVATURE_MLE = 3
 # Instead such a pixel is floored, which is what Picasso's own
 # maximum-likelihood code already does elsewhere: ``gaussmle._mlefit_sigma``
 # drops a pixel whose model is below ``10e-3`` from its Newton update, and
-# ``localize._spline_crlb`` floors the Fisher weight at
+# ``precision._spline_crlb`` floors the Fisher weight at
 # ``_SPLINE_CRLB_MU_FLOOR``. The pixel still contributes a (bounded) penalty to
 # the likelihood, so multi-start seeds stay comparable and solutions that need
 # a negative model are disfavoured, but it contributes nothing to the gradient
@@ -174,7 +174,7 @@ def resolve_schedule(
 # ----------------------------------------------------------------------
 # Spline evaluation
 #
-# The coefficient table is the one ``localize._spline_coeff_reshaped``
+# The coefficient table is the one ``precision._spline_coeff_reshaped``
 # produces: ``(n_channels, niz, niy, nix, 4, 4, 4)`` indexed
 # ``[c, k, j, i, z_power, y_power, x_power]`` (3D) or
 # ``(n_channels, niy, nix, 4, 4)`` indexed ``[c, j, i, y_power, x_power]``
@@ -1271,7 +1271,7 @@ def _check_inputs(
         raise ValueError(
             f"coefficients must have {expected_ndim} dimensions for this "
             f"model, got {coefficients.ndim}. Pass the output of "
-            "localize._spline_coeff_reshaped."
+            "precision._spline_coeff_reshaped."
         )
     if coefficients.shape[0] != n_channels:
         raise ValueError(
@@ -1402,14 +1402,14 @@ def fit_spots(
     coefficients : np.ndarray
         ``(n_channels, niy, nix, 4, 4)`` (2D) or
         ``(n_channels, niz, niy, nix, 4, 4, 4)`` (3D), i.e. the output of
-        ``localize._spline_coeff_reshaped``.
+        ``precision._spline_coeff_reshaped``.
     affines : np.ndarray
         ``(n_channels, 4)`` per-channel lateral affine ``[a00, a01, a10, a11]``
-        (``localize._spline_channel_affines``); the identity for a
+        (``precision._spline_channel_affines``); the identity for a
         single-channel fit.
     residuals : np.ndarray
         ``(n_spots, n_channels, 2)`` sub-pixel ROI offsets
-        (``localize._spline_crlb_residuals``); zeros for a single-channel fit.
+        (``precision._spline_crlb_residuals``); zeros for a single-channel fit.
     initial_parameters : np.ndarray
         ``(n_spots, n_params)`` seeds, from
         ``localize._initial_parameters_spline``.

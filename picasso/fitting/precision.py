@@ -139,7 +139,7 @@ def localization_precision(
     pixel falls under the PSF. For sCMOS data with a calibration loaded,
     prefer a maximum-likelihood method, whose Cramer-Rao bound is evaluated
     pixel by pixel and is exact under the noise model
-    (``picasso.localize._gauss_crlb``).
+    (:func:`_gauss_crlb`).
     """
     bg = bg + readout_variance
     s2 = s**2

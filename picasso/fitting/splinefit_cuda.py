@@ -28,7 +28,7 @@ Pixel loop order
     looks exactly like a broken model.
 
 Coefficient layout
-    ``localize._spline_coeff_reshaped``'s natural view,
+    ``precision._spline_coeff_reshaped``'s natural view,
     ``(n_channels, niz, niy, nix, 4, 4, 4)`` indexed
     ``[c, k, j, i, z_power, y_power, x_power]`` - the same array the CPU kernels
     and the CUDA CRLB kernels take. This is **not** the axis-reordered blob the
@@ -538,8 +538,8 @@ def _make_accumulate_link_xyz(eval_spline_3d, n_channels: int):
     that with 15 read-modify-writes into ``hess`` per pixel; on the GPU those
     would be 15 local-memory round trips, so here the same 15 quantities live in
     registers and are written out once per channel - the arrangement
-    ``localize._spline_crlb_link_xyz_kernel`` already uses. The summation order
-    is unchanged, so the two still agree to rounding.
+    ``precision._spline_crlb_link_xyz_kernel`` already uses. The summation
+    order is unchanged, so the two still agree to rounding.
     """
     n_ch = n_channels
 
