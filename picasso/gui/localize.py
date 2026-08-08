@@ -339,6 +339,14 @@ def _sanitize_filename(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "channel"
 
 
+def _format_mng(minimum_ng: float | list) -> str:
+    """Render a minimum net gradient for the status bar. Split-FOV data
+    carries one threshold per region, shown as ``ref/ch1/...``."""
+    if isinstance(minimum_ng, (list, tuple)):
+        return "/".join(f"{int(_):,}" for _ in minimum_ng)
+    return f"{int(minimum_ng):,}"
+
+
 class _LoadCancelledError(Exception):
     """Raised inside the loader's progress callback to abort a cancelled
     load mid-file (the io calls are otherwise uninterruptible)."""
@@ -520,6 +528,12 @@ class View(QtWidgets.QGraphicsView):
     selected_roi : int or None
         Index of the ROI currently highlighted (selected in the
         parameters dialog table), or None.
+    roi_mngs : list
+        Split-FOV only: the minimum net gradient of each region, parallel
+        to ``rois``. The regions are separate channels imaged through
+        different optics, so each gets its own detection threshold. Kept
+        in step with ``rois`` by ``Window.region_mngs``; empty (and
+        ignored) whenever ``split_fov_mode`` is off.
     roi_end : QtCore.QPoint
         End point of the ROI being dragged.
     window : QtWidgets.QMainWindow
@@ -538,6 +552,8 @@ class View(QtWidgets.QGraphicsView):
         self.rubberband = RubberBand(self)
         self.rois = []
         self.selected_roi = None
+        # per-region min. net gradient in split-FOV mode, see roi_mngs above
+        self.roi_mngs = []
         # Split-FOV region mode: ROIs are equal-size rectangular channels of one
         # movie. The first region drawn fixes the size (derived live from the
         # existing regions, so clearing them frees the size again); further
@@ -787,7 +803,10 @@ class View(QtWidgets.QGraphicsView):
         if idx is None:
             event.ignore()
             return
+        self.window.region_mngs()  # align the thresholds before deleting
         del self.rois[idx]
+        if idx < len(self.roi_mngs):
+            del self.roi_mngs[idx]
         self.selected_roi = None
         # the release that closes this double click must not re-add a region
         self._suppress_release = True
@@ -2263,15 +2282,9 @@ class ROIDialog(lib.Dialog):
 
         layout = QtWidgets.QVBoxLayout(self)
         header = QtWidgets.QHBoxLayout()
-        info = QtWidgets.QLabel(
-            "Each row is a rectangular ROI (y_min, x_min, y_max, x_max, "
-            "in camera pixels). Drag a rectangle in the preview or use "
-            "Add, then edit the cells. Overlapping ROIs are clipped "
-            "automatically so they never cover a pixel twice. Clear the "
-            "list to analyze the whole frame."
-        )
-        info.setWordWrap(True)
-        header.addWidget(info, 1)
+        self.info_label = QtWidgets.QLabel()
+        self.info_label.setWordWrap(True)
+        header.addWidget(self.info_label, 1)
         help_button = lib.HelpButton(ParametersDialog.ROI_URL)
         header.addWidget(help_button, 0, QtCore.Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
@@ -2310,6 +2323,11 @@ class ROIDialog(lib.Dialog):
         """Current box size, used as the minimum ROI side length."""
         return self.window.parameters.get("Box Size", 7)
 
+    def _split_fov(self) -> bool:
+        """Whether the ROIs are split-FOV channels, which get their own
+        per-region minimum net gradient column."""
+        return bool(self.window.view.split_fov_mode)
+
     def _commit(self, rois: list) -> None:
         """Clip ``rois`` and store them on the view, refreshing the
         compact field in the parameters dialog."""
@@ -2320,10 +2338,34 @@ class ROIDialog(lib.Dialog):
     def update_table(self) -> None:
         """Repopulate the table from the view's ROIs."""
         view = self.window.view
+        mngs = self.window.region_mngs()
+        split_fov = self._split_fov()
         self._updating = True
+        self.info_label.setText(
+            "Each row is a rectangular ROI (y_min, x_min, y_max, x_max, "
+            "in camera pixels). Drag a rectangle in the preview or use "
+            "Add, then edit the cells. Overlapping ROIs are clipped "
+            "automatically so they never cover a pixel twice. Clear the "
+            "list to analyze the whole frame."
+            + (
+                " In split-FOV mode each region is a channel with its own "
+                "min. net gradient (last column); selecting a row also puts "
+                "its value on the slider in the parameters dialog."
+                if split_fov
+                else ""
+            )
+        )
+        self.table.setColumnCount(5 if split_fov else 4)
+        self.table.setHorizontalHeaderLabels(
+            ["y_min", "x_min", "y_max", "x_max"]
+            + (["min_ng"] if split_fov else [])
+        )
         self.table.setRowCount(len(view.rois))
         for row, ((y_min, x_min), (y_max, x_max)) in enumerate(view.rois):
-            for col, val in enumerate((y_min, x_min, y_max, x_max)):
+            values = [y_min, x_min, y_max, x_max]
+            if split_fov:
+                values.append(mngs[row])
+            for col, val in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(str(int(val)))
                 item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row, col, item)
@@ -2334,18 +2376,29 @@ class ROIDialog(lib.Dialog):
         self._updating = False
 
     def on_table_changed(self, item: object = None) -> None:
-        """Rebuild the view's ROIs from the table, clipping overlaps."""
+        """Rebuild the view's ROIs (and, in split-FOV mode, their
+        thresholds) from the table, clipping overlaps."""
         if self._updating:
             return
+        split_fov = self._split_fov()
         rois = []
+        mngs = []
         for row in range(self.table.rowCount()):
             try:
                 vals = [int(self.table.item(row, c).text()) for c in range(4)]
+                if split_fov:
+                    mngs.append(int(self.table.item(row, 4).text()))
             except (AttributeError, ValueError):
                 return  # incomplete row, wait for the user to finish
             y_min, x_min, y_max, x_max = vals
             rois.append([[y_min, x_min], [y_max, x_max]])
         self._commit(rois)
+        # clipping can drop or split rectangles, so only adopt the edited
+        # thresholds when the rows still line up with the stored regions
+        if split_fov and len(mngs) == len(self.window.view.rois):
+            self.window.view.roi_mngs = mngs
+            self.window.parameters_dialog.sync_mng_to_selected_region()
+            self.window.draw_frame()
         self.update_table()
 
     def on_add(self) -> None:
@@ -2368,9 +2421,12 @@ class ROIDialog(lib.Dialog):
             {idx.row() for idx in self.table.selectedIndexes()},
             reverse=True,
         )
+        self.window.region_mngs()  # align the thresholds before deleting
         for row in rows:
             if 0 <= row < len(view.rois):
                 del view.rois[row]
+                if row < len(view.roi_mngs):
+                    del view.roi_mngs[row]
         view.selected_roi = None
         self._commit(view.rois)
         self.update_table()
@@ -2382,11 +2438,13 @@ class ROIDialog(lib.Dialog):
         self.update_table()
 
     def on_selection_changed(self) -> None:
-        """Highlight the ROI selected in the table."""
+        """Highlight the ROI selected in the table (and, in split-FOV mode,
+        put its threshold on the min. net gradient slider)."""
         if self._updating:
             return
         rows = {idx.row() for idx in self.table.selectedIndexes()}
         self.window.view.selected_roi = min(rows) if rows else None
+        self.window.parameters_dialog.sync_mng_to_selected_region()
         self.window.draw_frame()
 
 
@@ -2772,6 +2830,13 @@ class ParametersDialog(lib.Dialog):
         # last resolved fit2D code, so the convergence defaults are only
         # reapplied when the method actually changes
         self._last_fit_code = None
+        # guards the two-way binding between the min. net gradient slider and
+        # the selected split-FOV region (see sync_mng_to_selected_region)
+        self._syncing_mng = False
+        # last value the slider settled on. Split-FOV regions drawn later
+        # inherit it, so a slider move that edits one region cannot also
+        # seed its neighbours with the value being typed.
+        self._last_mng = DEFAULT_PARAMETERS["Min. Net Gradient"]
 
         self.scroll_area = QtWidgets.QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -2818,7 +2883,12 @@ class ParametersDialog(lib.Dialog):
         # Slider
         self.mng_slider = QtWidgets.QSlider()
         self.mng_slider.setToolTip(
-            "Adjust the minimum net gradient for spot identification."
+            "Adjust the minimum net gradient for spot identification.\n\n"
+            "In split-FOV mode ('Regions = channels') each region has its\n"
+            "own threshold: the slider shows and edits the selected\n"
+            "region's value, and sets every region's when none is\n"
+            "selected. Click a region in the preview (or a row in\n"
+            "'Edit ROIs...') to select it."
         )
         self.mng_slider.setOrientation(QtCore.Qt.Orientation.Horizontal)
         self.mng_slider.setRange(0, 10000)
@@ -2990,7 +3060,10 @@ class ParametersDialog(lib.Dialog):
             "regions are kept the same size: drag once to set the size, click\n"
             "to drop more regions, drag a region (or use the arrow keys) to\n"
             "fine-tune its registration. 'Calibrate spline PSF' and the\n"
-            "spline fit then use these regions as channels of this movie."
+            "spline fit then use these regions as channels of this movie.\n\n"
+            "Each region also carries its own min. net gradient, since the\n"
+            "channels need not share a brightness scale: select a region\n"
+            "and the slider above tunes that region alone."
         )
         self.split_fov_checkbox.setTristate(False)
         self.split_fov_checkbox.stateChanged.connect(self.on_split_fov_changed)
@@ -3647,6 +3720,10 @@ class ParametersDialog(lib.Dialog):
             self.roi_field.setReadOnly(True)
             self.roi_field.setText(f"{n} ROIs")
         self._updating_roi_field = False
+        # split-FOV: keep the per-region thresholds aligned with the regions
+        # and put the selected region's on the slider
+        self.window.region_mngs()
+        self.sync_mng_to_selected_region()
         if not skip_dialog and self.roi_dialog is not None:
             self.roi_dialog.update_table()
 
@@ -4403,8 +4480,64 @@ class ParametersDialog(lib.Dialog):
     def on_mng_slider_changed(self, value: int) -> None:
         """Handle change to the min. net gradient slider."""
         self.mng_spinbox.setValue(value)
+        if self._syncing_mng:
+            # only showing the selected region's threshold - nothing about
+            # the identification changed, so the locs must survive
+            self._last_mng = value
+            return
+        # in split-FOV mode the slider edits the selected region's own
+        # threshold; do this before ``_last_mng`` moves, so any region that
+        # has no threshold yet inherits the previous value rather than the
+        # one being typed, and before the preview, so it uses the new one
+        self._store_mng_for_regions(value)
+        self._last_mng = value
         if self.preview_checkbox.isChecked():
             self.window.on_parameters_changed()
+
+    def _store_mng_for_regions(self, value: int) -> None:
+        """Write the slider's value into the split-FOV region it belongs to.
+
+        With a region selected the value is that region's own threshold;
+        with none selected it is applied to every region, so the slider
+        still works as a global control. A no-op outside split-FOV mode.
+        """
+        window = self.window
+        mngs = window.region_mngs()
+        if not mngs:
+            return
+        index = window.view.selected_roi
+        if index is None or index >= len(mngs):
+            window.view.roi_mngs = [int(value)] * len(mngs)
+        else:
+            window.view.roi_mngs[index] = int(value)
+        if self.roi_dialog is not None:
+            self.roi_dialog.update_table()
+        if not self.preview_checkbox.isChecked():
+            # the region labels carry the value; with the preview on the
+            # redraw comes from on_parameters_changed instead
+            window.draw_frame()
+
+    def sync_mng_to_selected_region(self) -> None:
+        """Show the selected split-FOV region's own threshold on the min.
+        net gradient slider/spinbox, so selecting a region tunes that
+        region. A no-op outside split-FOV mode or with nothing selected."""
+        if self._syncing_mng:
+            return
+        window = self.window
+        mngs = window.region_mngs()
+        index = window.view.selected_roi
+        if not mngs or index is None or index >= len(mngs):
+            return
+        value = int(mngs[index])
+        if value == self.mng_spinbox.value():
+            return
+        self._syncing_mng = True
+        try:
+            # via the spinbox: its handler widens the slider range when the
+            # region's value falls outside it
+            self.mng_spinbox.setValue(value)
+        finally:
+            self._syncing_mng = False
 
     def on_mng_min_changed(self, value: int) -> None:
         self.mng_slider.setMinimum(value)
@@ -5326,7 +5459,7 @@ class Window(QtWidgets.QMainWindow):
             calibration_path=calib_path,
             transform_type=transform_type,
             box=self.parameters["Box Size"],
-            minimum_ng=self.parameters["Min. Net Gradient"],
+            minimum_ng=self.parameters_dialog.mng_slider.value(),
             prompt_for_path=self._prompt_for_path,
             pixelsize_prompt=_pixelsize_prompt,
         )
@@ -5603,6 +5736,10 @@ class Window(QtWidgets.QMainWindow):
         self.view.split_fov_mode = bool(enabled)
         if enabled:
             self.view.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        # seed each region's own min. net gradient from the current slider
+        # value on the way in, drop them again on the way out
+        self.region_mngs()
+        self.parameters_dialog.update_roi_display()
         self._update_multichannel_widgets()
         self.draw_frame()
 
@@ -6619,7 +6756,17 @@ class Window(QtWidgets.QMainWindow):
                 self.parameters_dialog.box_spinbox.setValue(box)
             if min_ng is not None:
                 self.last_identification_info["Min. Net Gradient"] = min_ng
-                self.parameters_dialog.mng_slider.setValue(min_ng)
+                if isinstance(min_ng, (list, tuple)):
+                    # split-FOV identifications carry one threshold per
+                    # region; the slider takes the reference region's and
+                    # the rest go back onto the regions themselves (when
+                    # they are still drawn)
+                    self.parameters_dialog.mng_slider.setValue(int(min_ng[0]))
+                    if len(min_ng) == len(self.view.rois):
+                        self.view.roi_mngs = [int(_) for _ in min_ng]
+                        self.parameters_dialog.update_roi_display()
+                else:
+                    self.parameters_dialog.mng_slider.setValue(min_ng)
         # restore the identification filters too, otherwise the loaded
         # identifications would immediately count as outdated
         self.parameters_dialog.temporal_median_checkbox.setChecked(
@@ -6796,6 +6943,7 @@ class Window(QtWidgets.QMainWindow):
             self.view.setScene(self.scene)
             # draw the ROI rectangles (in scene/pixel coordinates)
             split_fov = self.view.split_fov_mode
+            region_mngs = self.region_mngs()
             for i, ((y_min, x_min), (y_max, x_max)) in enumerate(
                 self.view.rois
             ):
@@ -6818,9 +6966,11 @@ class Window(QtWidgets.QMainWindow):
                 )
                 if split_fov:
                     # label each region by its channel index (0 = reference)
-                    text = self.scene.addSimpleText(
-                        "ref" if i == 0 else f"ch{i}"
-                    )
+                    # and the threshold it is identified with
+                    label = "ref" if i == 0 else f"ch{i}"
+                    if i < len(region_mngs):
+                        label += f" ({region_mngs[i]:,})"
+                    text = self.scene.addSimpleText(label)
                     text.setBrush(QtGui.QBrush(color))
                     text.setPos(float(x_min), float(y_min))
                     text.setFlag(
@@ -7524,11 +7674,42 @@ class Window(QtWidgets.QMainWindow):
             True,
         )
 
+    def region_mngs(self) -> list[int]:
+        """Per-region minimum net gradients in split-FOV mode, kept in step
+        with ``view.rois``.
+
+        The regions are separate channels (different dyes, different
+        optical paths), so a single threshold rarely suits all of them.
+        Regions added since the last call inherit the value the slider last
+        settled on; removed ones drop out. Returns an empty list whenever
+        split-FOV mode is off or no region is drawn - that is, whenever the
+        single shared threshold on the slider applies.
+        """
+        # ``parameters`` is also read from a partially built window, where
+        # the single shared threshold stands on its own
+        try:
+            view = self.view
+            if not view.split_fov_mode or not view.rois:
+                view.roi_mngs = []
+                return []
+            default = self.parameters_dialog._last_mng
+        except (AttributeError, RuntimeError):
+            return []
+        mngs = [int(_) for _ in view.roi_mngs[: len(view.rois)]]
+        mngs += [int(default)] * (len(view.rois) - len(mngs))
+        view.roi_mngs = mngs
+        return mngs
+
     @property
     def parameters(self) -> dict:
         """Dictionary with the identification settings: box size, min.
         net gradient, the temporal median window (0 when disabled) and the
         Gaussian filter sigma (0 when disabled).
+
+        In split-FOV mode "Min. Net Gradient" is the list of per-region
+        thresholds (see ``region_mngs``) rather than a single number; every
+        consumer passes it straight to ``localize.identify``, which accepts
+        one threshold per ROI.
 
         Every key is compared in ``identifications_outdated`` and stored
         in ``last_identification_info``, so adding one here is enough for
@@ -7537,7 +7718,9 @@ class Window(QtWidgets.QMainWindow):
         dialog = self.parameters_dialog
         return {
             "Box Size": dialog.box_spinbox.value(),
-            "Min. Net Gradient": dialog.mng_slider.value(),
+            "Min. Net Gradient": (
+                self.region_mngs() or dialog.mng_slider.value()
+            ),
             "Temporal Median Window": (
                 dialog.temporal_median_spinbox.value()
                 if (
@@ -7727,10 +7910,10 @@ class Window(QtWidgets.QMainWindow):
         progress."""
         n_frames = self.info[0]["Frames"]
         box = parameters["Box Size"]
-        mng = parameters["Min. Net Gradient"]
+        mng = _format_mng(parameters["Min. Net Gradient"])
         message = (
             f"Identifying in frame {frame_number:,} / {n_frames:,}"
-            f" (Box Size: {box}; Min. Net Gradient: {mng:,}) ..."
+            f" (Box Size: {box}; Min. Net Gradient: {mng}) ..."
         )
         self.status_bar.showMessage(message)
 
@@ -7826,7 +8009,7 @@ class Window(QtWidgets.QMainWindow):
             self.last_identification_info["Frame bounds"] = self.frame_range
             n_identifications = len(identifications)
             box = parameters["Box Size"]
-            mng = parameters["Min. Net Gradient"]
+            mng = _format_mng(parameters["Min. Net Gradient"])
             self.identifications = identifications
             self.ready_for_fit = True
             # for split-FOV data the detections of every region sit in this one
@@ -8357,13 +8540,21 @@ class Window(QtWidgets.QMainWindow):
                 return
 
             n_movie_frames = len(self.movie)
+            # per-region thresholds only apply when the regions being refined
+            # are the drawn ones; the calibration's own regions get the
+            # single slider value
+            minimum_ng = parameters["Min. Net Gradient"]
+            if not (
+                isinstance(minimum_ng, list) and len(minimum_ng) == n_channels
+            ):
+                minimum_ng = self.parameters_dialog.mng_slider.value()
 
             def _refine(frame_bounds, max_frames):
                 return spline.refine_split_fov_transforms_from_signal(
                     self.movie,
                     calibration,
                     regions,
-                    minimum_ng=parameters["Min. Net Gradient"],
+                    minimum_ng=minimum_ng,
                     box=parameters["Box Size"],
                     frame_bounds=frame_bounds,
                     max_frames=max_frames,
@@ -8966,7 +9157,9 @@ class Window(QtWidgets.QMainWindow):
         ids_info = {
             "Generated by": f"Picasso v{__version__} Localize",
             "Box Size": self.parameters_dialog.box_spinbox.value(),
-            "Min. Net Gradient": (self.parameters_dialog.mng_slider.value()),
+            # a list of per-region thresholds for split-FOV data, which
+            # load_identifications puts back onto the regions
+            "Min. Net Gradient": self.parameters["Min. Net Gradient"],
             "Temporal Median Window": (
                 self.parameters["Temporal Median Window"]
             ),

@@ -1647,7 +1647,7 @@ def calibrate_spline_multichannel(
     infos: list,
     camera_infos: list[dict],
     box: int,
-    minimum_ng: float,
+    minimum_ng: float | list | np.ndarray,
     d: float,
     frames_per_step: int = 1,
     frame_bounds: tuple[int, int] | list | None = None,
@@ -1682,7 +1682,10 @@ def calibrate_spline_multichannel(
     ``localize.fit_spline_multichannel`` / ``get_spots_multichannel``.
 
     Parameters are as in ``calibrate_spline`` but per-channel lists; all movies
-    must share the same frame layout (z scan). ``roi`` (in reference-channel
+    must share the same frame layout (z scan). ``minimum_ng`` may likewise be a
+    per-channel sequence (in the order of ``movies`` / ``regions``), since the
+    channels need not share a bead-brightness scale; a scalar applies to all.
+    ``roi`` (in reference-channel
     coordinates) restricts which reference-channel beads are calibrated on; the
     channel-to-channel transform is still estimated from all detected beads.
     Returns a ``"spline-3d-multichannel"`` calibration dict - or, with
@@ -1713,6 +1716,10 @@ def calibrate_spline_multichannel(
         )
     if max_match_distance is None:
         max_match_distance = float(box)
+    # One detection threshold per channel: split-FOV regions (and separate
+    # channels) see different dyes through different optics, so their beads
+    # need not share a brightness scale. A scalar applies to all channels.
+    minimum_ngs = localize._as_ng_list(minimum_ng, n_channels)
 
     # Split-FOV: the channels are rectangular sub-regions of one movie. Put the
     # reference region first (channel 0), require all regions to share a size,
@@ -1737,6 +1744,8 @@ def calibrate_spline_multichannel(
         # template conventions; reorder so it comes first.
         order = [reference] + [c for c in range(n_channels) if c != reference]
         region_rects = [region_rects[c] for c in order]
+        # the thresholds belong to the regions, so they follow the reorder
+        minimum_ngs = [minimum_ngs[c] for c in order]
         sizes = {(r[1][0] - r[0][0], r[1][1] - r[0][1]) for r in region_rects}
         if len(sizes) != 1:
             raise ValueError(
@@ -1767,7 +1776,7 @@ def calibrate_spline_multichannel(
     # different beads per field, extracted per FOV (see _bead_volumes).
     beads_ref = _detect_bead_positions(
         movies[0],
-        minimum_ng,
+        minimum_ngs[0],
         box,
         ref_bounds,
         roi=ref_roi,
@@ -1785,7 +1794,7 @@ def calibrate_spline_multichannel(
             movies[0],
             movies[c],
             beads_ref,
-            minimum_ng,
+            minimum_ngs[c],
             box,
             ref_bounds,
             mid_frame,
@@ -1829,7 +1838,7 @@ def calibrate_spline_multichannel(
             movies[c],
             camera_infos[c],
             box,
-            minimum_ng,
+            minimum_ngs[c],
             d,
             frames_per_step=frames_per_step,
             frame_bounds=frame_bounds,
@@ -2421,7 +2430,7 @@ def calibrate_spline_split_fov(
     info,
     camera_info: dict,
     box: int,
-    minimum_ng: float,
+    minimum_ng: float | list | np.ndarray,
     d: float,
     regions: list,
     reference: int = 0,
@@ -2461,6 +2470,9 @@ def calibrate_spline_split_fov(
         produced by the GUI ROI tool), all the same size.
     reference : int, optional
         Index into ``regions`` of the reference channel. Default 0.
+    minimum_ng : float or sequence of float, optional
+        Bead detection threshold, shared or one per region (in the order of
+        ``regions``, i.e. before the reference-first reordering).
 
     Remaining parameters are as in :func:`calibrate_spline_multichannel`.
     Returns a ``"spline-3d-multichannel"`` calibration with ``split_fov``,
@@ -2725,7 +2737,7 @@ def refine_split_fov_transforms_from_signal(
     movie,
     calibration: dict,
     regions: list,
-    minimum_ng: float,
+    minimum_ng: float | list | np.ndarray,
     box: int | None = None,
     reference: int = 0,
     frame_bounds: tuple[int, int] | list | None = None,
@@ -2757,7 +2769,8 @@ def refine_split_fov_transforms_from_signal(
        drops the coincidental (non-physical) pairs.
 
     ``regions`` are the channel ROIs in the current data (reference first, e.g.
-    freshly drawn in the GUI). The PSF ``coefficients`` are untouched; only the
+    freshly drawn in the GUI); ``minimum_ng`` may be a matching per-region
+    sequence. The PSF ``coefficients`` are untouched; only the
     registration (``channel_affines`` / ``channel_transforms`` / ``regions`` /
     ``region_size``) is updated. Requires channels that share signal.
 
@@ -2790,6 +2803,9 @@ def refine_split_fov_transforms_from_signal(
     # reference-first ordering for both the regions and the stored affines
     order = [reference] + [c for c in range(n_channels) if c != reference]
     region_rects = [_normalized_region(regions[c]) for c in order]
+    # one threshold per region, reordered with them (a scalar covers all)
+    minimum_ngs = localize._as_ng_list(minimum_ng, n_channels)
+    minimum_ngs = [minimum_ngs[c] for c in order]
     sizes = {(r[1][0] - r[0][0], r[1][1] - r[0][1]) for r in region_rects}
     if len(sizes) != 1:
         raise ValueError("All regions must have the same size.")
@@ -2833,8 +2849,8 @@ def refine_split_fov_transforms_from_signal(
     movie_sub = np.stack([np.asarray(movie[int(f)]) for f in sample_frames])
 
     # per-region, per-frame detections (absolute coords) on the sampled frames
-    def _by_frame(rect):
-        ids, _ = localize.identify(movie_sub, minimum_ng, box, roi=rect)
+    def _by_frame(rect, mng):
+        ids, _ = localize.identify(movie_sub, mng, box, roi=rect)
         if len(ids) == 0:
             return {}
         frame = np.asarray(ids["frame"], dtype=np.int64)
@@ -2849,7 +2865,7 @@ def refine_split_fov_transforms_from_signal(
             out[int(f)] = xy[frame == f]
         return out
 
-    ref_by_frame = _by_frame(region_rects[0])
+    ref_by_frame = _by_frame(region_rects[0], minimum_ngs[0])
     if not ref_by_frame:
         raise ValueError(
             "No detections in the reference region; lower the minimum net "
@@ -2865,7 +2881,7 @@ def refine_split_fov_transforms_from_signal(
     transforms = [np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])]
     reg_info = []
     for c in range(1, n_channels):
-        chan_by_frame = _by_frame(region_rects[c])
+        chan_by_frame = _by_frame(region_rects[c], minimum_ngs[c])
         common = sorted(set(ref_by_frame) & set(chan_by_frame))
         if not common:
             raise ValueError(

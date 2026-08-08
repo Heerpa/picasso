@@ -493,6 +493,8 @@ To build it in the GUI, first load the channels:
 - **Separate movies** — ``File`` > ``Open channels from several movies`` (or ``Open one multichannel movie`` for a single file holding several channels). The first movie loaded is the **reference channel**.
 - **Split field of view** — if the channels are imaged side by side on one camera, load the single movie, tick **Regions = channels** in the ``Parameters`` dialog and drag the ROIs onto the channels. The first region is the reference channel; all regions are kept the same size (drag once to set the size, click to drop more, drag a region or use the arrow keys to fine-tune it).
 
+  In this mode each region also carries its **own minimum net gradient**. Select a region (click it in the image, or its row in ``Edit ROIs...``) and the ``Min. net gradient`` slider shows and tunes *that* region alone — turn on ``Preview`` and sweep it as usual. With no region selected the slider still sets every region at once. The current value is drawn next to each region's ``ref`` / ``ch1`` label and listed in the ``min_ng`` column of the ``Edit ROIs...`` table, where it can also be typed in directly. The per-region values are used for identification, for ``Calibrate spline PSF`` and for ``Re-align channels (current signal)``.
+
 Then run ``Calibration`` > ``Calibrate spline PSF`` as for a single channel. The dialog is the same, with an additional option:
 
 - **Link photon counts across channels** — on by default, so all channels share one photon count and background. Turn it off (2 to 6 channels) to fit per-channel photons and background instead, with only ``x``, ``y`` and ``z`` shared.

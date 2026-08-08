@@ -7226,6 +7226,262 @@ class TestGaussianFilterGui:
             window.close()
 
 
+def _two_region_frame() -> np.ndarray:
+    """One frame with a bright spot in the left half and a ten-times dimmer
+    one in the right half - a split-FOV pair that no single threshold can
+    detect at once without also detecting the noise floor of the bright
+    region."""
+    frame = np.full((64, 128), 100.0, np.float32)
+    yy, xx = np.mgrid[-4:5, -4:5]
+    kernel = np.exp(-(yy**2 + xx**2) / 2.0)
+    frame[28:37, 26:35] += 2000.0 * kernel
+    frame[28:37, 90:99] += 200.0 * kernel
+    return frame
+
+
+TWO_REGIONS = [[[0, 0], [64, 64]], [[0, 64], [64, 128]]]
+
+
+class TestPerRoiMinNetGradient:
+    """``identify_in_frame`` with one threshold per ROI (split-FOV: the
+    regions are separate channels and need not share a brightness scale)."""
+
+    def test_scalar_applies_to_every_roi(self):
+        frame = _two_region_frame()
+        _, x, _ = localize.identify_in_frame(frame, 500, 7, TWO_REGIONS)
+        assert sorted(x.tolist()) == [30, 94]
+        _, x, _ = localize.identify_in_frame(frame, 5000, 7, TWO_REGIONS)
+        assert x.tolist() == [30]  # the dim region drops out
+
+    def test_each_roi_uses_its_own_threshold(self):
+        frame = _two_region_frame()
+        _, x, _ = localize.identify_in_frame(
+            frame, [5000, 500], 7, TWO_REGIONS
+        )
+        assert sorted(x.tolist()) == [30, 94]
+        # swapping the thresholds keeps only the bright spot: the dim one is
+        # now below its region's threshold
+        _, x, _ = localize.identify_in_frame(
+            frame, [500, 5000], 7, TWO_REGIONS
+        )
+        assert x.tolist() == [30]
+
+    def test_length_must_match_the_rois(self):
+        frame = _two_region_frame()
+        with pytest.raises(ValueError, match="one threshold per ROI"):
+            localize.identify_in_frame(frame, [1, 2, 3], 7, TWO_REGIONS)
+
+    def test_single_element_sequence_is_shared(self):
+        frame = _two_region_frame()
+        _, x, _ = localize.identify_in_frame(frame, [500], 7, TWO_REGIONS)
+        assert sorted(x.tolist()) == [30, 94]
+
+    def test_identify_carries_the_thresholds_into_the_metadata(self):
+        movie = np.stack([_two_region_frame()] * 3)
+        ids, info = localize.identify(
+            movie, [5000, 500], 7, roi=TWO_REGIONS, threaded=False
+        )
+        assert info["Min. Net Gradient"] == [5000, 500]
+        assert sorted(set(ids["x"])) == [30, 94]
+
+
+class TestPerRegionMinNetGradientGui:
+    """The split-FOV region <-> min. net gradient slider binding.
+
+    The slider is the only place these are tuned interactively, so it has
+    to follow the selected region without the selection itself counting as
+    a parameter change (which would throw away the localizations).
+    """
+
+    @staticmethod
+    def _window():
+        """A stub window carrying the real ``region_mngs`` / ``parameters``
+        over a minimal view, plus the dialog under test."""
+
+        class _View:
+            def __init__(self):
+                self.rois = []
+                self.roi_mngs = []
+                self.selected_roi = None
+                self.split_fov_mode = False
+
+        class _StubWindow(QtWidgets.QMainWindow):
+            movie = None
+            region_mngs = localize_gui.Window.region_mngs
+            parameters = localize_gui.Window.parameters
+
+            def __init__(self):
+                super().__init__()
+                self.view = _View()
+                self.draws = 0
+                self.invalidations = 0
+
+            def draw_frame(self):
+                self.draws += 1
+
+            def on_parameters_changed(self):
+                self.invalidations += 1
+
+        window = _StubWindow()
+        window.parameters_dialog = localize_gui.ParametersDialog(window)
+        return window
+
+    def test_no_thresholds_without_split_fov(self):
+        window = self._window()
+        try:
+            window.view.rois = [r[:] for r in TWO_REGIONS]
+            assert window.region_mngs() == []
+            assert isinstance(window.parameters["Min. Net Gradient"], int)
+        finally:
+            window.parameters_dialog.close()
+            window.close()
+
+    def test_regions_inherit_the_slider_value(self):
+        window = self._window()
+        try:
+            window.parameters_dialog.mng_slider.setValue(4000)
+            window.view.split_fov_mode = True
+            window.view.rois = [r[:] for r in TWO_REGIONS]
+            assert window.region_mngs() == [4000, 4000]
+            assert window.parameters["Min. Net Gradient"] == [4000, 4000]
+        finally:
+            window.parameters_dialog.close()
+            window.close()
+
+    def test_thresholds_follow_added_and_removed_regions(self):
+        window = self._window()
+        try:
+            window.parameters_dialog.mng_slider.setValue(4000)
+            window.view.split_fov_mode = True
+            window.view.rois = [r[:] for r in TWO_REGIONS]
+            window.region_mngs()
+            window.view.roi_mngs = [1000, 2000]
+            window.view.rois.append([[0, 0], [64, 64]])
+            assert window.region_mngs() == [1000, 2000, 4000]
+            del window.view.rois[2]
+            assert window.region_mngs() == [1000, 2000]
+        finally:
+            window.parameters_dialog.close()
+            window.close()
+
+    def test_slider_edits_only_the_selected_region(self):
+        window = self._window()
+        dialog = window.parameters_dialog
+        try:
+            dialog.mng_slider.setValue(4000)
+            window.view.split_fov_mode = True
+            window.view.rois = [r[:] for r in TWO_REGIONS]
+            window.view.selected_roi = 1
+            dialog.mng_slider.setValue(800)
+            assert window.region_mngs() == [4000, 800]
+        finally:
+            dialog.close()
+            window.close()
+
+    def test_slider_sets_every_region_when_none_is_selected(self):
+        window = self._window()
+        dialog = window.parameters_dialog
+        try:
+            dialog.mng_slider.setValue(4000)
+            window.view.split_fov_mode = True
+            window.view.rois = [r[:] for r in TWO_REGIONS]
+            window.view.roi_mngs = [1000, 2000]
+            window.view.selected_roi = None
+            dialog.mng_slider.setValue(777)
+            assert window.region_mngs() == [777, 777]
+        finally:
+            dialog.close()
+            window.close()
+
+    def test_selecting_a_region_shows_its_threshold(self):
+        window = self._window()
+        dialog = window.parameters_dialog
+        try:
+            window.view.split_fov_mode = True
+            window.view.rois = [r[:] for r in TWO_REGIONS]
+            window.view.roi_mngs = [4000, 800]
+            window.view.selected_roi = 1
+            dialog.sync_mng_to_selected_region()
+            assert dialog.mng_slider.value() == 800
+            assert dialog.mng_spinbox.value() == 800
+            # the other region is untouched by merely looking at this one
+            assert window.region_mngs() == [4000, 800]
+        finally:
+            dialog.close()
+            window.close()
+
+    def test_selecting_a_region_does_not_invalidate_the_locs(self):
+        """Switching regions moves the slider, but nothing about the
+        identification changed - the existing localizations must survive."""
+        window = self._window()
+        dialog = window.parameters_dialog
+        try:
+            dialog.preview_checkbox.setChecked(True)
+            window.view.split_fov_mode = True
+            window.view.rois = [r[:] for r in TWO_REGIONS]
+            window.view.roi_mngs = [4000, 800]
+            window.invalidations = 0
+            window.view.selected_roi = 1
+            dialog.sync_mng_to_selected_region()
+            assert dialog.mng_slider.value() == 800
+            assert window.invalidations == 0
+            # an actual edit still does invalidate them
+            dialog.mng_slider.setValue(900)
+            assert window.invalidations == 1
+        finally:
+            dialog.close()
+            window.close()
+
+    def test_identifications_metadata_round_trip(self, tmp_path):
+        """The per-region thresholds have to reach the metadata and come
+        back onto the regions, or reloaded split-FOV identifications count
+        as outdated straight away."""
+        movie = np.stack([_two_region_frame()] * 3).astype(np.uint16)
+        window = localize_gui.Window()
+        try:
+            window.movie = movie
+            window.curr_frame_number = 0
+            window.info = []
+            window.view.rois = [r[:] for r in TWO_REGIONS]
+            window.set_split_fov_mode(True)
+            window.view.roi_mngs = [5000, 500]
+            assert window.parameters["Min. Net Gradient"] == [5000, 500]
+            window.identifications = localize.identify(
+                movie,
+                [5000, 500],
+                BOX,
+                roi=TWO_REGIONS,
+                threaded=False,
+                return_info=False,
+            )
+            path = str(tmp_path / "ids.hdf5")
+            window.save_identifications(path)
+
+            window.view.roi_mngs = [1, 1]
+            window.load_identifications(path)
+            assert window.view.roi_mngs == [5000, 500]
+            assert window.parameters["Min. Net Gradient"] == [5000, 500]
+        finally:
+            window.close()
+
+    def test_a_region_threshold_outside_the_slider_range_widens_it(self):
+        window = self._window()
+        dialog = window.parameters_dialog
+        try:
+            dialog.mng_max_spinbox.setValue(10000)
+            window.view.split_fov_mode = True
+            window.view.rois = [r[:] for r in TWO_REGIONS]
+            window.view.roi_mngs = [4000, 25000]
+            window.view.selected_roi = 1
+            dialog.sync_mng_to_selected_region()
+            assert dialog.mng_slider.value() == 25000
+            assert dialog.mng_slider.maximum() >= 25000
+            assert window.region_mngs() == [4000, 25000]
+        finally:
+            dialog.close()
+            window.close()
+
+
 # ---------------------------------------------------------------------------
 # Affine calibration: target -> reference (astigmatism / chromatic)
 # ---------------------------------------------------------------------------

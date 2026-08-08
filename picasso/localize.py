@@ -436,6 +436,49 @@ def _as_roi_list(
     return rois if len(rois) else None
 
 
+def _as_ng_list(
+    minimum_ng: float | list | np.ndarray,
+    n_rois: int,
+) -> list[float]:
+    """Normalize ``minimum_ng`` into one threshold per ROI.
+
+    A scalar (the usual case) applies to every ROI. A sequence gives each
+    ROI its own threshold, which is what split-FOV data needs: the regions
+    are separate channels imaged through different optics, so their spots
+    do not share a brightness scale. A one-element sequence is treated as
+    a scalar.
+
+    Parameters
+    ----------
+    minimum_ng : float or sequence of float
+        Minimum net gradient, shared or one per ROI.
+    n_rois : int
+        Number of ROIs the thresholds have to cover.
+
+    Returns
+    -------
+    list of float
+        ``n_rois`` thresholds.
+
+    Raises
+    ------
+    ValueError
+        If a sequence is given whose length is neither 1 nor ``n_rois``.
+    """
+    if isinstance(minimum_ng, (list, tuple, np.ndarray, pd.Series)):
+        ngs = [float(_) for _ in minimum_ng]
+    else:
+        ngs = [float(minimum_ng)]
+    if len(ngs) == 1:
+        return ngs * n_rois
+    if len(ngs) != n_rois:
+        raise ValueError(
+            f"minimum_ng has {len(ngs)} values but there are {n_rois} "
+            "ROI(s); give one threshold per ROI or a single shared one."
+        )
+    return ngs
+
+
 def _temporal_median(
     frames: np.ndarray, max_stripe_bytes: int = 64 * 1024**2
 ) -> lib.FloatArray2D:
@@ -1043,7 +1086,7 @@ class GaussianFilteredMovie:
 
 def identify_in_frame(
     frame: lib.IntArray2D,
-    minimum_ng: float,
+    minimum_ng: float | list | np.ndarray,
     box: int,
     roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
 ) -> tuple[lib.IntArray1D, lib.IntArray1D, lib.FloatArray1D]:
@@ -1055,8 +1098,11 @@ def identify_in_frame(
     ----------
     frame : lib.IntArray2D
         An image frame, 2D array of shape (Y, X).
-    minimum_ng : float
-        Minimum net gradient value to consider a maximum as valid.
+    minimum_ng : float or sequence of float
+        Minimum net gradient value to consider a maximum as valid. A
+        sequence gives each ROI in ``roi`` its own threshold (split-FOV
+        regions are separate channels and need not share a brightness
+        scale); it must have one value per ROI.
     box : int
         Size of the box used for calculating the gradient. Should be
         an odd integer.
@@ -1082,16 +1128,19 @@ def identify_in_frame(
     rois = _as_roi_list(roi)
     if rois is None:
         image = np.float32(frame)  # otherwise numba goes crazy
-        return identify_in_image(image, minimum_ng, box)
+        return identify_in_image(image, _as_ng_list(minimum_ng, 1)[0], box)
+    minimum_ngs = _as_ng_list(minimum_ng, len(rois))
     height, width = frame.shape
     # pad each ROI to identify at the border
     pad = int(box / 2) + 1
     ys, xs, ngs = [], [], []
-    for (y0, x0), (y1, x1) in rois:
+    for roi_index, ((y0, x0), (y1, x1)) in enumerate(rois):
         py0, px0 = max(y0 - pad, 0), max(x0 - pad, 0)
         py1, px1 = min(y1 + pad, height), min(x1 + pad, width)
         image = np.float32(frame[py0:py1, px0:px1])  # numba needs float32!
-        y, x, net_gradient = identify_in_image(image, minimum_ng, box)
+        y, x, net_gradient = identify_in_image(
+            image, minimum_ngs[roi_index], box
+        )
         y += py0  # offset back to global frame coordinates
         x += px0
         # keep only maxima centered inside the actual ROI
@@ -1104,7 +1153,7 @@ def identify_in_frame(
 
 def identify_by_frame_number(
     movie: lib.IntArray3D,
-    minimum_ng: float,
+    minimum_ng: float | list | np.ndarray,
     box: int,
     frame_number: int,
     *,
@@ -1121,8 +1170,10 @@ def identify_by_frame_number(
     movie : lib.IntArray3D
         A 3D array representing the movie of shape (N, Y, X), where N is
         the number of frames, Y is the height, and X is the width.
-    minimum_ng : float
-        Minimum net gradient value to consider a maximum as valid.
+    minimum_ng : float or sequence of float
+        Minimum net gradient value to consider a maximum as valid. A
+        sequence gives each ROI its own threshold, one value per ROI (see
+        :func:`identify_in_frame`).
     box : int
         Size of the box used for calculating the gradient. Should be
         an odd integer.
@@ -1199,7 +1250,7 @@ def identify_by_frame_number(
 def _identify_worker(
     movie: lib.IntArray3D,
     current: list[int],
-    minimum_ng: float,
+    minimum_ng: float | list | np.ndarray,
     box: int,
     roi: tuple[tuple[int, int], tuple[int, int]] | list | None,
     frame_bounds: tuple[int, int] | list | None,
@@ -1256,7 +1307,7 @@ def identifications_from_futures(
 
 def identify_async(
     movie: lib.IntArray3D,
-    minimum_ng: float,
+    minimum_ng: float | list | np.ndarray,
     box: int,
     *,
     roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
@@ -1270,8 +1321,10 @@ def identify_async(
     ----------
     movie : lib.IntArray3D
         The input movie data as a 3D numpy array.
-    minimum_ng : float
-        The minimum net gradient for a spot to be considered.
+    minimum_ng : float or sequence of float
+        The minimum net gradient for a spot to be considered. A
+        sequence gives each ROI its own threshold, one value per ROI
+        (see :func:`identify_in_frame`).
     box : int
         The size of the box to extract around each spot.
     roi : tuple or list of tuples, optional
@@ -1421,7 +1474,7 @@ def _identify_serial(
 
 def identify(
     movie: lib.IntArray3D,
-    minimum_ng: float,
+    minimum_ng: float | list | np.ndarray,
     box: int,
     *,
     roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
@@ -1444,8 +1497,10 @@ def identify(
     ----------
     movie : lib.IntArray3D
         The input movie data as a 3D numpy array.
-    minimum_ng : float
-        The minimum net gradient for a spot to be considered.
+    minimum_ng : float or sequence of float
+        The minimum net gradient for a spot to be considered. A
+        sequence gives each ROI its own threshold, one value per ROI
+        (see :func:`identify_in_frame`).
     box : int
         The size of the box to extract around each spot.
     roi : tuple or list of tuples, optional
@@ -5848,7 +5903,9 @@ def localize_3D(
     assert (
         isinstance(box, int) and box > 0 and box % 2 == 1
     ), "box must be a positive odd integer"
-    assert isinstance(minimum_ng, (int, float)), "minimum_ng must be a number"
+    assert isinstance(
+        minimum_ng, (int, float, list, tuple, np.ndarray)
+    ), "minimum_ng must be a number or one number per ROI"
     assert fitting_method in [
         "gausslq",
         "gausslq-spherical",
