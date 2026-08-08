@@ -5637,11 +5637,8 @@ def localize(
     """Localize (i.e., identify and fit) spots in a movie using the
     specified parameters.
 
-    Fits in 2D, unless an astigmatism calibration is given in
-    ``calibration_3d``, in which case a z position is fitted on top of
-    the 2D fit, see Huang, et al. Science, 2008. A 3D
-    ``spline_calibration`` yields z directly from the fit itself and
-    needs no ``calibration_3d``.
+    Fits in 2D, or in 3D with ``calibration_3d`` (astigmatism, see
+    ``zfit``) or a 3D ``spline_calibration`` (z from the fit itself).
 
     Since v0.10.0: support for frame bounds and ROI for identification +
     all fitting methods.
