@@ -41,7 +41,7 @@ To see all changes introduced across releases, see `the changelog <https://githu
 
 Picasso 0.11
 ------------
-This update focuses mainly on (but is not limited to) the expansion of the Localize modules. A number of features have been added to allow the users to load many new file formats and use a range of fitting algorithms, including spline fitting. You can explore these improvements in the `changelog <https://github.com/jungmannlab/picasso/blob/master/changelog.md>`_.
+This release substantially expands Picasso: Localize. Localization can now be performed with an experimentally measured PSF (cubic-spline model), jointly across several channels (e.g. biplane 3D), and with a pixel-dependent sCMOS noise model; a rotated 2D Gaussian model was added as well. All GPU fitting was reimplemented in Numba CUDA, removing the dependency on Gpufit. Localize also reads a much wider range of data directly - ``.tif`` and OME-TIFF stacks (including movies split across several folders), MicroManager single-image acquisitions, Zeiss ``.czi`` and Leica ``.lif`` - so Picasso: ToRaw is no longer required and has been removed. Further additions include a temporal median filter for spot identification, affine calibrations for astigmatism and chromatic aberration correction, localization metadata embedded in the ``.hdf5`` files, a revised plugin system with an online plugin browser, and various performance and usability improvements throughout Localize, Render and SPINNA. See the `changelog <https://github.com/jungmannlab/picasso/blob/master/changelog.md>`_ for the complete list.
 
 Installation
 ------------
