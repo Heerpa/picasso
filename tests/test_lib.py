@@ -440,6 +440,210 @@ class TestRectangleContainment:
         assert out.iloc[0]["x"] == 5.0
 
 
+class TestSquareContainment:
+    def test_bounds_are_exclusive(self):
+        locs_xy = np.array(
+            [[10.0, 10.9, 11.0, 10.0], [10.0, 10.0, 10.0, 12.0]]
+        )
+        mask = lib.is_loc_in_square_numba(10.0, 10.0, locs_xy, 2.0)
+        assert mask.tolist() == [True, True, False, False]
+
+    def test_locs_in_square_filters(self):
+        locs_xy = np.array([[10.0, 20.0], [10.0, 20.0]])
+        out = lib.locs_in_square_numba(10.0, 10.0, locs_xy, 2.0)
+        assert out.shape == (2, 1)
+        assert out[0, 0] == 10.0
+
+
+class TestOrientedRectangleContainment:
+    def test_matches_check_if_in_rectangle(self):
+        rng = np.random.default_rng(0)
+        x = rng.uniform(0, 20, 10000)
+        y = rng.uniform(0, 20, 10000)
+        locs_xy = np.stack((x, y))
+        for theta in np.linspace(-np.pi / 2, np.pi / 2, 7):
+            xc, yc, length, width = 10.0, 10.0, 8.0, 3.0
+            half_x = 0.5 * length * np.cos(theta)
+            half_y = 0.5 * length * np.sin(theta)
+            X, Y = lib.get_pick_rectangle_corners(
+                xc - half_x, yc - half_y, xc + half_x, yc + half_y, width
+            )
+            reference = lib.check_if_in_rectangle(
+                x, y, np.array(X), np.array(Y)
+            )
+            mask = lib.is_loc_in_rectangle_numba(
+                xc, yc, theta, length, width, locs_xy
+            )
+            # points right at the boundary may be classified either way
+            u = (x - xc) * np.cos(theta) + (y - yc) * np.sin(theta)
+            v = -(x - xc) * np.sin(theta) + (y - yc) * np.cos(theta)
+            on_edge = (np.abs(np.abs(u) - length / 2) < 1e-9) | (
+                np.abs(np.abs(v) - width / 2) < 1e-9
+            )
+            assert np.array_equal(mask[~on_edge], reference[~on_edge])
+
+    def test_locs_in_rectangle_numba_filters(self):
+        locs_xy = np.array([[0.0, 0.0, 3.0, 5.0], [0.0, 2.0, 0.0, 0.0]])
+        out = lib.locs_in_rectangle_numba(0.0, 0.0, 0.0, 8.0, 1.0, locs_xy)
+        assert out.shape == (2, 2)
+        assert out[0].tolist() == [0.0, 3.0]
+
+
+class TestWrapAnglePi:
+    @pytest.mark.parametrize(
+        "angle, expected",
+        [
+            (0.0, 0.0),
+            (np.pi / 2, -np.pi / 2),
+            (np.pi, 0.0),
+            (-np.pi, 0.0),
+            (np.pi / 2 + 0.01, -np.pi / 2 + 0.01),
+            (-np.pi / 2 - 0.01, np.pi / 2 - 0.01),
+        ],
+    )
+    def test_wraps_into_half_open_interval(self, angle, expected):
+        assert lib.wrap_angle_pi(angle) == pytest.approx(expected)
+
+    def test_directors_differing_by_pi_are_equal(self):
+        theta = np.deg2rad(89.0)
+        other = np.deg2rad(-89.0)
+        assert abs(lib.wrap_angle_pi(theta - other)) == pytest.approx(
+            np.deg2rad(2.0)
+        )
+
+
+class TestPrincipalAxis:
+    @pytest.mark.parametrize("angle_deg", [0, 15, 45, 89, -89, -45])
+    def test_recovers_anisotropic_gaussian(self, angle_deg):
+        rng = np.random.default_rng(1)
+        theta = np.deg2rad(angle_deg)
+        n = 200000
+        u = rng.normal(0, 2.0, n)
+        v = rng.normal(0, 0.5, n)
+        x = u * np.cos(theta) - v * np.sin(theta)
+        y = u * np.sin(theta) + v * np.cos(theta)
+        found, along, across = lib.principal_axis(
+            np.mean((x - x.mean()) ** 2),
+            np.mean((x - x.mean()) * (y - y.mean())),
+            np.mean((y - y.mean()) ** 2),
+        )
+        d_theta = lib.wrap_angle_pi(found - theta)
+        assert abs(np.degrees(d_theta)) < 1.0
+        assert along == pytest.approx(2.0, abs=0.05)
+        assert across == pytest.approx(0.5, abs=0.05)
+
+    def test_isotropic_has_equal_rmsds(self):
+        _, along, across = lib.principal_axis(1.0, 0.0, 1.0)
+        assert along == pytest.approx(across)
+
+    def test_collinear_has_zero_across(self):
+        # all points on the line y = x
+        _, along, across = lib.principal_axis(1.0, 1.0, 1.0)
+        assert across == pytest.approx(0.0, abs=1e-12)
+        assert along == pytest.approx(np.sqrt(2.0))
+
+    def test_rmsds_decompose_isotropic_rmsd(self):
+        rng = np.random.default_rng(2)
+        locs_xy = rng.normal(0, 1, (2, 5000))
+        locs_xy[0] *= 3.0
+        x, y = locs_xy
+        _, along, across = lib.principal_axis(
+            np.mean((x - x.mean()) ** 2),
+            np.mean((x - x.mean()) * (y - y.mean())),
+            np.mean((y - y.mean()) ** 2),
+        )
+        rmsd = lib.rmsd_at_com(locs_xy)
+        assert along**2 + across**2 == pytest.approx(rmsd**2)
+
+
+def _rectangles_overlap_brute_force(rect_a, rect_b, rng, n=20000):
+    """Monte Carlo ground truth: sample points inside ``rect_a`` and
+    check whether any of them lies inside ``rect_b``."""
+    xa, ya, ta, la, wa = rect_a
+    u = rng.uniform(-la / 2, la / 2, n)
+    v = rng.uniform(-wa / 2, wa / 2, n)
+    x = xa + u * np.cos(ta) - v * np.sin(ta)
+    y = ya + u * np.sin(ta) + v * np.cos(ta)
+    xb, yb, tb, lb, wb = rect_b
+    return bool(
+        lib.is_loc_in_rectangle_numba(
+            xb, yb, tb, lb, wb, np.stack((x, y))
+        ).any()
+    )
+
+
+def _overlap(rect_a, rect_b):
+    xa, ya, ta, la, wa = rect_a
+    xb, yb, tb, lb, wb = rect_b
+    return lib.rectangles_overlap(
+        xa,
+        ya,
+        ta,
+        la,
+        wa,
+        0.5 * np.hypot(la, wa),
+        xb,
+        yb,
+        tb,
+        lb,
+        wb,
+        0.5 * np.hypot(lb, wb),
+    )
+
+
+class TestRectanglesOverlap:
+    def test_identical_rectangles(self):
+        rect = (0.0, 0.0, 0.3, 8.0, 1.0)
+        assert _overlap(rect, rect)
+
+    def test_same_rectangle_rotated_by_pi(self):
+        rect = (0.0, 0.0, 0.3, 8.0, 1.0)
+        assert _overlap(rect, (0.0, 0.0, 0.3 + np.pi, 8.0, 1.0))
+
+    def test_far_apart(self):
+        assert not _overlap(
+            (0.0, 0.0, 0.0, 8.0, 1.0), (100.0, 100.0, 0.0, 8.0, 1.0)
+        )
+
+    def test_parallel_side_by_side(self):
+        # gap of 0.2 px between two rectangles of width 1.0
+        assert not _overlap(
+            (0.0, 0.0, 0.0, 8.0, 1.0), (0.0, 1.2, 0.0, 8.0, 1.0)
+        )
+        assert _overlap((0.0, 0.0, 0.0, 8.0, 1.0), (0.0, 0.8, 0.0, 8.0, 1.0))
+
+    def test_crossing_at_right_angle(self):
+        # centers 3 px apart, which is less than either half length, so
+        # a center-distance test would call these disjoint
+        assert _overlap(
+            (0.0, 0.0, 0.0, 8.0, 1.0), (3.0, 0.0, np.pi / 2, 8.0, 1.0)
+        )
+
+    def test_one_inside_the_other(self):
+        assert _overlap(
+            (0.0, 0.0, 0.0, 8.0, 4.0), (0.0, 0.0, np.pi / 4, 1.0, 1.0)
+        )
+
+    def test_matches_monte_carlo_on_random_pairs(self):
+        rng = np.random.default_rng(3)
+        for _ in range(200):
+            rect_a = (
+                *rng.uniform(-5, 5, 2),
+                rng.uniform(-np.pi / 2, np.pi / 2),
+                rng.uniform(1, 8),
+                rng.uniform(0.5, 3),
+            )
+            rect_b = (
+                *rng.uniform(-5, 5, 2),
+                rng.uniform(-np.pi / 2, np.pi / 2),
+                rng.uniform(1, 8),
+                rng.uniform(0.5, 3),
+            )
+            if _rectangles_overlap_brute_force(rect_a, rect_b, rng):
+                # sampling can only prove overlap, never disprove it
+                assert _overlap(rect_a, rect_b)
+
+
 # ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------

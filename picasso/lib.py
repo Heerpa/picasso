@@ -1409,6 +1409,252 @@ def rmsd_at_com(locs_xy: FloatArray2D) -> float:
     )
 
 
+@numba.jit(nopython=True, nogil=True, cache=True)
+def is_loc_in_square_numba(
+    x: float,
+    y: float,
+    locs_xy: FloatArray2D,
+    a: float,
+) -> BoolArray1D:
+    """Check which localizations are within the axis-aligned square of
+    side length ``a`` centered at ``(x, y)``.
+
+    Square analogue of ``is_loc_at_numba``. The bounds are exclusive,
+    matching ``postprocess._picked_square_locs``.
+
+    Parameters
+    ----------
+    x, y : float
+        Center of the square.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+    a : float
+        Side length of the square.
+
+    Returns
+    -------
+    is_picked : BoolArray1D
+        True if a localization is within the square.
+    """
+    half_a = 0.5 * a
+    dx = np.abs(locs_xy[0] - x)
+    dy = np.abs(locs_xy[1] - y)
+    is_picked = (dx < half_a) & (dy < half_a)
+    return is_picked
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def locs_in_square_numba(
+    x: float,
+    y: float,
+    locs_xy: FloatArray2D,
+    a: float,
+) -> FloatArray2D:
+    """Return localizations within the axis-aligned square of side
+    length ``a`` centered at ``(x, y)``. See
+    ``is_loc_in_square_numba``."""
+    is_picked = is_loc_in_square_numba(x, y, locs_xy, a)
+    return locs_xy[:, is_picked]
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def is_loc_in_rectangle_numba(
+    xc: float,
+    yc: float,
+    theta: float,
+    length: float,
+    width: float,
+    locs_xy: FloatArray2D,
+) -> BoolArray1D:
+    """Check which localizations are within an oriented rectangle.
+
+    The rectangle is centered at ``(xc, yc)``, its long (center) axis
+    points along ``theta`` and has the given ``length``, and it extends
+    by ``width`` perpendicular to that axis.
+
+    Unlike ``check_if_in_rectangle``, this rotates the localizations
+    into the rectangle's frame instead of ray casting, so it does not
+    allocate intermediate arrays per side and has no division by zero
+    for axis-aligned rectangles. It is the variant used in the picking
+    kernels.
+
+    Parameters
+    ----------
+    xc, yc : float
+        Center of the rectangle.
+    theta : float
+        Angle of the center axis (radians).
+    length : float
+        Length of the rectangle along ``theta``.
+    width : float
+        Width of the rectangle perpendicular to ``theta``.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+
+    Returns
+    -------
+    is_picked : BoolArray1D
+        True if a localization is within the rectangle.
+    """
+    ct = np.cos(theta)
+    st = np.sin(theta)
+    dx = locs_xy[0] - xc
+    dy = locs_xy[1] - yc
+    u = dx * ct + dy * st  # along the center axis
+    v = -dx * st + dy * ct  # perpendicular to the center axis
+    half_l = 0.5 * length
+    half_w = 0.5 * width
+    is_picked = (np.abs(u) < half_l) & (np.abs(v) < half_w)
+    return is_picked
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def locs_in_rectangle_numba(
+    xc: float,
+    yc: float,
+    theta: float,
+    length: float,
+    width: float,
+    locs_xy: FloatArray2D,
+) -> FloatArray2D:
+    """Return localizations within an oriented rectangle. See
+    ``is_loc_in_rectangle_numba``."""
+    is_picked = is_loc_in_rectangle_numba(
+        xc, yc, theta, length, width, locs_xy
+    )
+    return locs_xy[:, is_picked]
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def wrap_angle_pi(angle: float) -> float:
+    """Wrap an angle to ``[-pi/2, pi/2)``.
+
+    The orientation of a rectangle is a director, i.e., it is only
+    defined modulo pi (``theta`` and ``theta + pi`` give the same
+    rectangle). Wrapping is required whenever two orientations are
+    compared, otherwise, e.g., +89 deg and -89 deg appear to differ by
+    178 deg instead of 2 deg.
+    """
+    return angle - np.pi * np.floor(angle / np.pi + 0.5)
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def principal_axis(
+    sxx: float,
+    sxy: float,
+    syy: float,
+) -> tuple[float, float, float]:
+    """Find the principal axis and the anisotropic RMSDs from the
+    central second moments of a set of 2D points.
+
+    Closed-form eigendecomposition of the 2x2 covariance matrix
+    ``[[sxx, sxy], [sxy, syy]]``. Note that
+    ``rmsd_along ** 2 + rmsd_across ** 2`` equals the squared isotropic
+    RMSD at the center of mass (``rmsd_at_com``).
+
+    Parameters
+    ----------
+    sxx, sxy, syy : float
+        Central second moments, i.e., ``mean((x - mx) ** 2)``,
+        ``mean((x - mx) * (y - my))`` and ``mean((y - my) ** 2)``.
+
+    Returns
+    -------
+    theta : float
+        Angle of the principal (major) axis, wrapped to
+        ``[-pi/2, pi/2)``. For an isotropic point cloud the axis is
+        undefined and 0.0 is returned; callers can detect this from
+        ``rmsd_along ** 2 - rmsd_across ** 2`` being (nearly) zero.
+    rmsd_along, rmsd_across : float
+        RMSD along the principal axis and perpendicular to it.
+    """
+    delta = np.sqrt((sxx - syy) ** 2 + 4 * sxy**2)
+    lambda_plus = 0.5 * (sxx + syy + delta)
+    lambda_minus = 0.5 * (sxx + syy - delta)
+    theta = 0.5 * np.arctan2(2 * sxy, sxx - syy)
+    rmsd_along = np.sqrt(max(lambda_plus, 0.0))
+    rmsd_across = np.sqrt(max(lambda_minus, 0.0))
+    return wrap_angle_pi(theta), rmsd_along, rmsd_across
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def rectangles_overlap(  # noqa: C901
+    x1: float,
+    y1: float,
+    theta1: float,
+    length1: float,
+    width1: float,
+    r1: float,
+    x2: float,
+    y2: float,
+    theta2: float,
+    length2: float,
+    width2: float,
+    r2: float,
+) -> bool:
+    """Check if two oriented rectangles overlap.
+
+    Uses the separating axis theorem: two convex polygons are disjoint
+    if and only if their projections onto one of the edge normals do not
+    overlap. For rectangles there are only four candidate axes (two per
+    rectangle). Two cheap tests based on the circumscribed and inscribed
+    circles are performed first.
+
+    Parameters
+    ----------
+    x1, y1, x2, y2 : float
+        Centers of the two rectangles.
+    theta1, theta2 : float
+        Angles of the center axes (radians).
+    length1, length2 : float
+        Lengths of the rectangles along their center axes.
+    width1, width2 : float
+        Widths of the rectangles.
+    r1, r2 : float
+        Circumscribed circle radii, i.e.,
+        ``sqrt(length ** 2 + width ** 2) / 2``. Passed in because they
+        are usually precomputed.
+
+    Returns
+    -------
+    overlap : bool
+        True if the two rectangles overlap.
+    """
+    dx = x2 - x1
+    dy = y2 - y1
+    d2 = dx**2 + dy**2
+    # cheap reject: circumscribed circles do not touch
+    if d2 > (r1 + r2) ** 2:
+        return False
+    # cheap accept: inscribed circles overlap
+    r_in = 0.5 * min(length1, width1) + 0.5 * min(length2, width2)
+    if d2 < r_in**2:
+        return True
+    # separating axis theorem
+    ct1 = np.cos(theta1)
+    st1 = np.sin(theta1)
+    ct2 = np.cos(theta2)
+    st2 = np.sin(theta2)
+    # only two distinct dot products exist between the two frames
+    c = abs(ct1 * ct2 + st1 * st2)
+    s = abs(ct1 * st2 - st1 * ct2)
+    half_l1 = 0.5 * length1
+    half_w1 = 0.5 * width1
+    half_l2 = 0.5 * length2
+    half_w2 = 0.5 * width2
+    # axes of the first rectangle
+    if abs(dx * ct1 + dy * st1) > half_l1 + half_l2 * c + half_w2 * s:
+        return False
+    if abs(-dx * st1 + dy * ct1) > half_w1 + half_l2 * s + half_w2 * c:
+        return False
+    # axes of the second rectangle
+    if abs(dx * ct2 + dy * st2) > half_l2 + half_l1 * c + half_w1 * s:
+        return False
+    if abs(-dx * st2 + dy * ct2) > half_w2 + half_l1 * s + half_w1 * c:
+        return False
+    return True
+
+
 @numba.jit(nopython=True)
 def check_if_in_polygon(
     x: FloatArray1D,

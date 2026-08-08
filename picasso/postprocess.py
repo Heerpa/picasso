@@ -429,27 +429,31 @@ def pick_similar(
     locs: pd.DataFrame,
     info: list[dict],
     picks: list[tuple],
-    d: float,
+    pick_shape: Literal["Circle", "Rectangle", "Square"] = "Circle",
+    pick_size: float = None,
     std_range: float = 2.0,
     index_blocks: tuple = None,
+    grid_spacing: float = None,
 ) -> list[tuple]:
-    """Find similar picks based on the number of localizations and
-    RMSD. Only implemented for circular picks.
+    """Find picks similar to the given ones, based on the number of
+    localizations and their RMSD.
 
     Mean number of localizations and RMSD in picks are calculated and
     the allowed range is defined by the given standard deviation range
     (``std_range``). Only picks with number of localizations and RMSD
-    within these ranges are returned.
+    within these ranges are returned. The input picks are always part of
+    the output.
 
-    Takes the grid of overlapping picks of the given size (defined by
-    ``x``, ``y_shift`` and ``y_base``) and shifts each pick towards the
-    center of mass of the localizations within the pick. If the picked
-    localizations have the required number of localizations and the
-    RMSD, it is added to the output list (``x_similar`` and
-    ``y_similar``).
+    A grid of overlapping candidate picks covering the field of view is
+    scanned and each candidate is shifted towards the center of mass of
+    the localizations within it. Rectangular picks are additionally
+    rotated onto the principal axis of the enclosed localizations, so
+    elongated structures are found at any orientation; they all take the
+    median length of the input picks. Candidates overlapping an already
+    accepted pick are discarded.
 
-    This function calls ``_pick_similar`` which is implemented in numba
-    for speed.
+    Not implemented for polygonal picks, which have no size to
+    replicate.
 
     Parameters
     ----------
@@ -458,21 +462,95 @@ def pick_similar(
     info : list of dicts
         Metadata of the localizations.
     picks : list
-        List of picks (x, y) coordinates.
-    d : float
-        Pick diameter (in camera pixels).
+        List of picks. ``(x, y)`` coordinates for circular and square
+        picks, ``((x_start, y_start), (x_end, y_end))`` center-axis
+        points for rectangular picks.
+    pick_shape : {'Circle', 'Rectangle', 'Square'}, optional
+        Shape of the picks. Default is 'Circle'.
+    pick_size : float, optional
+        Size of the pick in camera pixels. Diameter for circles, side
+        length for squares, width for rectangles. Default is None.
     std_range : float, optional
         Standard deviation range for picking similar localizations.
         Default is 2.0.
     index_blocks : tuple, optional
         Precomputed index blocks for localizations, see
-        ``get_index_blocks``. If None, they will be calculated
-        internally. Default is None.
+        ``get_index_blocks``. Rebuilt internally if None or if the block
+        size does not match the one required by ``pick_shape``. Default
+        is None.
+    grid_spacing : float, optional
+        Distance between neighboring candidate positions in camera
+        pixels. Only used for rectangular picks, where the default
+        (a quarter of the median pick length) trades speed for the
+        chance of missing closely spaced structures. Default is None.
 
     Returns
     -------
     new_picks : list of tuples
-        List of (x, y) coordinates of similar picks.
+        List of similar picks, in the same format as ``picks``.
+    """
+    _valid_shapes = ("Circle", "Rectangle", "Square")
+    assert (
+        pick_shape in _valid_shapes
+    ), f"Invalid pick shape: {pick_shape}. Choose one of {_valid_shapes}."
+    if len(picks) == 0:
+        return []
+    assert isinstance(pick_size, (int, float)), "pick_size must be a number."
+    if grid_spacing is not None and pick_shape != "Rectangle":
+        raise ValueError(
+            "grid_spacing is only supported for rectangular picks."
+        )
+
+    # the index grid size must guarantee that the 3x3 block neighborhood
+    # around a pick's center contains all localizations in that pick
+    if pick_shape == "Rectangle":
+        length = _median_pick_length(picks)
+        block_size = np.sqrt(length**2 + pick_size**2) / 2
+    else:  # circles and squares reach at most pick_size / 2 in x and y
+        block_size = pick_size / 2
+    if index_blocks is not None and not np.isclose(
+        index_blocks[1], block_size
+    ):
+        index_blocks = None
+    if index_blocks is None:
+        index_blocks = get_index_blocks(locs, info, block_size)
+
+    if pick_shape == "Circle":
+        return _pick_similar_circular(
+            locs, info, picks, pick_size, std_range, index_blocks
+        )
+    elif pick_shape == "Square":
+        return _pick_similar_square(
+            info, picks, pick_size, std_range, index_blocks
+        )
+    else:
+        return _pick_similar_rectangular(
+            info, picks, pick_size, std_range, index_blocks, grid_spacing
+        )
+
+
+def _median_pick_length(picks: list[tuple]) -> float:
+    """Return the median length of the center axes of rectangular
+    picks. The median (rather than the mean) keeps a single carelessly
+    drawn pick from skewing every candidate."""
+    lengths = [
+        np.hypot(end[0] - start[0], end[1] - start[1]) for start, end in picks
+    ]
+    return float(np.median(lengths))
+
+
+def _pick_similar_circular(
+    locs: pd.DataFrame,
+    info: list[dict],
+    picks: list[tuple],
+    d: float,
+    std_range: float,
+    index_blocks: tuple,
+) -> list[tuple]:
+    """Helper function for finding picks similar to circular picks.
+    See ``pick_similar`` for more details.
+
+    Calls ``_pick_similar``, which is implemented in numba for speed.
     """
     r = d / 2
     d2 = d**2
@@ -686,6 +764,869 @@ def _pick_similar(  # noqa: C901
                                 x_similar = np.append(x_similar, x_test)
                                 y_similar = np.append(y_similar, y_test)
     return x_similar, y_similar
+
+
+def _pick_similar_grid(
+    info: list[dict],
+    spacing: float,
+) -> tuple[lib.FloatArray1D, lib.FloatArray1D]:
+    """Return the candidate positions for picking similar.
+
+    The positions form a triangular lattice with nearest neighbor
+    distance ``spacing``, i.e., the densest lattice for a given number
+    of candidates. This is the same lattice as the one used for
+    circular picks, flattened to 1D arrays.
+
+    Parameters
+    ----------
+    info : list of dicts
+        Metadata of the localizations.
+    spacing : float
+        Distance between neighboring candidates in camera pixels.
+
+    Returns
+    -------
+    grid_x, grid_y : lib.FloatArray1D
+        Coordinates of the candidate positions.
+    """
+    width = lib.get_from_metadata(info, "Width", raise_error=True)
+    height = lib.get_from_metadata(info, "Height", raise_error=True)
+    x_range = np.arange(spacing / 2, width, np.sqrt(3) * spacing / 2)
+    y_range = np.arange(spacing / 2, height - spacing / 2, spacing)
+    n_cols = len(x_range)
+    n_rows = len(y_range)
+    grid_x = np.repeat(x_range, n_rows)
+    grid_y = np.tile(y_range, n_cols)
+    # every other column is shifted by half the spacing
+    is_odd_column = np.repeat(np.arange(n_cols) % 2, n_rows)
+    grid_y = grid_y + is_odd_column * spacing / 2
+    return grid_x, grid_y
+
+
+def _similarity_window(
+    values: list[float],
+    std_range: float,
+    minimum: float = -np.inf,
+) -> tuple[float, float]:
+    """Return the ``mean +/- std_range * std`` acceptance window for one
+    similarity measure, clipped at ``minimum`` from below."""
+    mean = np.mean(values)
+    std = np.std(values)
+    return (
+        max(minimum, mean - std_range * std),
+        mean + std_range * std,
+    )
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def _circle_moments_at(
+    xc: float,
+    yc: float,
+    r: float,
+    locs_xy: lib.FloatArray2D,
+    block_starts: lib.IntArray2D,
+    block_ends: lib.IntArray2D,
+    K: int,
+    L: int,
+    x_index: int,
+    y_index: int,
+) -> tuple[int, float, float, float, float, float]:
+    """Return the number of localizations, their center of mass and
+    their central second moments within a circle of radius ``r``
+    centered at ``(xc, yc)``.
+
+    The localizations are read directly from the 3x3 block neighborhood
+    around ``(x_index, y_index)``, without allocating intermediate
+    arrays - the picking kernels call this for every candidate position
+    and iteration, so the allocations would otherwise dominate the
+    runtime. Coordinates are shifted by ``(xc, yc)`` before accumulation
+    to avoid loss of precision in the second moments.
+
+    Note that the block bounds are inclusive of the first row and
+    column (``0 <= k < K``), like ``_get_block_locs_at_numba`` and
+    unlike ``_n_block_locs_at``.
+
+    Parameters
+    ----------
+    xc, yc : float
+        Center of the circle.
+    r : float
+        Radius of the circle.
+    locs_xy : lib.FloatArray2D
+        Localization coordinates, shape ``(2, N)``, sorted by index
+        blocks.
+    block_starts, block_ends : lib.IntArray2D
+        Block start and end indices.
+    K, L : int
+        Number of blocks in y and x direction.
+    x_index, y_index : int
+        Block indices of the neighborhood to scan.
+
+    Returns
+    -------
+    n : int
+        Number of localizations within the circle.
+    mx, my : float
+        Center of mass of these localizations.
+    sxx, sxy, syy : float
+        Their central second moments.
+    """
+    r2 = r**2
+    n = 0
+    sx = 0.0
+    sy = 0.0
+    sxx = 0.0
+    sxy = 0.0
+    syy = 0.0
+    for k in range(y_index - 1, y_index + 2):
+        if 0 <= k < K:
+            for ll in range(x_index - 1, x_index + 2):
+                if 0 <= ll < L:
+                    start = np.int64(block_starts[k, ll])
+                    end = np.int64(block_ends[k, ll])
+                    for i in range(start, end):
+                        dx = locs_xy[0, i] - xc
+                        dy = locs_xy[1, i] - yc
+                        if dx**2 + dy**2 < r2:
+                            n += 1
+                            sx += dx
+                            sy += dy
+                            sxx += dx * dx
+                            sxy += dx * dy
+                            syy += dy * dy
+    return _central_moments(n, xc, yc, sx, sy, sxx, sxy, syy)
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def _square_moments_at(
+    xc: float,
+    yc: float,
+    a: float,
+    locs_xy: lib.FloatArray2D,
+    block_starts: lib.IntArray2D,
+    block_ends: lib.IntArray2D,
+    K: int,
+    L: int,
+    x_index: int,
+    y_index: int,
+) -> tuple[int, float, float, float, float, float]:
+    """Return the number of localizations, their center of mass and
+    their central second moments within an axis-aligned square of side
+    length ``a`` centered at ``(xc, yc)``. See ``_circle_moments_at``.
+    """
+    half_a = 0.5 * a
+    n = 0
+    sx = 0.0
+    sy = 0.0
+    sxx = 0.0
+    sxy = 0.0
+    syy = 0.0
+    for k in range(y_index - 1, y_index + 2):
+        if 0 <= k < K:
+            for ll in range(x_index - 1, x_index + 2):
+                if 0 <= ll < L:
+                    start = np.int64(block_starts[k, ll])
+                    end = np.int64(block_ends[k, ll])
+                    for i in range(start, end):
+                        dx = locs_xy[0, i] - xc
+                        if -half_a < dx < half_a:
+                            dy = locs_xy[1, i] - yc
+                            if -half_a < dy < half_a:
+                                n += 1
+                                sx += dx
+                                sy += dy
+                                sxx += dx * dx
+                                sxy += dx * dy
+                                syy += dy * dy
+    return _central_moments(n, xc, yc, sx, sy, sxx, sxy, syy)
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def _rectangle_moments_at(
+    xc: float,
+    yc: float,
+    theta: float,
+    length: float,
+    width: float,
+    locs_xy: lib.FloatArray2D,
+    block_starts: lib.IntArray2D,
+    block_ends: lib.IntArray2D,
+    K: int,
+    L: int,
+    x_index: int,
+    y_index: int,
+) -> tuple[int, float, float, float, float, float]:
+    """Return the number of localizations, their center of mass and
+    their central second moments within an oriented rectangle centered
+    at ``(xc, yc)``. See ``_circle_moments_at``."""
+    ct = np.cos(theta)
+    st = np.sin(theta)
+    half_l = 0.5 * length
+    half_w = 0.5 * width
+    n = 0
+    sx = 0.0
+    sy = 0.0
+    sxx = 0.0
+    sxy = 0.0
+    syy = 0.0
+    for k in range(y_index - 1, y_index + 2):
+        if 0 <= k < K:
+            for ll in range(x_index - 1, x_index + 2):
+                if 0 <= ll < L:
+                    start = np.int64(block_starts[k, ll])
+                    end = np.int64(block_ends[k, ll])
+                    for i in range(start, end):
+                        dx = locs_xy[0, i] - xc
+                        dy = locs_xy[1, i] - yc
+                        u = dx * ct + dy * st
+                        if -half_l < u < half_l:
+                            v = -dx * st + dy * ct
+                            if -half_w < v < half_w:
+                                n += 1
+                                sx += dx
+                                sy += dy
+                                sxx += dx * dx
+                                sxy += dx * dy
+                                syy += dy * dy
+    return _central_moments(n, xc, yc, sx, sy, sxx, sxy, syy)
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def _central_moments(
+    n: int,
+    xc: float,
+    yc: float,
+    sx: float,
+    sy: float,
+    sxx: float,
+    sxy: float,
+    syy: float,
+) -> tuple[int, float, float, float, float, float]:
+    """Convert the raw moments accumulated relative to ``(xc, yc)`` into
+    the center of mass and the central second moments."""
+    if n == 0:
+        return 0, xc, yc, 0.0, 0.0, 0.0
+    inv_n = 1.0 / n
+    mx = sx * inv_n
+    my = sy * inv_n
+    return (
+        n,
+        xc + mx,
+        yc + my,
+        sxx * inv_n - mx * mx,
+        sxy * inv_n - mx * my,
+        syy * inv_n - my * my,
+    )
+
+
+def _pick_similar_square(
+    info: list[dict],
+    picks: list[tuple],
+    a: float,
+    std_range: float,
+    index_blocks: tuple,
+) -> list[tuple]:
+    """Helper function for finding picks similar to square picks. See
+    ``pick_similar`` for more details.
+
+    Square picks reach at most ``a / 2`` in x and y, exactly like
+    circular picks of diameter ``a``, so the index blocks, the candidate
+    lattice and the mean shift are the same as for circles; only the
+    membership test and the overlap criterion differ.
+    """
+    locs_temp, block_size, _, _, block_starts, block_ends, K, L = index_blocks
+    locs_xy = np.stack((locs_temp["x"].to_numpy(), locs_temp["y"].to_numpy()))
+
+    # extract n_locs and rmsd from the current picks
+    n_locs = []
+    rmsd = []
+    for x, y in picks:
+        n, _, _, sxx, _, syy = _square_moments_at(
+            x,
+            y,
+            a,
+            locs_xy,
+            block_starts,
+            block_ends,
+            K,
+            L,
+            int(x / block_size),
+            int(y / block_size),
+        )
+        if n < 2:
+            warnings.warn(
+                f"Pick at ({x:.2f}, {y:.2f}) contains fewer than 2 "
+                "localizations and is ignored when calculating the "
+                "similarity criteria."
+            )
+            continue
+        n_locs.append(n)
+        rmsd.append(np.sqrt(sxx + syy))
+    if not n_locs:
+        raise ValueError(
+            "None of the picks contains enough localizations to define "
+            "the similarity criteria."
+        )
+
+    min_n_locs, max_n_locs = _similarity_window(n_locs, std_range, minimum=2)
+    min_rmsd, max_rmsd = _similarity_window(rmsd, std_range)
+
+    # the current picks are kept and block any overlapping candidates
+    x_similar = np.array([_[0] for _ in picks], dtype=np.float64)
+    y_similar = np.array([_[1] for _ in picks], dtype=np.float64)
+
+    grid_x, grid_y = _pick_similar_grid(info, a)
+    x_similar, y_similar = _pick_similar_square_kernel(
+        grid_x,
+        grid_y,
+        locs_xy,
+        block_starts,
+        block_ends,
+        K,
+        L,
+        block_size,
+        a,
+        min_n_locs,
+        max_n_locs,
+        min_rmsd,
+        max_rmsd,
+        x_similar,
+        y_similar,
+    )
+    new_picks = list(zip(x_similar, y_similar))
+    return new_picks
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def _pick_similar_square_kernel(
+    grid_x: lib.FloatArray1D,
+    grid_y: lib.FloatArray1D,
+    locs_xy: lib.FloatArray2D,
+    block_starts: lib.IntArray2D,
+    block_ends: lib.IntArray2D,
+    K: int,
+    L: int,
+    block_size: float,
+    a: float,
+    min_n_locs: float,
+    max_n_locs: float,
+    min_rmsd: float,
+    max_rmsd: float,
+    x_similar: lib.FloatArray1D,
+    y_similar: lib.FloatArray1D,
+) -> tuple[lib.FloatArray1D, lib.FloatArray1D]:
+    """Scan the candidate lattice for squares similar to the given ones.
+
+    Each candidate is shifted towards the center of mass of the
+    localizations within it until it converges. The 3x3 block
+    neighborhood is re-read at the current position in every iteration,
+    so localizations are not lost when a candidate moves across a block
+    boundary.
+
+    Implemented in numba for speed, called from
+    ``_pick_similar_square``. See ``pick_similar`` for a more
+    user-friendly interface.
+
+    Parameters
+    ----------
+    grid_x, grid_y : lib.FloatArray1D
+        Candidate positions.
+    locs_xy : lib.FloatArray2D
+        Localization coordinates, shape ``(2, N)``, sorted by index
+        blocks.
+    block_starts, block_ends : lib.IntArray2D
+        Block start and end indices.
+    K, L : int
+        Number of blocks in y and x direction.
+    block_size : float
+        Size of the index blocks in camera pixels.
+    a : float
+        Side length of the square picks.
+    min_n_locs, max_n_locs : float
+        Minimum and maximum number of localizations in the pick.
+    min_rmsd, max_rmsd : float
+        Minimum and maximum RMSD for the pick.
+    x_similar, y_similar : lib.FloatArray1D
+        Centers of the accepted picks, seeded with the input picks.
+
+    Returns
+    -------
+    x_similar, y_similar : lib.FloatArray1D
+        Centers of the accepted picks.
+    """
+    for i in range(len(grid_x)):
+        x_test = grid_x[i]
+        y_test = grid_y[i]
+        n = 0
+        # move to the center of mass
+        for _ in range(500):
+            n, mx, my, _, _, _ = _square_moments_at(
+                x_test,
+                y_test,
+                a,
+                locs_xy,
+                block_starts,
+                block_ends,
+                K,
+                L,
+                int(x_test / block_size),
+                int(y_test / block_size),
+            )
+            if n < 2:
+                break
+            dx = mx - x_test
+            dy = my - y_test
+            x_test = mx
+            y_test = my
+            if np.abs(dx) <= 1e-3 and np.abs(dy) <= 1e-3:
+                break
+        if n < 2:
+            continue
+        # measure at the converged position
+        n, _, _, sxx, _, syy = _square_moments_at(
+            x_test,
+            y_test,
+            a,
+            locs_xy,
+            block_starts,
+            block_ends,
+            K,
+            L,
+            int(x_test / block_size),
+            int(y_test / block_size),
+        )
+        if not (min_n_locs <= n <= max_n_locs):
+            continue
+        if not (min_rmsd <= np.sqrt(sxx + syy) <= max_rmsd):
+            continue
+        # two axis-aligned squares of side a overlap if and only if
+        # their centers are closer than a in both x and y
+        if np.all(
+            (np.abs(x_similar - x_test) > a) | (np.abs(y_similar - y_test) > a)
+        ):
+            x_similar = np.append(x_similar, x_test)
+            y_similar = np.append(y_similar, y_test)
+    return x_similar, y_similar
+
+
+def _pick_similar_rectangular(
+    info: list[dict],
+    picks: list[tuple],
+    width: float,
+    std_range: float,
+    index_blocks: tuple,
+    grid_spacing: float | None,
+) -> list[tuple]:
+    """Helper function for finding picks similar to rectangular picks.
+    See ``pick_similar`` for more details.
+
+    Rectangular picks carry an orientation and a length on top of a
+    center, so unlike circles and squares they cannot be described by
+    their center alone. All candidates take the median length of the
+    input picks and are rotated onto the principal axis of the
+    localizations they contain, and the similarity criteria use the RMSD
+    along and across that axis rather than the isotropic RMSD.
+
+    The input picks are measured in canonical form (median length,
+    converged onto the localizations) rather than exactly as drawn -
+    otherwise a carelessly drawn pick would shift the acceptance windows
+    away from every candidate. Their drawn geometry is still what is
+    returned.
+    """
+    locs_temp, block_size, _, _, block_starts, block_ends, K, L = index_blocks
+    locs_xy = np.stack((locs_temp["x"].to_numpy(), locs_temp["y"].to_numpy()))
+    length = _median_pick_length(picks)
+    r_circ = 0.5 * np.sqrt(length**2 + width**2)
+
+    # extract n_locs and the anisotropic RMSDs from the current picks
+    n_locs = []
+    rmsd_along = []
+    rmsd_across = []
+    xc_similar = []
+    yc_similar = []
+    theta_similar = []
+    length_similar = []
+    for (x_start, y_start), (x_end, y_end) in picks:
+        xc = 0.5 * (x_start + x_end)
+        yc = 0.5 * (y_start + y_end)
+        theta = lib.wrap_angle_pi(np.arctan2(y_end - y_start, x_end - x_start))
+        drawn_length = np.hypot(x_end - x_start, y_end - y_start)
+        xc_similar.append(xc)
+        yc_similar.append(yc)
+        theta_similar.append(theta)
+        length_similar.append(drawn_length)
+        # initialize from the pick as drawn, using all localizations
+        # because a long pick may reach outside its block neighborhood
+        drawn_locs_xy = lib.locs_in_rectangle_numba(
+            xc, yc, theta, drawn_length, width, locs_xy
+        )
+        if drawn_locs_xy.shape[1] < 3:
+            warnings.warn(
+                f"Pick at ({xc:.2f}, {yc:.2f}) contains fewer than 3 "
+                "localizations and is ignored when calculating the "
+                "similarity criteria."
+            )
+            continue
+        x_init = np.mean(drawn_locs_xy[0])
+        y_init = np.mean(drawn_locs_xy[1])
+        theta_init, _, _ = lib.principal_axis(
+            np.mean((drawn_locs_xy[0] - x_init) ** 2),
+            np.mean((drawn_locs_xy[0] - x_init) * (drawn_locs_xy[1] - y_init)),
+            np.mean((drawn_locs_xy[1] - y_init) ** 2),
+        )
+        if np.abs(lib.wrap_angle_pi(theta_init - theta)) > np.deg2rad(20):
+            warnings.warn(
+                f"Pick at ({xc:.2f}, {yc:.2f}) is drawn more than 20 deg "
+                "away from the principal axis of the localizations it "
+                "contains. Check that it covers the intended structure."
+            )
+        # measure in canonical form, exactly like the candidates
+        n, _, _, _, along, across = _refine_rectangle(
+            x_init,
+            y_init,
+            theta_init,
+            length,
+            width,
+            locs_xy,
+            block_starts,
+            block_ends,
+            K,
+            L,
+            block_size,
+        )
+        if n < 3:
+            warnings.warn(
+                f"Pick at ({xc:.2f}, {yc:.2f}) contains fewer than 3 "
+                "localizations and is ignored when calculating the "
+                "similarity criteria."
+            )
+            continue
+        n_locs.append(n)
+        rmsd_along.append(along)
+        rmsd_across.append(across)
+    if not n_locs:
+        raise ValueError(
+            "None of the picks contains enough localizations to define "
+            "the similarity criteria."
+        )
+
+    min_n_locs, max_n_locs = _similarity_window(n_locs, std_range, minimum=3)
+    min_along, max_along = _similarity_window(rmsd_along, std_range)
+    min_across, max_across = _similarity_window(rmsd_across, std_range)
+
+    # the current picks are kept and block any overlapping candidates
+    n_picks = len(picks)
+    xc_similar = np.array(xc_similar, dtype=np.float64)
+    yc_similar = np.array(yc_similar, dtype=np.float64)
+    theta_similar = np.array(theta_similar, dtype=np.float64)
+    length_similar = np.array(length_similar, dtype=np.float64)
+    r_similar = 0.5 * np.sqrt(length_similar**2 + width**2)
+
+    if grid_spacing is None:
+        grid_spacing = length / 4
+    grid_x, grid_y = _pick_similar_grid(info, grid_spacing)
+    (
+        xc_similar,
+        yc_similar,
+        theta_similar,
+        length_similar,
+        _,
+    ) = _pick_similar_rectangle_kernel(
+        grid_x,
+        grid_y,
+        locs_xy,
+        block_starts,
+        block_ends,
+        K,
+        L,
+        block_size,
+        length,
+        width,
+        r_circ,
+        min_n_locs,
+        max_n_locs,
+        min_along,
+        max_along,
+        min_across,
+        max_across,
+        xc_similar,
+        yc_similar,
+        theta_similar,
+        length_similar,
+        r_similar,
+    )
+
+    # the input picks are returned exactly as drawn
+    new_picks = list(picks)
+    for i in range(n_picks, len(xc_similar)):
+        half_x = 0.5 * length_similar[i] * np.cos(theta_similar[i])
+        half_y = 0.5 * length_similar[i] * np.sin(theta_similar[i])
+        new_picks.append(
+            (
+                (xc_similar[i] - half_x, yc_similar[i] - half_y),
+                (xc_similar[i] + half_x, yc_similar[i] + half_y),
+            )
+        )
+    return new_picks
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def _refine_rectangle(
+    xc: float,
+    yc: float,
+    theta: float,
+    length: float,
+    width: float,
+    locs_xy: lib.FloatArray2D,
+    block_starts: lib.IntArray2D,
+    block_ends: lib.IntArray2D,
+    K: int,
+    L: int,
+    block_size: float,
+    max_iter: int = 100,
+) -> tuple[int, float, float, float, float, float]:
+    """Fit a rectangle of the given size onto the localizations around
+    ``(xc, yc)``.
+
+    Alternates between moving the rectangle onto the center of mass of
+    the localizations it contains and rotating it onto their principal
+    axis, until both converge. Each iteration re-reads the 3x3 block
+    neighborhood at the current center, so localizations are not lost
+    when the rectangle moves across a block boundary.
+
+    Parameters
+    ----------
+    xc, yc : float
+        Initial center of the rectangle.
+    theta : float
+        Initial angle of the center axis (radians).
+    length, width : float
+        Size of the rectangle in camera pixels.
+    locs_xy : lib.FloatArray2D
+        Localization coordinates, shape ``(2, N)``, sorted by index
+        blocks.
+    block_starts, block_ends : lib.IntArray2D
+        Block start and end indices.
+    K, L : int
+        Number of blocks in y and x direction.
+    block_size : float
+        Size of the index blocks in camera pixels.
+    max_iter : int, optional
+        Maximum number of iterations. Default is 100.
+
+    Returns
+    -------
+    n : int
+        Number of localizations in the converged rectangle, 0 if the
+        rectangle ran out of localizations.
+    xc, yc : float
+        Center of the converged rectangle.
+    theta : float
+        Angle of the converged rectangle, wrapped to ``[-pi/2, pi/2)``.
+    rmsd_along, rmsd_across : float
+        RMSD of the enclosed localizations along and across the center
+        axis.
+    """
+    for _ in range(max_iter):
+        n, mx, my, sxx, sxy, syy = _rectangle_moments_at(
+            xc,
+            yc,
+            theta,
+            length,
+            width,
+            locs_xy,
+            block_starts,
+            block_ends,
+            K,
+            L,
+            int(xc / block_size),
+            int(yc / block_size),
+        )
+        if n < 3:
+            return 0, xc, yc, theta, 0.0, 0.0
+        theta_new, along, across = lib.principal_axis(sxx, sxy, syy)
+        # the principal axis is undefined for an isotropic point cloud
+        if along**2 - across**2 <= 1e-12 * (along**2 + across**2):
+            theta_new = theta
+        d_theta = lib.wrap_angle_pi(theta_new - theta)
+        dx = mx - xc
+        dy = my - yc
+        xc = mx
+        yc = my
+        theta = theta_new
+        if (
+            np.abs(dx) <= 1e-3
+            and np.abs(dy) <= 1e-3
+            and np.abs(d_theta) <= 1e-4
+        ):
+            break
+    # measure at the converged pose
+    n, _, _, sxx, sxy, syy = _rectangle_moments_at(
+        xc,
+        yc,
+        theta,
+        length,
+        width,
+        locs_xy,
+        block_starts,
+        block_ends,
+        K,
+        L,
+        int(xc / block_size),
+        int(yc / block_size),
+    )
+    if n < 3:
+        return 0, xc, yc, theta, 0.0, 0.0
+    _, along, across = lib.principal_axis(sxx, sxy, syy)
+    return n, xc, yc, theta, along, across
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def _pick_similar_rectangle_kernel(
+    grid_x: lib.FloatArray1D,
+    grid_y: lib.FloatArray1D,
+    locs_xy: lib.FloatArray2D,
+    block_starts: lib.IntArray2D,
+    block_ends: lib.IntArray2D,
+    K: int,
+    L: int,
+    block_size: float,
+    length: float,
+    width: float,
+    r_circ: float,
+    min_n_locs: float,
+    max_n_locs: float,
+    min_along: float,
+    max_along: float,
+    min_across: float,
+    max_across: float,
+    xc_similar: lib.FloatArray1D,
+    yc_similar: lib.FloatArray1D,
+    theta_similar: lib.FloatArray1D,
+    length_similar: lib.FloatArray1D,
+    r_similar: lib.FloatArray1D,
+) -> tuple[
+    lib.FloatArray1D,
+    lib.FloatArray1D,
+    lib.FloatArray1D,
+    lib.FloatArray1D,
+    lib.FloatArray1D,
+]:
+    """Scan the candidate lattice for rectangles similar to the given
+    ones.
+
+    Each candidate is initialized from a circle of radius
+    ``length / 2``, which gives an orientation estimate that does not
+    depend on a guessed angle, and is then fitted with
+    ``_refine_rectangle``. This is why the lattice only has to bring a
+    candidate close to a structure, not onto it, and can be much
+    sparser than the pick width.
+
+    Implemented in numba for speed, called from
+    ``_pick_similar_rectangular``. See ``pick_similar`` for a more
+    user-friendly interface.
+
+    Parameters
+    ----------
+    grid_x, grid_y : lib.FloatArray1D
+        Candidate positions.
+    locs_xy : lib.FloatArray2D
+        Localization coordinates, shape ``(2, N)``, sorted by index
+        blocks.
+    block_starts, block_ends : lib.IntArray2D
+        Block start and end indices.
+    K, L : int
+        Number of blocks in y and x direction.
+    block_size : float
+        Size of the index blocks in camera pixels.
+    length, width : float
+        Size of the candidate rectangles in camera pixels.
+    r_circ : float
+        Circumscribed circle radius of the candidate rectangles.
+    min_n_locs, max_n_locs : float
+        Minimum and maximum number of localizations in the pick.
+    min_along, max_along : float
+        Minimum and maximum RMSD along the center axis.
+    min_across, max_across : float
+        Minimum and maximum RMSD across the center axis.
+    xc_similar, yc_similar, theta_similar, length_similar, r_similar :
+    lib.FloatArray1D
+        Center, angle, length and circumscribed radius of the accepted
+        picks, seeded with the input picks.
+
+    Returns
+    -------
+    xc_similar, yc_similar, theta_similar, length_similar, r_similar :
+    lib.FloatArray1D
+        Center, angle, length and circumscribed radius of the accepted
+        picks.
+    """
+    bootstrap_r = 0.5 * length
+    for i in range(len(grid_x)):
+        # isotropic initialization - no orientation is assumed
+        n, mx, my, sxx, sxy, syy = _circle_moments_at(
+            grid_x[i],
+            grid_y[i],
+            bootstrap_r,
+            locs_xy,
+            block_starts,
+            block_ends,
+            K,
+            L,
+            int(grid_x[i] / block_size),
+            int(grid_y[i] / block_size),
+        )
+        if n < 3 or n < min_n_locs:
+            continue
+        theta, _, _ = lib.principal_axis(sxx, sxy, syy)
+        n, xc, yc, theta, along, across = _refine_rectangle(
+            mx,
+            my,
+            theta,
+            length,
+            width,
+            locs_xy,
+            block_starts,
+            block_ends,
+            K,
+            L,
+            block_size,
+        )
+        # cheap tests first, the overlap test scans all accepted picks
+        if n < 3:
+            continue
+        if not (min_n_locs <= n <= max_n_locs):
+            continue
+        if not (min_along <= along <= max_along):
+            continue
+        if not (min_across <= across <= max_across):
+            continue
+        overlaps = False
+        for j in range(len(xc_similar)):
+            if lib.rectangles_overlap(
+                xc,
+                yc,
+                theta,
+                length,
+                width,
+                r_circ,
+                xc_similar[j],
+                yc_similar[j],
+                theta_similar[j],
+                length_similar[j],
+                width,
+                r_similar[j],
+            ):
+                overlaps = True
+                break
+        if overlaps:
+            continue
+        xc_similar = np.append(xc_similar, xc)
+        yc_similar = np.append(yc_similar, yc)
+        theta_similar = np.append(theta_similar, theta)
+        length_similar = np.append(length_similar, length)
+        r_similar = np.append(r_similar, r_circ)
+    return xc_similar, yc_similar, theta_similar, length_similar, r_similar
 
 
 def remove_locs_in_picks(

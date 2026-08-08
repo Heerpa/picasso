@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from picasso import clusterer, postprocess
+from picasso import clusterer, lib, postprocess
 
 
 # Reused parameters
@@ -281,13 +281,58 @@ class TestPickedLocs:
         assert (out["y"] > 14.5).all() and (out["y"] < 16.5).all()
 
 
+def _matches_origamis(new_picks, tolerance=0.5):
+    """Return True if the found picks map one-to-one onto the known
+    origami positions."""
+    if len(new_picks) != len(ORIGAMI_PICKS):
+        return False
+    found = np.array([(_[0], _[1]) for _ in new_picks])
+    truth = np.array(ORIGAMI_PICKS)
+    distances = np.hypot(
+        found[:, None, 0] - truth[None, :, 0],
+        found[:, None, 1] - truth[None, :, 1],
+    )
+    closest = distances.argmin(axis=1)
+    return (
+        len(set(closest.tolist())) == len(ORIGAMI_PICKS)
+        and distances.min(axis=1).max() < tolerance
+    )
+
+
+# Circular pick_similar output for the bundled test data, recorded
+# before the function was extended to squares and rectangles. Guards
+# against the refactoring silently changing the circular path.
+CIRCULAR_PICK_SIMILAR = np.array(
+    [
+        [5.5, 5.5],
+        [5.5, 15.5],
+        [5.471064897017046, 25.492258522727273],
+        [15.521154952375856, 5.451117946677012],
+        [15.500356998083726, 15.521690512603184],
+        [15.524771372477213, 25.543294270833332],
+        [25.496572921525186, 5.510046660010494],
+        [25.468092395413308, 15.52528824344758],
+        [25.53900722287736, 25.427370467275942],
+    ]
+)
+
+
 class TestPickSimilar:
     def test_finds_remaining_origamis(self, locs, info):
         seed_picks = [[5.5, 5.5], [5.5, 15.5]]
         new_picks = postprocess.pick_similar(
-            locs, info, seed_picks, PICK_SIZE, std_range=123.0
+            locs, info, seed_picks, "Circle", PICK_SIZE, std_range=123.0
         )
-        assert len(new_picks) == len(ORIGAMI_PICKS)
+        assert _matches_origamis(new_picks)
+
+    def test_circular_result_unchanged(self, locs, info):
+        seed_picks = [[5.5, 5.5], [5.5, 15.5]]
+        new_picks = postprocess.pick_similar(
+            locs, info, seed_picks, "Circle", PICK_SIZE, std_range=123.0
+        )
+        np.testing.assert_allclose(
+            np.array(new_picks), CIRCULAR_PICK_SIMILAR, rtol=0, atol=0
+        )
 
     def test_precomputed_index_blocks_path(self, locs, info):
         seed_picks = [[5.5, 5.5], [5.5, 15.5]]
@@ -296,11 +341,313 @@ class TestPickSimilar:
             locs,
             info,
             seed_picks,
+            "Circle",
             PICK_SIZE,
             std_range=123.0,
             index_blocks=ib,
         )
-        assert len(new_picks) == len(ORIGAMI_PICKS)
+        assert _matches_origamis(new_picks)
+
+    def test_empty_picks_returns_empty(self, locs, info):
+        for shape in ("Circle", "Square", "Rectangle"):
+            assert (
+                postprocess.pick_similar(locs, info, [], shape, PICK_SIZE)
+                == []
+            )
+
+    def test_polygon_is_rejected(self, locs, info):
+        with pytest.raises(AssertionError):
+            postprocess.pick_similar(
+                locs, info, [[(1.0, 1.0), (2.0, 2.0)]], "Polygon"
+            )
+
+    def test_grid_spacing_only_for_rectangles(self, locs, info):
+        with pytest.raises(ValueError):
+            postprocess.pick_similar(
+                locs,
+                info,
+                [[5.5, 5.5], [5.5, 15.5]],
+                "Circle",
+                PICK_SIZE,
+                grid_spacing=1.0,
+            )
+
+
+class TestPickSimilarSquare:
+    def test_finds_remaining_origamis(self, locs, info):
+        seed_picks = [[5.5, 5.5], [5.5, 15.5]]
+        new_picks = postprocess.pick_similar(
+            locs, info, seed_picks, "Square", PICK_SIZE, std_range=123.0
+        )
+        assert _matches_origamis(new_picks)
+
+    def test_found_squares_do_not_overlap(self, locs, info):
+        seed_picks = [[5.5, 5.5], [5.5, 15.5]]
+        new_picks = postprocess.pick_similar(
+            locs, info, seed_picks, "Square", PICK_SIZE, std_range=123.0
+        )
+        found = np.array(new_picks)
+        for i, (x, y) in enumerate(found):
+            others = np.delete(found, i, axis=0)
+            chebyshev = np.maximum(
+                np.abs(others[:, 0] - x), np.abs(others[:, 1] - y)
+            )
+            assert (chebyshev > PICK_SIZE).all()
+
+    def test_precomputed_index_blocks_path(self, locs, info):
+        # circular index blocks of diameter a are valid for squares of
+        # side a: both reach at most a / 2 in x and y
+        seed_picks = [[5.5, 5.5], [5.5, 15.5]]
+        ib = postprocess.get_index_blocks(locs, info, PICK_SIZE / 2)
+        new_picks = postprocess.pick_similar(
+            locs,
+            info,
+            seed_picks,
+            "Square",
+            PICK_SIZE,
+            std_range=123.0,
+            index_blocks=ib,
+        )
+        assert _matches_origamis(new_picks)
+
+    def test_wrong_sized_index_blocks_are_rebuilt(self, locs, info):
+        seed_picks = [[5.5, 5.5], [5.5, 15.5]]
+        wrong = postprocess.get_index_blocks(locs, info, 5.0)
+        new_picks = postprocess.pick_similar(
+            locs,
+            info,
+            seed_picks,
+            "Square",
+            PICK_SIZE,
+            std_range=123.0,
+            index_blocks=wrong,
+        )
+        assert _matches_origamis(new_picks)
+
+
+# ---------------------------------------------------------------------------
+# Pick similar for rectangles
+# ---------------------------------------------------------------------------
+
+# The bundled test data has no elongated structures, so the rectangular
+# path is tested against synthetic line segments.
+LINE_ANGLES_DEG = [0, 15, 30, 45, 60, 75, 89, -89, -75, -60, -45, -30]
+LINE_LENGTH = 8.0
+LINE_WIDTH = 0.6
+
+
+def _make_line_locs():
+    """Return ``(locs, info, centers)`` for 12 line segments at
+    different angles on a 64x64 px field of view, plus uniform
+    background."""
+    rng = np.random.default_rng(42)
+    centers = [
+        (
+            8.0 + 16.0 * i + rng.uniform(-2, 2),
+            8.0 + 16.0 * j + rng.uniform(-2, 2),
+        )
+        for i in range(4)
+        for j in range(3)
+    ]
+    xs = []
+    ys = []
+    for (cx, cy), angle in zip(centers, LINE_ANGLES_DEG):
+        theta = np.deg2rad(angle)
+        along = rng.uniform(-LINE_LENGTH / 2, LINE_LENGTH / 2, 150)
+        across = rng.normal(0, 0.15, 150)
+        xs.append(cx + along * np.cos(theta) - across * np.sin(theta))
+        ys.append(cy + along * np.sin(theta) + across * np.cos(theta))
+    xs.append(rng.uniform(0, 64, 200))
+    ys.append(rng.uniform(0, 64, 200))
+    x = np.concatenate(xs)
+    y = np.concatenate(ys)
+    locs = pd.DataFrame(
+        {
+            "frame": np.arange(len(x), dtype=np.int32),
+            "x": x.astype(np.float32),
+            "y": y.astype(np.float32),
+            "photons": np.full(len(x), 1000.0, dtype=np.float32),
+            "lpx": np.full(len(x), 0.1, dtype=np.float32),
+            "lpy": np.full(len(x), 0.1, dtype=np.float32),
+        }
+    )
+    info = [
+        {
+            "Width": 64,
+            "Height": 64,
+            "Frames": len(x),
+            "Generated by": "tests.test_postprocess",
+        }
+    ]
+    return locs, info, centers
+
+
+@pytest.fixture(scope="module")
+def line_data():
+    return _make_line_locs()
+
+
+def _line_pick(centers, index):
+    """Return the ground-truth rectangular pick for one line."""
+    cx, cy = centers[index]
+    theta = np.deg2rad(LINE_ANGLES_DEG[index])
+    half_x = 0.5 * LINE_LENGTH * np.cos(theta)
+    half_y = 0.5 * LINE_LENGTH * np.sin(theta)
+    return (
+        (cx - half_x, cy - half_y),
+        (cx + half_x, cy + half_y),
+    )
+
+
+def _as_center_angle(picks):
+    """Convert rectangular picks to ``(center_x, center_y, angle_deg,
+    length)``."""
+    out = []
+    for (x_start, y_start), (x_end, y_end) in picks:
+        out.append(
+            (
+                0.5 * (x_start + x_end),
+                0.5 * (y_start + y_end),
+                np.degrees(np.arctan2(y_end - y_start, x_end - x_start)),
+                np.hypot(x_end - x_start, y_end - y_start),
+            )
+        )
+    return out
+
+
+class TestPickSimilarRectangle:
+    # three seeds spanning the natural spread of the segments; with only
+    # two nearly identical seeds the standard deviation, and hence the
+    # acceptance windows, collapse
+    SEEDS = (0, 3, 7)
+    STD_RANGE = 6.0
+
+    def _run(self, line_data, **kwargs):
+        locs, info, centers = line_data
+        picks = [_line_pick(centers, i) for i in self.SEEDS]
+        kwargs.setdefault("std_range", self.STD_RANGE)
+        return postprocess.pick_similar(
+            locs, info, picks, "Rectangle", LINE_WIDTH, **kwargs
+        )
+
+    def test_recovers_all_segments(self, line_data):
+        _, _, centers = line_data
+        new_picks = self._run(line_data)
+        assert len(new_picks) == len(LINE_ANGLES_DEG)
+        found = _as_center_angle(new_picks)
+        for (cx, cy), angle in zip(centers, LINE_ANGLES_DEG):
+            distances = [np.hypot(cx - f[0], cy - f[1]) for f in found]
+            nearest = found[int(np.argmin(distances))]
+            assert min(distances) < 1.0
+            # the pick axis is a director, so compare modulo 180 deg
+            d_angle = (nearest[2] - angle + 90) % 180 - 90
+            assert abs(d_angle) < 5.0
+
+    def test_steep_angles_are_not_merged(self, line_data):
+        # the +89 deg and -89 deg segments differ by 2 deg, not 178 deg
+        _, _, centers = line_data
+        new_picks = self._run(line_data)
+        found = _as_center_angle(new_picks)
+        for index in (6, 7):
+            cx, cy = centers[index]
+            matches = [
+                f for f in found if np.hypot(cx - f[0], cy - f[1]) < 1.0
+            ]
+            assert len(matches) == 1
+
+    def test_found_rectangles_do_not_overlap(self, line_data):
+        new_picks = self._run(line_data)
+        found = _as_center_angle(new_picks)
+        for i, (x1, y1, angle1, length1) in enumerate(found):
+            for x2, y2, angle2, length2 in found[i + 1 :]:
+                assert not lib.rectangles_overlap(
+                    x1,
+                    y1,
+                    np.deg2rad(angle1),
+                    length1,
+                    LINE_WIDTH,
+                    0.5 * np.hypot(length1, LINE_WIDTH),
+                    x2,
+                    y2,
+                    np.deg2rad(angle2),
+                    length2,
+                    LINE_WIDTH,
+                    0.5 * np.hypot(length2, LINE_WIDTH),
+                )
+
+    def test_new_picks_take_the_median_seed_length(self, line_data):
+        _, _, centers = line_data
+        picks = [_line_pick(centers, i) for i in self.SEEDS]
+        new_picks = self._run(line_data)
+        # the input picks are returned exactly as drawn
+        assert new_picks[: len(picks)] == picks
+        expected = np.median([_[3] for _ in _as_center_angle(picks)])
+        for _, _, _, length in _as_center_angle(new_picks[len(picks) :]):
+            assert length == pytest.approx(expected)
+
+    def test_deterministic(self, line_data):
+        first = np.array(self._run(line_data))
+        second = np.array(self._run(line_data))
+        np.testing.assert_array_equal(first, second)
+
+    def test_coarser_grid_spacing_still_finds_segments(self, line_data):
+        new_picks = self._run(line_data, grid_spacing=LINE_LENGTH / 2)
+        assert len(new_picks) >= len(LINE_ANGLES_DEG) - 1
+
+    def test_isotropic_decoy_is_rejected(self, line_data):
+        # a dense blob has as many localizations inside a rectangle as a
+        # line does, but fails both anisotropic RMSD windows
+        locs, info, centers = line_data
+        rng = np.random.default_rng(7)
+        n_decoy = 1500
+        decoy = pd.DataFrame(
+            {
+                "frame": np.arange(n_decoy, dtype=np.int32) + 10**6,
+                "x": rng.normal(40.0, 0.7, n_decoy).astype(np.float32),
+                "y": rng.normal(55.0, 0.7, n_decoy).astype(np.float32),
+                "photons": np.full(n_decoy, 1000.0, dtype=np.float32),
+                "lpx": np.full(n_decoy, 0.1, dtype=np.float32),
+                "lpy": np.full(n_decoy, 0.1, dtype=np.float32),
+            }
+        )
+        with_decoy = pd.concat([locs, decoy], ignore_index=True)
+        picks = [_line_pick(centers, i) for i in self.SEEDS]
+        new_picks = postprocess.pick_similar(
+            with_decoy,
+            info,
+            picks,
+            "Rectangle",
+            LINE_WIDTH,
+            std_range=self.STD_RANGE,
+        )
+        assert len(new_picks) == len(LINE_ANGLES_DEG)
+        for cx, cy, _, _ in _as_center_angle(new_picks):
+            assert np.hypot(cx - 40.0, cy - 55.0) > 3.0
+
+    def test_single_seed_does_not_crash(self, line_data):
+        locs, info, centers = line_data
+        new_picks = postprocess.pick_similar(
+            locs,
+            info,
+            [_line_pick(centers, 0)],
+            "Rectangle",
+            LINE_WIDTH,
+            std_range=2.0,
+        )
+        assert np.isfinite(np.array(new_picks, dtype=float)).all()
+
+    def test_empty_pick_raises(self, line_data):
+        # a pick drawn on empty space cannot define the criteria
+        locs, info, _ = line_data
+        with pytest.warns(UserWarning):
+            with pytest.raises(ValueError):
+                postprocess.pick_similar(
+                    locs,
+                    info,
+                    [((62.0, 62.0), (63.0, 63.0))],
+                    "Rectangle",
+                    0.01,
+                )
 
 
 class TestRemoveLocsInPicks:

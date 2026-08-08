@@ -150,20 +150,29 @@ def check_picks(f: Callable) -> Callable:
     return wrapper
 
 
-def check_circular_picks(f: Callable) -> Callable:
-    """Decorator verifying if the picks are circular."""
+def check_pick_shapes(*shapes: str) -> Callable:
+    """Decorator factory verifying that the current pick shape is one of
+    ``shapes``."""
 
-    def wrapper(*args):
-        if args[0]._pick_shape != "Circle":
-            QtWidgets.QMessageBox.warning(
-                args[0],
-                "Pick Error",
-                "This operation is only implemented for circular picks.",
-            )
-        else:
-            return f(args[0])
+    def decorator(f: Callable) -> Callable:
+        def wrapper(*args):
+            if args[0]._pick_shape not in shapes:
+                QtWidgets.QMessageBox.warning(
+                    args[0],
+                    "Pick Error",
+                    "This operation is only implemented for these pick "
+                    "shapes: {}.".format(", ".join(shapes)),
+                )
+            else:
+                return f(args[0])
 
-    return wrapper
+        return wrapper
+
+    return decorator
+
+
+#: Decorator verifying if the picks are circular.
+check_circular_picks = check_pick_shapes("Circle")
 
 
 class FloatEdit(QtWidgets.QLineEdit):
@@ -5960,20 +5969,7 @@ class PickToolCircleSettings(QtWidgets.QWidget):
             tools_settings_dialog.on_pick_dimension_changed
         )
         self.grid.addWidget(self.pick_diameter, 0, 1)
-        range_label = QtWidgets.QLabel("Pick similar +/- range (std):")
-        range_label.setToolTip(
-            "Range for picking similar picks in standard deviations.\n"
-            "Pick similar uses the mean and standard deviation of the "
-            "number of localizations and their RMSD per pick to select "
-            "similar picks."
-        )
-        self.grid.addWidget(range_label, 1, 0)
-        self.pick_similar_range = QtWidgets.QDoubleSpinBox()
-        self.pick_similar_range.setRange(0, 100000)
-        self.pick_similar_range.setValue(2)
-        self.pick_similar_range.setSingleStep(0.1)
-        self.pick_similar_range.setDecimals(2)
-        self.grid.addWidget(self.pick_similar_range, 1, 1)
+        self.grid.setRowStretch(1, 1)
 
 
 class PickToolRectangleSettings(QtWidgets.QWidget):
@@ -6043,8 +6039,12 @@ class ToolsSettingsDialog(lib.Dialog):
     pick_diameter : QDoubleSpinBox
         Contains the diameter of circular picks (nm)).
     pick_shape : QComboBox
-        Contains the str with the shape of picks (circle, rectangle or
-        polygon).
+        Contains the str with the shape of picks (circle, rectangle,
+        polygon or square).
+    pick_side_length : QDoubleSpinBox
+        Contains the side length of square picks (nm).
+    pick_similar_range : QDoubleSpinBox
+        Contains the standard deviation range used by Pick similar.
     pick_width : QDoubleSpinBox
         Contains the width of rectangular picks (nm).
     point_picks : QCheckBox
@@ -6074,13 +6074,16 @@ class ToolsSettingsDialog(lib.Dialog):
         self.pick_shape.addItems(["Circle", "Rectangle", "Polygon", "Square"])
         first_row.addWidget(self.pick_shape)
         pick_stack = QtWidgets.QStackedWidget()
-        pick_grid.addWidget(pick_stack, 2, 0, 1, 2)
+        pick_grid.addWidget(pick_stack, 1, 0, 1, 2)
         self.pick_shape.currentIndexChanged.connect(pick_stack.setCurrentIndex)
+        # the index blocks are built for the current pick shape and size
+        self.pick_shape.currentIndexChanged.connect(
+            self.on_pick_dimension_changed
+        )
 
         # Circle
         self.pick_circle_settings = PickToolCircleSettings(window, self)
         pick_stack.addWidget(self.pick_circle_settings)
-        self.pick_similar_range = self.pick_circle_settings.pick_similar_range
         self.pick_diameter = self.pick_circle_settings.pick_diameter
 
         # Rectangle
@@ -6096,6 +6099,29 @@ class ToolsSettingsDialog(lib.Dialog):
         self.pick_square_settings = PickToolSquareSettings(window, self)
         pick_stack.addWidget(self.pick_square_settings)
         self.pick_side_length = self.pick_square_settings.pick_side_length
+
+        # Pick similar works for all shapes but polygons, so its
+        # settings live below the shape-specific pages
+        range_label = QtWidgets.QLabel("Pick similar +/- range (std):")
+        range_label.setToolTip(
+            "Range for picking similar picks in standard deviations.\n\n"
+            "Pick similar uses the mean and standard deviation of the\n"
+            "number of localizations and their RMSD per pick to select\n"
+            "similar picks. For rectangular picks, the RMSD along and\n"
+            "across the pick's center axis are used separately."
+        )
+        pick_grid.addWidget(range_label, 2, 0)
+        self.pick_similar_range = QtWidgets.QDoubleSpinBox()
+        self.pick_similar_range.setRange(0, 100000)
+        self.pick_similar_range.setValue(2)
+        self.pick_similar_range.setSingleStep(0.1)
+        self.pick_similar_range.setDecimals(2)
+        pick_grid.addWidget(self.pick_similar_range, 2, 1)
+        self.pick_shape.currentTextChanged.connect(
+            lambda shape: self.pick_similar_range.setEnabled(
+                shape != "Polygon"
+            )
+        )
 
         self.pick_annotation = QtWidgets.QCheckBox("Annotate picks")
         self.pick_annotation.setToolTip(
@@ -10302,16 +10328,17 @@ class View(QtWidgets.QLabel):
 
     def index_locs(self, channel: int) -> None:
         """Indexes localizations from a given channel in a grid with
-        grid size equal to the pick radius."""
-        if self._pick_shape != "Circle":
+        grid size equal to half the pick size.
+
+        Only circular and square picks are indexed: both reach at most
+        half their size in x and y, so the 3x3 block neighborhood around
+        a pick's center is guaranteed to contain all its localizations.
+        """
+        if self._pick_shape not in ("Circle", "Square"):
             return None
         locs = self.locs[channel]
         info = self.infos[channel]
-        size = (
-            self._pick_size / 2
-            if self._pick_shape == "Circle"
-            else self._pick_size
-        )
+        size = self._pick_size / 2
         status = lib.StatusDialog("Indexing localizations...", self.window)
         index_blocks = postprocess.get_index_blocks(locs, info, size)
         status.close()
@@ -10477,31 +10504,36 @@ class View(QtWidgets.QLabel):
             df.to_csv(path, index=False)
 
     @check_picks
-    @check_circular_picks
+    @check_pick_shapes("Circle", "Square", "Rectangle")
     def pick_similar(self) -> None:
-        """Searche picks similar to the current picks.
+        """Search picks similar to the current picks.
 
         Focuses on the number of locs and their root mean square
-        displacement from center of mass. Std is defined in
-        ``ToolsSettingsDialog``.
-
-        Raises
-        ------
-        NotImplementedError
-            If pick shape is rectangle.
+        displacement from center of mass. Rectangular picks are
+        additionally rotated onto the principal axis of the
+        localizations they contain and all take the median length of the
+        current picks; their similarity is judged by the RMSD along and
+        across that axis. Std is defined in ``ToolsSettingsDialog``.
         """
         channel = self.get_channel("Pick similar")
         if channel is not None:
             std_range = (
                 self.window.tools_settings_dialog.pick_similar_range.value()
             )
-            index_blocks = self.get_index_blocks(channel)
+            # rectangular picks need index blocks of a size that depends
+            # on the pick length, so they are built in pick_similar
+            index_blocks = (
+                None
+                if self._pick_shape == "Rectangle"
+                else self.get_index_blocks(channel)
+            )
             status = lib.StatusDialog("Picking similar...", self.window)
             new_picks = postprocess.pick_similar(
                 locs=self.locs[channel],
                 info=self.infos[channel],
                 picks=self._picks,
-                d=self._pick_size,
+                pick_shape=self._pick_shape,
+                pick_size=self._pick_size,
                 std_range=std_range,
                 index_blocks=index_blocks,
             )

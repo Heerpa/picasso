@@ -61,6 +61,7 @@ This update focuses mainly on (but is not limited to) the expansion of the Local
 - Fixed reading of the movies from the network storage after interuption
 
 #### Render
+- `Pick similar` now works with square and rectangular picks, not only circular ones, see [documentation](https://picassosr.readthedocs.io/en/latest/render.html#pick-similar-ctrl-shift-p)
 - Rendering rotated Gaussians
 - Improved measure tool
 - Faster AIM through smarter implementation
@@ -116,6 +117,7 @@ This update focuses mainly on (but is not limited to) the expansion of the Local
 - Nanotron accepts `disp_px_size` instead of `oversampling` for easier user interaction
 - Plugins location changed, see [here](https://picassosr.readthedocs.io/en/latest/plugins.html); `picasso/gui/plugins` folder removed
 - `picasso.gui.toraw`, the CLI command `picasso toraw` and the conversion functions `picasso.io.to_raw`, `picasso.io.to_raw_combined` and `picasso.io.get_movie_groups` were removed
+- `picasso.postprocess.pick_similar` takes `pick_shape` and `pick_size` instead of `d`, matching `picked_locs`. `pick_size` keeps the usual meaning per shape (diameter for circles, side length for squares, width for rectangles), so `pick_similar(locs, info, picks, d=1.5)` becomes `pick_similar(locs, info, picks, "Circle", 1.5)`
 
 #### *Deprecation warnings:*
 - **`picasso.gausslq` and `picasso.gaussmle` are deprecated and will be removed in Picasso 1.0.**

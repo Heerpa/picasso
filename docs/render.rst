@@ -49,7 +49,7 @@ Picking of regions of interest
 2. Switch the active tool by selecting ``Tools > Pick``. The mouse cursor will now change to a circle. Alternatively, open ``Tools > Tools Settings`` to change the shape into a rectangle. Lastly, choosing ``Polygon`` allows for drawing polygons of any shape.
 3. Set the size of the pick circle by adjusting the ``Diameter`` field in the tool settings dialog (``Tools > Tools Settings``). Alternatively, choose ``Width`` for a rectangular shape.
 4. Pick regions of interest using the circular mouse cursor by clicking the left mouse button. All localizations within the circle will be selected for further processing.
-5. (Optional) Automated region of interest selection. Select ``Tools > Pick similar`` to automatically detect and pick structures that have similar numbers of localizations and RMS deviation (RMSD) from their center of mass than already-picked structures. The upper and lower thresholds for these similarity measures are the respective standard deviations of already-picked regions, scaled by a tunable factor. This factor can be adjusted using the field ``Tools > Tools Settings > Pick similar ± range``. To display the mean and standard deviation of localization number and RMSD for currently picked regions, select ``View > Show info`` and click ``Calculate info below``.
+5. (Optional) Automated region of interest selection. Select ``Tools > Pick similar`` to automatically detect and pick structures that have similar numbers of localizations and RMS deviation (RMSD) from their center of mass than already-picked structures. The upper and lower thresholds for these similarity measures are the respective standard deviations of already-picked regions, scaled by a tunable factor. This factor can be adjusted using the field ``Tools > Tools Settings > Pick similar ± range``. To display the mean and standard deviation of localization number and RMSD for currently picked regions, select ``View > Show info`` and click ``Calculate info below``. ``Pick similar`` works with circular, square and rectangular picks (not with polygons). Rectangular picks all take the median length of the already-picked regions and are automatically rotated onto the principal axis of the localizations they contain, so elongated structures are found at any orientation; for them the RMSD along and across that axis are used as two separate similarity measures.
 6. (Optional) Exporting of pick information. All localizations in picked regions can be saved by selecting ``File > Save picked localizations``. The resulting HDF5 file will contain a new integer column ``group`` indicating to which pick each localization is assigned.
 7. (Optional) Statistics about each pick region can be saved by selecting ``File > Save pick properties``. The resulting HDF5 file is not a localization file. Instead, it holds a data set called ``groups`` in which the rows show statistical values for each pick region.
 8. (Optional) The picked positions and diameter itself can be saved by selecting ``File > Save pick regions``. Such saved pick information can also be loaded into ``Picasso: Render`` by selecting ``File > Load pick regions``.
@@ -397,11 +397,11 @@ Distances and lines are only drawn within a set, never across sets, so multiple 
 
 Tools settings (CTRL + T)
 ^^^^^^^^^^^^^^^^^^^^^^^^^
-Define the settings of the tools, i.e., the radius of the pick and an option to annotate each pick. For the circular picks the range of pick similar can be set.
+Define the settings of the tools, i.e., the radius of the pick and an option to annotate each pick. The range of pick similar can be set here as well.
 
 Pick similar (CTRL + Shift + P)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Automatically identifies picks that are similar to the current picks.
+Automatically identifies picks that are similar to the current picks. Available for circular, square and rectangular picks. For rectangular picks, the new picks take the median length of the current picks and are oriented along the localizations they contain.
 
 Remove localizations in picks
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
