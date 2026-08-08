@@ -34,8 +34,7 @@ import warnings
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future
 from itertools import chain
-from typing import Literal
-from typing import Callable
+from typing import Literal, Callable, TypeAlias, Union
 from datetime import datetime
 
 import numba
@@ -80,6 +79,21 @@ except Exception:
 
 
 plt.style.use("ggplot")
+
+
+#: A movie Picasso can read frames from: one loaded by
+#: ``picasso.io.load_movie`` (an ``io.AbstractPicassoMovie``, or the
+#: ``np.memmap`` of a ``.raw`` file). Not a plain 3D array: the readers are
+#: lazy, so a movie is only indexed frame by frame.
+LoadedMovie: TypeAlias = Union["io.AbstractPicassoMovie", np.memmap]
+
+#: Anything the identification reads frames from, i.e. a loaded movie or one
+#: of the filter wrappers below, which deliberately do not implement
+#: ``io.AbstractPicassoMovie`` so that they cannot reach the fit (see
+#: ``TemporalMedianMovie``).
+MovieLike: TypeAlias = Union[
+    LoadedMovie, "TemporalMedianMovie", "GaussianFilteredMovie"
+]
 
 
 MAX_LOCS = int(1e6)
@@ -572,7 +586,7 @@ class TemporalMedianMovie:
     cutting and photon conversion must always use the raw movie, since
     the subtracted background would otherwise corrupt the photon counts.
     It deliberately does not implement the ``io.AbstractPicassoMovie``
-    interface so that accidentally handing it to ``fit2D`` trips that
+    interface so that accidentally handing it to ``fit`` trips that
     function's input assertion instead of silently returning wrong
     photon numbers.
 
@@ -590,7 +604,7 @@ class TemporalMedianMovie:
 
     Parameters
     ----------
-    movie : lib.IntArray3D
+    movie : MovieLike
         The raw movie, i.e. any object supporting ``len()`` and integer
         indexing that returns 2D frames.
     window : int, optional
@@ -629,7 +643,7 @@ class TemporalMedianMovie:
 
     def __init__(
         self,
-        movie: lib.IntArray3D,
+        movie: MovieLike,
         window: int = 51,
         *,
         stride: int | None = None,
@@ -946,7 +960,7 @@ class GaussianFilteredMovie:
     cutting and photon conversion must always use the raw movie, since
     the smoothed intensities would otherwise corrupt the photon counts.
     It deliberately does not implement the ``io.AbstractPicassoMovie``
-    interface so that accidentally handing it to ``fit2D`` trips that
+    interface so that accidentally handing it to ``fit`` trips that
     function's input assertion instead of silently returning wrong
     photon numbers.
 
@@ -955,7 +969,7 @@ class GaussianFilteredMovie:
 
     Parameters
     ----------
-    movie : lib.IntArray3D
+    movie : MovieLike
         The raw movie, i.e. any object supporting ``len()`` and integer
         indexing that returns 2D frames. May itself be a
         ``TemporalMedianMovie``, in which case the median is subtracted
@@ -988,7 +1002,7 @@ class GaussianFilteredMovie:
 
     def __init__(
         self,
-        movie: lib.IntArray3D,
+        movie: MovieLike,
         sigma: float,
         *,
         truncate: float = GAUSSIAN_FILTER_TRUNCATE,
@@ -1152,7 +1166,7 @@ def identify_in_frame(
 
 
 def identify_by_frame_number(
-    movie: lib.IntArray3D,
+    movie: MovieLike,
     minimum_ng: float | list | np.ndarray,
     box: int,
     frame_number: int,
@@ -1167,7 +1181,7 @@ def identify_by_frame_number(
 
     Parameters
     ----------
-    movie : lib.IntArray3D
+    movie : MovieLike
         A 3D array representing the movie of shape (N, Y, X), where N is
         the number of frames, Y is the height, and X is the width.
     minimum_ng : float or sequence of float
@@ -1248,7 +1262,7 @@ def identify_by_frame_number(
 
 
 def _identify_worker(
-    movie: lib.IntArray3D,
+    movie: MovieLike,
     current: list[int],
     minimum_ng: float | list | np.ndarray,
     box: int,
@@ -1306,7 +1320,7 @@ def identifications_from_futures(
 
 
 def identify_async(
-    movie: lib.IntArray3D,
+    movie: MovieLike,
     minimum_ng: float | list | np.ndarray,
     box: int,
     *,
@@ -1319,8 +1333,8 @@ def identify_async(
 
     Parameters
     ----------
-    movie : lib.IntArray3D
-        The input movie data as a 3D numpy array.
+    movie : MovieLike
+        The input movie, read frame by frame.
     minimum_ng : float or sequence of float
         The minimum net gradient for a spot to be considered. A
         sequence gives each ROI its own threshold, one value per ROI
@@ -1473,7 +1487,7 @@ def _identify_serial(
 
 
 def identify(
-    movie: lib.IntArray3D,
+    movie: MovieLike,
     minimum_ng: float | list | np.ndarray,
     box: int,
     *,
@@ -1495,8 +1509,8 @@ def identify(
 
     Parameters
     ----------
-    movie : lib.IntArray3D
-        The input movie data as a 3D numpy array.
+    movie : MovieLike
+        The input movie, read frame by frame.
     minimum_ng : float or sequence of float
         The minimum net gradient for a spot to be considered. A
         sequence gives each ROI its own threshold, one value per ROI
@@ -1895,7 +1909,7 @@ def _n_io_workers() -> int:
 
 @numba.jit(nopython=True, cache=False)
 def _cut_spots_daskmov(
-    movie: lib.IntArray3D,
+    movie: MovieLike,
     l_mov: lib.IntArray1D,
     ids_frame: lib.IntArray1D,
     ids_x: lib.IntArray1D,
@@ -1907,8 +1921,8 @@ def _cut_spots_daskmov(
 
     Parameters
     ----------
-    movie : lib.IntArray3D
-        The input movie data as a 3D numpy array.
+    movie : MovieLike
+        The input movie, read frame by frame.
     l_mov : lib.IntArray1D
         Length of the movie, a 1D array with a single element.
     ids_frame, ids_x, ids_y : lib.IntArray1D
@@ -1946,7 +1960,7 @@ def _cut_spots_daskmov(
 
 
 def _cut_spots_framebyframe(
-    movie: lib.IntArray3D,
+    movie: MovieLike,
     ids_frame: lib.IntArray1D,
     ids_x: lib.IntArray1D,
     ids_y: lib.IntArray1D,
@@ -1958,8 +1972,8 @@ def _cut_spots_framebyframe(
 
     Parameters
     ----------
-    movie : lib.IntArray3D
-        The input movie data as a 3D numpy array.
+    movie : MovieLike
+        The input movie, read frame by frame.
     ids_frame, ids_x, ids_y : lib.IntArray1D
         1D arrays containing spot positions in the image data.
     box : int
@@ -2032,7 +2046,7 @@ def _cut_spots_framebyframe(
 
 
 def _cut_spots(
-    movie: lib.IntArray3D,
+    movie: MovieLike,
     ids: pd.DataFrame,
     box: int,
     progress_callback: Callable[[int], None] | None = None,
@@ -2257,8 +2271,8 @@ def camera_calibration_info(camera_calibration: dict | None) -> dict:
     Every caller that fits with a calibration must record this, or a
     localization file carries no trace of the noise model that produced it and
     two runs become indistinguishable after the fact. It lives here, rather
-    than inline in ``fit2D``, because Picasso Localize rebuilds its own
-    metadata when saving instead of using what ``fit2D`` returns, and the two
+    than inline in ``fit``, because Picasso Localize rebuilds its own
+    metadata when saving instead of using what ``fit`` returns, and the two
     must not drift apart.
 
     Returns an empty dict when there is no calibration, so callers can
@@ -2313,7 +2327,7 @@ def _seed_spots(
 
 
 def get_spots(
-    movie: lib.IntArray3D,
+    movie: MovieLike,
     identifications: pd.DataFrame,
     box: int,
     camera_info: dict,
@@ -2326,8 +2340,8 @@ def get_spots(
 
     Parameters
     ----------
-    movie : lib.IntArray3D
-        The input movie data as a 3D numpy array.
+    movie : MovieLike
+        The input movie, read frame by frame.
     identifications : pd.DataFrame
         Data frame containing the identified spots. Contains fields
         `frame`, `x`, `y`, and `net_gradient`.
@@ -2452,9 +2466,9 @@ def locs_from_fits(
     return locs
 
 
-def fit2D(
-    movie: lib.IntArray3D,
-    movie_info: list[dict],
+def fit(
+    movie: LoadedMovie,
+    *,
     camera_info: dict,
     identifications: pd.DataFrame,
     box: int,
@@ -2478,7 +2492,6 @@ def fit2D(
     ] = "gausslq",
     eps: float | None = None,
     max_it: int | None = None,
-    mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
     spline_calibration: dict | None = None,
     camera_calibration: dict | None = None,
     multiprocess: bool = True,
@@ -2491,12 +2504,14 @@ def fit2D(
     """Fit 2D localizations to a movie, given positions of the detected
     spots (identifications).
 
+    Since v0.11.0: renamed from ``fit2D``, which is deprecated and will
+    be removed in v0.12.0, together with its unused ``movie_info`` and
+    ``mle_method`` arguments. Only the movie is accepted positionally.
+
     Parameters
     ----------
-    movie : lib.IntArray3D
-        The input movie data as a 3D numpy array.
-    movie_info : list of dicts
-        Movie metadata.
+    movie : LoadedMovie
+        The input movie, as loaded by ``picasso.io.load_movie``.
     camera_info : dict
         A dictionary containing camera information: "Baseline",
         "Sensitivity", "Gain" and "Pixelsize".
@@ -2543,9 +2558,6 @@ def fit2D(
         default) means 100 for "gaussmle", 200 for "gausslq" (MINPACK's
         own default), 20 for the GPU Gaussians and, for either spline
         backend, 100 with the axial multi-start and 20 without.
-    mle_method : Literal["sigma", "sigmaxy"], optional
-        The method used for CPU MLE fitting (impose same sigma in x and
-        y or not, respectively). Default is "sigmaxy".
     spline_calibration : dict or None, optional
         Cubic-spline PSF calibration (see ``io.load_spline_calibration``),
         required for any "spline*" ``fitting_method`` and ignored
@@ -2601,7 +2613,6 @@ def fit2D(
     assert isinstance(
         movie, accepted_movie_types
     ), "movie must be a movie loaded by picasso.io.load_movie"
-    assert isinstance(movie_info, list), "movie_info must be a list"
     assert isinstance(camera_info, dict), "camera_info must be a dict"
     assert isinstance(
         identifications, pd.DataFrame
@@ -2622,14 +2633,10 @@ def fit2D(
     assert max_it is None or (
         isinstance(max_it, int) and max_it > 0
     ), "max_it must be a positive integer or None"
-    assert mle_method in [
-        "sigma",
-        "sigmaxy",
-    ], "mle_method must be 'sigma' or 'sigmaxy'"
     assert isinstance(multiprocess, bool), "multiprocess must be a boolean"
     if "Pixelsize" not in camera_info:
         warnings.warn(
-            "Camera info in picasso.localize.fit2D does not contain "
+            "Camera info in picasso.localize.fit does not contain "
             "'Pixelsize', i.e., effective camera pixel size in nm. "
             "Assuming 130."
         )
@@ -2761,6 +2768,50 @@ def fit2D(
     localize_info.update(camera_calibration_info(camera_calibration))
     new_info = localize_info | camera_info
     return locs, new_info
+
+
+# TODO: remove in v0.12.0
+def fit2D(
+    movie: LoadedMovie,
+    movie_info: list[dict] | None = None,
+    camera_info: dict | None = None,
+    identifications: pd.DataFrame | None = None,
+    box: int | None = None,
+    fitting_method: str = "gausslq",
+    eps: float | None = None,
+    max_it: int | None = None,
+    mle_method: Literal["sigma", "sigmaxy"] | None = None,
+    **kwargs,
+) -> tuple[pd.DataFrame | None, dict]:
+    """Deprecated alias for ``fit``.
+
+    .. deprecated:: 0.11.0
+        Use ``picasso.localize.fit`` instead. ``fit2D`` will be removed
+        in v0.12.0, together with the ``movie_info`` and ``mle_method``
+        arguments, neither of which affects the fit.
+    """
+    lib.deprecation_warning(
+        "picasso.localize.fit2D is deprecated and will be removed in "
+        "version 0.12; use picasso.localize.fit instead. Its movie_info "
+        "and mle_method arguments will be removed with it - neither has "
+        "any effect on the fit."
+    )
+    if mle_method is not None:
+        lib.deprecation_warning(
+            "The mle_method argument is ignored and will be removed in "
+            "version 0.12."
+        )
+    assert isinstance(movie_info, list), "movie_info must be a list"
+    return fit(
+        movie=movie,
+        camera_info=camera_info,
+        identifications=identifications,
+        box=box,
+        fitting_method=fitting_method,
+        eps=eps,
+        max_it=max_it,
+        **kwargs,
+    )
 
 
 def _initial_widths_gauss(
@@ -2900,7 +2951,7 @@ def gauss_fit_methods() -> list[str]:
     return codes
 
 
-#: Every ``fit2D`` method. Generated for the Gaussians (see
+#: Every ``fit`` method. Generated for the Gaussians (see
 #: :func:`gauss_fit_methods`) and listed for the rest, which have no grammar.
 FIT_METHODS = tuple(
     gauss_fit_methods()
@@ -3324,7 +3375,7 @@ def _fit2d_gauss(
     Gaussian is fitted and the resulting localizations contain the fitted
     rotation angle (in degrees) in the column ``angle``. If ``spherical``, an
     isotropic Gaussian with a single width is fitted and the resulting ``sx``
-    and ``sy`` columns are identical. See ``fit2D`` for more details."""
+    and ``sy`` columns are identical. See ``fit`` for more details."""
     theta, log_likelihood, iterations, chi_square = fit_spots_gauss(
         spots,
         rotated=rotated,
@@ -3602,7 +3653,7 @@ def _run_splinefit(
     byte-identical inputs. That is what makes a CPU/GPU comparison meaningful
     rather than a test of two translation layers agreeing.
 
-    ``multiprocess`` keeps ``fit2D``'s argument name, but as for ``gaussmle``
+    ``multiprocess`` keeps ``fit``'s argument name, but as for ``gaussmle``
     it selects a **thread** pool: the CPU kernels are ``nogil``, so the workers
     run concurrently while sharing the spots and the coefficient table rather
     than pickling a copy of each into a subprocess. False runs the fit serially
@@ -4185,7 +4236,7 @@ def _fit2d_spline_gpu(
 ) -> pd.DataFrame:
     """Fit an experimentally measured cubic-spline PSF on the GPU. For a 3D
     calibration the localizations contain the fitted ``z`` directly. See
-    ``fit2D`` for more details. ``progress_callback`` tracks the per-spot CRLB
+    ``fit`` for more details. ``progress_callback`` tracks the per-spot CRLB
     computation in ``locs_from_fits_spline``.
 
     ``n_z_starts`` is the axial multi-start (see
@@ -4237,7 +4288,7 @@ def _fit2d_spline_cpu(
 ) -> pd.DataFrame | None:
     """Fit an experimentally measured cubic-spline PSF on the CPU. For a 3D
     calibration the localizations contain the fitted ``z`` directly. See
-    ``fit2D`` for more details.
+    ``fit`` for more details.
 
     Unlike the GPU path, whose fit is one launch per chunk,
     ``progress_callback`` here tracks the fit itself, one step per spot. The
@@ -5536,10 +5587,13 @@ def _process_fitting_futures(
 
 
 def localize(
-    movie: lib.IntArray3D,
-    camera_info: dict,
-    parameters: dict,
-    *,
+    movie: LoadedMovie,
+    # TODO: remove in v0.12.0 - only movie may be passed positionally, and
+    # camera_info / identification_parameters become keyword-only
+    *args,
+    camera_info: dict | None = None,
+    identification_parameters: dict | None = None,
+    parameters: dict | None = None,  # TODO: remove in v0.12.0 (renamed)
     roi: tuple[tuple[int, int], tuple[int, int]] | None = None,
     frame_bounds: tuple[int, int] | None = None,
     movie_info: list[dict] | None = None,
@@ -5563,53 +5617,70 @@ def localize(
     ] = "gausslq",
     eps: float | None = None,
     max_it: int | None = None,
-    mle_method: Literal["sigma", "sigmaxy"] = "sigmaxy",
+    mle_method: Literal["sigma", "sigmaxy"] | None = None,  # TODO: rm v0.12.0
     spline_calibration: dict | None = None,
+    calibration_3d: dict | str | None = None,
     affine_calibration: dict | list | None = None,
     camera_calibration: dict | None = None,
     threaded: bool = True,
-    gaussian_filter_sigma: float | None = None,
     identification_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
     fit_progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
+    fit_z_progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
     return_info: bool = True,  # TODO: remove in v0.12.0
 ) -> pd.DataFrame | tuple[pd.DataFrame, list[dict]]:
-    """Localize (i.e., identify and fit) spots in 2D in a movie using
-    the specified parameters.
+    """Localize (i.e., identify and fit) spots in a movie using the
+    specified parameters.
+
+    Fits in 2D, unless an astigmatism calibration is given in
+    ``calibration_3d``, in which case a z position is fitted on top of
+    the 2D fit, see Huang, et al. Science, 2008. A 3D
+    ``spline_calibration`` yields z directly from the fit itself and
+    needs no ``calibration_3d``.
 
     Since v0.10.0: support for frame bounds and ROI for identification +
     all fitting methods.
 
+    Since v0.11.0: astigmatic 3D fitting via ``calibration_3d``, which
+    replaces the deprecated ``localize_3D``.
+
     Parameters
     ----------
-    movie : lib.IntArray3D
-        The input movie data as a 3D numpy array.
+    movie : LoadedMovie
+        The input movie, as loaded by ``picasso.io.load_movie``.
     camera_info : dict
         A dictionary containing camera information such as
         `Baseline`, `Sensitivity`, and `Gain`.
-    parameters : dict
-        A dictionary containing localization parameters, including:
+    identification_parameters : dict
+        A dictionary containing spot identification parameters,
+        including:
+
         - `Min. Net Gradient`: Minimum net gradient for spot
           identification.
         - `Box Size`: Size of the box to cut out around each spot.
         - `Temporal Median Window`: optional, window length (in frames)
           of the temporal median filter applied before identification;
           0 or missing disables it. Fitting always uses the raw movie.
+        - `Gaussian Filter Sigma`: optional, standard deviation (in
+          camera pixels) of a spatial Gaussian filter applied to every
+          frame before identification, see ``GaussianFilteredMovie``. It
+          merges the several local maxima of a spot that is not
+          Gaussian-shaped into one. Applied after the temporal median
+          filter, if both are used. The filter applies to the
+          identification only - the spots are always cut out of and
+          fitted on the raw movie. Note that the minimum net gradient
+          has to be re-tuned when this is changed, since smoothing
+          lowers gradient magnitudes. 0 or missing disables it.
+    parameters : dict, optional
+        Deprecated alias for ``identification_parameters``, removed in
+        v0.12.0.
     threaded : bool, optional
         Whether to use multithreading/multiprocessing. Default is True.
-    gaussian_filter_sigma : float or None, optional
-        Standard deviation (in camera pixels) of a spatial Gaussian
-        filter applied to every frame before spot identification, see
-        ``GaussianFilteredMovie``. It merges the several local maxima of
-        a spot that is not Gaussian-shaped into one. Applied after the
-        temporal median filter, if both are used. The filter applies to
-        the identification only - the spots are always cut out of and
-        fitted on the raw movie. Note that the minimum net gradient has
-        to be re-tuned when this is changed, since smoothing lowers
-        gradient magnitudes. Default is None (no filtering).
     movie_info : list[dict], optional
         Movie metadata. If None, an empty list is used. Default is None.
     roi : tuple, optional
@@ -5626,25 +5697,48 @@ def localize(
             "gaussmle", "gaussmle-spherical", "gaussmle-gpu", \
             "gaussmle-rotated-gpu", "gaussmle-spherical-gpu" or "avg"}, \
             optional
-        Which 2D fitting algorithm to use, see ``fit2D``. Default is
+        Which 2D fitting algorithm to use, see ``fit``. Default is
         "gausslq".
     eps : float or None, optional
-        The convergence criterion for CPU MLE and CPU spline fitting.
-        None (the default) picks the value that suits the method, see
-        ``fit2D``.
+        The convergence criterion, honoured by every iterating method on
+        either device (all of them except "avg"). None (the default)
+        picks the value that suits the method, see ``fit``.
     max_it : int or None, optional
-        The maximum number of iterations, as ``eps``. None (the default)
-        picks the value that suits the method.
-    mle_method : Literal["sigma", "sigmaxy"], optional
-        The method used for MLE fitting. Default is "sigmaxy".
+        The maximum number of iterations per spot, as ``eps``. None (the
+        default) picks the value that suits the method, see ``fit``.
+    mle_method : Literal["sigma", "sigmaxy"] or None, optional
+        Deprecated and ignored, removed in v0.12.0. Specify the
+        fitting_method instead.
+    calibration_3d : dict, str or None, optional
+        Astigmatism calibration for fitting z on top of the 2D fit,
+        either an already loaded calibration dictionary or a path to a
+        YAML file holding one, with the keys:
+
+        - "X Coefficients": list of 7 floats, polynomial coefficients
+          for the x-axis calibration curve;
+        - "Y Coefficients": list of 7 floats, polynomial coefficients
+          for the y-axis calibration curve;
+        - "Magnification factor": float, magnification factor of the
+          microscope, i.e., the ratio between the actual z position of
+          the calibration sample and the estimated z position from the
+          localization data.
+
+        Ignored for the "spline*" fitting methods, which fit z
+        themselves from ``spline_calibration``. Not supported for "avg",
+        which fits no Gaussian widths, nor for the "*-spherical" methods,
+        which constrain sx == sy and so carry no astigmatism. The
+        "*-rotated" methods report sx and sy along the rotated principal
+        axes, whereas the astigmatism calibration assumes the camera
+        axes, so use them for z fitting with care. Default is None (2D
+        localization).
     affine_calibration : dict or list or None, optional
         Additional lateral (x, y) affine corrections to apply after
         fitting, e.g. a standalone chromatic-aberration calibration used
         on its own in a 2D experiment. Either a calibration dictionary
         carrying an ``"Affine transforms"`` list or the list itself; they
         are applied in order. Corrections stored in ``spline_calibration``
-        are applied by the fit itself, so they must not be repeated here.
-        Default is None.
+        or ``calibration_3d`` are applied by the fit itself, so they must
+        not be repeated here. Default is None.
     camera_calibration : dict or None, optional
         A per-pixel sCMOS camera calibration for the (single) camera. All
         split-FOV regions are read from one sensor and the maps are indexed by
@@ -5658,6 +5752,9 @@ def localize(
         A callback for progress updates during fitting. If "console",
         progress will be printed to the console. If None, progress is
         not reported. Default is None.
+    fit_z_progress_callback : callable or "console" or None
+        As ``fit_progress_callback``, for the astigmatic z fitting.
+        Ignored unless ``calibration_3d`` is given. Default is None.
     return_info : bool, optional
         Whether to return additional information about the fitting
         process. Default is True. If True, a tuple of (locs, info) is
@@ -5679,6 +5776,14 @@ def localize(
             "that picasso.localize.localize() will always return both "
             "the localizations and the metadata dictionary."
         )
+    camera_info, identification_parameters = _localize_legacy_arguments(
+        args, camera_info, identification_parameters, parameters, mle_method
+    )
+    assert isinstance(camera_info, dict), "camera_info must be a dict"
+    assert isinstance(
+        identification_parameters, dict
+    ), "identification_parameters must be a dict"
+    fit_z = _validate_calibration_3d(calibration_3d, fitting_method)
 
     # Use empty list as default for movie_info
     if movie_info is None:
@@ -5687,32 +5792,62 @@ def localize(
     # Identify spots
     identifications, identify_info = identify(
         movie,
-        parameters["Min. Net Gradient"],
-        parameters["Box Size"],
+        identification_parameters["Min. Net Gradient"],
+        identification_parameters["Box Size"],
         roi=roi,
         frame_bounds=frame_bounds,
         threaded=threaded,
-        temporal_median_window=parameters.get("Temporal Median Window", 0),
-        gaussian_filter_sigma=gaussian_filter_sigma,
+        temporal_median_window=identification_parameters.get(
+            "Temporal Median Window", 0
+        ),
+        gaussian_filter_sigma=identification_parameters.get(
+            "Gaussian Filter Sigma", None
+        ),
         progress_callback=identification_progress_callback,
     )
 
     # Fit spots
-    locs, fit_info = fit2D(
+    locs, fit_info = fit(
         movie=movie,
-        movie_info=movie_info,
         camera_info=camera_info,
         identifications=identifications,
-        box=parameters["Box Size"],
+        box=identification_parameters["Box Size"],
         fitting_method=fitting_method,
         eps=eps,
         max_it=max_it,
-        mle_method=mle_method,
         spline_calibration=spline_calibration,
         camera_calibration=camera_calibration,
         multiprocess=threaded,
         progress_callback=fit_progress_callback,
     )
+    info = movie_info + [identify_info] + [fit_info]
+
+    if fit_z:
+        # Astigmatic z fitting on top of the 2D fit, see Huang, et al.
+        # Science, 2008. zfit only knows gausslq/gaussmle; map the GPU /
+        # rotated codes to the corresponding CPU noise model.
+        locs, info = zfit.zfit(
+            locs=locs,
+            info=info,
+            calibration=calibration_3d,
+            fitting_method=(
+                "gaussmle"
+                if fitting_method.startswith("gaussmle")
+                else "gausslq"
+            ),
+            filter=0,
+            multiprocess=threaded,
+            progress_callback=fit_z_progress_callback,
+        )
+        # The astigmatism calibration's own affine corrections were applied
+        # by zfit, so they are not repeated here.
+        return _localize_return(
+            *_apply_extra_affine(
+                locs, info, affine_calibration, applied=calibration_3d
+            ),
+            return_info=return_info,
+        )
+
     # Standalone affine corrections (e.g. a chromatic one used without a 3D
     # calibration); those carried by the spline calibration were already
     # applied by the fit, so they are dropped here rather than applied twice.
@@ -5725,14 +5860,106 @@ def localize(
         fit_info["Affine corrections applied"] = (
             lib.describe_affine_transforms(extra)
         )
-    info = movie_info + [identify_info] + [fit_info]
+    return _localize_return(locs, info, return_info=return_info)
+
+
+# TODO: remove in v0.12.0 (return_info is removed, info is always returned)
+def _localize_return(
+    locs: pd.DataFrame,
+    info: list[dict],
+    return_info: bool,
+) -> pd.DataFrame | tuple[pd.DataFrame, list[dict]]:
+    """``localize``'s return value, honouring the deprecated
+    ``return_info``."""
     if return_info:
         return locs, info
     return locs
 
 
+# TODO: remove in v0.12.0, together with the *args, ``parameters`` and
+# ``mle_method`` arguments of ``localize`` that it resolves
+def _localize_legacy_arguments(
+    args: tuple,
+    camera_info: dict | None,
+    identification_parameters: dict | None,
+    parameters: dict | None,
+    mle_method: str | None,
+) -> tuple[dict | None, dict | None]:
+    """Map ``localize``'s pre-v0.11.0 calling conventions onto the current
+    arguments, warning about each one, and return the resolved
+    ``(camera_info, identification_parameters)``."""
+    if args:
+        lib.deprecation_warning(
+            "In version 0.12, picasso.localize.localize() will only accept "
+            "the movie as a positional argument; pass camera_info and "
+            "identification_parameters as keyword arguments."
+        )
+        if len(args) > 2:
+            raise TypeError(
+                "localize() takes at most 3 positional arguments "
+                f"(movie, camera_info, identification_parameters), "
+                f"{len(args) + 1} given"
+            )
+        if camera_info is not None:
+            raise TypeError("localize() got multiple values for camera_info")
+        camera_info = args[0]
+        if len(args) == 2:
+            if identification_parameters is not None or parameters is not None:
+                raise TypeError(
+                    "localize() got multiple values for "
+                    "identification_parameters"
+                )
+            identification_parameters = args[1]
+    if parameters is not None:
+        lib.deprecation_warning(
+            "The parameters argument of picasso.localize.localize() was "
+            "renamed to identification_parameters and will be removed in "
+            "version 0.12."
+        )
+        if identification_parameters is None:
+            identification_parameters = parameters
+    if mle_method is not None:
+        lib.deprecation_warning(
+            "The mle_method argument of picasso.localize.localize() is "
+            "ignored and will be removed in version 0.12."
+        )
+    return camera_info, identification_parameters
+
+
+def _validate_calibration_3d(
+    calibration_3d: dict | str | None,
+    fitting_method: str,
+) -> bool:
+    """Whether an astigmatic z fit is to be run after the 2D fit, i.e.
+    ``calibration_3d`` was given and the fitting method supports it."""
+    if calibration_3d is None:
+        return False
+    assert isinstance(
+        calibration_3d, (dict, str)
+    ), "calibration_3d must be a dict or a path to a YAML file"
+    if fitting_method.startswith("spline"):
+        # The spline PSF fit recovers z itself, from spline_calibration.
+        warnings.warn(
+            "Ignoring calibration_3d: the spline PSF fit recovers z itself, "
+            "using spline_calibration.",
+            stacklevel=3,
+        )
+        return False
+    assert fitting_method != "avg", (
+        "astigmatic z fitting (calibration_3d) requires fitted Gaussian "
+        "widths, which 'avg' does not provide"
+    )
+    assert "spherical" not in fitting_method, (
+        "astigmatic z fitting (calibration_3d) is not possible with the "
+        "spherical Gaussian methods, which constrain sx == sy and thus "
+        "carry no astigmatism"
+    )
+    return True
+
+
+# TODO: remove in v0.12.0 - superseded by localize(calibration_3d=...)
 def localize_3D(
-    movie: lib.IntArray3D,
+    movie: LoadedMovie,
     *,
     movie_info: list[dict],
     camera_info: dict,
@@ -5780,6 +6007,11 @@ def localize_3D(
     """Localize (i.e., identify and fit) spots in 3D in a movie using
     the specified parameters.
 
+    .. deprecated:: 0.11.0
+        Use ``picasso.localize.localize`` with its ``calibration_3d``
+        argument instead - the two functions differ only in the astigmatic
+        z fitting. ``localize_3D`` will be removed in v0.12.0.
+
     For the Gaussian ``fitting_method`` values this first runs 2D
     localizations, followed by z position fitting assuming astigmatism, see
     Huang, et al. Science, 2008 (``calibration_3d`` holds the astigmatism
@@ -5789,8 +6021,8 @@ def localize_3D(
 
     Parameters
     ----------
-    movie : lib.IntArray3D
-        The input movie data as a 3D numpy array.
+    movie : LoadedMovie
+        The input movie, read frame by frame.
     movie_info : list of dicts
         Movie metadata.
     camera_info : dict
@@ -5830,7 +6062,7 @@ def localize_3D(
             "gausslq-gpu", "gausslq-rotated-gpu", "gausslq-spherical-gpu", \
             "gaussmle", "gaussmle-spherical", "gaussmle-gpu", \
             "gaussmle-rotated-gpu" or "gaussmle-spherical-gpu"}, optional
-        Which 2D fitting algorithm to use, see ``fit2D``. "avg" is not
+        Which 2D fitting algorithm to use, see ``fit``. "avg" is not
         supported since z fitting requires the fitted Gaussian sigmas.
         Note that the rotated elliptical Gaussian methods report sx and
         sy along the rotated principal axes, whereas the astigmatism
@@ -5895,6 +6127,11 @@ def localize_3D(
         A list of dictionaries containing metadata about the movie and
         the fitting processes.
     """
+    lib.deprecation_warning(
+        "picasso.localize.localize_3D is deprecated and will be removed in "
+        "version 0.12; use picasso.localize.localize with its calibration_3d "
+        "argument instead."
+    )
     assert isinstance(
         movie, (np.ndarray, io.ND2Movie)
     ), "movie must be a numpy array or ND2Movie"
@@ -5941,12 +6178,12 @@ def localize_3D(
         assert isinstance(
             calibration_3d, (dict, str)
         ), "calibration_3d must be a dict or a path to a YAML file"
-    assert (
+    assert eps is None or (
         isinstance(eps, (int, float)) and eps > 0
-    ), "eps must be a positive number"
-    assert (
+    ), "eps must be a positive number or None"
+    assert max_it is None or (
         isinstance(max_it, int) and max_it > 0
-    ), "max_it must be a positive integer"
+    ), "max_it must be a positive integer or None"
     assert mle_method in [
         "sigma",
         "sigmaxy",
@@ -5978,7 +6215,7 @@ def localize_3D(
 
 
 def _localize_3D(
-    movie: lib.IntArray3D,
+    movie: LoadedMovie,
     *,
     movie_info: list[dict],
     camera_info: dict,
@@ -6023,14 +6260,20 @@ def _localize_3D(
     ) = None,
     camera_calibration: dict | None = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """Internal function for `localize_3D`, assumes validated inputs."""
-    locs, info = localize(
+    """Internal function for `localize_3D`, assumes validated inputs.
+
+    A thin wrapper around ``localize``, which does the astigmatic z
+    fitting itself since v0.11.0. ``mle_method`` is not passed on: it has
+    no effect on the fit and warns in ``localize``.
+    """
+    return localize(
         movie=movie,
         camera_info=camera_info,
-        parameters={
+        identification_parameters={
             "Min. Net Gradient": minimum_ng,
             "Box Size": box,
             "Temporal Median Window": temporal_median_window,
+            "Gaussian Filter Sigma": gaussian_filter_sigma,
         },
         roi=roi,
         frame_bounds=frame_bounds,
@@ -6038,39 +6281,18 @@ def _localize_3D(
         fitting_method=fitting_method,
         eps=eps,
         max_it=max_it,
-        mle_method=mle_method,
         spline_calibration=spline_calibration,
+        # The spline fit recovers z itself, from spline_calibration; the
+        # astigmatism polynomials only apply to the Gaussian methods.
+        calibration_3d=(
+            None if fitting_method.startswith("spline") else calibration_3d
+        ),
+        affine_calibration=affine_calibration,
         camera_calibration=camera_calibration,
         threaded=multiprocess,
-        gaussian_filter_sigma=gaussian_filter_sigma,
         identification_progress_callback=identification_progress_callback,
         fit_progress_callback=fit_progress_callback,
-        return_info=True,  # TODO: remove in v0.12.0
-    )
-    if fitting_method.startswith("spline"):
-        # The 3D cubic-spline fit already produced the z column directly, so
-        # there is no separate astigmatism z-fitting step to run. The spline
-        # calibration's own affine corrections were applied by the fit, so
-        # they are not repeated here.
-        return _apply_extra_affine(
-            locs, info, affine_calibration, applied=spline_calibration
-        )
-    # zfit only knows gausslq/gaussmle; map the GPU/rotated codes to the
-    # corresponding CPU noise model
-    fitting_method_3d = (
-        "gaussmle" if fitting_method.startswith("gaussmle") else "gausslq"
-    )
-    locs, info = zfit.zfit(
-        locs=locs,
-        info=info,
-        calibration=calibration_3d,
-        fitting_method=fitting_method_3d,
-        filter=0,
-        multiprocess=multiprocess,
-        progress_callback=fit_z_progress_callback,
-    )
-    return _apply_extra_affine(
-        locs, info, affine_calibration, applied=calibration_3d
+        fit_z_progress_callback=fit_z_progress_callback,
     )
 
 

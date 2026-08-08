@@ -159,7 +159,7 @@ LINK_PHOTONS_TIP = (
 )
 
 # Fitting models offered in the GUI, decoupled from the optimizer. Each
-# model maps its optimizer labels to the internal ``fit2D`` codes;
+# model maps its optimizer labels to the internal ``fit`` codes;
 # models without an optimizer (e.g. averaging) declare a fixed ``code``
 # and ``optimizers=None``. Add a new fitting algorithm by adding an
 # entry here.
@@ -242,7 +242,7 @@ OPTIMIZER_TOOLTIP = (
 
 
 def _fit_code(model: str, optimizer: str) -> str:
-    """Resolve a (model, optimizer) selection to an internal ``fit2D`` code."""
+    """Resolve a (model, optimizer) selection to an internal ``fit`` code."""
     entry = FIT_MODELS[model]
     if entry["optimizers"] is None:
         return entry["code"]
@@ -266,7 +266,7 @@ _GPU_CAPABLE_CODES = frozenset(
 
 
 def _effective_fit_code(code: str, use_gpu: bool) -> str:
-    """The ``fit2D`` code a (code, GPU checkbox) pair actually runs.
+    """The ``fit`` code a (code, GPU checkbox) pair actually runs.
 
     "Use GPU" is a *modifier* on the model and optimizer comboboxes, so the
     code it produces is assembled here rather than enumerated."""
@@ -2827,7 +2827,7 @@ class ParametersDialog(lib.Dialog):
         # further below
         self.z_groupbox = None
         self.spline_groupbox = None
-        # last resolved fit2D code, so the convergence defaults are only
+        # last resolved fit code, so the convergence defaults are only
         # reapplied when the method actually changes
         self._last_fit_code = None
         # guards the two-way binding between the min. net gradient slider and
@@ -3369,7 +3369,7 @@ class ParametersDialog(lib.Dialog):
         )
         mle_grid.addWidget(cc_label, 0, 0)
         self.convergence_criterion = QtWidgets.QDoubleSpinBox()
-        # Never 0: fit2D requires a positive tolerance, and below ~1e-6 the
+        # Never 0: fit requires a positive tolerance, and below ~1e-6 the
         # test is answering noise in the chi-square rather than convergence.
         self.convergence_criterion.setRange(1e-6, 1e6)
         self.convergence_criterion.setDecimals(6)
@@ -3808,7 +3808,7 @@ class ParametersDialog(lib.Dialog):
             self.spline_groupbox.setVisible(needs_spline)
 
     def current_fit_code(self) -> str:
-        """The ``fit2D`` code the current selection would run."""
+        """The ``fit`` code the current selection would run."""
         model = self.fit_model.currentText()
         optimizer = self.fit_optimizer.currentText()
         if not optimizer and FIT_MODELS[model]["optimizers"] is not None:
@@ -9125,7 +9125,7 @@ class Window(QtWidgets.QMainWindow):
             localize_info["Spline Calibration Model"] = (
                 self.parameters_dialog.spline_calibration.get("model")
             )
-        # ``fit2D`` records this itself, but its info is discarded here (see
+        # ``fit`` records this itself, but its info is discarded here (see
         # FitWorker.run) and this dict is rebuilt from the dialog, so without
         # this line a GUI run leaves no trace of the noise model it used.
         localize_info.update(
@@ -9382,16 +9382,14 @@ class FitWorker(QtCore.QThread):
         t0 = time.time()
         # we ignore info since we will merge the metadata from identification
         # as well when saving localizations
-        locs, info = localize.fit2D(
+        locs, info = localize.fit(
             movie=self.movie,
-            movie_info=self.movie_info,
             camera_info=self.camera_info,
             identifications=self.identifications,
             box=self.box,
             fitting_method=self.method,
             eps=self.eps,
             max_it=self.max_it,
-            mle_method="sigmaxy",
             spline_calibration=self.spline_calibration,
             camera_calibration=self.camera_calibration,
             multiprocess=True,

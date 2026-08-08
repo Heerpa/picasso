@@ -1726,10 +1726,10 @@ class TestCliWiring:
 
     def test_backend_accepts_both_spline_codes(self):
         # both spline codes must be recognised model ids by the backend
-        # (guards the fit2D / localize / localize_3D dispatch strings)
+        # (guards the fit / localize dispatch strings)
         import inspect
 
-        src = inspect.getsource(localize.fit2D)
+        src = inspect.getsource(localize.fit)
         for code in ("spline", "spline-mle", "spline-gpu", "spline-mle-gpu"):
             assert f'"{code}"' in src
 

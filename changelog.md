@@ -123,6 +123,12 @@ This update focuses mainly on (but is not limited to) the expansion of the Local
 #### *Deprecation warnings:*
 - **`picasso.gausslq` and `picasso.gaussmle` are deprecated and will be removed in Picasso 1.0.**
 - `picasso.localize.identify` and `picasso.localize.localize` will always return metadata in v0.12.0, `return_info` will no longer be accepted
+- `picasso.localize.fit2D` was renamed to `picasso.localize.fit` and will be removed in v0.12.0, together with its `movie_info` and `mle_method` arguments, neither of which affects the fit
+- `picasso.localize.localize_3D` will be removed in v0.12.0; `picasso.localize.localize` now takes the astigmatism calibration as `calibration_3d` and fits z itself, which was the only difference between the two functions
+- `picasso.localize.localize` will only accept the movie as a positional argument in v0.12.0; `camera_info` and `identification_parameters` become keyword-only
+- `picasso.localize.localize`'s `parameters` argument was renamed to `identification_parameters` and now also carries the spatial Gaussian filter (as the `Gaussian Filter Sigma` key, replacing the `gaussian_filter_sigma` argument added earlier in this release); `parameters` will be removed in v0.12.0
+- `picasso.localize.localize`'s `mle_method` argument is ignored and will be removed in v0.12.0
+- `eps` and `max_it` are honoured by every iterating fitting method on either device (all of them except `avg`)
 
 ## 0.10.3
 - Fixed total pick area in the .yamls for circular and square picks (Render)

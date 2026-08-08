@@ -1185,12 +1185,13 @@ def _localize_process_file(
         "Min. Net Gradient": min_net_gradient,
         "Box Size": box,
         "Temporal Median Window": args.temporal_median,
+        "Gaussian Filter Sigma": args.gaussian_filter,
     }
 
     locs, info = localize(
         movie,
-        cam_info,
-        parameters,
+        camera_info=cam_info,
+        identification_parameters=parameters,
         roi=roi,
         frame_bounds=frame_bounds,
         movie_info=info,
@@ -1200,7 +1201,6 @@ def _localize_process_file(
         spline_calibration=spline_calibration,
         camera_calibration=camera_calibration,
         threaded=True,
-        gaussian_filter_sigma=args.gaussian_filter,
         identification_progress_callback="console",
         fit_progress_callback="console",
         return_info=True,
@@ -1375,7 +1375,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     }
 
     # 0 means "let the fitting method use its own default", which differs
-    # per model and per device - see localize.fit2D's eps / max_it.
+    # per model and per device - see localize.fit's eps / max_it.
     convergence = args.convergence
     max_iterations = args.max_iterations
 

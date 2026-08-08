@@ -1335,6 +1335,186 @@ class TestLocalize3D:
 
 
 # ---------------------------------------------------------------------------
+# The v0.12.0 API changes: ``fit2D`` -> ``fit``, ``localize_3D`` folded into
+# ``localize(calibration_3d=...)``, ``parameters`` ->
+# ``identification_parameters``, keyword-only arguments, ``mle_method`` gone.
+# Every old call must keep working (with a DeprecationWarning) until then.
+# ---------------------------------------------------------------------------
+
+
+class TestDeprecatedLocalizeAPI:
+    """The deprecated spellings still run and warn."""
+
+    def test_fit2d_warns_and_matches_fit(
+        self, picasso_movie, real_identifications, movie_info
+    ):
+        with pytest.warns(DeprecationWarning, match="fit2D"):
+            old, old_info = localize.fit2D(
+                picasso_movie,
+                movie_info,
+                CAMERA_INFO_WITH_PIXELSIZE,
+                real_identifications,
+                BOX,
+                fitting_method="gausslq",
+                mle_method="sigmaxy",
+                multiprocess=False,
+            )
+        new, new_info = localize.fit(
+            picasso_movie,
+            camera_info=CAMERA_INFO_WITH_PIXELSIZE,
+            identifications=real_identifications,
+            box=BOX,
+            fitting_method="gausslq",
+            multiprocess=False,
+        )
+        pd.testing.assert_frame_equal(old, new)
+        assert old_info == new_info
+
+    def test_fit2d_mle_method_warns_separately(
+        self, picasso_movie, real_identifications, movie_info
+    ):
+        with pytest.warns(DeprecationWarning, match="mle_method"):
+            localize.fit2D(
+                picasso_movie,
+                movie_info,
+                CAMERA_INFO_WITH_PIXELSIZE,
+                real_identifications,
+                BOX,
+                fitting_method="avg",
+                mle_method="sigma",
+                multiprocess=False,
+            )
+
+    def test_positional_arguments_warn(self, picasso_movie, movie_info):
+        with pytest.warns(DeprecationWarning, match="positional"):
+            locs, _ = localize.localize(
+                picasso_movie,
+                CAMERA_INFO_WITH_PIXELSIZE,
+                {"Min. Net Gradient": MIN_NG, "Box Size": BOX},
+                movie_info=movie_info,
+                fitting_method="gausslq",
+                threaded=False,
+            )
+        assert len(locs) > 0
+
+    def test_parameters_keyword_warns_and_still_works(
+        self, picasso_movie, movie_info
+    ):
+        with pytest.warns(DeprecationWarning, match="identification_para"):
+            locs, _ = localize.localize(
+                picasso_movie,
+                camera_info=CAMERA_INFO_WITH_PIXELSIZE,
+                parameters={"Min. Net Gradient": MIN_NG, "Box Size": BOX},
+                movie_info=movie_info,
+                fitting_method="gausslq",
+                threaded=False,
+            )
+        assert len(locs) > 0
+
+    def test_mle_method_warns(self, picasso_movie, movie_info):
+        with pytest.warns(DeprecationWarning, match="mle_method"):
+            localize.localize(
+                picasso_movie,
+                camera_info=CAMERA_INFO_WITH_PIXELSIZE,
+                identification_parameters={
+                    "Min. Net Gradient": MIN_NG,
+                    "Box Size": BOX,
+                },
+                movie_info=movie_info,
+                fitting_method="gausslq",
+                mle_method="sigmaxy",
+                threaded=False,
+            )
+
+    def test_duplicate_camera_info_raises(self, picasso_movie):
+        with pytest.raises(TypeError, match="camera_info"):
+            localize.localize(
+                picasso_movie,
+                CAMERA_INFO_WITH_PIXELSIZE,
+                camera_info=CAMERA_INFO_WITH_PIXELSIZE,
+            )
+
+    def test_localize_3d_warns(self, picasso_movie, movie_info):
+        with pytest.warns(DeprecationWarning, match="localize_3D"):
+            with pytest.raises(AssertionError):
+                # the movie type guard fires after the warning
+                localize.localize_3D(
+                    picasso_movie,
+                    movie_info=movie_info,
+                    camera_info=CAMERA_INFO_WITH_PIXELSIZE,
+                    box=BOX,
+                    minimum_ng=MIN_NG,
+                    calibration_3d=dict(CALIB_3D),
+                )
+
+
+class TestLocalizeAstigmatism3D:
+    """``localize(calibration_3d=...)``, the replacement for
+    ``localize_3D``."""
+
+    def _localize(self, movie, movie_info, **kwargs):
+        return localize.localize(
+            movie,
+            camera_info=CAMERA_INFO_WITH_PIXELSIZE,
+            identification_parameters={
+                "Min. Net Gradient": MIN_NG,
+                "Box Size": BOX,
+            },
+            movie_info=movie_info,
+            fitting_method="gausslq",
+            threaded=False,
+            **kwargs,
+        )
+
+    def test_matches_localize_3d(self, picasso_movie, movie_info):
+        """The astigmatic path reproduces the old ``_localize_3D``."""
+        old, old_info = localize._localize_3D(
+            picasso_movie,
+            movie_info=movie_info,
+            camera_info=CAMERA_INFO_WITH_PIXELSIZE,
+            box=BOX,
+            minimum_ng=MIN_NG,
+            calibration_3d=dict(CALIB_3D),
+            fitting_method="gausslq",
+            multiprocess=False,
+        )
+        new, new_info = self._localize(
+            picasso_movie, movie_info, calibration_3d=dict(CALIB_3D)
+        )
+        pd.testing.assert_frame_equal(old, new)
+        assert len(new_info) == len(old_info)
+        for col in ["z", "d_zcalib", "lpz"]:
+            assert col in new.columns
+        assert np.all(np.isfinite(new["z"].to_numpy()))
+
+    def test_no_calibration_stays_2d(self, picasso_movie, movie_info):
+        locs, _ = self._localize(picasso_movie, movie_info)
+        assert "z" not in locs.columns
+
+    def test_invalid_calibration_type(self, picasso_movie, movie_info):
+        with pytest.raises(AssertionError, match="calibration_3d"):
+            self._localize(picasso_movie, movie_info, calibration_3d=12345)
+
+    @pytest.mark.parametrize("fitting_method", ["avg", "gausslq-spherical"])
+    def test_rejects_methods_without_astigmatism(
+        self, picasso_movie, movie_info, fitting_method
+    ):
+        with pytest.raises(AssertionError, match="calibration_3d"):
+            localize.localize(
+                picasso_movie,
+                camera_info=CAMERA_INFO_WITH_PIXELSIZE,
+                identification_parameters={
+                    "Min. Net Gradient": MIN_NG,
+                    "Box Size": BOX,
+                },
+                movie_info=movie_info,
+                fitting_method=fitting_method,
+                calibration_3d=dict(CALIB_3D),
+                threaded=False,
+            )
+
+
+# ---------------------------------------------------------------------------
 # MovieLoadWorker — background loader for Picasso: Localize
 #
 # The GUI opens movies on a background QThread so the window stays

@@ -233,7 +233,7 @@ def _dedupe_beads(
 
 
 def _detect_bead_positions(
-    movie: lib.IntArray3D,
+    movie: localize.LoadedMovie,
     minimum_ng: float,
     box: int,
     ref_frame_bounds: tuple[int, int],
@@ -325,7 +325,7 @@ def _detect_bead_positions(
 
 
 def _bead_volumes(
-    movie: lib.IntArray3D,
+    movie: localize.LoadedMovie,
     camera_info: dict,
     beads: pd.DataFrame,
     box: int,
@@ -1012,7 +1012,7 @@ def _reference_mid_frame(
 
 
 def build_psf_template(
-    movie: lib.IntArray3D,
+    movie: localize.LoadedMovie,
     camera_info: dict,
     box: int,
     minimum_ng: float,
@@ -1143,7 +1143,7 @@ def build_psf_template(
 
 
 def calibrate_spline(
-    movie: lib.IntArray3D,
+    movie: localize.LoadedMovie,
     info: list[dict],
     camera_info: dict,
     box: int,
@@ -1164,7 +1164,7 @@ def calibrate_spline(
 
     Parameters
     ----------
-    movie : lib.IntArray3D
+    movie : localize.LoadedMovie
         The bead z-stack movie (as loaded by ``picasso.io.load_movie``).
     info : list of dicts
         Movie metadata.
