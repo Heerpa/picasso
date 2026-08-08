@@ -3209,6 +3209,29 @@ class STKMultiMovie(AbstractPicassoMovie):
             map_.tofile(file_handle, byte_order)
 
 
+def _scaled_progress(progress, j: int, n: int):
+    """Return a per-component progress callback that reports into the
+    ``j``-th of ``n`` equal slices of a composite progress bar.
+
+    Movies assembled from several files (a multi-file OME set, or several
+    files concatenated across folders) open one component at a time, each
+    reporting its own ``(done, total)``. Weighting the slices by frame
+    count is not possible before the components are opened, so every one
+    gets an equal share. ``SCALE`` sub-steps per component keep a
+    single-component movie animating smoothly across ``0..SCALE``.
+    Returns None when ``progress`` is None (no reporting).
+    """
+    SCALE = 1000
+    if progress is None:
+        return None
+
+    def callback(done, total):
+        if total > 0:
+            progress(int((j + done / total) * SCALE), n * SCALE)
+
+    return callback
+
+
 class TiffMultiMap(AbstractPicassoMovie):
     """Read ``.ome.tif`` files created by MicroManager. Single files are
     maxed out at 4GB, so this class orchestrates reading from single
@@ -3244,26 +3267,15 @@ class TiffMultiMap(AbstractPicassoMovie):
         self.paths = [self.path] + [
             path for index, path in sorted(paths_indices)
         ]
-        # A multi-file OME movie is opened as several TiffMaps. Give each
-        # an equal slice of the composite progress range (weighting by
-        # frame count is not possible before the maps are built) and
-        # rescale its per-page reports into the overall bar. SCALE keeps
-        # a single-file movie animating smoothly across 0..SCALE.
+        # A multi-file OME movie is opened as several TiffMaps; each gets
+        # an equal slice of the composite progress range.
         n_maps = len(self.paths)
-        SCALE = 1000
-
-        def map_progress(j):
-            if progress is None:
-                return None
-
-            def cb(done, total):
-                if total > 0:
-                    progress(int((j + done / total) * SCALE), n_maps * SCALE)
-
-            return cb
-
         self.maps = [
-            TiffMap(path, verbose=verbose, progress=map_progress(j))
+            TiffMap(
+                path,
+                verbose=verbose,
+                progress=_scaled_progress(progress, j, n_maps),
+            )
             for j, path in enumerate(self.paths)
         ]
         self.n_maps = len(self.maps)
@@ -3606,6 +3618,231 @@ def find_mm_separate_first(directory: str) -> str | None:
             if _mm_separate_files(candidate) is not None:
                 return candidate
     return None
+
+
+def _open_tif_component(path: str, verbose: bool = False, progress=None):
+    """Open one TIFF movie for concatenation, applying the same dispatch
+    as :func:`load_tif`: a MicroManager "separate image files" frame
+    opens its whole folder, anything else opens as a (possibly
+    multi-file) ``TiffMultiMap``."""
+    separate_paths = _mm_separate_files(path)
+    if separate_paths is not None:
+        return MMSeparateTiffMovie(separate_paths, verbose=verbose)
+    return TiffMultiMap(
+        path, memmap_frames=False, verbose=verbose, progress=progress
+    )
+
+
+class ConcatenatedTiffMovie(TiffMultiMap):
+    """Concatenate several TIFF movies along the frame axis.
+
+    One acquisition is sometimes saved as several TIFF files sitting in
+    different folders. This opens them as a single movie whose frames run
+    through the files in the given order, so it can be localized in one
+    go.
+
+    ``TiffMultiMap`` already dispatches frame reads through
+    ``cum_n_frames`` into a list of components, so array-like access,
+    iteration, ``camera_parameters``, ``tofile`` and ``close`` are all
+    inherited. Only the components differ: they are supplied here instead
+    of being discovered next to a single file, and each one is itself
+    opened with ``TiffMultiMap`` so a component that is a multi-file OME
+    set or an ImageJ stack still contributes all of its frames.
+
+    Every component must share the first one's frame shape and dtype;
+    otherwise a ``ValueError`` names the offending file. Metadata is
+    taken from the first component, with ``Frames`` set to the total and
+    the source paths recorded (see :meth:`info`).
+    """
+
+    def __init__(self, paths: list[str], verbose: bool = False, progress=None):
+        # Deliberately skip TiffMultiMap.__init__, which would discover
+        # the components by name next to a single file; here they are
+        # given (mirroring how MMSeparateTiffMovie builds its own state).
+        AbstractPicassoMovie.__init__(self)
+        if not paths:
+            raise ValueError("No TIFF files given to concatenate.")
+        self.paths = [os.path.abspath(_) for _ in paths]
+        self.path = self.paths[0]
+        self.dir = os.path.dirname(self.path)
+        n_paths = len(self.paths)
+        self.maps = [
+            _open_tif_component(
+                path,
+                verbose=verbose,
+                progress=_scaled_progress(progress, j, n_paths),
+            )
+            for j, path in enumerate(self.paths)
+        ]
+        self.n_maps = len(self.maps)
+        self.n_frames_per_map = [_.n_frames for _ in self.maps]
+        self.n_frames = sum(self.n_frames_per_map)
+        self.cum_n_frames = np.insert(np.cumsum(self.n_frames_per_map), 0, 0)
+        self._dtype = self.maps[0].dtype
+        self.height = self.maps[0].height
+        self.width = self.maps[0].width
+        self.shape = (self.n_frames, self.height, self.width)
+        self._check_compatible()
+
+    def _check_compatible(self) -> None:
+        """Raise if any component's geometry or dtype differs from the
+        first one's - concatenating those would silently produce a movie
+        whose frames do not all mean the same thing."""
+        expected = (self.height, self.width, self._dtype)
+        for map_, path in zip(self.maps[1:], self.paths[1:]):
+            found = (map_.height, map_.width, map_.dtype)
+            if found != expected:
+                self.close()
+                raise ValueError(
+                    f"Cannot concatenate {path}: its frames are "
+                    f"{found[0]}x{found[1]} of type {found[2]}, but "
+                    f"{self.path} has {expected[0]}x{expected[1]} of type "
+                    f"{expected[2]}."
+                )
+
+    def info(self):
+        """Metadata of the first file, with the total frame count and a
+        record of which files were concatenated.
+
+        ``Concatenated Files`` and ``Frames per File`` end up in the
+        saved localization metadata, so it stays reconstructable which
+        folders went into the movie and which frame range came from
+        which file - otherwise unrecoverable after the fact.
+        """
+        info = self.maps[0].info()
+        info["Frames"] = self.n_frames
+        info["Concatenated Files"] = list(self.paths)
+        info["Frames per File"] = list(self.n_frames_per_map)
+        self.meta = info
+        return info
+
+
+def natural_key(text: str) -> list:
+    """Sort key that orders embedded numbers numerically, so ``file_2``
+    comes before ``file_10``."""
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", text)
+    ]
+
+
+def natural_path_key(path: str) -> tuple:
+    """Sort key ordering paths by folder, then file name, with numbers
+    compared numerically (see :func:`natural_key`)."""
+    return (
+        natural_key(os.path.dirname(path)),
+        natural_key(os.path.basename(path)),
+    )
+
+
+# The continuation files of a multi-file OME set (``*_1.ome.tif``, ...).
+# They are not movies in their own right: ``TiffMultiMap`` re-attaches
+# them to their first file, so listing them as well repeats frames.
+_OME_CONTINUATION_RE = re.compile(r"_\d+\.ome\.tif$", re.IGNORECASE)
+
+
+def is_ome_continuation(path: str) -> bool:
+    """Whether ``path`` is a continuation file of a multi-file OME set
+    (``*_1.ome.tif``), i.e. part of another file's movie rather than a
+    movie of its own."""
+    return _OME_CONTINUATION_RE.search(os.path.basename(path)) is not None
+
+
+def find_tif_movies(
+    root: str,
+    recursive: bool = True,
+    key: Callable[[str], object] | None = None,
+) -> list[str]:
+    """Find the TIFF movies below ``root``, one path per movie.
+
+    Intended to collect the files of an acquisition that was spread over
+    several folders, so they can be concatenated (see
+    :func:`load_tif_concatenated`).
+
+    Files that are not movies in their own right are collapsed away, so
+    each returned path opens exactly one whole movie:
+
+    * The continuation files of a multi-file OME set (``*_1.ome.tif``,
+      ``*_2.ome.tif``, ...) are dropped - ``TiffMultiMap`` re-attaches
+      them to their first file, and keeping them would repeat frames.
+    * A folder holding a MicroManager "separate image files" acquisition
+      (thousands of one-frame ``img_*.tif``) contributes only the first
+      frame's path, which opens the whole folder as one movie.
+
+    Parameters
+    ----------
+    root : str
+        Directory to search.
+    recursive : bool, optional
+        Search sub-folders as well. Default is True.
+    key : Callable, optional
+        Sort key applied to each path. Default is None, which sorts by
+        folder and then file name with numbers compared numerically
+        (``run_2`` before ``run_10``). Pass a custom key when the file
+        names do not reflect acquisition order.
+
+    Returns
+    -------
+    paths : list of str
+        Absolute, sorted movie paths. Empty if nothing was found.
+    """
+    paths = []
+    walker = os.walk(root) if recursive else [next(os.walk(root))]
+    for directory, _, names in walker:
+        separate_first = find_mm_separate_first(directory)
+        if separate_first is not None:
+            # The whole folder is one movie; its individual frame files
+            # must not also be listed.
+            paths.append(os.path.abspath(separate_first))
+            continue
+        for name in names:
+            if not name.lower().endswith(TIFF_EXTENSIONS):
+                continue
+            if is_ome_continuation(name):
+                continue
+            paths.append(os.path.abspath(os.path.join(directory, name)))
+    return sorted(paths, key=natural_path_key if key is None else key)
+
+
+def load_tif_concatenated(
+    paths: list[str],
+    prompt_info: Callable[[dict], tuple[dict, bool]] | None = None,
+    progress=None,
+) -> tuple[ConcatenatedTiffMovie, list[dict]] | None:
+    """Load several TIFF files as one movie, concatenated along frames.
+
+    Mirrors :func:`load_tif`, but takes an ordered list of files (e.g.
+    from :func:`find_tif_movies`) instead of a single path. The files are
+    concatenated in the order given.
+
+    Parameters
+    ----------
+    paths : list of str
+        The TIFF movies to concatenate, in the order their frames should
+        appear.
+    prompt_info : Callable, optional
+        Called with the readable movie dimensions if the first file's
+        metadata cannot be parsed, so the user can enter it manually.
+        Must return ``(info, save)`` or None if cancelled.
+    progress : callable, optional
+        ``callable(done, total)`` invoked as the files are scanned, so a
+        determinate progress bar can be shown. Default is None.
+
+    Returns
+    -------
+    movie : ConcatenatedTiffMovie
+        A movie object providing array-like access to all frames.
+    info : list[dict]
+        A list containing a dictionary with metadata about the movie.
+
+    Returns None if the metadata could not be read and the user
+    cancelled the manual-metadata fallback dialog.
+    """
+    movie = ConcatenatedTiffMovie(paths, progress=progress)
+    info = _movie_info_or_prompt(movie, movie.path, prompt_info)
+    if info is None:
+        return None
+    return movie, [info]
 
 
 def save_datasets(path: str, info: dict, **kwargs) -> None:

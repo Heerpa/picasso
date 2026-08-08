@@ -994,6 +994,34 @@ def _localize_collect_paths(files: str) -> list[str]:
     return paths
 
 
+def _localize_collect_concat_paths(files: str) -> list[str]:
+    """Resolve ``files`` to the TIFF movies to concatenate into one
+    movie, in the order their frames will run (``--concat``).
+
+    A folder is searched recursively (see ``io.find_tif_movies``); a glob
+    pattern is taken as given, minus the continuation files of split OME
+    sets, which belong to their first file. Both are sorted by folder and
+    file name with numbers compared numerically, so ``run_2`` comes
+    before ``run_10``.
+    """
+    from glob import glob
+    from os.path import abspath, isdir
+    from .io import find_tif_movies, is_ome_continuation, natural_path_key
+
+    if isdir(files):
+        return find_tif_movies(files)
+    paths = [abspath(_) for _ in glob(files)]
+    skipped = [_ for _ in paths if is_ome_continuation(_)]
+    if skipped:
+        print(
+            f"Skipping {len(skipped)} continuation file(s) of split "
+            "OME-TIFF stacks; they are read together with their first "
+            "file."
+        )
+    paths = [_ for _ in paths if not is_ome_continuation(_)]
+    return sorted(paths, key=natural_path_key)
+
+
 def _prompt_info() -> tuple[dict, bool]:
     """Interactively prompt the user for raw file metadata."""
     info = {}
@@ -1090,7 +1118,7 @@ _FIT_METHOD_MAP = {
 
 
 def _localize_process_file(
-    path: str,
+    paths: str | list[str],
     i: int,
     n_total: int,
     args: argparse.Namespace,
@@ -1106,10 +1134,14 @@ def _localize_process_file(
     camera_calibration: dict | None = None,
     affine_transforms: list | None = None,
 ) -> None:
-    """Identify, fit, save and optionally undrift one movie file.
+    """Identify, fit, save and optionally undrift one movie.
 
     Parameters
     ----------
+    paths : str or list of str
+        The movie to process. Several paths (``--concat``) are read as
+        one movie whose frames run through the files in that order; the
+        results are saved next to the first file.
     z_params : tuple or None
         If 3D astigmatism fitting is active, a tuple
         ``(zpath, magnification_factor, z_calibration)``; else ``None``.
@@ -1122,14 +1154,29 @@ def _localize_process_file(
         applied the ones stored in the 3D calibration.
     """
     from os.path import splitext
-    from .io import load_movie, save_locs
+    from .io import load_movie, load_tif_concatenated, save_locs
     from .localize import localize, add_file_to_db
+
+    if isinstance(paths, str):
+        paths = [paths]
+    path = paths[0]
 
     print("------------------------------------------")
     print("------------------------------------------")
-    print(f"Processing {path}, File {i + 1} of {n_total}")
+    if len(paths) > 1:
+        print(
+            f"Processing {len(paths)} files concatenated into one movie, "
+            f"starting with {path}"
+        )
+        for j, each in enumerate(paths):
+            print(f"  {j + 1}. {each}")
+    else:
+        print(f"Processing {path}, File {i + 1} of {n_total}")
     print("------------------------------------------")
-    movie, info = load_movie(path)
+    if len(paths) > 1:
+        movie, info = load_tif_concatenated(paths)
+    else:
+        movie, info = load_movie(path)
 
     fitting_method = _FIT_METHOD_MAP[args.fit_method]
     cam_info = dict(camera_info)
@@ -1284,12 +1331,25 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             print("{:<8} {:<15} {}".format(index + 1, element, "None"))
     print("------------------------------------------")
 
-    paths = _localize_collect_paths(args.files)
-    _localize_ensure_raw_yaml(paths, save_info)
+    concat = getattr(args, "concat", False)
+    if concat:
+        paths = _localize_collect_concat_paths(args.files)
+    else:
+        paths = _localize_collect_paths(args.files)
+        _localize_ensure_raw_yaml(paths, save_info)
 
     if not paths:
         print("Error. No files found.")
         raise FileNotFoundError
+
+    if concat:
+        print(
+            f"Concatenating {len(paths)} file(s) into a single movie, in "
+            "this order:"
+        )
+        for i, path in enumerate(paths):
+            print(f"  {i + 1}. {path}")
+        print("------------------------------------------")
 
     print(args)
     box = args.box_side_length
@@ -1389,11 +1449,14 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             f"{args.camera_calibration}"
         )
 
-    for i, path in enumerate(paths):
+    # Normally one movie per file; with --concat all files together are
+    # one movie, so there is a single job.
+    jobs = [paths] if concat else [[_] for _ in paths]
+    for i, job in enumerate(jobs):
         _localize_process_file(
-            path,
+            job,
             i,
-            len(paths),
+            len(jobs),
             args,
             box,
             min_net_gradient,
@@ -2836,6 +2899,17 @@ def main():  # noqa: C901
         help=(
             "one movie file or a folder containing movie files"
             " specified by a unix style path pattern"
+        ),
+    )
+    localize_parser.add_argument(
+        "--concat",
+        action="store_true",
+        help=(
+            "treat all the TIFF movies found as a single movie, with"
+            " their frames concatenated in order (folder: searched"
+            " recursively; pattern: as matched), instead of localizing"
+            " each file separately. Results are saved next to the first"
+            " file"
         ),
     )
     localize_parser.add_argument(

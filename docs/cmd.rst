@@ -41,6 +41,7 @@ The reconstruction parameters can be specified by adding respective arguments. I
    '-zc', '--zc', type=str, default='', help='path to 3D calibration file (3D only)'
    '-sf', '--suffix', type=str, default='', help='suffix to add to output files'
    '-db', '--database', action='store_true', help='add the run to the local database'
+   '--concat', action='store_true', help='treat all TIFF movies found as one movie, with their frames concatenated in order'
 
 Localize will automatically try to perform an RCC drift correction on the dataset. As this will not always work with the default settings after an unsuccessful attempt, the program will continue with the next file. If the drift correction succeeds, another hdf5 file with the drift corrected locs will be created.
 
@@ -49,6 +50,8 @@ Make sure to set the camera settings correctly; otherwise photon counts are wron
 ``--temporal-median`` subtracts a rolling per-pixel median background before spots are identified, which suppresses uneven background and static structures. It affects identification only. See Martens KJA, Turkowyd B, Endesfelder U, `Raw data to results: a hands-on introduction and overview of computational analysis for single-molecule localization microscopy <https://doi.org/10.3389/fbinf.2021.817254>`_, *Frontiers in Bioinformatics* 1, 817254 (2022).
 
 ``--gaussian-filter`` smooths each frame with a Gaussian of the given standard deviation before spots are identified. Spot identification looks for a single local maximum per spot, so a PSF that is not Gaussian-shaped may break into several maxima and is detected several times; smoothing merges them into one. It affects identification only — fitting always uses the raw movie — and since smoothing lowers gradient magnitudes, ``-g`` needs re-tuning when it is changed. It can be combined with ``--temporal-median``, which is applied first.
+
+``--concat`` accumulates movies found in the folder specified as on concatenated movie. Given a folder, Picasso searches it and all of its sub-folders; given a pattern (e.g. ``"experiment_folder/*/*.tif"``), it uses the matching files. In both cases the files are ordered by folder and file name with numbers compared numerically, so ``run_2`` comes before ``run_10``, and the full order is printed before the analysis starts — check it, since a wrong order is only noticeable afterwards. Each entry is one whole movie: the continuation files of a split OME-TIFF stack (``*_1.ome.tif``, ...) and the individual frames of a MicroManager "separate image files" folder are read together with the movie they belong to, so no frames are repeated.
 
 If you select one of the 3D algorithms (``lq-3d``, ``lq-gpu-3d`` or ``mle-3d``) you must supply both the magnification factor (``-mf``) and the path to the 3D calibration file (``-zc``). If either is omitted, the program will prompt you for it interactively.
 

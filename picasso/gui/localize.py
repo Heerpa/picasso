@@ -368,7 +368,11 @@ class MovieLoadWorker(QtCore.QObject):
     failed = QtCore.pyqtSignal(str)
 
     def __init__(
-        self, paths: list[str], prompt_for_path, load_all: bool = False
+        self,
+        paths: list[str],
+        prompt_for_path,
+        load_all: bool = False,
+        concat: bool = False,
     ) -> None:
         super().__init__()
         self.paths = paths
@@ -377,6 +381,9 @@ class MovieLoadWorker(QtCore.QObject):
         # channel of one multichannel file); otherwise ``io.load_movie``
         # loads one channel per file.
         self.load_all = load_all
+        # When True, all paths are read as *one* movie, concatenated
+        # along the frame axis (``io.load_tif_concatenated``).
+        self.concat = concat
         self._prompt_event = threading.Event()
         self._cancelled = False
 
@@ -402,10 +409,20 @@ class MovieLoadWorker(QtCore.QObject):
     def run(self) -> None:
         movies, infos, paths = [], [], []
         try:
-            for i, path in enumerate(self.paths):
+            # Normally one job per file (one channel each); when
+            # concatenating, all files together form a single job that
+            # yields one movie.
+            jobs = [self.paths] if self.concat else [[_] for _ in self.paths]
+            for i, job in enumerate(jobs):
                 if self._cancelled:
                     break
-                self.progress.emit(i, os.path.basename(path))
+                path = job[0]
+                label = (
+                    f"{len(job)} files"
+                    if self.concat
+                    else os.path.basename(path)
+                )
+                self.progress.emit(i, label)
                 prompt = self._proxy_prompt(self._prompt_for_path(path))
 
                 # Called (queued to the GUI thread) as io scans the
@@ -418,7 +435,17 @@ class MovieLoadWorker(QtCore.QObject):
                         raise _LoadCancelledError
                     self.subprogress.emit(done, total)
 
-                if self.load_all:
+                if self.concat:
+                    result = io.load_tif_concatenated(
+                        job, prompt_info=prompt, progress=report
+                    )
+                    if result is None:
+                        continue
+                    movie, info = result
+                    movies.append(movie)
+                    infos.append(info)
+                    paths.append(path)
+                elif self.load_all:
                     result = io.load_movie_all(
                         path, prompt_info=prompt, progress=report
                     )
@@ -1295,6 +1322,162 @@ class PromptChannelDialog(lib.Dialog):
         result = dialog.exec()
         channel = dialog.byte_order.currentText()
         return channel, result == QtWidgets.QDialog.DialogCode.Accepted
+
+
+class ConcatenateMoviesDialog(lib.Dialog):
+    """Dialog for reviewing and ordering the TIFF files that are opened
+    as one concatenated movie.
+
+    The files are found automatically (see ``io.find_tif_movies``) and
+    listed in the order their frames will run. That order is sorted by
+    folder and file name, which is usually - but not always - the
+    acquisition order, and getting it wrong is only noticed after the
+    movie has been localized. So the list is shown for confirmation and
+    can be reordered by dragging or with the buttons, and files can be
+    removed or added from elsewhere.
+    """
+
+    def __init__(
+        self, window: QtWidgets.QWidget, paths: list[str], root: str = ""
+    ) -> None:
+        super().__init__(window)
+        self.window = window
+        self.root = root
+        self.setWindowTitle("Concatenate movies")
+        self.resize(700, 400)
+        vbox = QtWidgets.QVBoxLayout(self)
+        vbox.addWidget(
+            QtWidgets.QLabel(
+                "The files below are opened as one movie, with their "
+                "frames in this order.\nDrag to reorder."
+            )
+        )
+
+        hbox = QtWidgets.QHBoxLayout()
+        vbox.addLayout(hbox)
+        self.file_list = QtWidgets.QListWidget()
+        self.file_list.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.file_list.setDragDropMode(
+            QtWidgets.QAbstractItemView.DragDropMode.InternalMove
+        )
+        for path in paths:
+            self._add_path(path)
+        hbox.addWidget(self.file_list)
+
+        buttons_vbox = QtWidgets.QVBoxLayout()
+        hbox.addLayout(buttons_vbox)
+        for label, slot in (
+            ("Move up", self.move_up),
+            ("Move down", self.move_down),
+            ("Remove", self.remove_selected),
+            ("Add files...", self.add_files),
+        ):
+            button = QtWidgets.QPushButton(label)
+            button.setAutoDefault(False)
+            button.clicked.connect(slot)
+            buttons_vbox.addWidget(button)
+        buttons_vbox.addStretch(1)
+
+        self.count_label = QtWidgets.QLabel()
+        vbox.addWidget(self.count_label)
+
+        self.buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            QtCore.Qt.Orientation.Horizontal,
+            self,
+        )
+        vbox.addWidget(self.buttons)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.file_list.model().rowsInserted.connect(self._update_count)
+        self.file_list.model().rowsRemoved.connect(self._update_count)
+        self._update_count()
+
+    def _add_path(self, path: str) -> None:
+        """Append ``path``, shown relative to the searched folder (full
+        paths are too long to compare at a glance) with the absolute path
+        as the tooltip."""
+        display = path
+        if self.root:
+            try:
+                display = os.path.relpath(path, self.root)
+            except ValueError:  # different drive on Windows
+                pass
+        item = QtWidgets.QListWidgetItem(display)
+        item.setData(QtCore.Qt.ItemDataRole.UserRole, path)
+        item.setToolTip(path)
+        self.file_list.addItem(item)
+
+    def _update_count(self) -> None:
+        n = self.file_list.count()
+        self.count_label.setText(f"{n} file(s)")
+        self.buttons.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+        ).setEnabled(n > 0)
+
+    def _move(self, offset: int) -> None:
+        """Move the selected rows by ``offset``, keeping them selected."""
+        rows = sorted(
+            self.file_list.row(item) for item in self.file_list.selectedItems()
+        )
+        if not rows:
+            return
+        if offset < 0 and rows[0] == 0:
+            return
+        if offset > 0 and rows[-1] == self.file_list.count() - 1:
+            return
+        for row in rows if offset < 0 else reversed(rows):
+            item = self.file_list.takeItem(row)
+            self.file_list.insertItem(row + offset, item)
+            item.setSelected(True)
+
+    def move_up(self) -> None:
+        self._move(-1)
+
+    def move_down(self) -> None:
+        self._move(1)
+
+    def remove_selected(self) -> None:
+        for item in self.file_list.selectedItems():
+            self.file_list.takeItem(self.file_list.row(item))
+
+    def add_files(self) -> None:
+        """Append files from elsewhere, e.g. a folder that the automatic
+        search did not cover."""
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Add movies to concatenate",
+            directory=self.root or None,
+            filter="TIFF (%s)" % " ".join("*" + e for e in io.TIFF_EXTENSIONS),
+        )
+        existing = self.paths()
+        for path in paths:
+            path = os.path.abspath(path)
+            if path not in existing:
+                self._add_path(path)
+
+    def paths(self) -> list[str]:
+        """The absolute file paths in their current order."""
+        return [
+            self.file_list.item(row).data(QtCore.Qt.ItemDataRole.UserRole)
+            for row in range(self.file_list.count())
+        ]
+
+    @staticmethod
+    def getPaths(
+        parent: QtWidgets.QWidget,
+        paths: list[str],
+        root: str = "",
+    ) -> tuple[list[str], bool]:
+        dialog = ConcatenateMoviesDialog(parent, paths, root=root)
+        result = dialog.exec()
+        return (
+            dialog.paths(),
+            result == QtWidgets.QDialog.DialogCode.Accepted,
+        )
 
 
 class Calibrate3DDialog(lib.Dialog):
@@ -4801,6 +4984,9 @@ class Window(QtWidgets.QMainWindow):
         )
         open_mm_folder_action.triggered.connect(self.open_mm_folder_dialog)
         file_menu.addAction(open_mm_folder_action)
+        open_concat_action = file_menu.addAction("Open several movies as one")
+        open_concat_action.triggered.connect(self.open_concatenated_dialog)
+        file_menu.addAction(open_concat_action)
         save_identifications_action = file_menu.addAction(
             "Save identifications"
         )
@@ -5691,6 +5877,36 @@ class Window(QtWidgets.QMainWindow):
         self.pwd = path
         self.open(path)
 
+    def open_concatenated_dialog(self) -> None:
+        """Open the TIFF movies found below one folder as a single movie.
+
+        An acquisition split over several files and folders is loaded as
+        one movie, with the frames running through the files in the order
+        confirmed in ``ConcatenateMoviesDialog``.
+        """
+        dir = None if self.pwd == [] else self.pwd
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select the folder containing the movies", directory=dir
+        )
+        if not directory:
+            return
+        paths = io.find_tif_movies(directory)
+        if not paths:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No movies found",
+                f"No TIFF movies were found in {directory} or its "
+                "sub-folders.",
+            )
+            return
+        paths, ok = ConcatenateMoviesDialog.getPaths(
+            self, paths, root=directory
+        )
+        if not ok or not paths:
+            return
+        self.pwd = paths[0]
+        self._start_movie_load(paths, self._prompt_for_path, concat=True)
+
     def _prompt_for_path(self, path: str):
         """Return the metadata prompt callback appropriate for ``path``."""
         if path.lower().endswith((".ims", ".czi", ".lif")):
@@ -5752,6 +5968,7 @@ class Window(QtWidgets.QMainWindow):
         prompt_for_path,
         load_all: bool = False,
         multi_file: bool = False,
+        concat: bool = False,
     ) -> None:
         """Load movies on a background thread (see ``MovieLoadWorker``) so
         the GUI keeps repainting and responding while files are read.
@@ -5759,6 +5976,8 @@ class Window(QtWidgets.QMainWindow):
         ``load_all`` reads every channel of each file (single multichannel
         file); otherwise one channel is loaded per file. ``multi_file``
         controls channel naming when several separate files are loaded.
+        ``concat`` reads all ``paths`` as a single movie whose frames run
+        through the files in the given order.
         """
         if self._load_thread is not None:
             if self._load_worker is not None and self._load_worker._cancelled:
@@ -5770,6 +5989,7 @@ class Window(QtWidgets.QMainWindow):
                     prompt_for_path,
                     load_all,
                     multi_file,
+                    concat,
                 )
                 self.status_bar.showMessage(
                     "Finishing cancelled load, the new file will open "
@@ -5785,11 +6005,15 @@ class Window(QtWidgets.QMainWindow):
         # smoothly *within* a file from the worker's per-page reports,
         # instead of only ticking once per file.
         self._load_index = 0
+        # Concatenation reads every file into one movie, so the whole
+        # load is a single step whose sub-progress already spans all
+        # files (see ``io._scaled_progress``).
+        n_steps = 1 if concat else len(paths)
         progress = QtWidgets.QProgressDialog(
             "Loading movie...",
             "Cancel",
             0,
-            len(paths) * PROGRESS_RESOLUTION,
+            n_steps * PROGRESS_RESOLUTION,
             self,
         )
         progress.setWindowTitle("Opening movie")
@@ -5799,7 +6023,9 @@ class Window(QtWidgets.QMainWindow):
         self._load_progress = progress
 
         thread = QtCore.QThread(self)
-        worker = MovieLoadWorker(paths, prompt_for_path, load_all=load_all)
+        worker = MovieLoadWorker(
+            paths, prompt_for_path, load_all=load_all, concat=concat
+        )
         worker.moveToThread(thread)
         self._load_thread = thread
         self._load_worker = worker

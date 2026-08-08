@@ -1240,6 +1240,190 @@ class TestMMSeparateFiles:
 
 
 # ---------------------------------------------------------------------------
+# Concatenating TIFF movies found across folders
+# (find_tif_movies / ConcatenatedTiffMovie / load_tif_concatenated)
+# ---------------------------------------------------------------------------
+
+
+class TestConcatenatedTiffMovies:
+    def _write_movie(self, directory, name, data):
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        _write_tif_stack(path, data)
+        return str(path)
+
+    def test_concatenates_in_given_order(self, tmp_path):
+        rng = np.random.default_rng(30)
+        parts = [
+            rng.integers(0, 60000, size=(n, 12, 16), dtype="<u2")
+            for n in (3, 5, 2)
+        ]
+        paths = [
+            self._write_movie(tmp_path / f"run_{i}", "movie.tif", part)
+            for i, part in enumerate(parts)
+        ]
+        expected = np.concatenate(parts)
+
+        movie, info = io.load_tif_concatenated(paths)
+        try:
+            assert movie.n_frames == 10
+            assert movie.shape == (10, 12, 16)
+            assert len(movie) == 10
+            np.testing.assert_array_equal(np.array(list(movie)), expected)
+            np.testing.assert_array_equal(movie[...], expected)
+            # A frame from each component, including across a boundary.
+            np.testing.assert_array_equal(movie[0], expected[0])
+            np.testing.assert_array_equal(movie[3], expected[3])
+            np.testing.assert_array_equal(movie[9], expected[9])
+            np.testing.assert_array_equal(movie[2:6], expected[2:6])
+            # Metadata records the total and the provenance.
+            assert info[0]["Frames"] == 10
+            assert info[0]["Concatenated Files"] == paths
+            assert info[0]["Frames per File"] == [3, 5, 2]
+        finally:
+            movie.close()
+
+    def test_order_follows_the_given_list(self, tmp_path):
+        rng = np.random.default_rng(31)
+        parts = [
+            rng.integers(0, 60000, size=(2, 8, 8), dtype="<u2")
+            for _ in range(2)
+        ]
+        paths = [
+            self._write_movie(tmp_path / f"run_{i}", "movie.tif", part)
+            for i, part in enumerate(parts)
+        ]
+
+        movie, _ = io.load_tif_concatenated(paths[::-1])
+        try:
+            np.testing.assert_array_equal(
+                np.array(list(movie)), np.concatenate(parts[::-1])
+            )
+        finally:
+            movie.close()
+
+    def test_mismatched_geometry_raises(self, tmp_path):
+        rng = np.random.default_rng(32)
+        good = self._write_movie(
+            tmp_path / "a",
+            "movie.tif",
+            rng.integers(0, 60000, size=(2, 8, 8), dtype="<u2"),
+        )
+        wide = self._write_movie(
+            tmp_path / "b",
+            "movie.tif",
+            rng.integers(0, 60000, size=(2, 8, 12), dtype="<u2"),
+        )
+        with pytest.raises(ValueError, match="Cannot concatenate"):
+            io.load_tif_concatenated([good, wide])
+
+    def test_no_paths_raises(self):
+        with pytest.raises(ValueError, match="No TIFF files"):
+            io.ConcatenatedTiffMovie([])
+
+    def test_find_tif_movies_sorts_numerically(self, tmp_path):
+        rng = np.random.default_rng(33)
+        for name in ("run_10", "run_2", "run_1"):
+            self._write_movie(
+                tmp_path / name,
+                "movie.tif",
+                rng.integers(0, 60000, size=(1, 8, 8), dtype="<u2"),
+            )
+        found = io.find_tif_movies(str(tmp_path))
+        assert [os.path.basename(os.path.dirname(_)) for _ in found] == [
+            "run_1",
+            "run_2",
+            "run_10",
+        ]
+
+    def test_find_tif_movies_skips_ome_continuations(self, tmp_path):
+        rng = np.random.default_rng(34)
+        data = rng.integers(0, 60000, size=(2, 8, 8), dtype="<u2")
+        _write_tif_stack(tmp_path / "acq.ome.tif", data)
+        _write_tif_stack(tmp_path / "acq_1.ome.tif", data)
+        # The continuation file belongs to acq.ome.tif and is re-attached
+        # by TiffMultiMap; listing it as well would repeat its frames.
+        found = io.find_tif_movies(str(tmp_path))
+        assert [os.path.basename(_) for _ in found] == ["acq.ome.tif"]
+
+    def test_find_tif_movies_collapses_mm_separate_folder(self, tmp_path):
+        rng = np.random.default_rng(35)
+        separate = tmp_path / "separate"
+        separate.mkdir()
+        frames = rng.integers(0, 60000, size=(4, 8, 8), dtype="<u2")
+        for t, frame in enumerate(frames):
+            _write_single_frame(
+                separate / f"img_channel000_position000_time{t:09d}_z000.tif",
+                frame,
+            )
+        stack = rng.integers(0, 60000, size=(3, 8, 8), dtype="<u2")
+        self._write_movie(tmp_path / "plain", "movie.tif", stack)
+
+        found = io.find_tif_movies(str(tmp_path))
+        # One entry for the whole separate-files folder, one for the
+        # ordinary stack.
+        assert len(found) == 2
+        movie, info = io.load_tif_concatenated(found)
+        try:
+            assert movie.n_frames == 7
+            assert info[0]["Frames per File"] == [3, 4]
+            np.testing.assert_array_equal(
+                np.array(list(movie)), np.concatenate([stack, frames])
+            )
+        finally:
+            movie.close()
+
+    def test_non_recursive_ignores_subfolders(self, tmp_path):
+        rng = np.random.default_rng(36)
+        self._write_movie(
+            tmp_path,
+            "top.tif",
+            rng.integers(0, 60000, size=(1, 8, 8), dtype="<u2"),
+        )
+        self._write_movie(
+            tmp_path / "sub",
+            "nested.tif",
+            rng.integers(0, 60000, size=(1, 8, 8), dtype="<u2"),
+        )
+        assert [
+            os.path.basename(_)
+            for _ in io.find_tif_movies(str(tmp_path), recursive=False)
+        ] == ["top.tif"]
+        assert len(io.find_tif_movies(str(tmp_path))) == 2
+
+    def test_cli_collects_folder_recursively(self, tmp_path):
+        from picasso.__main__ import _localize_collect_concat_paths
+
+        rng = np.random.default_rng(37)
+        for name in ("run_10", "run_2"):
+            self._write_movie(
+                tmp_path / name,
+                "movie.tif",
+                rng.integers(0, 60000, size=(1, 8, 8), dtype="<u2"),
+            )
+        found = _localize_collect_concat_paths(str(tmp_path))
+        assert [os.path.basename(os.path.dirname(_)) for _ in found] == [
+            "run_2",
+            "run_10",
+        ]
+
+    def test_cli_collects_pattern_and_skips_continuations(self, tmp_path):
+        from picasso.__main__ import _localize_collect_concat_paths
+
+        rng = np.random.default_rng(38)
+        data = rng.integers(0, 60000, size=(1, 8, 8), dtype="<u2")
+        _write_tif_stack(tmp_path / "acq.ome.tif", data)
+        _write_tif_stack(tmp_path / "acq_1.ome.tif", data)
+        _write_tif_stack(tmp_path / "other.tif", data)
+
+        found = _localize_collect_concat_paths(str(tmp_path / "*.tif"))
+        assert [os.path.basename(_) for _ in found] == [
+            "acq.ome.tif",
+            "other.tif",
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Manual-metadata fallback for movie files whose metadata cannot be read
 # (load_tif / load_nd2 / load_stk via _movie_info_or_prompt).
 # ---------------------------------------------------------------------------
