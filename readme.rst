@@ -48,7 +48,7 @@ Installation
 
 Check out the `Picasso release page <https://github.com/jungmannlab/picasso/releases/>`__ to download and run the latest compiled one-click installer for Windows or MacOS (the latter is experimental and feedback is welcome). Here you will also find the Nature Protocols legacy version (v0.1.0).
 
-For Windows, two one-click installers are provided: a default (CPU) build and a **GPU** build. The GPU build additionally bundles the CUDA runtime so that GPU-accelerated (numba.cuda) code can run. It is larger and requires an NVIDIA (CUDA-capable) GPU; on machines without one, GPU-only options are simply hidden, so most users can stay with the default build. Choose the GPU installer only if you have a compatible NVIDIA GPU and want to use the accelerated tools. Picasso uses Cuda12 in the one-click-installer.
+For Windows, two one-click installers are provided: a default (CPU) build and a **GPU** build. The GPU build additionally bundles the CUDA runtime so that GPU-accelerated (numba.cuda) code can run. It is larger and requires an NVIDIA (CUDA-capable) GPU; on machines without one, GPU-only options are simply hidden. Choose the GPU installer only if you have a compatible NVIDIA GPU and want to use the accelerated tools, for example localization fitting. Picasso uses Cuda12 in the one-click-installer.
 
 Python is also distributed as a PyPI package that is platform-independent (``pip install picassosr``) which grants not only GUI but also access to Picasso’s internal routines in custom Python programs. For more details, see the `Via PyPI <https://github.com/jungmannlab/picasso#via-pypi>`__ section below. For examples of how to use Picasso in Python scripts, see the section `Example Usage <https://github.com/jungmannlab/picasso#example-usage>`__ below.
 
@@ -77,12 +77,13 @@ If you wish to use your local version of Picasso with your own modifications:
 5. Open the Picasso directory: ``cd picasso``.
 6. You can modify Picasso code in this directory.
 7. To create a *local* Picasso package to use it in other Python scripts, run ``pip install -e ".[dev]"``. When you change the code in the ``picasso`` directory, the changes will be reflected in the package.
-8. You can now run any Picasso module directly from the console/terminal by running: ``picasso render``, ``picasso localize``, etc, or import Picasso functions in your own Python scripts.
+8. You can install other extensions, such as ``".[gpu]"``, etc. The whole list of optional dependencies can be found in ``pyproject.toml``.
+9. You can now run any Picasso module directly from the console/terminal by running: ``picasso render``, ``picasso localize``, etc, or import Picasso functions in your own Python scripts.
 
 Creating shortcuts on Windows (*optional*)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Run the PowerShell script “createShortcuts.ps1” in the gui directory. This should be doable by right-clicking on the script and choosing “Run with PowerShell”. Alternatively, run the command
+This applies only to the users who installed Picasso via PyPI or through the editable, developer version and want to use desktop shortcuts. If you installed Picasso from the one-click installer on the `Release page <https://github.com/jungmannlab/picasso/releases/>`__, you can ignore this section. Run the PowerShell script “createShortcuts.ps1” in the ``gui`` directory. This should be doable by right-clicking on the script and choosing “Run with PowerShell”. Alternatively, run the command
 ``powershell ./createShortcuts.ps1`` in the command line. Use the generated shortcuts in the top level directory to start GUI components. Users can drag these shortcuts to their Desktop, Start Menu or Task Bar.
 
 Example Usage
@@ -107,7 +108,7 @@ For more examples, visit the `sample notebooks <https://github.com/jungmannlab/p
 Contributing
 ------------
 
-If you have a feature request or a bug report, please post it as an issue on the GitHub issue tracker. If you want to contribute, put a PR for it. You can find more guidelines for contributing `here <https://github.com/jungmannlab/picasso/blob/master/CONTRIBUTING.rst>`__. We will gladly guide you through the codebase and credit you accordingly. Additionally, you can check out the ``Projects``-page on GitHub.  You can also contact us via picasso@jungmannlab.org.
+If you have a feature request or a bug report, please post it as an issue on the GitHub issue tracker. If you want to contribute, put a pull request (PR) for it. You can find more guidelines for contributing `here <https://github.com/jungmannlab/picasso/blob/master/CONTRIBUTING.rst>`__. We will gladly guide you through the codebase and credit you accordingly.  You can also contact us via picasso@jungmannlab.org.
 
 .. SYNC-START: contributions
 
