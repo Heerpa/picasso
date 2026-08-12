@@ -44,6 +44,12 @@ from playsound3 import playsound
 
 CUDA_AVAILABLE = localize.CUDA_AVAILABLE
 CMAP_GRAYSCALE = [QtGui.qRgb(_, _, _) for _ in range(256)]
+# Frames sampled to size the contrast slider's track. Kept small: with
+# the temporal median on, reading one frame reads a whole window.
+CONTRAST_SLIDER_SAMPLES = 10
+# Extra headroom on the sampled range, so that the white point can be
+# pushed past the brightest sampled pixel (and black below the dimmest).
+CONTRAST_SLIDER_PADDING = 0.05
 DEFAULT_PARAMETERS = {
     "Box Size": 7,
     "Min. Net Gradient": 5000,
@@ -4412,6 +4418,13 @@ class ParametersDialog(lib.Dialog):
         contrast_dialog = getattr(self.window, "contrast_dialog", None)
         if contrast_dialog is not None:
             contrast_dialog.reset_to_frame()
+        # the filtered frames live on a different scale, so the slider's
+        # track has to be re-derived, not just widened
+        update_range = getattr(
+            self.window, "update_contrast_slider_range", None
+        )
+        if update_range is not None:
+            update_range()
         self.window.on_parameters_changed()
 
     def on_link_params_changed(self, _state: int = 0) -> None:
@@ -4703,6 +4716,37 @@ class ContrastDialog(lib.Dialog):
         self.black_spinbox.setValue(black)
         self.white_spinbox.setValue(white)
         self.silent_contrast_change = False
+        self.sync_slider()
+
+    def sync_slider(self) -> None:
+        """Mirror the spinboxes onto the window's contrast slider.
+
+        The spinboxes stay the single source of truth; the slider is a
+        second view onto them.
+        """
+        sync = getattr(self.window, "sync_contrast_slider", None)
+        if sync is not None:
+            sync()
+
+    def set_contrast_from_slider(self, black: float, white: float) -> None:
+        """Apply a contrast dragged on the window's slider.
+
+        Same outcome as typing into the spinboxes (manual contrast, Auto
+        off), but both values are set at once so that a drag redraws the
+        frame once per step instead of twice.
+        """
+        self.silent_contrast_change = True
+        try:
+            self.black_spinbox.setValue(black)
+            self.white_spinbox.setValue(white)
+        finally:
+            self.silent_contrast_change = False
+        self.manual_contrast_change = True
+        try:
+            self.auto_checkbox.setChecked(False)
+        finally:
+            self.manual_contrast_change = False
+        self.window.draw_frame()
 
     def reset_to_frame(self) -> None:
         """Re-derive the range from the frame currently on screen.
@@ -4750,6 +4794,7 @@ class ContrastDialog(lib.Dialog):
                 self.auto_checkbox.setChecked(False)
             finally:
                 self.manual_contrast_change = False
+            self.sync_slider()
             self.window.draw_frame()
 
     def on_auto_changed(self, _state: int) -> None:
@@ -4910,6 +4955,19 @@ class Window(QtWidgets.QMainWindow):
             """
         )
         self.frame_slider.valueChanged.connect(self.on_frame_slider_changed)
+        # Two-handle slider below it for the display contrast, mirroring
+        # the black and white points of the contrast dialog.
+        self.contrast_slider = lib.RangeSlider()
+        self.contrast_slider.setEnabled(False)
+        self.contrast_slider.setMaximumHeight(15)
+        self.contrast_slider.setValueLabels("Black", "White")
+        # the spinboxes the slider writes into round to integers, so the
+        # handles must not be able to land on the same value (white is a
+        # divisor in ``ContrastDialog.to_uint8``)
+        self.contrast_slider.setMinimumGap(1)
+        self.contrast_slider.valuesChanged.connect(
+            self.on_contrast_slider_changed
+        )
         # Channel selector (hidden unless several channels are loaded).
         self.channel_combo = QtWidgets.QComboBox()
         self.channel_combo.setVisible(False)
@@ -4923,6 +4981,7 @@ class Window(QtWidgets.QMainWindow):
         central_layout.addWidget(self.channel_combo)
         central_layout.addWidget(self.view)
         central_layout.addWidget(self.frame_slider)
+        central_layout.addWidget(self.contrast_slider)
         self.setCentralWidget(central_widget)
         self.status_bar = self.statusBar()
         self.status_bar_frame_indicator = QtWidgets.QLabel()
@@ -6362,6 +6421,7 @@ class Window(QtWidgets.QMainWindow):
             self._switching_channel = False
         self._populate_channel_combo()
         self.frame_slider.setEnabled(True)
+        self.contrast_slider.setEnabled(True)
         # A fresh load starts at frame 0; contrast is shared and keeps its
         # current dialog state.
         self.curr_frame_number = 0
@@ -6476,6 +6536,11 @@ class Window(QtWidgets.QMainWindow):
         self.frame_slider.setMaximum(max(0, last_frame))
         self.frame_slider.blockSignals(False)
         frame_number = min(max(0, frame_number), max(0, last_frame))
+        self.curr_frame_number = frame_number
+        # before set_frame: this channel's intensities can differ from the
+        # previous one's, and set_frame's auto contrast then lands on a
+        # track that already fits
+        self.update_contrast_slider_range()
         self.set_frame(frame_number)
         self.fit_in_view()
         self._update_temporal_median_availability()
@@ -6899,6 +6964,101 @@ class Window(QtWidgets.QMainWindow):
         """Navigate to the frame selected with the slider."""
         if self.movie is not None and value != self.curr_frame_number:
             self.set_frame(value)
+
+    def _contrast_slider_bounds(self) -> tuple[float, float] | None:
+        """The intensity range the contrast slider should span.
+
+        There is no cheap movie-wide range to read: the raw dtype range is
+        useless (camera counts fill a sliver of it, and the displayed
+        frames are float32 whenever an identification filter is on), and
+        the current frame's range would rescale the track on every frame
+        step. So a handful of evenly spaced frames of the *displayed*
+        movie are sampled and padded.
+        """
+        # the parameters dialog is built (and can fire) before the movie
+        # attribute and the slider exist
+        if getattr(self, "movie", None) is None:
+            return None
+        movie = self.identification_movie()
+        if movie is None:
+            return None
+        n_frames = len(movie)
+        if not n_frames:
+            return None
+        indices = np.unique(
+            np.linspace(
+                0, n_frames - 1, min(CONTRAST_SLIDER_SAMPLES, n_frames)
+            ).astype(int)
+        )
+        try:
+            lo = min(float(movie[int(i)].min()) for i in indices)
+            hi = max(float(movie[int(i)].max()) for i in indices)
+        except Exception:
+            # a sampled frame could not be read (e.g. a truncated file);
+            # fall back to the frame already on screen
+            try:
+                frame = movie[self.curr_frame_number]
+            except Exception:
+                return None
+            lo, hi = float(frame.min()), float(frame.max())
+        pad = CONTRAST_SLIDER_PADDING * max(hi - lo, 1.0)
+        return lo - pad, hi + pad
+
+    def _clamp_contrast_bounds(
+        self, lo: float, hi: float
+    ) -> tuple[float, float]:
+        """Fit a candidate track into what the contrast spinboxes accept."""
+        black_box = self.contrast_dialog.black_spinbox
+        white_box = self.contrast_dialog.white_spinbox
+        lo = max(lo, black_box.minimum())
+        hi = min(hi, white_box.maximum())
+        hi = max(hi, lo + 1.0, white_box.minimum())
+        return lo, hi
+
+    def update_contrast_slider_range(self) -> None:
+        """Re-derive the contrast slider's track from the movie.
+
+        Only called when the displayed intensities move onto a different
+        scale (a movie loaded, a channel switched, an identification
+        filter toggled). Browsing frames must not resize the track, or the
+        handles would jump around; it grows there instead, in
+        ``sync_contrast_slider``.
+        """
+        if getattr(self, "contrast_slider", None) is None:
+            return
+        bounds = self._contrast_slider_bounds()
+        if bounds is None:
+            return
+        lo, hi = self._clamp_contrast_bounds(*bounds)
+        self.contrast_slider.blockSignals(True)
+        self.contrast_slider.setRange(lo, hi)
+        self.contrast_slider.blockSignals(False)
+        self.sync_contrast_slider()
+
+    def sync_contrast_slider(self) -> None:
+        """Move the contrast slider's handles onto the spinbox values,
+        widening the track if a value falls outside it."""
+        if getattr(self, "contrast_slider", None) is None:
+            return
+        black = self.contrast_dialog.black_spinbox.value()
+        white = self.contrast_dialog.white_spinbox.value()
+        lo, hi = self.contrast_slider.range()
+        self.contrast_slider.blockSignals(True)
+        try:
+            if black < lo or white > hi:
+                self.contrast_slider.setRange(
+                    *self._clamp_contrast_bounds(
+                        min(lo, black), max(hi, white)
+                    )
+                )
+            self.contrast_slider.setValues(black, white)
+        finally:
+            self.contrast_slider.blockSignals(False)
+
+    def on_contrast_slider_changed(self, black: float, white: float) -> None:
+        """Apply a contrast dragged on the slider below the movie."""
+        if getattr(self, "movie", None) is not None:
+            self.contrast_dialog.set_contrast_from_slider(black, white)
 
     def draw_frame(self) -> None:
         """Draw the current frame - show the movie frame, apply

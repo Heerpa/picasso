@@ -99,6 +99,7 @@ _QT_NAMES = (
     "ProgressType",
     "ScrollableGroupBox",
     "LogDoubleSpinBox",
+    "RangeSlider",
     "GenericPlotWindow",
     "RemoveColumnsDialog",
     "HelpButton",

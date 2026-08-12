@@ -459,6 +459,261 @@ class LogDoubleSpinBox(QtWidgets.QDoubleSpinBox):
             self.setValue(self.value() / (self._factor ** abs(steps)))
 
 
+class RangeSlider(QtWidgets.QWidget):
+    """Horizontal slider with two handles, spanning a value range.
+
+    Qt has no two-handle slider, so this is a minimal one: a groove with
+    a low and a high handle, painted to match the stylesheet of the plain
+    ``QSlider``s used elsewhere in Picasso. Values are floats, so that the
+    slider is not limited to the integer positions of ``QSlider``.
+
+    ``valuesChanged`` is emitted whenever the pair changes, both on user
+    interaction and on a programmatic ``setValues`` / ``setRange`` (like
+    ``QSlider.setValue``); block the signals to update silently.
+    """
+
+    valuesChanged = QtCore.pyqtSignal(float, float)
+
+    HANDLE_WIDTH = 10
+    HANDLE_HEIGHT = 12
+    GROOVE_HEIGHT = 4
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._minimum = 0.0
+        self._maximum = 1.0
+        self._low = 0.0
+        self._high = 1.0
+        # Smallest allowed distance between the handles. 0 lets them meet;
+        # consumers that quantize the values (e.g. to integers) set it to
+        # the quantum so that low and high cannot collapse onto each other.
+        self._min_gap = 0.0
+        self._pressed_handle = None  # None, "low" or "high"
+        self._last_handle = "low"  # the one the arrow keys move
+        self._value_labels = ("Min", "Max")
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self._update_tooltip()
+
+    # -- API ---------------------------------------------------------
+
+    def setRange(self, minimum: float, maximum: float) -> None:
+        """Set the ends of the track, re-clamping the current values."""
+        minimum = float(minimum)
+        maximum = max(float(maximum), minimum)
+        self._minimum = minimum
+        self._maximum = maximum
+        self.setValues(self._low, self._high)
+        self.update()
+
+    def range(self) -> tuple[float, float]:
+        return self._minimum, self._maximum
+
+    def minimum(self) -> float:
+        return self._minimum
+
+    def maximum(self) -> float:
+        return self._maximum
+
+    def setValues(
+        self, low: float, high: float, moved: str | None = None
+    ) -> bool:
+        """Set both handles, clamped into the track and kept ``_min_gap``
+        apart. ``moved`` names the handle the user is dragging, which is
+        the one that gives way when the two would cross.
+
+        Returns whether anything changed (and, if so, emits
+        ``valuesChanged``).
+        """
+        low = min(max(float(low), self._minimum), self._maximum)
+        high = min(max(float(high), self._minimum), self._maximum)
+        gap = min(self._min_gap, self._maximum - self._minimum)
+        if high - low < gap:
+            if moved == "low":
+                low = high - gap
+                if low < self._minimum:
+                    low = self._minimum
+                    high = low + gap
+            else:
+                high = low + gap
+                if high > self._maximum:
+                    high = self._maximum
+                    low = high - gap
+        if low == self._low and high == self._high:
+            return False
+        self._low = low
+        self._high = high
+        self._update_tooltip()
+        self.update()
+        self.valuesChanged.emit(low, high)
+        return True
+
+    def values(self) -> tuple[float, float]:
+        return self._low, self._high
+
+    def setMinimumGap(self, gap: float) -> None:
+        self._min_gap = max(0.0, float(gap))
+        self.setValues(self._low, self._high)
+
+    def setValueLabels(self, low_label: str, high_label: str) -> None:
+        """Name the two handles, for the tooltip."""
+        self._value_labels = (low_label, high_label)
+        self._update_tooltip()
+
+    # -- Painting ----------------------------------------------------
+
+    def sizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(150, self.HANDLE_HEIGHT + 3)
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(4 * self.HANDLE_WIDTH, self.HANDLE_HEIGHT + 3)
+
+    def paintEvent(self, _event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        enabled = self.isEnabled()
+        groove_color = QtGui.QColor("#b0b0b0" if enabled else "#d8d8d8")
+        handle_color = QtGui.QColor("#5a5a5a" if enabled else "#b8b8b8")
+        mid_y = self.height() / 2
+        radius = self.GROOVE_HEIGHT / 2
+        groove = QtCore.QRectF(
+            0.0,
+            mid_y - radius,
+            float(self.width()),
+            float(self.GROOVE_HEIGHT),
+        )
+        painter.setBrush(groove_color)
+        painter.drawRoundedRect(groove, radius, radius)
+        # the selected span, so that the covered part of the range reads
+        # at a glance
+        x_low = self._value_to_x(self._low)
+        x_high = self._value_to_x(self._high)
+        painter.setBrush(handle_color)
+        painter.drawRoundedRect(
+            QtCore.QRectF(
+                x_low,
+                mid_y - radius,
+                max(0.0, x_high - x_low),
+                groove.height(),
+            ),
+            radius,
+            radius,
+        )
+        for x in (x_low, x_high):
+            painter.drawRoundedRect(
+                QtCore.QRectF(
+                    x - self.HANDLE_WIDTH / 2,
+                    mid_y - self.HANDLE_HEIGHT / 2,
+                    float(self.HANDLE_WIDTH),
+                    float(self.HANDLE_HEIGHT),
+                ),
+                3.0,
+                3.0,
+            )
+        painter.end()
+
+    # -- Interaction -------------------------------------------------
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() != QtCore.Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        x = event.position().x()
+        self._pressed_handle = self._handle_at(x)
+        self._last_handle = self._pressed_handle
+        self._move_handle(self._pressed_handle, x)
+        event.accept()
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._pressed_handle is None:
+            super().mouseMoveEvent(event)
+            return
+        self._move_handle(self._pressed_handle, event.position().x())
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._pressed_handle is None:
+            super().mouseReleaseEvent(event)
+            return
+        self._pressed_handle = None
+        event.accept()
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        key = event.key()
+        if key in (
+            QtCore.Qt.Key.Key_Left,
+            QtCore.Qt.Key.Key_Right,
+            QtCore.Qt.Key.Key_Down,
+            QtCore.Qt.Key.Key_Up,
+        ):
+            step = self._step()
+            if key in (QtCore.Qt.Key.Key_Left, QtCore.Qt.Key.Key_Down):
+                step = -step
+            if self._last_handle == "high":
+                self.setValues(self._low, self._high + step, moved="high")
+            else:
+                self.setValues(self._low + step, self._high, moved="low")
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        # the slider sits under a scrollable movie view; scrolling over it
+        # should not silently change the contrast
+        event.ignore()
+
+    # -- Helpers -----------------------------------------------------
+
+    def _step(self) -> float:
+        span = self._maximum - self._minimum
+        return max(self._min_gap, span / 100.0) if span else 0.0
+
+    def _usable_width(self) -> float:
+        return max(1.0, self.width() - self.HANDLE_WIDTH)
+
+    def _value_to_x(self, value: float) -> float:
+        """Pixel position of a handle's centre, inset by half a handle so
+        that the handles stay inside the widget at both ends."""
+        span = self._maximum - self._minimum
+        fraction = (value - self._minimum) / span if span else 0.0
+        fraction = min(max(fraction, 0.0), 1.0)
+        return self.HANDLE_WIDTH / 2 + fraction * self._usable_width()
+
+    def _x_to_value(self, x: float) -> float:
+        fraction = (x - self.HANDLE_WIDTH / 2) / self._usable_width()
+        fraction = min(max(fraction, 0.0), 1.0)
+        return self._minimum + fraction * (self._maximum - self._minimum)
+
+    def _handle_at(self, x: float) -> str:
+        """The handle a click at ``x`` grabs: the one under the cursor, or
+        else the one nearer to it (so clicking the bare groove moves the
+        closer handle there)."""
+        x_low = self._value_to_x(self._low)
+        x_high = self._value_to_x(self._high)
+        if x < x_low:
+            return "low"
+        if x > x_high:
+            return "high"
+        return "low" if (x - x_low) <= (x_high - x) else "high"
+
+    def _move_handle(self, handle: str, x: float) -> None:
+        value = self._x_to_value(x)
+        if handle == "low":
+            self.setValues(value, self._high, moved="low")
+        else:
+            self.setValues(self._low, value, moved="high")
+
+    def _update_tooltip(self) -> None:
+        low_label, high_label = self._value_labels
+        self.setToolTip(
+            f"{low_label}: {self._low:,.0f}, {high_label}: {self._high:,.0f}"
+        )
+
+
 class GenericPlotWindow(QtWidgets.QTabWidget):
     """Interface for displaying matplotlib plots in a separate
     window."""

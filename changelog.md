@@ -43,6 +43,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Loading a movie with corrupted metadata lets the user specify the most important ones without errors
 - 3D calibration allows for multiple FOVs per z position (thanks to Aditya Ajay Chhatre for the suggestion)
 - Slider at the bottom of the app was added to allow easy navigation across frames
+- Contrast slider below it, with a black-point and a white-point handle
 - New keyboard shortcuts for navigating movies (move by 10/100/1,000 frames)
 - Slight adjustments to some status bar messages
 - Cutting spots progress is reported between identification and fitting

@@ -8437,6 +8437,206 @@ class TestChainedAffineTransforms:
         assert len(lib.affine_transforms(cropped)) == 1
 
 
+class TestRangeSlider:
+    """The two-handle slider behind the contrast slider below the movie.
+    Qt has no such widget, so every invariant here is hand-rolled."""
+
+    @staticmethod
+    def _slider(minimum=0, maximum=1000, gap=1):
+        slider = lib.RangeSlider()
+        slider.resize(200, 15)
+        slider.setMinimumGap(gap)
+        slider.setRange(minimum, maximum)
+        slider.setValues(100, 900)
+        return slider
+
+    def test_values_are_clamped_into_the_track(self):
+        slider = self._slider()
+        try:
+            slider.setValues(-500, 5000)
+            assert slider.values() == (0.0, 1000.0)
+        finally:
+            slider.deleteLater()
+
+    @pytest.mark.parametrize(
+        "low, high, moved, expected",
+        [
+            (500, 500, "low", (499.0, 500.0)),  # the dragged handle gives way
+            (500, 500, "high", (500.0, 501.0)),
+            (0, 0, "low", (0.0, 1.0)),  # ... unless it is at the end
+            (1000, 1000, "high", (999.0, 1000.0)),
+        ],
+    )
+    def test_handles_stay_a_gap_apart(self, low, high, moved, expected):
+        """White divides in ``ContrastDialog.to_uint8`` and both values are
+        rounded to integers, so the handles must never collapse onto the
+        same value."""
+        slider = self._slider()
+        try:
+            slider.setValues(low, high, moved=moved)
+            assert slider.values() == expected
+        finally:
+            slider.deleteLater()
+
+    def test_pixel_mapping_round_trips(self):
+        slider = self._slider()
+        try:
+            for value in (0, 1, 250, 999, 1000):
+                x = slider._value_to_x(value)
+                assert slider._x_to_value(x) == pytest.approx(value)
+            # both extremes stay inside the widget, handle included
+            assert slider._value_to_x(0) >= slider.HANDLE_WIDTH / 2
+            assert (
+                slider._value_to_x(1000)
+                <= slider.width() - slider.HANDLE_WIDTH / 2
+            )
+        finally:
+            slider.deleteLater()
+
+    def test_a_degenerate_track_does_not_divide_by_zero(self):
+        slider = self._slider()
+        try:
+            slider.setRange(7, 7)
+            assert slider.values() == (7.0, 7.0)
+            slider._value_to_x(7)
+            slider._x_to_value(0)
+        finally:
+            slider.deleteLater()
+
+    def test_setting_the_range_reclamps_the_values(self):
+        slider = self._slider()
+        try:
+            slider.setRange(0, 500)
+            assert slider.values() == (100.0, 500.0)
+        finally:
+            slider.deleteLater()
+
+    def test_clicking_grabs_the_nearer_handle(self):
+        slider = self._slider()
+        try:
+            assert slider._handle_at(slider._value_to_x(120)) == "low"
+            assert slider._handle_at(slider._value_to_x(880)) == "high"
+            # outside the span, the handle on that side
+            assert slider._handle_at(slider._value_to_x(10)) == "low"
+            assert slider._handle_at(slider._value_to_x(990)) == "high"
+        finally:
+            slider.deleteLater()
+
+    def test_dragging_emits_the_pair(self):
+        slider = self._slider()
+        emitted = []
+        slider.valuesChanged.connect(lambda lo, hi: emitted.append((lo, hi)))
+        try:
+            slider._move_handle("high", slider._value_to_x(400))
+            assert slider.values()[1] == pytest.approx(400)
+            assert emitted[-1] == slider.values()
+            # a no-op move must not emit (it would redraw the frame)
+            emitted.clear()
+            slider._move_handle("high", slider._value_to_x(400))
+            assert emitted == []
+        finally:
+            slider.deleteLater()
+
+
+class TestContrastSliderGUI:
+    """The contrast slider below the frame slider is a second view onto the
+    contrast dialog's spinboxes; the two must never drift apart."""
+
+    @pytest.fixture
+    def window(self):
+        window = localize_gui.Window()
+        yield window
+        window.close()
+
+    @staticmethod
+    def _movie(n_frames=20):
+        rng = np.random.default_rng(0)
+        movie = rng.normal(200, 10, (n_frames, 32, 32)).astype("uint16")
+        movie[:, 10, 10] = 3000  # a bright spot to widen the range
+        return movie
+
+    def _show(self, window, movie=None):
+        movie = self._movie() if movie is None else movie
+        window.movie = movie
+        window.info = [{"Frames": len(movie), "Height": 32, "Width": 32}]
+        window.contrast_slider.setEnabled(True)
+        window._apply_channel_to_ui(0)
+        return movie
+
+    def test_track_spans_the_sampled_movie(self, window):
+        movie = self._show(window)
+        lo, hi = window.contrast_slider.range()
+        assert lo <= movie.min()
+        assert hi >= movie.max()
+        # padded, but not by orders of magnitude (the dtype range would be
+        # 0-65535 and leave both handles crammed on the left)
+        assert hi < 2 * movie.max()
+
+    def test_handles_follow_the_spinboxes(self, window):
+        self._show(window)
+        contrast = window.contrast_dialog
+        assert window.contrast_slider.values() == (
+            contrast.black_spinbox.value(),
+            contrast.white_spinbox.value(),
+        )
+        contrast.black_spinbox.setValue(150)
+        assert window.contrast_slider.values()[0] == 150
+
+    def test_a_value_beyond_the_track_widens_it(self, window):
+        self._show(window)
+        window.contrast_dialog.white_spinbox.setValue(50000)
+        assert window.contrast_slider.range()[1] >= 50000
+        assert window.contrast_slider.values()[1] == 50000
+
+    def test_dragging_sets_a_manual_contrast_and_redraws_once(self, window):
+        self._show(window)
+        contrast = window.contrast_dialog
+        assert contrast.auto_checkbox.isChecked()
+        draws = []
+        window.draw_frame = lambda: draws.append(1)
+        window.contrast_slider.setValues(150, 1000)
+        assert not contrast.auto_checkbox.isChecked()
+        assert (
+            contrast.black_spinbox.value(),
+            contrast.white_spinbox.value(),
+        ) == (150, 1000)
+        # one redraw per drag step, not one per spinbox
+        assert len(draws) == 1
+
+    def test_the_track_does_not_shrink_while_browsing_frames(self, window):
+        self._show(window)
+        track = window.contrast_slider.range()
+        for number in range(1, 10):
+            window.set_frame(number)
+            lo, hi = window.contrast_slider.range()
+            assert lo <= track[0] and hi >= track[1]
+
+    def test_a_filter_rescales_the_track(self, window):
+        """Temporal median subtracts the background, so the displayed
+        intensities collapse towards zero; a track left at the raw camera
+        counts would pin both handles to its left edge."""
+        self._show(window)
+        raw_track = window.contrast_slider.range()
+        window.parameters_dialog.temporal_median_checkbox.setChecked(True)
+        filtered_track = window.contrast_slider.range()
+        assert filtered_track[1] < raw_track[1] / 2
+        filtered = window.identification_movie()[window.curr_frame_number]
+        assert filtered_track[1] >= filtered.max()
+
+    def test_bounds_stay_within_what_the_spinboxes_accept(self, window):
+        """The track is what the handles can reach, so it must not run past
+        the spinbox limits the values are written into."""
+        self._show(window)
+        contrast = window.contrast_dialog
+        lo, hi = window._clamp_contrast_bounds(-1e6, 1e9)
+        assert lo == contrast.black_spinbox.minimum()
+        assert hi == contrast.white_spinbox.maximum()
+
+    def test_no_movie_leaves_the_slider_alone(self, window):
+        window.update_contrast_slider_range()
+        assert not window.contrast_slider.isEnabled()
+
+
 class TestContrastDialog:
     """The contrast mapping is shared by the Auto and the manual branch, so
     unchecking Auto must freeze what is on screen rather than re-scale it on
