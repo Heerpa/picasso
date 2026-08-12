@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 08-AUG-2026 CEST
+Last change: 12-AUG-2026 CEST
 
 ## 0.11.0
 
@@ -94,6 +94,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Fixed ind. loc. precision rendering of `lpx = 0` [#685](https://github.com/jungmannlab/picasso/issues/685)
 - Fixed z color rendering in 3D
 - Fixed `Length of values does not match length of index` error when saving pick properties in a channel where some picks contain no localizations
+- Fixed aspect ratio change by clicking Apply in the Change FOV dialog
 
 #### SPINNA
 - Adjustable font sizes and names for the NND plot's title, labels and ticks

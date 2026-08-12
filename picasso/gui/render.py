@@ -4615,7 +4615,6 @@ class ChangeFOV(lib.Dialog):
         self.y_box.setValue(y)
         self.w_box.setValue(w)
         self.h_box.setValue(h)
-        self.window.resize_view_to_fov(w, h)
         self.update_scene()
 
     def update_scene(self) -> None:
@@ -4623,14 +4622,17 @@ class ChangeFOV(lib.Dialog):
         InfoDialog."""
         x_min = self.x_box.value()
         y_min = self.y_box.value()
-        x_max = self.x_box.value() + self.w_box.value()
-        y_max = self.y_box.value() + self.h_box.value()
+        w = self.w_box.value()
+        h = self.h_box.value()
+        x_max = x_min + w
+        y_max = y_min + h
         viewport = [(y_min, x_min), (y_max, x_max)]
+        # resize the main window such that the view has the same aspect
+        # ratio as the requested FOV
+        self.window.resize_view_to_fov(w, h)
         self.window.view.update_scene(viewport=viewport)
         self.window.info_dialog.xy_label.setText(f"{x_min:.2f} / {y_min:.2f}")
-        self.window.info_dialog.wh_label.setText(
-            f"{self.w_box.value():.2f} / {self.h_box.value():.2f}"
-        )
+        self.window.info_dialog.wh_label.setText(f"{w:.2f} / {h:.2f}")
 
 
 class InfoDialog(lib.Dialog):
