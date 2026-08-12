@@ -330,8 +330,11 @@ class TestPickSimilar:
         new_picks = postprocess.pick_similar(
             locs, info, seed_picks, "Circle", PICK_SIZE, std_range=123.0
         )
+        # the pick centers are centers of mass of float32 coordinates, so
+        # the last digits depend on the platform's summation order; the
+        # tolerance is still orders of magnitude below any real change
         np.testing.assert_allclose(
-            np.array(new_picks), CIRCULAR_PICK_SIMILAR, rtol=0, atol=0
+            np.array(new_picks), CIRCULAR_PICK_SIMILAR, rtol=1e-6, atol=1e-6
         )
 
     def test_precomputed_index_blocks_path(self, locs, info):

@@ -2846,6 +2846,74 @@ def _initial_widths_gauss(
     return width_x, width_y
 
 
+def _initial_shape_gauss_rotated(
+    spots: lib.FloatArray3D,
+    size: int,
+    background: lib.FloatArray1D,
+) -> tuple[lib.FloatArray1D, lib.FloatArray1D, lib.FloatArray1D]:
+    """Seed the widths and the rotation angle of a rotated elliptical
+    Gaussian from the spot's 2D second-moment tensor.
+
+    The central row and column (see ``_initial_widths_gauss``) say nothing
+    about the orientation, so seeding the angle with zero leaves the fit to
+    find it on its own - which it fails to do for the steeper angles, where
+    the least-squares problem has the optimizer walk the angle away by
+    several turns. The moment tensor gives both principal widths and the
+    orientation directly.
+
+    Returns ``(width_u, width_v, angle)``, where ``width_u`` is the width
+    along the axis the model's ``angle`` refers to.
+    """
+    half = int(size / 2)
+    # float64: the moments weight photons by squared distances, which
+    # overflows a float32 accumulator on a bright spot.
+    g = np.arange(size, dtype=np.float64) - half
+    image = spots.astype(np.float64) - background[:, None, None]
+    np.clip(image, 0.0, None, out=image)
+    # spots is (n, y, x)
+    x = g[None, None, :]
+    y = g[None, :, None]
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        total = image.sum(axis=(1, 2))[:, None, None]
+        weights = image / total
+        dx = x - (weights * x).sum(axis=(1, 2))[:, None, None]
+        dy = y - (weights * y).sum(axis=(1, 2))[:, None, None]
+        m_xx = (weights * dx**2).sum(axis=(1, 2))
+        m_yy = (weights * dy**2).sum(axis=(1, 2))
+        m_xy = (weights * dx * dy).sum(axis=(1, 2))
+        # eigenvalues of [[m_xx, m_xy], [m_xy, m_yy]]
+        mean = 0.5 * (m_xx + m_yy)
+        spread = np.sqrt((0.5 * (m_xx - m_yy)) ** 2 + m_xy**2)
+        width_u = np.sqrt(mean + spread)
+        width_v = np.sqrt(mean - spread)
+        # The model's u axis is ``(cos angle, -sin angle)`` in image
+        # coordinates, so the angle is minus the usual orientation of the
+        # major axis.
+        angle = -0.5 * np.arctan2(2 * m_xy, m_xx - m_yy)
+
+    fallback = max(size / 5.0, 1.0)
+    invalid = ~(np.isfinite(width_u) & np.isfinite(width_v))
+    width_u[invalid] = fallback
+    width_v[invalid] = fallback
+    angle[invalid | ~np.isfinite(angle)] = 0.0
+    # On a wide box most pixels are background, which inflates the moments;
+    # cap them exactly as ``_initial_widths_gauss`` does, since a seed
+    # several times wider than the PSF makes the first (undamped) MLE step
+    # overshoot the background below zero.
+    np.minimum(width_u, fallback, out=width_u)
+    np.minimum(width_v, fallback, out=width_v)
+    np.clip(width_u, 0.5, size / 3.0, out=width_u)
+    np.clip(width_v, 0.5, size / 3.0, out=width_v)
+    # With equal widths the rotated Gaussian does not depend on the angle,
+    # so its derivative is exactly zero and the first LM Hessian is
+    # singular - the fit then aborts, returning the initial parameters.
+    # Break the symmetry to keep the angle parameter well-defined.
+    degenerate = width_u < 1.01 * width_v
+    width_u[degenerate] *= 1.1
+    width_v[degenerate] *= 0.9
+    return width_u, width_v, angle
+
+
 def _initial_parameters_gauss(
     spots: lib.FloatArray3D,
     size: int,
@@ -2883,14 +2951,14 @@ def _initial_parameters_gauss(
     initial_parameters[:, 4] = width_y
     initial_parameters[:, 5] = spot_min
     if rotated:
-        # With sx == sy, the rotated Gaussian is independent of the
-        # angle, so its derivative is exactly zero and the first LM
-        # Hessian is singular - the fit then aborts, returning the
-        # initial parameters. Break the symmetry of the widths to keep
-        # the angle parameter well-defined.
-        initial_parameters[:, 3] *= 1.1
-        initial_parameters[:, 4] *= 0.9
-        initial_parameters[:, 6] = 0.0
+        # the central row and column carry no orientation, so the widths
+        # and the angle are seeded from the full second-moment tensor
+        width_u, width_v, angle = _initial_shape_gauss_rotated(
+            spots, size, spot_min
+        )
+        initial_parameters[:, 3] = width_u
+        initial_parameters[:, 4] = width_v
+        initial_parameters[:, 6] = angle
 
     return initial_parameters
 
