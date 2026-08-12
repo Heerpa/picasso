@@ -460,6 +460,7 @@ class DatasetDialog(lib.Dialog):
         self.colorpickers = []
         self.colorpreviews = []
         self.intensitysettings = []
+        self._next_channel_id = 0
         # Per-channel resolved LUTs (each shape (256, 3) float32) and
         # caches for the built-in and user-defined cmap LUTs.
         self._channel_luts = []
@@ -647,13 +648,17 @@ class DatasetDialog(lib.Dialog):
         c.customContextMenuRequested.connect(
             partial(self.show_only_channel, c)
         )
-        currentline = self.scroll_area.rowCount()
+        # unique (never reused) identifier for this channel; used by the
+        # signal handlers to find the channel again, so it must not
+        # change when channels are closed and the rows shift up
+        channel_id = str(self._next_channel_id)
+        self._next_channel_id += 1
         t = QtWidgets.QPushButton("#")
         t.setToolTip("Change the displayed name of this dataset.")
-        t.setObjectName(str(currentline))
+        t.setObjectName(channel_id)
         p = QtWidgets.QPushButton("x")
         p.setToolTip("Close this dataset.")
-        p.setObjectName(str(currentline))
+        p.setObjectName(channel_id)
 
         # Append and setup the buttons
         self.checks.append(c)
@@ -727,7 +732,7 @@ class DatasetDialog(lib.Dialog):
         picker.setAutoDefault(False)
         picker.setFixedWidth(28)
         picker.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-        picker.setObjectName(str(currentline))
+        picker.setObjectName(channel_id)
         picker.clicked.connect(
             partial(self.select_channel_color, t.objectName())
         )
@@ -750,7 +755,9 @@ class DatasetDialog(lib.Dialog):
         self.intensitysettings.append(intensity)
         self.intensitysettings[-1].valueChanged.connect(self.update_viewport)
 
-        # add all the widgets to the Dataset Dialog
+        # add all the widgets to the Dataset Dialog (row 0 holds the
+        # column headers, so channel i lives in row i + 1)
+        currentline = len(self.checks)
         self.scroll_area.addWidget(c, currentline, 0)
         self.scroll_area.addWidget(t, currentline, 1)
         self.scroll_area.addWidget(colordrop, currentline, 2)
@@ -759,6 +766,18 @@ class DatasetDialog(lib.Dialog):
         self.scroll_area.addWidget(p, currentline, 5)
 
         self._fit_scroll_width()
+
+    def _relayout_channels(self) -> None:
+        """Re-add all channel widgets to the scroll area so that the
+        rows are contiguous after a channel has been closed."""
+        for i in range(len(self.checks)):
+            row = i + 1
+            self.scroll_area.addWidget(self.checks[i], row, 0)
+            self.scroll_area.addWidget(self.title[i], row, 1)
+            self.scroll_area.addWidget(self.colorselection[i], row, 2)
+            self.scroll_area.addWidget(self.colorpreviews[i], row, 3)
+            self.scroll_area.addWidget(self.intensitysettings[i], row, 4)
+            self.scroll_area.addWidget(self.closebuttons[i], row, 5)
 
     def _fit_scroll_width(self) -> None:
         """Ensure the dialog is wide enough that the scroll area's
@@ -807,14 +826,20 @@ class DatasetDialog(lib.Dialog):
     def _close_one_channel(self, i: int, render_=True) -> None:
         """Close the channel with the given index and delete all
         corresponding attributes."""
-        # remove widgets from the Dataset Dialog
-        self.scroll_area.removeWidget(self.checks[i])
-        self.scroll_area.removeWidget(self.title[i])
-        self.scroll_area.removeWidget(self.colorselection[i])
-        self.scroll_area.removeWidget(self.colorpreviews[i])
-        self.colorpreviews[i].setParent(None)
-        self.scroll_area.removeWidget(self.intensitysettings[i])
-        self.scroll_area.removeWidget(self.closebuttons[i])
+        # remove widgets from the Dataset Dialog; they must be
+        # reparented and scheduled for deletion, otherwise they stay
+        # visible in the scroll area and overlap the rows that move up
+        for widget in (
+            self.checks[i],
+            self.title[i],
+            self.colorselection[i],
+            self.colorpreviews[i],
+            self.intensitysettings[i],
+            self.closebuttons[i],
+        ):
+            self.scroll_area.removeWidget(widget)
+            widget.setParent(None)
+            widget.deleteLater()
 
         # delete the widgets from the lists
         del self.checks[i]
@@ -888,6 +913,8 @@ class DatasetDialog(lib.Dialog):
         # remove the channel from test clustering dialog
         self.window.test_clusterer_dialog.channels.removeItem(i)
 
+        # move the remaining channels up so that there is no empty row
+        self._relayout_channels()
         self._fit_scroll_width()
 
     def close_file(self, i: int | str, render=True) -> None:
