@@ -1897,11 +1897,32 @@ class TestGuiWiring:
         app.processEvents()
         assert vbar.value() > 0
 
-        # a fixed zoom enlarges the gallery (and then scrolls both ways)
-        fit_width = dialog.canvas.width()
-        dialog.zoom.setCurrentIndex(dialog.zoom.findText("200 %"))
+        # a fixed zoom sizes the gallery to the figure itself, so a larger
+        # percentage always draws a larger gallery
+        width_in = dialog._figure_inches[0]
+        dialog.zoom.setCurrentIndex(dialog.zoom.findText("150 %"))
         app.processEvents()
-        assert dialog.canvas.width() > fit_width
+        assert dialog.canvas.width() == pytest.approx(150 * width_in, abs=2)
+        dialog.zoom.setCurrentIndex(dialog.zoom.findText("300 %"))
+        app.processEvents()
+        assert dialog.canvas.width() == pytest.approx(300 * width_in, abs=2)
+        # ... and once it is wider than the window, it scrolls both ways.
+        # Which percentage that is depends on the window (the dialog is
+        # laid out wider under the offscreen Qt platform), so pick the
+        # first one that overflows.
+        percent = next(
+            (
+                dialog.zoom.itemData(i)
+                for i in range(dialog.zoom.count())
+                if dialog.zoom.itemData(i) is not None
+                and dialog.zoom.itemData(i) * width_in > viewport.width()
+            ),
+            None,
+        )
+        assert percent is not None, "the window is wider than any zoom"
+        dialog.zoom.setCurrentIndex(dialog.zoom.findText(f"{percent} %"))
+        app.processEvents()
+        assert dialog.canvas.width() > viewport.width()
         assert dialog.scroll.horizontalScrollBar().maximum() > 0
         dialog.close()
 
