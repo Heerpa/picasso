@@ -4587,15 +4587,24 @@ class ParametersDialog(lib.Dialog):
 
     def set_gain(self, camera: str, mm_info: dict, cam_config: dict) -> None:
         """Set EM gain if the relevant information is available in the
-        config and metadata."""
+        config and metadata.
+
+        The properties named in the config need not be present in the
+        metadata (e.g. a movie recorded with the device missing from the
+        MicroManager hardware config), in which case the gain is left
+        untouched instead of raising."""
         if "Gain Property Name" in cam_config:
             gain_property_name = cam_config["Gain Property Name"]
-            gain = mm_info[camera + "-" + gain_property_name]
+            gain_property = camera + "-" + gain_property_name
+            if gain_property not in mm_info:
+                return
+            gain = mm_info[gain_property]
             if "EM Switch Property" in cam_config:
                 switch_property_name = cam_config["EM Switch Property"]["Name"]
-                switch_property_value = mm_info[
-                    camera + "-" + switch_property_name
-                ]
+                switch_property = camera + "-" + switch_property_name
+                if switch_property not in mm_info:
+                    return
+                switch_property_value = mm_info[switch_property]
                 if (
                     switch_property_value
                     == cam_config["EM Switch Property"][True]
@@ -4623,8 +4632,17 @@ class ParametersDialog(lib.Dialog):
     def set_wavelength(
         self, camera: str, mm_info: dict, cam_config: dict
     ) -> None:
+        """Set the emission wavelength from the channel device property
+        named in the config.
+
+        The property need not be present in the metadata (e.g. a movie
+        recorded with the filter turret missing from the MicroManager
+        hardware config), in which case the wavelength is left untouched
+        instead of raising."""
         if "Channel Device" in cam_config:
             channel_device_name = cam_config["Channel Device"]["Name"]
+            if channel_device_name not in mm_info:
+                return
             channel = mm_info[channel_device_name]
             channels = cam_config["Channel Device"]["Emission Wavelengths"]
             if channel in channels:

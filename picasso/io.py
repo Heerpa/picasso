@@ -3414,19 +3414,22 @@ class TiffMultiMap(AbstractPicassoMovie):
 
         mm_info = info["Micro-Manager Metadata"]
         cam_config = config["Cameras"][camera]
+        # The properties named in the config need not be present in the
+        # metadata, in which case the default values below are kept
+        # instead of raising.
         if "Gain Property Name" in cam_config:
             gain_property_name = cam_config["Gain Property Name"]
-            gain = mm_info[camera + "-" + gain_property_name]
-            if "EM Switch Property" in cam_config:
-                switch_property_name = cam_config["EM Switch Property"]["Name"]
-                switch_property_value = mm_info[
-                    camera + "-" + switch_property_name
-                ]
-                if (
-                    switch_property_value
-                    == cam_config["EM Switch Property"][True]
-                ):
-                    parameters["gain"] = int(gain)
+            gain_property = camera + "-" + gain_property_name
+            if gain_property in mm_info:
+                gain = mm_info[gain_property]
+                if "EM Switch Property" in cam_config:
+                    switch_config = cam_config["EM Switch Property"]
+                    switch_property = camera + "-" + switch_config["Name"]
+                    if (
+                        switch_property in mm_info
+                        and mm_info[switch_property] == switch_config[True]
+                    ):
+                        parameters["gain"] = int(gain)
         if "gain" not in parameters.keys():
             parameters["gain"] = [1]
         parameters["Sensitivity"] = {}
@@ -3439,9 +3442,10 @@ class TiffMultiMap(AbstractPicassoMovie):
                     parameters["Sensitivity"][category] = exp_setting
         if "Quantum Efficiency" in cam_config:
             if "Channel Device" in cam_config:
-                channel_device_name = cam_config["Channel Device"]["Name"]
-                channel = mm_info[channel_device_name]
-                channels = cam_config["Channel Device"]["Emission Wavelengths"]
+                channel_device = cam_config["Channel Device"]
+                channel_device_name = channel_device["Name"]
+                channels = channel_device["Emission Wavelengths"]
+                channel = mm_info.get(channel_device_name)
                 if channel in channels:
                     wavelength = channels[channel]
                     parameters["wavelength"] = [str(wavelength)]
