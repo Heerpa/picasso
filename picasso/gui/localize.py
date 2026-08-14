@@ -5359,7 +5359,7 @@ class Window(QtWidgets.QMainWindow):
         )
         open_mm_folder_action.triggered.connect(self.open_mm_folder_dialog)
         file_menu.addAction(open_mm_folder_action)
-        open_concat_action = file_menu.addAction("Open several movies as one")
+        open_concat_action = file_menu.addAction("Concatenate movies")
         open_concat_action.triggered.connect(self.open_concatenated_dialog)
         file_menu.addAction(open_concat_action)
         save_identifications_action = file_menu.addAction(

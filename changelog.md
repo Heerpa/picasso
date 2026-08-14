@@ -4,21 +4,26 @@ Last change: 14-AUG-2026 CEST
 
 ## 0.11.0
 
-This release substantially expands Picasso: Localize. Localization can now be performed with an experimentally measured PSF (cubic-spline model), jointly across several channels (e.g. biplane 3D), and with a pixel-dependent sCMOS noise model; a rotated 2D Gaussian model was added as well. All GPU fitting was reimplemented in Numba CUDA, removing the dependency on Gpufit. Localize also reads a much wider range of data directly - `.tif` and OME-TIFF stacks (including movies split across several folders), MicroManager single-image acquisitions, Zeiss `.czi` and Leica `.lif` - so Picasso: ToRaw is no longer required and has been removed. Further additions include a temporal median filter for spot identification, affine calibrations for astigmatism and chromatic aberration correction, localization metadata embedded in the `.hdf5` files, and a revised plugin system with an online plugin browser. We encourage all users to acquaint themselves with the new features in the [Localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html). Render, SPINNA and the rest of the suite received numerous improvements as well, all listed below.
+This release substantially expands Picasso: Localize. Localization can now be performed with an experimentally measured PSF (cubic-spline model), jointly across several channels (e.g. biplane 3D), and with a pixel-dependent sCMOS noise model; rotated and spherical 2D Gaussian models were added as well. All GPU fitting was reimplemented in Numba CUDA, removing the dependency on Gpufit. Localize also reads a much wider range of data directly - `.tif` and OME-TIFF stacks (including movies split across several folders), MicroManager single-image acquisitions, Zeiss `.czi` and Leica `.lif` - so Picasso: ToRaw is no longer required and has been removed. Further additions include a temporal median filter for spot identification, affine calibrations for astigmatism and chromatic aberration correction, localization metadata embedded in the `.hdf5` files, and a revised plugin system with an online plugin browser. We encourage all users to acquaint themselves with the new features in the [Localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html). Render, SPINNA and the rest of the suite received numerous improvements as well, all listed below.
 
 ### **General important updates:**
 - Localization metadata is now embedded directly in the `.hdf5` file (under the `/metadata` dataset, as a JSON string), making the file self-contained even if moved or renamed without its `.yaml` sidecar. When loading, Picasso looks for the metadata in the `.yaml` file first, then falls back to the embedded copy. Writing the `.yaml` sidecar is still on by default but can be disabled via the new user setting `Save metadata in .yaml` in `~/.picasso/settings.yaml` (also available via any module under File > Picasso settings). See [file formats documentation](https://picassosr.readthedocs.io/en/latest/files.html) for more info.
-- Improved architecture for plugins, see [here](https://picassosr.readthedocs.io/en/latest/plugins.html). Note that the plugins must now be stored in a different location.
-- Plugins can now be easily downloaded from our repository, using Plugins > Browse online plugins
-- `config.yaml` can now be stored in the `.picasso` directory and the location is easily accessible via Localize
+- Improved architecture for plugins, see [here](https://picassosr.readthedocs.io/en/latest/plugins.html). Note that the plugins should now be stored in a different location.
+- Plugins can now be easily downloaded from our repository, using Plugins > Browse online plugins.
+- `config.yaml` can now be stored in the `~/.picasso` directory and the location is easily accessible via Localize. `config.yaml` can still be read from the `picasso` folder for backward compatibility.
 - Picasso: ToRaw was removed. Localize now reads multi-file OME-TIFF stacks (see below) and all other supported movie formats directly, so converting movies to `.raw` is no longer necessary. Existing `.raw` movies still load in Localize as before.
 - PyQt6 is now imported lazily across the core library: the Qt widget classes formerly in `picasso.lib` moved to the new `picasso.lib_qt` module but remain accessible under their old `lib.<name>` names, and PyQt6 is only imported on first use — so `import picasso` and headless/CLI workflows no longer require PyQt6 to be installed
 
 #### Localize
-- **GPU fitting is now implemented in Numba CUDA instead of Gpufit.** All seven models Picasso fits on the GPU — the spherical, elliptical and rotated 2D Gaussians and the cubic splines — now run through kernels written in Python and compiled at run time (`picasso.fitting.splinefit_cuda`, `picasso.fitting.gaussfit_cuda`, `picasso.fitting.lmfit_cuda`). The fitting algorithm itself is unchanged — it remains a port of [Gpufit](https://github.com/gpufit/Gpufit) (Przybylski et al., Scientific Reports 7, 15722, 2017). All CRLB calculations and parameter uncertainties are calculated in `picasso.fitting.precision`.
+- Picasso relies on package `tifffile` for processing `.tif` files and many other grayscale movie formats, see [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html). **Note:** this is an experimental feature, do not hesitate to let us know if you detect bugs/unexpected behavior or would like to see more file formats in Picasso, see our [GitHub page](https://github.com/jungmannlab/picasso/issues) for contact information.
+- Added support for Zeiss `.czi` and Leica `.lif` movies in Localize (open dialog, drag-and-drop and batch CLI). These read via the optional `czifile` and `liffile` libraries (Python ≥ 3.12); install with `pip install picassosr[czi,lif]`. Multi-channel files prompt for a channel, and a `.lif` file with several acquisitions uses the one with the most frames.
+- Added support for multichannel data, i.e., several movie files in a single Localize window. These can be analyzed sequentially or be treated as a multichannel data for combined localizations, for example, in biplane 3D imaging.
+- Added support for MicroManager "separate image files" acquisitions (one `img_*.tif` per frame in a folder), see [Localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html#extra-features).
+- TIFF movies found across several folders can be opened as one concatenated movie (`File` > `Concatenate movies`), with the file order shown for confirmation before loading, see [Localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html#extra-features).
 - New fitting model: **Experimental PSF (cubic spline)** — fits an experimentally measured PSF (a cubic-spline model built from a bead z-stack), via the new `picasso.fitting.splinefit_cuda` module on the GPU or `picasso.fitting.splinefit` on the CPU. The spline coefficients of the calibration are computed in pure Python (NumPy/SciPy) on the CPU. In single-channel data, the bead alignment follows the workflow from [Li, et al, Nature Methods, 2018](https://www.nature.com/articles/nmeth.4661). See the [experimental PSF (cubic-spline) fitting documentation](https://picassosr.readthedocs.io/en/latest/localize.html#experimental-psf-cubic-spline-fitting) for details. *Note this is an experimental feature, do let us know if you find any bugs/unexpected behavior*
 - Multichannel spline PSF fitting (a shared-amplitude 3D spline model, e.g. biplane); additionally a new model was added for uncoupled photons with up to 6 channels. The global (multichannel) fitting follows globLoc, see [Li, et al, Nature Communications, 2022](https://doi.org/10.1038/s41467-022-30719-4)
 - New fitting algorithms supported: 2D rotated Gaussian, 2D spherical Gaussian
+- **GPU fitting is now implemented in Numba CUDA instead of Gpufit.** All seven models Picasso fits on the GPU — the spherical, elliptical and rotated 2D Gaussians and the cubic splines — now run through kernels written in Python and compiled at run time (`picasso.fitting.splinefit_cuda`, `picasso.fitting.gaussfit_cuda`, `picasso.fitting.lmfit_cuda`). The fitting algorithm itself is unchanged — it remains a port of [Gpufit](https://github.com/gpufit/Gpufit) (Przybylski et al., Scientific Reports 7, 15722, 2017). All CRLB calculations and parameter uncertainties are calculated in `picasso.fitting.precision`. Note that all the models are also available on the CPU.
 - **sCMOS pixel-dependent noise model.** Picasso can now use a per-pixel camera calibration — offset, readout variance and, optionally, amplification gain — instead of the scalar `Baseline` and `Sensitivity`, and applies the noise model of [Huang et al., Nat. Methods 10, 653-658 (2013)](https://doi.org/10.1038/nmeth.2488) to MLE fitting. See the [Localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html) for the acquisition protocol and the per-method behaviour.
 - **`picasso.gausslq` and `picasso.gaussmle` are deprecated and the whole modules will be removed in Picasso 1.0**, so that all fitting lives in the `picasso.fitting` subpackage. Every public name in them now raises a `DeprecationWarning` naming its replacement:
   - the fitters (`fit_spot`, `fit_spots`, `fit_spots_parallel`, `gaussmle`, `gaussmle_async`) → `picasso.fitting.gaussfit.fit_spots` / `fit_spots_async`
@@ -27,21 +32,15 @@ This release substantially expands Picasso: Localize. Localization can now be pe
   - `localization_precision` and the two `sigma_uncertainty` functions → the new `picasso.fitting.precision` module, as `localization_precision`, `sigma_uncertainty_lsq` and `sigma_uncertainty_mle`
   - Implementation of elliptical Gaussian MLE fitting on CPU changed slightly, now matching the results from Gpufit
 - New CPU fitting backend `picasso.fitting.gaussfit`: all three 2D Gaussian models (spherical, elliptical and rotated) over the same Levenberg-Marquardt driver as the GPU (Gpufit). Multithreading is used instead of multiprocessing.
-- Picasso relies on package `tifffile` for processing `.tif` files and many other grayscale movie formats, see [localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html). **Note:** this is an experimental feature, do not hesitate to let us know if you detect bugs/unexpected behavior or would like to see more file formats in Picasso, see our [GitHub page](https://github.com/jungmannlab/picasso/issues) for contact information.
-- Added support for Zeiss `.czi` and Leica `.lif` movies in Localize (open dialog, drag-and-drop and batch CLI). These read via the optional `czifile` and `liffile` libraries (Python ≥ 3.12); install with `pip install picassosr[czi,lif]`. Multi-channel files prompt for a channel, and a `.lif` file with several acquisitions uses the one with the most frames.
-- Added support for multichannel data, i.e., several movie files in a single Localize window. These can be analyzed sequentially or be treated as a multichannel data for combined localizations, for example, in biplane 3D imaging.
-- Added support for MicroManager "separate image files" acquisitions (one `img_*.tif` per frame in a folder), see [Localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html#extra-features).
-- TIFF movies found across several folders can be opened as one concatenated movie (`File` > `Open several movies as one`), with the file order shown for confirmation before loading, see [Localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html#extra-features).
+- Z fitting (Gaussian-fitted localizations using astigmatism) on CUDA GPU
 - Gaussian filtering for spot identification of multiple-peak single-emitter images
-- Z fitting on CUDA GPU
-- Movies now load on a background thread, so the Localize window stays responsive (and other windows are no longer blocked) while files are read; a progress dialog with a `Cancel` button is shown
-- Affine transform calibration for astigmatic imaging and chromatic abberation correction. A transform is fitted from two bead images and appended to any calibration (Gaussian astigmatism `.yaml`, spline PSF `.hdf5`) or saved as a standalone calibration for 2D data; several corrections stack in one ordered list and are applied to `x`/`y` one after another (e.g. cylindrical lens, then chromatic)
 - New temporal median filter for spot identification with adaptable background, see [Martens, et al, Frontiers in Bioinformatics, 2022](https://doi.org/10.3389/fbinf.2021.817254). It is applied to the identification only (spots are always fitted on the raw movie) and it changes the scale of the net gradient, so `Min. net gradient` needs re-tuning when it is switched on or off
+- Affine transform calibration for astigmatic imaging and chromatic abberation correction. A transform is fitted from two bead images and appended to any calibration (Gaussian astigmatism `.yaml`, spline PSF `.hdf5`) or saved as a standalone calibration for 2D data; several corrections stack in one ordered list and are applied to `x`/`y` one after another (e.g. cylindrical lens, then chromatic) ([#15](https://github.com/jungmannlab/picasso/issues/15))
 - Accept multiple frame bounds
 - Accept multiple rectangular ROIs
 - Remove a ROI by double-clicking it in the preview
-- Loading a movie with corrupted metadata lets the user specify the most important ones without errors
 - 3D calibration allows for multiple FOVs per z position (thanks to Aditya Ajay Chhatre for the suggestion)
+- Movies now load on a background thread, so the Localize window stays responsive (and other windows are no longer blocked) while files are read; a progress dialog with a `Cancel` button is shown
 - Slider at the bottom of the app was added to allow easy navigation across frames
 - Contrast slider below it, with a black-point and a white-point handle
 - New keyboard shortcuts for navigating movies (move by 10/100/1,000 frames)
@@ -49,27 +48,25 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Cutting spots progress is reported between identification and fitting
 - Faster spot identification on network storage: `.tif`/`.ome.tif` and `.stk` movies are now read through a private file handle per worker thread instead of one shared, lock-serialized handle, so frame reads overlap and per-frame network latency is hidden
 - Faster spot cutting (`get_spots`) on network storage (see above)
+- Smooth zooming in/out via scroll wheel
+- Contrast dialog's spin boxes use logarithmic scaling
 - Chi-square is saved for least-squares fitting results
-- Single-channel data loading with smooth progress bar
-- Improved zooming in/out via scroll wheel
-- Contrast spin boxes use logarithmic scaling
 - GPU MLE-fitted localizations save log-likelihood and iterations
 - GPU Gaussian MLE-fitted localizations' precisions corrected/included (`lpx`, `photon_unc`, etc)
-- Hovering over a fit marker or an identification box shows a tooltip listing the properties of the fitted localization (all saved columns, e.g. `x`, `y`, `photons`, `bg`) [#239](https://github.com/jungmannlab/picasso/issues/239)
+- Hovering over a fit marker or an identification box shows a tooltip listing the properties of the fitted localization (all saved columns, e.g. `x`, `y`, `photons`, `bg`) ([#239](https://github.com/jungmannlab/picasso/issues/239))
+- Loading a movie with corrupted metadata lets the user specify the most important ones without errors
 - Missing keys in MicroManager metadata based from camera configuration are ignored
 - Fixed ImageJ "contiguous stack" `.tif`/`.tiff` files (as written by ImageJ's "Save As > Tiff" for large stacks) being read as a single frame; all planes are now detected and read.
 - Fixed a gap of roughly one box size in the identified spots along the borders between adjacent (e.g. overlapping) ROIs
-- Fixed handling abortions during identification
-- Fixed zooming in Localize with scale bar + better appearance on Windows
+- Fixed aborting identification
 - Fixed reading of the movies from the network storage after interuption
-- Fixed the default directory in the load and save dialogs in the mask settings dialog
 
 #### Render
 - `Pick similar` now works with square and rectangular picks, not only circular ones, see [documentation](https://picassosr.readthedocs.io/en/latest/render.html#pick-similar-ctrl-shift-p)
 - Rendering rotated Gaussians
-- Improved measure tool
+- More user-friendly measure tool
 - Faster AIM through smarter implementation
-- Faster and more memory efficient (especially for large datasets) SMLM clusterer + progress bar added
+- Faster and more memory efficient (especially for large datasets) SMLM clusterer + progress bar
 - Progress bar for finding cluster centers
 - SMAP localization file reading, see "Other improvements" below
 - Rotation dialog allows for rotations around the localizations or the world (see [3D documentation](https://picassosr.readthedocs.io/en/latest/render.html#d-rotation-window))
@@ -79,13 +76,13 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Right clicking a channel's checkbox in the Files dialog displays that channel only (all other channels are hidden)
 - "Apply to all sequentially" available for drift correction algorithms, including drift from an external file
 - "Apply to all sequentially" available in Apply expression to localizations
-- G5M now supports 3D localizations fit with the experimental spline PSF, not only astigmatism.
+- G5M now supports 3D localizations fit with the experimental spline PSF, not only Gaussian fitting + astigmatism.
 - G5M can model rotated (elliptical) molecules in 3D
 - G5M accepts `group_input` as the cluster id columns (useful if `group` is overwritten after clustering)
 - Re-grouping localizations (picking, DBSCAN/HDBSCAN/SMLM clustering) now preserves the previous grouping in the `group_input` column instead of discarding it, so the original cluster ids remain available (e.g. for G5M)
 - Updated G5M documentation - drift correction importance
 - Test clusterer with a constrast bar
-- Select localizations in the center of the binding event added. See [Steen et al., Nature Methods 21, 1755-1762 (2024)](https://doi.org/10.1038/s41592-024-02374-8), Extended Data Fig. 1f
+- Select localizations in the center of the binding event. See [Steen et al., Nature Methods 21, 1755-1762 (2024)](https://doi.org/10.1038/s41592-024-02374-8), Extended Data Fig. 1f
 - The picked regions can now be saved in the metadata when saving picked localizations, so the picks used to generate a file can be recovered from it. This is off by default and controlled by the new user setting `Save picks in metadata` in `~/.picasso/settings.yaml` (also available via any module under File > Picasso settings)
 - Removed the switch to no blur method while panning
 - Improved robustness of NeNA calculation by trying out 3 starting positions for the fit
@@ -99,6 +96,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Fixed z color rendering in 3D
 - Fixed `Length of values does not match length of index` error when saving pick properties in a channel where some picks contain no localizations
 - Fixed aspect ratio change by clicking Apply in the Change FOV dialog
+- Fixed the default directory in the load and save dialogs in the mask settings dialog
 
 #### SPINNA
 - Adjustable font sizes and names for the NND plot's title, labels and ticks
@@ -115,12 +113,12 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Removed `notification_sounds` folder, the users can add their notification sounds in the `.picasso` folder
 - Progress reporting now goes through a uniform duck-typed interface (`lib.normalize_progress`): `None`, `"console"` and `lib.ProgressDialog` arguments are normalized once at the public entry points and driven with plain method calls, replacing the per-call-site `isinstance`/`"console"` branches — so headless runs never touch Qt at runtime either. `lib.TqdmProgress` and `lib.MockProgress` now implement the full `ProgressDialog` interface (`setMaximum`, `maximum`, `zero_progress`, `close`)
 - Localizations imported from ThunderSTORM and SMAP maintain all their columns, not only the Picasso pre-defined ones
-- The `Micro-Manager Metadata` block (the microscope properties read from a MicroManager movie) can now be left out when localizing, see [documentation](https://picassosr.readthedocs.io/en/latest/files.html#metadata)
+- `Micro-Manager Metadata` block (the microscope properties read from a MicroManager movie) can now be left out when localizing, see [documentation](https://picassosr.readthedocs.io/en/latest/files.html#metadata)
 - `Micro-Manager Acquisition Comments` is only saved in the metadata if the acquisition actually has a comment; an empty one is no longer written
 
 
 ### **Backward incompatible changes:**
-- All the functions deprecated in v0.10 were removed, see section 0.10.0 below
+- All the functions deprecated in v0.10 were removed, see section **0.10.0** below
 - `picasso.clusterer.cluster_center` removed (the functionality provided by `find_cluster_centers`)
 - `render.render` only keyword arguments except `locs` and `info`
 - Nanotron accepts `disp_px_size` instead of `oversampling` for easier user interaction
