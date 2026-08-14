@@ -11154,6 +11154,68 @@ class View(QtWidgets.QLabel):
         ):
             pick_info["Number of picks"] -= 1
 
+    def _picks_dict(self, picks: list | None = None) -> dict:
+        """Build the dictionary describing pick regions, in the format
+        used by ``save_picks`` and read by ``io.load_picks``.
+
+        Parameters
+        ----------
+        picks : list, optional
+            Picks to describe. Default is None, i.e., all current picks.
+
+        Returns
+        -------
+        regions : dict
+            Pick shape, size (in nm) and positions.
+        """
+        if picks is None:
+            picks = self._picks
+        regions = {}
+        pixelsize = self.pixelsize
+        if self._pick_shape == "Circle":
+            d = self._pick_size * pixelsize
+            regions["Diameter (nm)"] = float(d)
+            regions["Centers"] = [[float(_[0]), float(_[1])] for _ in picks]
+        elif self._pick_shape == "Rectangle":
+            w = self._pick_size * pixelsize
+            regions["Width (nm)"] = float(w)
+            regions["Center-Axis-Points"] = [
+                [
+                    [float(s[0]), float(s[1])],
+                    [float(e[0]), float(e[1])],
+                ]
+                for s, e in picks
+            ]
+        elif self._pick_shape == "Polygon":
+            vertices = []
+            for pick in picks:
+                if len(pick):
+                    vertices.append([[float(v[0]), float(v[1])] for v in pick])
+            regions["Vertices"] = vertices
+        elif self._pick_shape == "Square":
+            a = self._pick_size * pixelsize
+            regions["Side Length (nm)"] = float(a)
+            regions["Centers"] = [[float(_[0]), float(_[1])] for _ in picks]
+        regions["Shape"] = self._pick_shape
+        return regions
+
+    def _add_picks_to_info(
+        self, pick_info: dict, picks: list | None = None
+    ) -> None:
+        """Add the pick regions to ``pick_info`` if the user settings ask
+        for it (``Save picks in metadata``, disabled by default).
+
+        Parameters
+        ----------
+        pick_info : dict
+            Dictionary to update with the pick regions.
+        picks : list, optional
+            Picks to save. Default is None, i.e., all current picks.
+        """
+        if not io._save_picks_in_metadata():
+            return
+        pick_info["Picks"] = self._picks_dict(picks)
+
     def _build_base_pick_info(
         self, channels_combined: list | None = None
     ) -> dict:
@@ -11204,6 +11266,7 @@ class View(QtWidgets.QLabel):
         if locs is not None:
             pick_info = self._build_base_pick_info()
             self._add_shape_specific_info(pick_info)
+            self._add_picks_to_info(pick_info)
             io.save_locs(path, locs, self.infos[channel] + [pick_info])
 
     def save_picked_locs_sep(self, path: str, channel: int) -> None:
@@ -11230,6 +11293,7 @@ class View(QtWidgets.QLabel):
                     "Area (um^2)": float(areas[i]),
                 }
                 self._add_shape_specific_info(pick_info)
+                self._add_picks_to_info(pick_info, [self._picks[i]])
                 io.save_locs(
                     os.path.splitext(path)[0] + f"_{i}.hdf5",
                     pick_locs,
@@ -11259,6 +11323,7 @@ class View(QtWidgets.QLabel):
         if locs is not None:
             pick_info = self._build_base_pick_info(self.locs_paths)
             self._add_shape_specific_info(pick_info)
+            self._add_picks_to_info(pick_info)
             io.save_locs(path, locs, self.infos[0] + [pick_info])
 
     def save_picked_locs_multi_sep(self, path: str) -> None:
@@ -11293,6 +11358,7 @@ class View(QtWidgets.QLabel):
                     "Channels combined": self.locs_paths,
                 }
                 self._add_shape_specific_info(pick_info)
+                self._add_picks_to_info(pick_info, [self._picks[i]])
                 io.save_locs(
                     os.path.splitext(path)[0] + f"_{i}.hdf5",
                     pick_locs,
@@ -11372,44 +11438,8 @@ class View(QtWidgets.QLabel):
         """
         if len(self._picks) == 0:
             return
-        picks = {}
-        pixelsize = self.pixelsize
-        if self._pick_shape == "Circle":
-            d = self._pick_size * pixelsize
-            picks["Diameter (nm)"] = float(d)
-            picks["Centers"] = [
-                [float(_[0]), float(_[1])] for _ in self._picks
-            ]
-        elif self._pick_shape == "Rectangle":
-            w = self._pick_size * pixelsize
-            picks["Width (nm)"] = float(w)
-            picks["Center-Axis-Points"] = [
-                [
-                    [float(s[0]), float(s[1])],
-                    [float(e[0]), float(e[1])],
-                ]
-                for s, e in self._picks
-            ]
-        elif self._pick_shape == "Polygon":
-            vertices = []
-            for pick in self._picks:
-                # vertices.append([])
-                if len(pick):
-                    vertices.append([])
-                    for vertex in pick:
-                        vertices[-1].append(
-                            [float(vertex[0]), float(vertex[1])]
-                        )
-            picks["Vertices"] = vertices
-        elif self._pick_shape == "Square":
-            a = self._pick_size * pixelsize
-            picks["Side Length (nm)"] = float(a)
-            picks["Centers"] = [
-                [float(_[0]), float(_[1])] for _ in self._picks
-            ]
-        picks["Shape"] = self._pick_shape
         with open(path, "w") as f:
-            yaml.dump(picks, f)
+            yaml.dump(self._picks_dict(), f)
 
     def activate_render_property(self) -> None:
         """Assign localizations by color to render a chosen property."""

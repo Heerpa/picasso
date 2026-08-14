@@ -211,6 +211,8 @@ Save the localizations that are within a picked region (yellow circle, rectangle
 In case of rectangular picks, the saved localizations file will contain new columns `x_pick_rot` and `y_pick_rot`, which are localization coordinates into the coordinate system of the pick rectangle (coordinate (0,0) is where the rectangle was started to be drawn, and `y_pick_rot` is in the direction of the drawn line.)
 These columns can be used to plot density profiles of localizations along the rectangle dimensions easily (e.g., with "Filter").
 
+The picked regions themselves (shape, size and positions, in the same format as a pick regions ``.yaml`` file, see "Save pick regions" below) can additionally be stored in the metadata of the saved file, under the key ``Picks``. This is switched off by default, since it can add a substantial amount of data to the metadata. To switch it on, set ``Save picks in metadata`` to ``True`` in ``~/.picasso/settings.yaml`` (also available under File > Picasso settings in any module).
+
 Save pick properties
 ^^^^^^^^^^^^^^^^^^^^
 Calculates the properties of each pick (i.e., mean frame, mean x mean y as well as kinetic information) and saves it as an hdf5 file.

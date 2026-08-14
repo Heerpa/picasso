@@ -324,6 +324,40 @@ class TestSaveLoadLocs:
         assert loaded_info == list(info)
 
 
+class TestSavePicksInMetadataSetting:
+    @pytest.fixture(autouse=True)
+    def _settings_file(self, tmp_path, monkeypatch):
+        # Never touch the developer's ~/.picasso/settings.yaml.
+        path = tmp_path / "settings.yaml"
+        monkeypatch.setattr(io, "_user_settings_filename", lambda: str(path))
+        return path
+
+    def test_defaults_to_false_and_is_persisted(self, _settings_file):
+        # Nothing is defined yet: the default must not crash and must be
+        # written out, so the setting is visible and editable.
+        assert io._save_picks_in_metadata() is False
+        assert (
+            yaml.safe_load(_settings_file.read_text())[
+                "Save picks in metadata"
+            ]
+            is False
+        )
+
+    def test_respects_the_setting(self, _settings_file):
+        io.save_user_settings({"Save picks in metadata": True})
+        assert io._save_picks_in_metadata() is True
+        io.save_user_settings({"Save picks in metadata": False})
+        assert io._save_picks_in_metadata() is False
+
+    def test_other_settings_are_kept(self, _settings_file):
+        # Persisting the default must not wipe unrelated settings.
+        io.save_user_settings({"Colors": {"Render": "hot"}})
+        io._save_picks_in_metadata()
+        settings = io.load_user_settings()
+        assert settings["Colors"]["Render"] == "hot"
+        assert settings["Save picks in metadata"] is False
+
+
 class TestSaveDatasets:
     def test_writes_named_datasets(self, tmp_path):
         path = tmp_path / "datasets.hdf5"

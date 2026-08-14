@@ -1426,6 +1426,33 @@ def _save_metadata_in_yaml() -> bool:
     return bool(settings["Save metadata in .yaml"])
 
 
+def _save_picks_in_metadata() -> bool:
+    """Whether to embed the picked regions (pick shape, size and
+    positions) in the metadata when saving picked localizations from
+    Render.
+
+    The regions are stored in the same format as a picks ``.yaml`` file
+    (see ``load_picks``), so the picks used to generate a file can be
+    recovered from it. This can add a lot of data to the metadata (one
+    entry per pick, and polygonal picks store every vertex), so it
+    defaults to False. When the setting is absent, the default is
+    persisted to the user settings file so it becomes visible and
+    editable.
+
+    Returns
+    -------
+    bool
+        True if the picked regions should be saved in the metadata.
+    """
+    settings = load_user_settings()
+    # cannot rely on truthiness: AutoDict auto-creates an empty (falsy)
+    # dict for a missing key, so check membership explicitly.
+    if "Save picks in metadata" not in settings:
+        settings["Save picks in metadata"] = False
+        save_user_settings(settings)
+    return bool(settings["Save picks in metadata"])
+
+
 def _write_metadata_dataset(hdf_file: h5py.File, info: list[dict]) -> bool:
     """Embed metadata in an open HDF5 file as a JSON string dataset at
     ``/metadata``.

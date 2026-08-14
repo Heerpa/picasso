@@ -85,6 +85,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Updated G5M documentation - drift correction importance
 - Test clusterer with a constrast bar
 - Select localizations in the center of the binding event added. See [Steen et al., Nature Methods 21, 1755-1762 (2024)](https://doi.org/10.1038/s41592-024-02374-8), Extended Data Fig. 1f
+- The picked regions can now be saved in the metadata when saving picked localizations, so the picks used to generate a file can be recovered from it. This is off by default and controlled by the new user setting `Save picks in metadata` in `~/.picasso/settings.yaml` (also available via any module under File > Picasso settings)
 - Removed the switch to no blur method while panning
 - Improved robustness of NeNA calculation by trying out 3 starting positions for the fit
 - Fixed `picasso.g5m` bootstrap SEM (`bootstrap_check=True`) raising `AssertionError` for spline 3D data, because the resampling model was rebuilt without carrying over the fit mode
