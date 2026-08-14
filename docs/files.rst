@@ -78,6 +78,8 @@ Since v0.11, Picasso embeds this metadata directly inside the HDF5 file as a JSO
 
 For convenience and backward compatibility, the metadata is, by default, also written to a separate YAML file (see "YAML Metadata Files" below). Whether this YAML copy is written is controlled by the user setting ``Save metadata in .yaml`` in ``~/.picasso/settings.yaml`` (default: ``True``). Picasso settings are also available under Files > Picasso settings in any module. Set ``Save metadata in .yaml`` to ``False`` to save only the embedded ``/metadata`` dataset.
 
+Movies acquired with MicroManager carry a large block of microscope properties, which Picasso reads from the movie (as ``Micro-Manager Metadata``) and copies into the metadata of the localizations fitted from it. Set the user setting ``Save Micro-Manager metadata`` to ``false`` in ``~/.picasso/settings.yaml`` to leave it out (default: ``true``, i.e., the block is kept). This applies when localizing only - the block is dropped as the movie metadata is carried over into the localizations (and identifications/spots).
+
 When loading metadata (``picasso.io.load_info``, used by ``load_locs``), Picasso looks for the metadata in the following order:
 
 1. The accompanying ``.yaml`` file (preferred, as it is easy to inspect and hand-edit);

@@ -1453,6 +1453,70 @@ def _save_picks_in_metadata() -> bool:
     return bool(settings["Save picks in metadata"])
 
 
+#: Key holding the (often very large) block of MicroManager properties
+#: read from a movie, see ``_mm_metadata_from_tifffile``.
+_MM_METADATA_KEY = "Micro-Manager Metadata"
+
+
+def _save_mm_metadata() -> bool:
+    """Whether to carry the MicroManager metadata block over from a
+    movie into the metadata of the localizations fitted from it.
+
+    MicroManager movies carry a large block of microscope properties
+    (``Micro-Manager Metadata``), which Picasso copies from the movie
+    metadata into the localizations. It is needed to read the camera
+    settings while localizing, but it makes the metadata of the saved
+    localizations long and hard to read, so users can switch it off.
+    Defaults to True, i.e., the block is kept as before. When the
+    setting is absent, the default is persisted to the user settings
+    file so it becomes visible and editable.
+
+    Returns
+    -------
+    bool
+        True if the MicroManager metadata should be kept.
+    """
+    settings = load_user_settings()
+    # cannot rely on truthiness: AutoDict auto-creates an empty (falsy)
+    # dict for a missing key, so check membership explicitly.
+    if "Save Micro-Manager metadata" not in settings:
+        settings["Save Micro-Manager metadata"] = True
+        save_user_settings(settings)
+    return bool(settings["Save Micro-Manager metadata"])
+
+
+def strip_mm_metadata(info: list[dict]) -> list[dict]:
+    """Remove the MicroManager metadata block from movie metadata if the
+    user settings ask for it (``Save Micro-Manager metadata``).
+
+    The input is not modified: the entries holding the block are copied
+    without it, so the movie metadata kept in memory (used, e.g., to
+    read the camera settings while localizing) is unaffected.
+
+    Parameters
+    ----------
+    info : list of dict
+        Movie metadata, about to be carried over into the metadata of
+        the localizations.
+
+    Returns
+    -------
+    info : list of dict
+        The metadata without the ``Micro-Manager Metadata`` keys, or the
+        input unchanged if the setting is on (the default).
+    """
+    if _save_mm_metadata():
+        return info
+    return [
+        (
+            {k: v for k, v in entry.items() if k != _MM_METADATA_KEY}
+            if isinstance(entry, dict) and _MM_METADATA_KEY in entry
+            else entry
+        )
+        for entry in info
+    ]
+
+
 def _write_metadata_dataset(hdf_file: h5py.File, info: list[dict]) -> bool:
     """Embed metadata in an open HDF5 file as a JSON string dataset at
     ``/metadata``.

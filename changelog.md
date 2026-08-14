@@ -114,6 +114,8 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Removed `notification_sounds` folder, the users can add their notification sounds in the `.picasso` folder
 - Progress reporting now goes through a uniform duck-typed interface (`lib.normalize_progress`): `None`, `"console"` and `lib.ProgressDialog` arguments are normalized once at the public entry points and driven with plain method calls, replacing the per-call-site `isinstance`/`"console"` branches — so headless runs never touch Qt at runtime either. `lib.TqdmProgress` and `lib.MockProgress` now implement the full `ProgressDialog` interface (`setMaximum`, `maximum`, `zero_progress`, `close`)
 - Localizations imported from ThunderSTORM and SMAP maintain all their columns, not only the Picasso pre-defined ones
+- The `Micro-Manager Metadata` block (the microscope properties read from a MicroManager movie) can now be left out when localizing, see [documentation](https://picassosr.readthedocs.io/en/latest/files.html#metadata)
+
 
 ### **Backward incompatible changes:**
 - All the functions deprecated in v0.10 were removed, see section 0.10.0 below

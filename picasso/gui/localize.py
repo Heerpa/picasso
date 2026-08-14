@@ -10269,7 +10269,9 @@ class Window(QtWidgets.QMainWindow):
         spots = localize.get_spots(
             self.movie, self.identifications, box, self.camera_info
         )
-        info = self.info + [self.last_identification_info | self.camera_info]
+        info = io.strip_mm_metadata(self.info) + [
+            self.last_identification_info | self.camera_info
+        ]
         info_path = os.path.splitext(path)[0] + ".yaml"
         if path.endswith(".npy"):
             np.save(path, spots)
@@ -10363,7 +10365,11 @@ class Window(QtWidgets.QMainWindow):
                 self.parameters_dialog.camera_calibration
             )
         )
-        self.extra_info = self.info + [localize_info | self.camera_info]
+        # the MicroManager metadata block of the movie is only carried
+        # over if the user settings ask for it (it is by default)
+        self.extra_info = io.strip_mm_metadata(self.info) + [
+            localize_info | self.camera_info
+        ]
         self.select_locs_columns()  # save only selected columns
         io.save_locs(path, self.locs, self.extra_info)
 
@@ -10397,7 +10403,7 @@ class Window(QtWidgets.QMainWindow):
                 self.parameters["Gaussian Filter Sigma"]
             ),
         }
-        info = self.info + [ids_info]
+        info = io.strip_mm_metadata(self.info) + [ids_info]
         io.save_identifications(path, self.identifications, info)
 
     def save_identifications_dialog(self) -> None:

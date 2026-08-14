@@ -1208,6 +1208,36 @@ class TestLocalize:
         assert "Min. Net Gradient" in info[-2]
         assert "Fit method" in info[-1]
 
+    def test_mm_metadata_carried_over_unless_disabled(
+        self, picasso_movie, movie_info, monkeypatch
+    ):
+        """The MicroManager block of the movie ends up in the
+        localizations' metadata, unless the user switched it off."""
+        mm_info = [
+            dict(movie_info[0], **{"Micro-Manager Metadata": {"Cam": "Zyla"}})
+        ] + list(movie_info[1:])
+        kwargs = dict(
+            camera_info=CAMERA_INFO_WITH_PIXELSIZE,
+            identification_parameters={
+                "Min. Net Gradient": MIN_NG,
+                "Box Size": BOX,
+            },
+            movie_info=mm_info,
+            fitting_method="gausslq",
+            threaded=False,
+            return_info=True,
+        )
+        _, info = localize.localize(picasso_movie, **kwargs)
+        assert info[0]["Micro-Manager Metadata"] == {"Cam": "Zyla"}
+
+        monkeypatch.setattr(io, "_save_mm_metadata", lambda: False)
+        _, info = localize.localize(picasso_movie, **kwargs)
+        assert "Micro-Manager Metadata" not in info[0]
+        # the rest of the movie metadata is untouched, and so is the
+        # caller's copy
+        assert info[0]["Frames"] == mm_info[0]["Frames"]
+        assert "Micro-Manager Metadata" in mm_info[0]
+
     def test_localize_matches_identify_plus_fit2d(
         self, picasso_movie, real_identifications, movie_info
     ):

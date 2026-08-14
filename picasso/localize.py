@@ -6274,7 +6274,7 @@ def localize(
         multiprocess=threaded,
         progress_callback=fit_progress_callback,
     )
-    info = movie_info + [identify_info] + [fit_info]
+    info = io.strip_mm_metadata(movie_info) + [identify_info] + [fit_info]
 
     if fit_z:
         # Astigmatic z fitting on top of the 2D fit, see Huang, et al.
