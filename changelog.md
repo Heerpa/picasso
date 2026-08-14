@@ -115,6 +115,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Progress reporting now goes through a uniform duck-typed interface (`lib.normalize_progress`): `None`, `"console"` and `lib.ProgressDialog` arguments are normalized once at the public entry points and driven with plain method calls, replacing the per-call-site `isinstance`/`"console"` branches — so headless runs never touch Qt at runtime either. `lib.TqdmProgress` and `lib.MockProgress` now implement the full `ProgressDialog` interface (`setMaximum`, `maximum`, `zero_progress`, `close`)
 - Localizations imported from ThunderSTORM and SMAP maintain all their columns, not only the Picasso pre-defined ones
 - The `Micro-Manager Metadata` block (the microscope properties read from a MicroManager movie) can now be left out when localizing, see [documentation](https://picassosr.readthedocs.io/en/latest/files.html#metadata)
+- `Micro-Manager Acquisition Comments` is only saved in the metadata if the acquisition actually has a comment; an empty one is no longer written
 
 
 ### **Backward incompatible changes:**

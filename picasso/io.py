@@ -2504,7 +2504,8 @@ def _mm_metadata_from_tifffile(tif: "tifffile.TiffFile") -> dict:
         comments_block = mm_file.get("Comments")
         if isinstance(comments_block, dict):
             summary = comments_block.get("Summary")
-            if isinstance(summary, str):
+            # key is left out if the comments is empty
+            if isinstance(summary, str) and summary.strip():
                 out["Micro-Manager Acquisition Comments"] = summary.split("\n")
     except Exception:
         pass
@@ -2930,10 +2931,10 @@ class TiffMap(_PerThreadFileHandles):
             "Frames": self.n_frames,
         }
         mm = _mm_metadata_from_tifffile(self._tif)
-        # The comments key is always present (possibly empty)
-        info["Micro-Manager Acquisition Comments"] = mm.get(
-            "Micro-Manager Acquisition Comments", ""
-        )
+        # only carried over if the acquisition actually has a comment
+        comments = mm.get("Micro-Manager Acquisition Comments")
+        if comments:
+            info["Micro-Manager Acquisition Comments"] = comments
         if "Micro-Manager Metadata" in mm:
             info["Micro-Manager Metadata"] = mm["Micro-Manager Metadata"]
             info["Camera"] = mm["Camera"]

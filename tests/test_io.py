@@ -1194,8 +1194,9 @@ class TestTiffLoading:
             assert mm_meta["TestCam-Gain"] == "300"
             assert mm_meta["Camera"] == "TestCam"
             assert "scopeDataKeys" not in mm_meta
-            # The comments key is always present for parity with old reader
-            assert "Micro-Manager Acquisition Comments" in meta
+            # This acquisition has no comment, so the key is left out
+            # rather than saved empty with every file.
+            assert "Micro-Manager Acquisition Comments" not in meta
         finally:
             movie.close()
 
@@ -1241,6 +1242,44 @@ class TestTiffLoading:
             np.testing.assert_array_equal(np.array(list(movie)), data)
         finally:
             movie.close()
+
+
+class _FakeTif:
+    """Just enough of a ``tifffile.TiffFile`` for
+    ``_mm_metadata_from_tifffile``: no pages (so the per-image tag is
+    skipped) and a file-level MicroManager block."""
+
+    def __init__(self, micromanager_metadata):
+        self.pages = []
+        self.micromanager_metadata = micromanager_metadata
+
+
+class TestMMAcquisitionComments:
+    @pytest.mark.parametrize("summary", ["", "   ", "\n", None, 42], ids=repr)
+    def test_left_out_when_empty(self, summary):
+        # An empty comment is not worth a key in the metadata of every
+        # file of the acquisition.
+        tif = _FakeTif({"Comments": {"Summary": summary}})
+        out = io._mm_metadata_from_tifffile(tif)
+        assert "Micro-Manager Acquisition Comments" not in out
+
+    def test_left_out_when_no_comments_block(self):
+        assert (
+            "Micro-Manager Acquisition Comments"
+            not in io._mm_metadata_from_tifffile(_FakeTif({}))
+        )
+        assert (
+            "Micro-Manager Acquisition Comments"
+            not in io._mm_metadata_from_tifffile(_FakeTif(None))
+        )
+
+    def test_kept_when_present(self):
+        tif = _FakeTif({"Comments": {"Summary": "line one\nline two"}})
+        out = io._mm_metadata_from_tifffile(tif)
+        assert out["Micro-Manager Acquisition Comments"] == [
+            "line one",
+            "line two",
+        ]
 
 
 # ---------------------------------------------------------------------------
