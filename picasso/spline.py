@@ -1327,8 +1327,8 @@ def calibrate_spline(
         io.save_spline_calibration(path, calibration)
         # empirical axial precision (z RMSD to the true stage position vs z)
         # from fitting every individual per-frame bead spot through the
-        # just-built spline model; None when no GPU fitter is available or for a
-        # 2D calibration (the plot then falls back to the model-vs-data RMSE)
+        # just-built spline model; None for a 2D calibration or if the refit
+        # fails (the plot then falls back to the model-vs-data RMSE)
         precision = _axial_precision(built, calibration)
         _save_diagnostic_plot(built, calibration, path, precision=precision)
         # gallery of the individual beads, showing which were averaged into the
@@ -1949,8 +1949,8 @@ def calibrate_spline_multichannel(
     if path is not None:
         io.save_spline_calibration(path, calibration)
         # diagnostic PNGs: one per-channel PSF plot (reusing the single-channel
-        # diagnostic, with the axial-precision panels when a GPU fitter is
-        # present) plus one channel-registration plot. Never fatal.
+        # diagnostic, with its axial-precision panels) plus one
+        # channel-registration plot. Never fatal.
         try:
             _save_multichannel_diagnostics(
                 per_channel,
@@ -3257,7 +3257,7 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
     """Empirical axial precision of the spline PSF model across z.
 
     Every individual single-frame bead spot (``built["spots"]``) is fitted with
-    the calibration's own spline PSF model (the very GPU fitter used at
+    the calibration's own spline PSF model (the very fitter used at
     localization time) and the recovered z - referenced to the scan center, the
     same zero as ``z_of_step`` - is compared against the known stage position of
     its frame. The per-z-step RMSD of that deviation is the calibration's axial
@@ -3291,11 +3291,9 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
         ``scatter_fit``/``scatter_stage`` are per-spot (subsampled) estimated z
         and stage position, in raw stage nm, for the fitted-vs-truth scatter.
         Returns ``None`` for a 2D calibration (no z), when the per-frame spots
-        are absent, or when GPU spline fitting is unavailable or fails, so the
-        caller can fall back to the model-vs-data RMSE panel.
+        are absent, or when the refit fails, so the caller can fall back to the
+        model-vs-data RMSE panel.
     """
-    if not localize.CUDA_AVAILABLE:
-        return None
     if calibration["model"] == "spline-2d":
         return None  # no axial coordinate to assess
     spots = built.get("spots")
@@ -3314,8 +3312,11 @@ def _axial_precision(built: dict, calibration: dict) -> dict | None:
         # spots and stays closer to the CRLB than least squares, especially for
         # the dim, defocused spots in the tails. The axial multi-start is left
         # at its default so this measures what the fitting path delivers.
+        # ``use_gpu=None`` picks the GPU when there is one and the CPU
+        # otherwise - both devices run the same fit, so the diagnostic is
+        # available on a machine without CUDA too (it just takes longer).
         theta = localize.fit_spots_spline(
-            spots, calibration, mle=True, use_gpu=True
+            spots, calibration, mle=True, use_gpu=None
         )
     except Exception:
         return None
@@ -3395,8 +3396,6 @@ def _axial_precision_multichannel(
     ``spot_residuals`` (``(n_spots, n_channels, 2)``, see
     :func:`_spot_roi_residuals`) are the sub-pixel ROI offsets of the bead
     spots being refitted."""
-    if not localize.CUDA_AVAILABLE:
-        return None
     # only the plain multichannel spline fitter is used here
     if calibration.get("model") != "spline-3d-multichannel":
         return None
@@ -3429,11 +3428,12 @@ def _axial_precision_multichannel(
     ):
         spot_residuals = None
     try:
+        # GPU when there is one, CPU otherwise (see ``_axial_precision``)
         theta = localize.fit_spots_spline(
             spots,
             fit_cal,
             mle=True,
-            use_gpu=True,
+            use_gpu=None,
             residuals=spot_residuals,
         )
     except Exception:

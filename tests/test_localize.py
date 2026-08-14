@@ -4391,6 +4391,19 @@ class TestGuiConvergenceDefaults:
             assert not code.endswith("-gpu")
             assert code + "-gpu" in localize_gui._CONVERGENCE_CODES
 
+    def test_every_fitted_model_can_use_the_gpu(self):
+        """Every PSF model in the dialog runs on both devices now, so ticking
+        "Use GPU" must move *all* of them onto the GPU - a code left out of
+        ``_GPU_CAPABLE_CODES`` would silently keep fitting on the CPU. Only
+        "Average of ROI", which does not fit, is exempt."""
+        for entry in localize_gui.FIT_MODELS.values():
+            for code in (entry["optimizers"] or {}).values():
+                assert code in localize_gui._GPU_CAPABLE_CODES
+                assert (
+                    localize_gui._effective_fit_code(code, True)
+                    == code + "-gpu"
+                )
+
     def test_z_fitting_follows_the_fit_gpu_checkbox(self):
         """The astigmatism box no longer carries its own GPU checkbox, so a
         user cannot put the two devices in disagreement."""

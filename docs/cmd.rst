@@ -25,7 +25,7 @@ The reconstruction parameters can be specified by adding respective arguments. I
 ::
 
    '-b', '--box-side-length', type=int, default=7, help='box side length'
-   '-a', '--fit-method', choices=["mle", "mle-spherical", "mle-spherical-gpu", "mle-rotated-gpu", "lq", "lq-spherical", "lq-spherical-gpu", "lq-rotated", "lq-rotated-gpu", "lq-gpu", "lq-3d", "lq-gpu-3d", "mle-3d", "spline", "spline-mle", "spline-gpu", "spline-mle-gpu", "avg"], default='mle', help='fitting method'
+   '-a', '--fit-method', choices=["mle", "mle-gpu", "mle-spherical", "mle-spherical-gpu", "mle-rotated", "mle-rotated-gpu", "lq", "lq-spherical", "lq-spherical-gpu", "lq-rotated", "lq-rotated-gpu", "lq-gpu", "lq-3d", "lq-gpu-3d", "mle-3d", "spline", "spline-mle", "spline-gpu", "spline-mle-gpu", "avg"], default='mle', help='fitting method'
    '-g', '--gradient', type=int, default=5000, help='minimum net gradient'
    '-tm', '--temporal-median', type=int, default=0, help='window length (frames) of the temporal median filter applied before identification, 0 to deactivate'
    '-gf', '--gaussian-filter', type=float, default=0.0, help='sigma (camera pixels) of the spatial Gaussian filter applied before identification, 0 to deactivate'

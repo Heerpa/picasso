@@ -455,7 +455,7 @@ The diagnostic ``.png`` summarizes the averaged PSF and lets you judge the calib
 - **xz and yz cross-sections** — side views with z on the vertical axis; a cyan line marks the sharpest slice. Look for a smooth, symmetric hourglass shape, without double-lobing or abrupt jumps between z-steps.
 - **Axial intensity profile** (always shown) — the brightest normalized pixel per slice versus stage position. Expect a single clean peak, ≈ 1 at focus, decaying smoothly with defocus.
 
-For a 3D calibration, when a GPU is present Picasso also re-fits the individual beads through the new spline model and adds three panels:
+For a 3D calibration, Picasso also re-fits the individual beads through the new spline model (on the GPU when one is present, otherwise on the CPU) and adds three panels:
 
 - **Estimated z vs stage** — recovered z against the known stage position, with the identity line. Points should be found around the diagonal across the whole z range.
 - **Axial bias** — the mean signed z error per step; ideally flat and near 0 nm.

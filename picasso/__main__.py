@@ -1104,6 +1104,7 @@ _FIT_METHOD_MAP = {
     "lq-gpu": "gausslq-gpu",
     "lq-gpu-3d": "gausslq-gpu",
     "mle": "gaussmle",
+    "mle-gpu": "gaussmle-gpu",
     "mle-spherical": "gaussmle-spherical",
     "mle-spherical-gpu": "gaussmle-spherical-gpu",
     "mle-rotated": "gaussmle-rotated",
@@ -1311,7 +1312,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     print("Localize - Parameters:")
     print("{:<8} {:<15} {:<10}".format("No", "Label", "Value"))
 
-    if args.fit_method in ("lq-gpu", "spline-gpu", "spline-mle-gpu"):
+    if _FIT_METHOD_MAP[args.fit_method].endswith("-gpu"):
         if localize.CUDA_AVAILABLE:
             print("CUDA GPU found")
         else:
@@ -2920,6 +2921,7 @@ def main():  # noqa: C901
         "--fit-method",
         choices=[
             "mle",
+            "mle-gpu",
             "mle-spherical",
             "mle-spherical-gpu",
             "mle-rotated",

@@ -1101,7 +1101,6 @@ class TestCalibrateSplineMultichannel:
         assert abs(t1[1, 1] + 1.0) < 0.1  # y scale ~ -1
         assert abs(t1[1, 2] - (h - 1)) < 2.0  # y offset ~ H - 1
 
-    @pytest.mark.skipif(not localize.CUDA_AVAILABLE, reason="no CUDA device")
     def test_axial_precision_multichannel_is_joint(self):
         """The multichannel axial-precision diagnostic must fit all channels
         *jointly* (the real pipeline) rather than each plane alone. This checks
@@ -1687,13 +1686,20 @@ class TestCliWiring:
         assert cli._FIT_METHOD_MAP["spline-gpu"] == "spline-gpu"
         assert cli._FIT_METHOD_MAP["spline-mle-gpu"] == "spline-mle-gpu"
 
-    def test_only_the_gpu_codes_require_gpufit(self):
-        """The CPU spline codes must not trip the GPUfit precheck."""
+    def test_only_the_gpu_codes_require_a_gpu(self):
+        """The CPU codes must not trip the GPU precheck, and every "-gpu" one
+        must. Keyed on the resolved fit code rather than a hand-written list,
+        which went stale as the remaining methods gained a GPU backend."""
         import inspect
         from picasso import __main__ as cli
 
         src = inspect.getsource(cli._localize)
-        assert '("lq-gpu", "spline-gpu", "spline-mle-gpu")' in src
+        assert '_FIT_METHOD_MAP[args.fit_method].endswith("-gpu")' in src
+        # aliases that hide the suffix still resolve to a GPU code ...
+        assert cli._FIT_METHOD_MAP["lq-gpu-3d"].endswith("-gpu")
+        # ... and no CPU alias does
+        for alias in ("spline", "spline-mle", "lq", "mle", "lq-3d", "avg"):
+            assert not cli._FIT_METHOD_MAP[alias].endswith("-gpu")
 
     def test_spline_calibrate_handler_exists(self):
         from picasso import __main__ as cli

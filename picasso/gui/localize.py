@@ -328,18 +328,11 @@ def _fit_code(model: str, optimizer: str) -> str:
 
 
 # Fit codes with both a CPU and a GPU implementation, selected by the "Use
-# GPU" checkbox rather than by the model/optimizer comboboxes. The remaining
-# codes are either GPU-only (they already end in "-gpu") or CPU-only.
+# GPU" checkbox rather than by the model/optimizer comboboxes.
 _GPU_CAPABLE_CODES = frozenset(
-    {
-        "gausslq",
-        "gausslq-spherical",
-        "gausslq-rotated",
-        "gaussmle",
-        "gaussmle-spherical",
-        "spline",
-        "spline-mle",
-    }
+    code
+    for code in localize.FIT_METHODS
+    if not code.endswith("-gpu") and f"{code}-gpu" in localize.FIT_METHODS
 )
 
 
@@ -3958,13 +3951,8 @@ class ParametersDialog(lib.Dialog):
         model and optimizer, then show that method's convergence schedule."""
         model = self.fit_model.currentText()
         optimizer = self.fit_optimizer.currentText()
-        if optimizer and _fit_code(model, optimizer).endswith("-gpu"):
-            # GPU-only method (e.g. the rotated elliptical Gaussian):
-            # fitting always runs on the GPU, so pin the checkbox.
-            self.gpu_checkbox.setChecked(True)
-            self.gpu_checkbox.setDisabled(True)
-        elif optimizer in ("Least squares", "MLE"):
-            # Both estimators are implemented on the GPU
+        code = _fit_code(model, optimizer) if optimizer else ""
+        if code in _GPU_CAPABLE_CODES:
             self.gpu_checkbox.setDisabled(not CUDA_AVAILABLE)
         else:
             self.gpu_checkbox.setChecked(False)
