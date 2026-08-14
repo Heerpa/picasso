@@ -62,6 +62,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Fixed handling abortions during identification
 - Fixed zooming in Localize with scale bar + better appearance on Windows
 - Fixed reading of the movies from the network storage after interuption
+- Fixed the default directory in the load and save dialogs in the mask settings dialog
 
 #### Render
 - `Pick similar` now works with square and rectangular picks, not only circular ones, see [documentation](https://picassosr.readthedocs.io/en/latest/render.html#pick-similar-ctrl-shift-p)

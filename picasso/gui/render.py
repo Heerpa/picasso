@@ -5659,11 +5659,20 @@ class MaskSettingsDialog(lib.Dialog):
             title="Blur",
         )
 
+    def last_used_directory(self) -> str:
+        """Return the last used directory, i.e., the one stored in the
+        user settings (window's pwd attribute). Falls back to the
+        directory of the loaded localizations."""
+        pwd = getattr(self.window, "pwd", [])
+        if pwd:
+            return pwd if os.path.isdir(pwd) else os.path.dirname(pwd)
+        return os.path.dirname(self.paths[0])
+
     def save_mask(self) -> None:
         """Save binary mask to .npy and .png formats."""
-        directory, file_name = os.path.split(self.paths[0])
+        file_name = os.path.basename(self.paths[0])
         base, ext = os.path.splitext(file_name)
-        name_mask = base + "_mask"
+        name_mask = os.path.join(self.last_used_directory(), base + "_mask")
         path, ext = lib.get_save_filename_ext_dialog(
             self, "Save mask to", name_mask, filter="*.npy", check_ext=".png"
         )
@@ -5676,9 +5685,9 @@ class MaskSettingsDialog(lib.Dialog):
 
     def save_blur(self) -> None:
         """Save blurred image to a .png format."""
-        directory, file_name = os.path.split(self.paths[0])
+        file_name = os.path.basename(self.paths[0])
         base, ext = os.path.splitext(file_name)
-        name_blur = base + "_blur"
+        name_blur = os.path.join(self.last_used_directory(), base + "_blur")
         path, ext = lib.get_save_filename_ext_dialog(
             self, "Save blur to", name_blur, filter="*.png"
         )
@@ -5691,7 +5700,10 @@ class MaskSettingsDialog(lib.Dialog):
         """Load binary mask from .npy format."""
         # choose which file to load
         path, ext = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load mask", filter="*.npy"
+            self,
+            "Load mask",
+            directory=self.last_used_directory(),
+            filter="*.npy",
         )
         if path:
             self.mask = np.load(path)
