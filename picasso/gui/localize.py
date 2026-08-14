@@ -267,6 +267,58 @@ OPTIMIZER_TOOLTIP = (
 )
 
 
+def _filtered_identification_movie(
+    movie,
+    window: int,
+    sigma: float,
+    rois: list | None,
+    roi_pad: int,
+    cache: list,
+) -> tuple[object, list]:
+    """Put the identification filters on top of ``movie``: the temporal
+    median background subtraction, then the Gaussian smoothing - built
+    exactly the way ``localize.identify`` builds them, so the preview and
+    the batch run search the same image.
+
+    Both stages are lazy views, so ``cache`` (a ``[temporal, gaussian]``
+    pair) keeps them across redraws: a stage is rebuilt only when its
+    source movie or its setting changed. Comparing the source by identity
+    chains the invalidation, so rebuilding (or dropping) the median also
+    rebuilds the Gaussian on top of it. Returns the filtered movie and the
+    refreshed cache; ``window`` of 0 (or a movie too short for it, which
+    the caller resolves) and ``sigma`` of 0 switch the respective stage
+    off.
+    """
+    temporal, gaussian = cache
+    if window:
+        if (
+            temporal is None
+            or temporal.raw is not movie
+            or temporal.window != min(window, len(movie))
+            or temporal.roi != rois
+            or temporal.roi_pad != roi_pad
+        ):
+            # comparing against the raw movie by identity means loading a
+            # movie or switching channel invalidates this for free
+            temporal = localize.TemporalMedianMovie(
+                movie, window, roi=rois, roi_pad=roi_pad
+            )
+        movie = temporal
+    else:
+        temporal = None
+    if sigma:
+        if (
+            gaussian is None
+            or gaussian.raw is not movie
+            or gaussian.sigma != sigma
+        ):
+            gaussian = localize.GaussianFilteredMovie(movie, sigma)
+        movie = gaussian
+    else:
+        gaussian = None
+    return movie, [temporal, gaussian]
+
+
 def _fit_code(model: str, optimizer: str) -> str:
     """Resolve a (model, optimizer) selection to an internal ``fit`` code."""
     entry = FIT_MODELS[model]
@@ -3049,8 +3101,7 @@ class ParametersDialog(lib.Dialog):
             "gray. Pairing uses the loaded multichannel / split-FOV spline\n"
             "calibration's inter-channel transform. With no calibration\n"
             "loaded, the transform is estimated from the identifications "
-            "themselves.\n"
-            "Identify every channel first."
+            "themselves."
         )
         self.link_colors_checkbox.setTristate(False)
         self.link_colors_checkbox.stateChanged.connect(
@@ -5109,6 +5160,22 @@ class Window(QtWidgets.QMainWindow):
         # ``identification_movie``. Never used for fitting.
         self._temporal_movie = None
         self._gaussian_movie = None
+        # The same filter stacks for the channels that are *not* on screen,
+        # built for the link-color preview only (see
+        # ``channel_identification_movie``): {channel index: [temporal,
+        # gaussian]}.
+        self._channel_filter_cache = {}
+        # This frame's detections per channel while the identification
+        # preview draws them, so the link colors can pair spots that have
+        # not been identified yet (see ``_preview_link_identifications``).
+        # None whenever the preview is not drawing.
+        self._preview_link_ids = None
+        # Cached preview detections of the off-screen channels, keyed by
+        # channel and by everything they were identified with.
+        self._preview_ids_cache = {}
+        # (linked, total) boxes the last link-color draw put on screen, for
+        # the preview's status message.
+        self._link_box_counts = None
         # Dictionary of analysis parameters used for the last operation
         self.last_identification_info = None
         # Dataframe of identifcations with fields frame, x and y
@@ -6544,6 +6611,9 @@ class Window(QtWidgets.QMainWindow):
         if not movies:
             return
         self._warn_if_channel_lengths_differ(infos)
+        # the preview's link colors cache the other channels' detections and
+        # filter stacks, and these are other channels now
+        self.drop_preview_link_cache()
         # Build channels and seed each channel's parameter/contrast
         # snapshot from the current dialog state, applying any camera /
         # pixel-size hints from that channel's metadata. Guarded so the
@@ -7296,7 +7366,8 @@ class Window(QtWidgets.QMainWindow):
             else:
                 if self.parameters_dialog.preview_checkbox.isChecked():
                     # scrubbing into a new temporal window costs one median
-                    # (~0.1 s at 512x512, more for larger frames)
+                    # (~0.1 s at 512x512, more for larger frames), and the
+                    # link colors identify the other channels' frames on top
                     QtWidgets.QApplication.setOverrideCursor(
                         QtCore.Qt.CursorShape.WaitCursor
                     )
@@ -7311,16 +7382,12 @@ class Window(QtWidgets.QMainWindow):
                                 frame_bounds=self.frame_range,
                             )
                         )
+                        self.draw_preview_identifications(
+                            identifications_frame,
+                            self.parameters["Box Size"],
+                        )
                     finally:
                         QtWidgets.QApplication.restoreOverrideCursor()
-                    box = self.parameters["Box Size"]
-                    self.status_bar.showMessage(
-                        f"Found {len(identifications_frame):,} spots in "
-                        "current frame."
-                    )
-                    self.draw_identifications(
-                        identifications_frame, box, QtGui.QColor("red")
-                    )
                 else:
                     self.status_bar.showMessage("")
             locs_frame = self._current_frame_locs()
@@ -7440,6 +7507,215 @@ class Window(QtWidgets.QMainWindow):
                 format_hover_tooltip(identification if loc is None else loc)
             )
 
+    def draw_preview_identifications(
+        self, identifications_frame: pd.DataFrame, box: int
+    ) -> None:
+        """Draw the identification preview for the current frame and report
+        what it found in the status bar.
+
+        With 'Link colors' on the boxes are color-coded by their cross-channel
+        link, exactly as they are after an identification run - the pairing is
+        made from the detections the preview itself produces, so the channels
+        do not have to be identified first. Plain red boxes otherwise, and
+        whenever the channels cannot be linked (yet).
+        """
+        self._link_box_counts = None
+        self._preview_link_ids = self._preview_link_identifications(
+            identifications_frame
+        )
+        try:
+            linked = self._draw_linked_identifications(
+                self.curr_frame_number, box
+            )
+        finally:
+            self._preview_link_ids = None
+        if not linked:
+            self.draw_identifications(
+                identifications_frame, box, QtGui.QColor("red")
+            )
+        message = (
+            f"Found {len(identifications_frame):,} spots in current frame"
+        )
+        counts = self._link_box_counts
+        if counts is not None:
+            n_linked, n_total = counts
+            where = "regions" if self.view.split_fov_mode else "channels"
+            message += (
+                f", {n_linked:,} of {n_total:,} linked across all {where}"
+            )
+        self.status_bar.showMessage(message + ".")
+
+    def _preview_link_identifications(
+        self, identifications_frame: pd.DataFrame
+    ) -> list | None:
+        """This frame's detections in every channel, for the link colors of
+        the identification preview. Returns None when there is nothing to
+        link, which keeps the preview on its plain boxes.
+
+        Split-FOV data has every channel in the displayed frame, so the
+        preview has already searched all of them and its one table is all
+        that is needed. Separate channel movies show one channel at a time,
+        so the frames of the other channels are identified here as well -
+        with their own settings, exactly as the preview identifies the
+        displayed one (see :meth:`channel_frame_identifications`).
+        """
+        pdialog = self.parameters_dialog
+        if not getattr(pdialog, "link_colors_checkbox", None):
+            return None
+        if not pdialog.link_colors_checkbox.isChecked():
+            return None
+        if self.identify_mode() == IDENTIFY_MODE_SUM:
+            # the preview searches the summed channels, so every detection is
+            # a cross-channel spot already - there is nothing to pair
+            return None
+        if self.view.split_fov_mode:
+            if len(self.view.rois) < 2:
+                return None
+            return [identifications_frame]
+        if len(self.channels) < 2:
+            return None
+        return [
+            (
+                identifications_frame
+                if c == self.current_channel
+                else self.channel_frame_identifications(c)
+            )
+            for c in range(len(self.channels))
+        ]
+
+    def channel_frame_identifications(
+        self, channel: int
+    ) -> pd.DataFrame | None:
+        """Identify the current frame in a channel that is not on screen, the
+        way the preview identifies the displayed one.
+
+        Cached per channel and per everything the detections depend on: the
+        preview redraws on every scroll, every parameter change and every
+        mouse move over the frame slider, and each of these calls is a full
+        frame identification of another movie.
+        """
+        movie = self.channels[channel].movie
+        if movie is None:
+            return None
+        frame_number = self.curr_frame_number
+        if frame_number >= len(movie):
+            # the channels can differ in length; a frame the movie does not
+            # have simply has no detections to link against
+            return None
+        parameters = self.channel_parameters(channel)
+        rois = self.identification_rois()
+        key = (
+            frame_number,
+            parameters["Box Size"],
+            str(parameters["Min. Net Gradient"]),
+            parameters["Temporal Median Window"],
+            parameters["Gaussian Filter Sigma"],
+            tuple(np.asarray(rois).ravel().tolist()) if rois else None,
+            None if self.frame_range is None else str(self.frame_range),
+        )
+        cached = self._preview_ids_cache.get(channel)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            identifications = localize.identify_by_frame_number(
+                self.channel_identification_movie(channel),
+                parameters["Min. Net Gradient"],
+                parameters["Box Size"],
+                frame_number,
+                roi=rois,
+                frame_bounds=self.frame_range,
+            )
+        except Exception:
+            # another channel's movie must never break the display; without
+            # its detections the link colors simply fall back
+            return None
+        self._preview_ids_cache[channel] = (key, identifications)
+        return identifications
+
+    def channel_parameters(self, channel: int) -> dict:
+        """The identification settings of a channel that is not on screen.
+
+        The dialog only ever holds the active channel's values, so the others
+        come from the snapshot taken when they were last displayed - except
+        for the settings whose 'Same across channels' box is ticked, which are
+        the dialog's current ones by definition. The temporal median needs a
+        stack, so it is switched off for a channel whose movie is too short
+        for it, exactly as ``parameters`` does for the displayed one.
+        """
+        parameters = dict(self.parameters)
+        if channel == self.current_channel:
+            return parameters
+        pdialog = self.parameters_dialog
+        params = self.channels[channel].params or {}
+        if params:
+            if not pdialog.link_box_checkbox.isChecked():
+                parameters["Box Size"] = params.get(
+                    "box", parameters["Box Size"]
+                )
+            if not pdialog.link_mng_checkbox.isChecked():
+                parameters["Min. Net Gradient"] = params.get(
+                    "mng", parameters["Min. Net Gradient"]
+                )
+            # the filters are per channel: they are always restored from the
+            # snapshot on a channel switch (see ``_apply_params``)
+            parameters["Temporal Median Window"] = (
+                params.get(
+                    "temporal_median",
+                    DEFAULT_PARAMETERS["Temporal Median Window"],
+                )
+                if params.get("temporal_median_on", False)
+                else 0
+            )
+            parameters["Gaussian Filter Sigma"] = params.get(
+                "gaussian_filter_sigma",
+                DEFAULT_PARAMETERS["Gaussian Filter Sigma"],
+            )
+        movie = self.channels[channel].movie
+        if movie is not None and len(movie) < _TEMPORAL_MEDIAN_MIN_FRAMES:
+            parameters["Temporal Median Window"] = 0
+        return parameters
+
+    def channel_identification_movie(self, channel: int):
+        """The identification-filtered movie of a channel that is not on
+        screen, built like :meth:`identification_movie` builds the displayed
+        one but from that channel's own settings.
+
+        Only the link-color preview needs this; the filter stacks are lazy
+        views, so they are cached per channel (and dropped with the channels
+        themselves) rather than rebuilt on every redraw.
+        """
+        if channel == self.current_channel:
+            return self.identification_movie()
+        movie = self.channels[channel].movie
+        if movie is None:
+            return None
+        parameters = self.channel_parameters(channel)
+        sigma = parameters["Gaussian Filter Sigma"]
+        rois = self.identification_rois() or None
+        roi_pad = (
+            localize.identification_roi_pad(parameters["Box Size"], sigma)
+            if rois
+            else 0
+        )
+        movie, cache = _filtered_identification_movie(
+            movie,
+            parameters["Temporal Median Window"],
+            sigma,
+            rois,
+            roi_pad,
+            self._channel_filter_cache.get(channel, [None, None]),
+        )
+        self._channel_filter_cache[channel] = cache
+        return movie
+
+    def drop_preview_link_cache(self) -> None:
+        """Forget the off-screen channels' preview detections and filter
+        stacks. Called wherever they would no longer describe the channels
+        they were built from (channels loaded or closed, a channel switched
+        in, an identification run)."""
+        self._preview_ids_cache = {}
+        self._channel_filter_cache = {}
+
     def _current_frame_locs(self) -> pd.DataFrame | None:
         """Fitted localizations in the currently displayed frame, or
         None if no localizations are available."""
@@ -7479,6 +7755,11 @@ class Window(QtWidgets.QMainWindow):
         calibration's inter-channel transform, as the signal re-registration
         does) share a color; unmatched spots are grey. Returns True if it
         handled the drawing, False to fall back to plain single-color boxes.
+
+        Drawn from the identifications of the last Identify run, or - while the
+        preview is drawing (``_preview_link_ids``) - from the detections the
+        preview has just made in this frame, so the links show up before
+        anything has been identified.
         """
         pdialog = self.parameters_dialog
         if not getattr(pdialog, "link_colors_checkbox", None):
@@ -7518,6 +7799,10 @@ class Window(QtWidgets.QMainWindow):
             return False
         if boxes is None:
             return False
+        self._link_box_counts = (
+            sum(1 for *_, color in boxes if color != LINK_UNMATCHED_COLOR),
+            len(boxes),
+        )
         box_half = int(box / 2)
         locs_frame = self._current_frame_locs()
         for x, y, color in boxes:
@@ -7591,8 +7876,31 @@ class Window(QtWidgets.QMainWindow):
             ],
         }
 
+    def link_identifications(self, channel: int = 0) -> pd.DataFrame | None:
+        """The detections the link colors pair ``channel`` from.
+
+        While the identification preview draws, these are the current frame's
+        detections it has just made (see ``_preview_link_ids``), so the links
+        are shown before anything has been identified; otherwise they are the
+        identifications of the last Identify run. Split-FOV data keeps every
+        region's detections in one table, so ``channel`` is ignored there and
+        the caller splits the table by region.
+        """
+        preview = self._preview_link_ids
+        if preview is not None:
+            if self.view.split_fov_mode:
+                return preview[0]
+            return preview[channel] if channel < len(preview) else None
+        if self.view.split_fov_mode or channel == self.current_channel:
+            return self.identifications
+        if channel < len(self.channels):
+            # the active channel's live detections are not mirrored back into
+            # ``self.channels`` until the channel is switched
+            return self.channels[channel].identifications
+        return None
+
     def _channel_identification_inputs(
-        self,
+        self, preview: bool = False
     ) -> tuple[list | None, list | None]:
         """The per-channel detections the channels can be registered from,
         and the regions they sit in.
@@ -7602,28 +7910,32 @@ class Window(QtWidgets.QMainWindow):
         movies, or ``(None, None)`` when there is nothing to register. Shared
         by the link-color preview and the channel-sum identification, so both
         register the channels from exactly the same detections.
+
+        With ``preview`` the preview's current-frame detections stand in for
+        the channels while it is drawing (see :meth:`link_identifications`);
+        the channel sum registers off the full identifications only.
         """
+        ids = (
+            self.link_identifications
+            if preview
+            else lambda c: (
+                self.identifications
+                if self.view.split_fov_mode or c == self.current_channel
+                else self.channels[c].identifications
+            )
+        )
         if self.view.split_fov_mode:
             regions = [list(map(list, r)) for r in self.view.rois]
-            if len(regions) < 2 or self.identifications is None:
+            if len(regions) < 2 or ids(0) is None:
                 return None, None
             # split-FOV: one table holds every region's detections
             rects = [_normalize_rect(r) for r in regions]
             return [
-                self._identifications_in_region(rect) for rect in rects
+                self._identifications_in_region(rect, ids(0)) for rect in rects
             ], regions
         if len(self.channels) < 2:
             return None, None
-        # the active channel's live detections are not mirrored back into
-        # ``self.channels`` until the channel is switched
-        return [
-            (
-                self.identifications
-                if c == self.current_channel
-                else self.channels[c].identifications
-            )
-            for c in range(len(self.channels))
-        ], None
+        return [ids(c) for c in range(len(self.channels))], None
 
     def _frame_shape_for_registration(self) -> tuple[int, int] | None:
         """``(height, width)`` used to seed the mirror orientations when the
@@ -7646,9 +7958,17 @@ class Window(QtWidgets.QMainWindow):
         Estimating is not free, so the result is cached until the detections,
         the box size or the ROIs change. Returns None if there is nothing to
         link.
+
+        In the preview the detections are the current frame's alone, so the
+        registration is estimated from that one frame - enough for a dense
+        frame, and the channels simply stay grey (unregistered) where it is
+        not. The cached result is therefore also keyed by the frame.
         """
         split_fov = self.view.split_fov_mode
-        ids_per_channel, regions = self._channel_identification_inputs()
+        preview = self._preview_link_ids is not None
+        ids_per_channel, regions = self._channel_identification_inputs(
+            preview=preview
+        )
         if ids_per_channel is None:
             return None
         n_channels = len(ids_per_channel)
@@ -7662,6 +7982,7 @@ class Window(QtWidgets.QMainWindow):
                 else None
             ),
             tuple(0 if ids is None else len(ids) for ids in ids_per_channel),
+            self.curr_frame_number if preview else None,
         )
         cached = getattr(self, "_link_cal_cache", None)
         if cached is not None and cached[0] == key:
@@ -7717,10 +8038,14 @@ class Window(QtWidgets.QMainWindow):
         self._link_cal_cache = (key, cal)
         return cal
 
-    def _identifications_in_region(self, rect: tuple) -> pd.DataFrame | None:
+    def _identifications_in_region(
+        self, rect: tuple, ids: pd.DataFrame | None = None
+    ) -> pd.DataFrame | None:
         """The identifications inside a ``((y_min, x_min), (y_max, x_max))``
-        region (split-FOV: one region per channel)."""
-        ids = self.identifications
+        region (split-FOV: one region per channel). ``ids`` defaults to the
+        window's own identifications."""
+        if ids is None:
+            ids = self.identifications
         if ids is None or len(ids) == 0:
             return None
         (y0, x0), (y1, x1) = rect
@@ -7735,7 +8060,7 @@ class Window(QtWidgets.QMainWindow):
         one frame, so paired boxes across regions get the same color. Returns a
         list of ``(x, y, QColor)`` for all this-frame spots, or None to fall
         back."""
-        ids = self.identifications
+        ids = self.link_identifications()
         if ids is None or len(ids) == 0:
             return None
         # place the channels at the drawn ROIs when they match the channel
@@ -7824,8 +8149,8 @@ class Window(QtWidgets.QMainWindow):
             return None
         if len(self.channels) < 2:
             return None
-        reference = self.channels[0]
-        if reference.identifications is None:
+        reference_ids = self.link_identifications(0)
+        if reference_ids is None:
             return None
 
         def frame_xy(ids) -> np.ndarray:
@@ -7836,7 +8161,7 @@ class Window(QtWidgets.QMainWindow):
                 [np.asarray(ids["x"])[m], np.asarray(ids["y"])[m]]
             ).astype(float)
 
-        ref_xy = frame_xy(reference.identifications)
+        ref_xy = frame_xy(reference_ids)
 
         # A reference spot counts as linked only if it is matched in EVERY
         # other channel (i.e. the bead is found in all channels). Count, per
@@ -7849,7 +8174,7 @@ class Window(QtWidgets.QMainWindow):
             if c2 >= len(self.channels):
                 continue
             n_checked += 1
-            chan_xy = frame_xy(self.channels[c2].identifications)
+            chan_xy = frame_xy(self.link_identifications(c2))
             if n_ref == 0 or len(chan_xy) == 0:
                 continue
             pred = localize.apply_affine_transform(
@@ -7881,7 +8206,7 @@ class Window(QtWidgets.QMainWindow):
         # a non-reference channel: color its detections by the reference spot
         # they pair with, but only when that reference spot links across ALL
         # channels; otherwise grey (matches that spot's box in channel 0)
-        cur_xy = frame_xy(self.identifications)
+        cur_xy = frame_xy(self.link_identifications(c))
         if len(cur_xy) == 0:
             return []
         matches = {}
@@ -8301,38 +8626,18 @@ class Window(QtWidgets.QMainWindow):
             if rois
             else 0
         )
-        if window and self.temporal_median_applicable():
-            cached = self._temporal_movie
-            if (
-                cached is None
-                or cached.raw is not movie
-                or cached.window != min(window, len(movie))
-                or cached.roi != rois
-                or cached.roi_pad != roi_pad
-            ):
-                # comparing against self.movie by identity means loading a
-                # movie or switching channel invalidates this for free
-                cached = localize.TemporalMedianMovie(
-                    movie, window, roi=rois, roi_pad=roi_pad
-                )
-                self._temporal_movie = cached
-            movie = cached
-        else:
-            self._temporal_movie = None
-        if sigma:
-            cached = self._gaussian_movie
-            # comparing the source by identity chains the invalidation:
-            # whenever the stage below is rebuilt (or dropped), so is this
-            if (
-                cached is None
-                or cached.raw is not movie
-                or cached.sigma != sigma
-            ):
-                cached = localize.GaussianFilteredMovie(movie, sigma)
-                self._gaussian_movie = cached
-            movie = cached
-        else:
-            self._gaussian_movie = None
+        if not self.temporal_median_applicable():
+            window = 0
+        try:
+            cache = [self._temporal_movie, self._gaussian_movie]
+        except (AttributeError, RuntimeError):
+            # also called from a partially built window, which has no
+            # cached filter stack yet
+            cache = [None, None]
+        movie, cache = _filtered_identification_movie(
+            movie, window, sigma, rois, roi_pad, cache
+        )
+        self._temporal_movie, self._gaussian_movie = cache
         return movie
 
     def on_parameters_changed(self) -> None:

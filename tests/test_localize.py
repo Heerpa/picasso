@@ -10885,3 +10885,326 @@ class TestChannelSumAfterRealignment:
             localize_gui.Window.reregister_channels_from_signal
         )
         assert "self.drop_channel_sum()" in source
+
+
+# the plain (unlinked) identification preview color
+_RED = "#ff0000"
+
+
+def _movie_info(movie, name="Channel 0"):
+    """Metadata matching a synthetic movie, as loading one produces."""
+    return [
+        {
+            "Frames": len(movie),
+            "Height": int(movie.shape[1]),
+            "Width": int(movie.shape[2]),
+            "Channel": name,
+        }
+    ]
+
+
+def _two_channel_window(reference, channel, box=BOX, mng=800):
+    """A Localize window with two channel movies loaded, identified with a
+    unit camera and the given box size / threshold, shared across both
+    channels ('Same settings across channels')."""
+    window = localize_gui.Window()
+    dialog = window.parameters_dialog
+    dialog.baseline.setValue(0)
+    dialog.sensitivity.setValue(1.0)
+    dialog.gain.setValue(1)
+    window._set_channels(
+        [reference, channel],
+        [
+            _movie_info(reference, "Channel 0"),
+            _movie_info(channel, "Channel 1"),
+        ],
+        ["ref.tif", "ch1.tif"],
+        ["Channel 0", "Channel 1"],
+    )
+    dialog.link_box_checkbox.setChecked(True)
+    dialog.link_mng_checkbox.setChecked(True)
+    dialog.box_spinbox.setValue(box)
+    dialog.mng_slider.setValue(mng)
+    return window
+
+
+def _preview_box_colors(window):
+    """Draw the frame and return the identification box colors in the order
+    they were added."""
+    window.draw_frame()
+    return [
+        item.pen().color().name()
+        for item in window.scene.items()[::-1]
+        if isinstance(item, QtWidgets.QGraphicsRectItem)
+    ]
+
+
+class TestPreviewLinkColors:
+    """'Link colors' on top of the identification preview: the cross-channel
+    links are shown for the displayed frame before anything is identified, so
+    the registration can be judged while the settings are still being tuned."""
+
+    POSITIONS = [(12.0, 15.0), (30.0, 22.0), (20.0, 36.0)]
+    TRANSFORM = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+
+    def _window(self, positions=None, transform=None, **kwargs):
+        reference, channel = _channel_pair(
+            self.POSITIONS if positions is None else positions,
+            self.TRANSFORM if transform is None else transform,
+            amplitudes=(300.0, 300.0),
+            **kwargs,
+        )
+        window = _two_channel_window(reference, channel)
+        dialog = window.parameters_dialog
+        dialog.preview_checkbox.setChecked(True)
+        dialog.link_colors_checkbox.setChecked(True)
+        return window
+
+    def _with_calibration(self, window, transform=None):
+        calibration = _fake_spline_calibration(model="spline-3d-multichannel")
+        calibration["channel_transforms"] = [
+            IDENTITY_AFFINE.tolist(),
+            (self.TRANSFORM if transform is None else transform).tolist(),
+        ]
+        window.parameters_dialog.spline_calibration = calibration
+        return window
+
+    def test_the_links_are_drawn_before_anything_is_identified(self):
+        """The request this covers: seeing the linked identifications in the
+        preview rather than only after a full identification run."""
+        window = self._with_calibration(self._window())
+        try:
+            assert window.identifications is None
+            assert not window.ready_for_fit
+            colors = _preview_box_colors(window)
+            assert len(colors) == len(self.POSITIONS)
+            # every spot is in both channels, so none of them stays grey ...
+            assert localize_gui.LINK_UNMATCHED_COLOR.name() not in colors
+            # ... and none is drawn in the plain preview red
+            assert _RED not in colors
+            assert len(set(colors)) == len(self.POSITIONS)
+            message = window.status_bar.currentMessage()
+            assert "3 of 3 linked across all channels" in message
+        finally:
+            window.close()
+
+    def test_the_colors_follow_a_channel_switch(self):
+        """The second channel is drawn in its own coordinates, and a spot
+        keeps the color of the reference spot it pairs with."""
+        window = self._with_calibration(self._window())
+        try:
+            reference_colors = _preview_box_colors(window)
+            window.set_current_channel(1)
+            colors = _preview_box_colors(window)
+            assert colors == reference_colors
+            boxes = [
+                item.rect()
+                for item in window.scene.items()[::-1]
+                if isinstance(item, QtWidgets.QGraphicsRectItem)
+            ]
+            mapped = localize.apply_affine_transform(
+                np.asarray(self.POSITIONS, dtype=float), self.TRANSFORM
+            )
+            half = int(window.parameters["Box Size"] / 2)
+            assert sorted(
+                (rect.x() + half, rect.y() + half) for rect in boxes
+            ) == sorted((round(x), round(y)) for x, y in mapped.tolist())
+        finally:
+            window.close()
+
+    def test_a_spot_missing_from_the_other_channel_stays_grey(self):
+        window = self._with_calibration(
+            self._window(positions=self.POSITIONS[:1])
+        )
+        try:
+            # a spot the second channel does not have: it cannot link
+            window.channels[0].movie = _channel_pair(
+                self.POSITIONS[:2], self.TRANSFORM, amplitudes=(300.0, 300.0)
+            )[0]
+            window.movie = window.channels[0].movie
+            colors = _preview_box_colors(window)
+            assert len(colors) == 2
+            assert colors.count(localize_gui.LINK_UNMATCHED_COLOR.name()) == 1
+            assert "1 of 2 linked across all channels" in (
+                window.status_bar.currentMessage()
+            )
+        finally:
+            window.close()
+
+    def test_the_other_channels_frame_is_identified_for_it(self):
+        """The displayed channel is the only one the preview searches, so the
+        others have to be searched here - in their own coordinates."""
+        window = self._with_calibration(self._window())
+        try:
+            ids = window.channel_frame_identifications(1)
+            mapped = localize.apply_affine_transform(
+                np.asarray(self.POSITIONS, dtype=float), self.TRANSFORM
+            )
+            found = sorted(zip(ids["x"].tolist(), ids["y"].tolist()))
+            assert found == sorted(
+                (round(x), round(y)) for x, y in mapped.tolist()
+            )
+            assert set(ids["frame"]) == {window.curr_frame_number}
+        finally:
+            window.close()
+
+    def test_the_other_channels_detections_are_cached(self):
+        """The preview redraws on every scroll and every parameter change;
+        identifying the other channels' frames again each time is what makes
+        it too slow to leave on."""
+        window = self._with_calibration(self._window())
+        try:
+            first = window.channel_frame_identifications(1)
+            assert window.channel_frame_identifications(1) is first
+            # ... but a setting the detections depend on invalidates it
+            window.parameters_dialog.mng_slider.setValue(1500)
+            assert window.channel_frame_identifications(1) is not first
+        finally:
+            window.close()
+
+    def test_the_channels_are_registered_from_the_preview_itself(self):
+        """No calibration loaded: the transform is estimated from the frame's
+        own detections, mirror orientations included."""
+        rng = np.random.default_rng(7)
+        positions = [
+            tuple(xy) for xy in rng.uniform(8.0, 40.0, size=(14, 2)).round(0)
+        ]
+        window = self._window(positions=positions)
+        try:
+            colors = _preview_box_colors(window)
+            # a couple of the random spots fall too close to resolve
+            assert len(colors) >= len(positions) - 2
+            grey = localize_gui.LINK_UNMATCHED_COLOR.name()
+            assert sum(color != grey for color in colors) >= 10
+        finally:
+            window.close()
+
+    def test_plain_red_boxes_without_link_colors(self):
+        window = self._with_calibration(self._window())
+        try:
+            window.parameters_dialog.link_colors_checkbox.setChecked(False)
+            colors = _preview_box_colors(window)
+            assert colors == [_RED] * len(self.POSITIONS)
+            assert window.status_bar.currentMessage() == (
+                "Found 3 spots in current frame."
+            )
+        finally:
+            window.close()
+
+    def test_nothing_to_link_on_the_channel_sum(self):
+        """The sum is searched as one image, so its detections are
+        cross-channel spots already."""
+        window = self._with_calibration(self._window())
+        try:
+            window.parameters_dialog.identify_mode_combo.setCurrentText(
+                localize_gui.IDENTIFY_MODE_SUM
+            )
+            assert window._preview_link_identifications(pd.DataFrame()) is None
+        finally:
+            window.close()
+
+    def test_an_off_screen_channel_keeps_its_own_threshold(self):
+        window = self._with_calibration(self._window())
+        dialog = window.parameters_dialog
+        try:
+            dialog.link_mng_checkbox.setChecked(False)
+            window.channels[1].params["mng"] = 4321
+            assert window.channel_parameters(1)["Min. Net Gradient"] == 4321
+            # ... unless the threshold is shared across channels
+            dialog.link_mng_checkbox.setChecked(True)
+            assert window.channel_parameters(1)["Min. Net Gradient"] == (
+                dialog.mng_slider.value()
+            )
+        finally:
+            window.close()
+
+    def test_loading_other_channels_drops_the_cached_detections(self):
+        window = self._with_calibration(self._window())
+        try:
+            window.channel_frame_identifications(1)
+            assert window._preview_ids_cache
+            movie = np.zeros((2, 16, 16), np.float32)
+            window._set_channels(
+                [movie, movie],
+                [_movie_info(movie), _movie_info(movie, "Channel 1")],
+                ["a.tif", "b.tif"],
+                ["Channel 0", "Channel 1"],
+            )
+            # the stale detections are gone: these movies are empty, and a
+            # redraw has already cached that
+            assert len(window.channel_frame_identifications(1)) == 0
+        finally:
+            window.close()
+
+
+class TestPreviewLinkColorsSplitFov:
+    """The same on split-FOV data, where the channels are regions of the one
+    displayed frame - the preview already searches all of them."""
+
+    REGIONS = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
+    # spaced well apart, so a region shifted by more than the pairing
+    # tolerance really has nothing to pair with
+    POSITIONS = [(10.0, 8.0), (34.0, 8.0), (10.0, 32.0)]
+
+    def _window(self, shift=(48.0, 0.0)):
+        """One movie holding both regions; the right region is the left one
+        shifted by ``shift``."""
+        spots = [(x, y, 300.0) for x, y in self.POSITIONS]
+        spots += [
+            (x + shift[0], y + shift[1], 300.0) for x, y in self.POSITIONS
+        ]
+        movie = np.stack([_spots_frame((48, 96), spots)] * 2)
+        window = localize_gui.Window()
+        dialog = window.parameters_dialog
+        dialog.baseline.setValue(0)
+        dialog.sensitivity.setValue(1.0)
+        dialog.gain.setValue(1)
+        window._set_channels(
+            [movie], [_movie_info(movie)], ["split.tif"], ["Channel 0"]
+        )
+        window.view.rois = [[r[:] for r in region] for region in self.REGIONS]
+        window.set_split_fov_mode(True)
+        dialog.box_spinbox.setValue(BOX)
+        dialog.mng_slider.setValue(800)
+        calibration = _fake_spline_calibration(model="spline-3d-multichannel")
+        calibration["split_fov"] = True
+        calibration["regions"] = self.REGIONS
+        calibration["channel_affines"] = [
+            IDENTITY_AFFINE.tolist(),
+            IDENTITY_AFFINE.tolist(),
+        ]
+        dialog.spline_calibration = calibration
+        dialog.preview_checkbox.setChecked(True)
+        dialog.link_colors_checkbox.setChecked(True)
+        return window
+
+    def test_the_regions_are_linked_in_the_preview(self):
+        window = self._window()
+        try:
+            assert window.identifications is None
+            colors = _preview_box_colors(window)
+            # the two region rectangles are drawn as boxes too
+            boxes = colors[len(self.REGIONS) :]
+            assert len(boxes) == 2 * len(self.POSITIONS)
+            assert localize_gui.LINK_UNMATCHED_COLOR.name() not in boxes
+            # each spot has the same color in both regions, and the spots
+            # differ from one another
+            assert boxes[: len(self.POSITIONS)] == boxes[len(self.POSITIONS) :]
+            assert len(set(boxes)) == len(self.POSITIONS)
+            assert "6 of 6 linked across all regions" in (
+                window.status_bar.currentMessage()
+            )
+        finally:
+            window.close()
+
+    def test_a_misregistered_region_stays_grey(self):
+        """The registration is the calibration's, so a shift it does not
+        know about shows up as unlinked spots rather than being absorbed."""
+        window = self._window(shift=(48.0, 12.0))
+        try:
+            boxes = _preview_box_colors(window)[len(self.REGIONS) :]
+            grey = localize_gui.LINK_UNMATCHED_COLOR.name()
+            assert len(boxes) > len(self.POSITIONS)
+            assert boxes == [grey] * len(boxes)
+        finally:
+            window.close()
