@@ -2617,7 +2617,8 @@ def estimate_transforms_from_identifications(
     max_frames: int = 50,
     n_iter: int = 4,
     min_pairs: int = 10,
-) -> list | None:
+    return_diagnostics: bool = False,
+) -> list | None | tuple[list | None, list]:
     """Reference->channel affine transforms estimated from *identifications
     alone*, with no calibration and no prior knowledge of the optical path.
 
@@ -2638,10 +2639,22 @@ def estimate_transforms_from_identifications(
     region plus the ``regions`` themselves. Returns one ``(2, 3)`` transform per
     channel (the reference's is the identity) with ``None`` for channels that
     could not be registered, or ``None`` if none of them could.
+
+    ``max_frames`` bounds how many frames are sampled; a dim channel yields few
+    detections per frame, so a caller that needs every channel registered (the
+    channel-sum identification, which must not fall back to the identity)
+    should raise it. With ``return_diagnostics`` the number of correspondences
+    each channel was registered on is returned alongside the transforms (0 for
+    the reference and for channels that failed), so the caller can say *which*
+    channel could not be registered.
     """
     n_channels = len(identifications)
+
+    def result(transforms, n_pairs):
+        return (transforms, n_pairs) if return_diagnostics else transforms
+
     if n_channels < 2:
-        return None
+        return result(None, [0] * n_channels)
 
     # Only an evenly-spaced sample of frames is used (as the signal
     # re-registration does): the transform is global, so a few tens of frames
@@ -2650,7 +2663,7 @@ def estimate_transforms_from_identifications(
     # every channel is cut down to them before it is grouped per frame.
     ref_ids = identifications[0]
     if ref_ids is None or len(ref_ids) == 0:
-        return None
+        return result(None, [0] * n_channels)
     ref_frames = np.unique(np.asarray(ref_ids["frame"], dtype=np.int64))
     if ref_frames.size > max_frames:
         pick = np.unique(
@@ -2676,11 +2689,11 @@ def estimate_transforms_from_identifications(
     per_channel = [by_frame(ids) for ids in identifications]
     ref_by_frame = per_channel[0]
     if not ref_by_frame:
-        return None
+        return result(None, [0] * n_channels)
     region_rects = None
     if regions is not None:
         if len(regions) != n_channels:
-            return None
+            return result(None, [0] * n_channels)
         region_rects = [_normalized_region(r) for r in regions]
 
     # radii shrink from generous (absorb the coarse seed's error) to sub-box
@@ -2688,11 +2701,13 @@ def estimate_transforms_from_identifications(
         1.5 * float(box), max(2.0, 0.3 * float(box)), max(1, int(n_iter))
     )
     transforms: list = [np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])]
+    n_pairs_per_channel: list = [0]
     for c in range(1, n_channels):
         chan_by_frame = per_channel[c]
         common = sorted(sample & set(chan_by_frame))
         if not common:
             transforms.append(None)
+            n_pairs_per_channel.append(0)
             continue
         ref_pool = np.vstack([ref_by_frame[f] for f in common])
         chan_pool = np.vstack([chan_by_frame[f] for f in common])
@@ -2727,10 +2742,12 @@ def estimate_transforms_from_identifications(
             scale = abs(float(np.linalg.det(transform[:, :2])))
             if n_pairs > best_pairs and 0.5 <= scale <= 2.0:
                 best_pairs, best_transform = n_pairs, transform
-        transforms.append(best_transform if best_pairs >= min_pairs else None)
+        registered = best_pairs >= min_pairs
+        transforms.append(best_transform if registered else None)
+        n_pairs_per_channel.append(best_pairs if registered else 0)
     if all(t is None for t in transforms[1:]):
-        return None
-    return transforms
+        return result(None, n_pairs_per_channel)
+    return result(transforms, n_pairs_per_channel)
 
 
 def refine_split_fov_transforms_from_signal(

@@ -20,7 +20,7 @@ import time
 import warnings
 from collections import UserDict
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Callable, Literal
 
 import numpy as np
 import pandas as pd
@@ -50,6 +50,9 @@ DEFAULT_PARAMETERS = {
     "Gaussian Filter Sigma": 0.0,
     "Temporal Median Window": 51,
 }
+
+IDENTIFY_MODE_SEPARATE = "Each channel separately"
+IDENTIFY_MODE_SUM = "Sum of channels"
 IMAGE_FILTER = (
     "All supported formats ("
     + " ".join("*" + e for e in io.MOVIE_EXTENSIONS)
@@ -96,6 +99,23 @@ LINK_UNMATCHED_COLOR = QtGui.QColor(150, 150, 150)
 # rolling median over one frame is that frame, so the filtered movie is
 # identically zero (see Window.identification_movie).
 _TEMPORAL_MEDIAN_MIN_FRAMES = 2
+
+# Frames sampled when the channels are registered from their own detections
+# for the channel sum. Generous compared to the link-color preview's default:
+# the channel that makes summing worthwhile in the first place is the dim one,
+# and it contributes few detections per frame.
+_SUM_REGISTRATION_MAX_FRAMES = 200
+
+
+def _retain_size_when_hidden(widget: QtWidgets.QWidget) -> None:
+    """Keep a widget's space reserved while it is hidden.
+
+    The multichannel-only widgets appear and disappear with the loaded data.
+    Reserving their space means the Parameters dialog keeps one shape: nothing
+    below them shifts when channels are opened or closed."""
+    policy = widget.sizePolicy()
+    policy.setRetainSizeWhenHidden(True)
+    widget.setSizePolicy(policy)
 
 
 def _normalized_path(path: str) -> str:
@@ -3032,10 +3052,54 @@ class ParametersDialog(lib.Dialog):
         )
         # shown by the window for multichannel / split-FOV data
         # (see Window._update_multichannel_widgets)
+        _retain_size_when_hidden(self.link_colors_checkbox)
         self.link_colors_checkbox.hide()
         preview_row.addWidget(self.link_colors_checkbox)
         preview_row.addStretch(1)
         identification_grid.addLayout(preview_row, 6, 0)
+
+        # Multichannel: identify each channel on its own, or on the channels
+        # added together. Shown by the window for multichannel / split-FOV
+        # data (see Window._update_multichannel_widgets); its space is
+        # reserved while hidden, so loading channels does not reflow the
+        # dialog.
+        mode_row = QtWidgets.QHBoxLayout()
+        self.identify_mode_label = QtWidgets.QLabel("Identify on:")
+        identify_mode_tip = (
+            "What the spots are searched in.\n\n"
+            f"'{IDENTIFY_MODE_SEPARATE}': every channel (or split-FOV\n"
+            "region) is identified on its own, and the joint spline fit then\n"
+            "keeps only the molecules found in all of them.\n\n"
+            f"'{IDENTIFY_MODE_SUM}': the channels are mapped onto the\n"
+            "reference channel and added up (in photons), and the spots are\n"
+            "identified in that sum. Use this when a channel is too dim to\n"
+            "detect in by itself - a molecule that is faint everywhere can\n"
+            "still stand out in the sum. The fit then uses these detections\n"
+            "directly, without requiring a detection in every channel.\n\n"
+            "The registration comes from the loaded multichannel / split-FOV\n"
+            "spline calibration; without one, every channel is identified\n"
+            "first and the transform is estimated from those detections.\n"
+            "The sum is shown (and previewed) as soon as it is selected,\n"
+            "wherever the channels are already registered.\n"
+            "Note that the minimum net gradient has to be re-tuned for the\n"
+            "sum: it is in photons and over all channels."
+        )
+        self.identify_mode_label.setToolTip(identify_mode_tip)
+        self.identify_mode_combo = QtWidgets.QComboBox()
+        self.identify_mode_combo.addItems(
+            [IDENTIFY_MODE_SEPARATE, IDENTIFY_MODE_SUM]
+        )
+        self.identify_mode_combo.setToolTip(identify_mode_tip)
+        self.identify_mode_combo.currentIndexChanged.connect(
+            self.on_identify_mode_changed
+        )
+        mode_row.addWidget(self.identify_mode_label)
+        mode_row.addWidget(self.identify_mode_combo)
+        mode_row.addStretch(1)
+        for widget in (self.identify_mode_label, self.identify_mode_combo):
+            _retain_size_when_hidden(widget)
+            widget.hide()
+        identification_grid.addLayout(mode_row, 6, 1)
 
         # ROIs
         label = QtWidgets.QLabel("ROIs:")
@@ -3141,6 +3205,7 @@ class ParametersDialog(lib.Dialog):
             cb.stateChanged.connect(self.on_link_params_changed)
             link_layout.addWidget(cb)
         link_layout.addStretch(1)
+        _retain_size_when_hidden(self.link_groupbox)
         self.link_groupbox.hide()  # shown by the window for >1 channel
 
         # Camera:
@@ -4270,6 +4335,18 @@ class ParametersDialog(lib.Dialog):
             )
             self.spline_calib_label.setText("-- no calibration loaded --")
         self._update_link_photons_visibility()
+        # The channel sum may have been registered from the calibration that
+        # has just been replaced. Dropping it re-registers it from the new one
+        # on the next draw, which is also what brings the summed view up when
+        # a calibration is loaded while 'Identify on' is set to the sum (see
+        # ``Window.ensure_channel_sum``).
+        self.window.drop_channel_sum()
+        try:
+            if self.window.movie is not None:
+                self.window._reset_contrast_to_frame()
+                self.window.draw_frame()
+        except (AttributeError, RuntimeError):
+            pass  # called during startup, before the window is fully built
 
     def _update_link_photons_visibility(self) -> None:
         """Show the 'Link photons across channels' checkbox only for a
@@ -4553,6 +4630,24 @@ class ParametersDialog(lib.Dialog):
         """Redraw with/without cross-channel link color-coding of the
         identification boxes."""
         self.window.draw_frame()
+
+    def on_identify_mode_changed(self) -> None:
+        """Switch between per-channel and channel-sum identification.
+
+        The two modes search different images, so any identification made in
+        the other mode is stale - dropping the channel sum here also takes the
+        summed view out of the display and the preview. Like the filters, the
+        sum lives on a different intensity scale (photons, over all channels),
+        so the contrast has to be re-derived with it.
+
+        Selecting the sum builds the summed view straight away wherever the
+        channels can be registered without identifying them first, so that the
+        display and the identification preview show the image the
+        identification will actually search rather than the raw movie."""
+        self.window.drop_channel_sum()
+        if self.identify_mode_combo.currentText() == IDENTIFY_MODE_SUM:
+            self.window.ensure_channel_sum(notify=True)
+        self._reset_contrast_and_refresh()
 
     def on_gpu_fitting_changed(self) -> None:
         """Handle changes to the GPU fitting option."""
@@ -4968,6 +5063,21 @@ class Window(QtWidgets.QMainWindow):
         # Bookkeeping for a multichannel "Identify" (Ctrl+I) batch that runs
         # identification on every channel in turn; None when not running.
         self._multi_identify = None
+        # Channel-sum identification (IDENTIFY_MODE_SUM), see
+        # ``identify_channel_sum``. ``sum_identifications`` marks the current
+        # detections as coming from the summed channels, which is what tells
+        # the joint fit not to link them across channels again;
+        # ``_sum_movie`` is the summed view the display and the preview use.
+        self.sum_identifications = None
+        self.sum_transforms = None
+        self.sum_transform_source = ""
+        self._sum_movie = None
+        self._sum_identify = None
+        # the summed view is built as soon as the mode is selected, so that
+        # the display and the preview show it (see ``ensure_channel_sum``);
+        # this remembers a failed attempt, so that a registration that cannot
+        # succeed is not retried on every redraw
+        self._sum_registration_failed = False
         # Multichannel state. ``self.channels[self.current_channel]`` is
         # the active channel, mirrored into the flat attributes above.
         # Single movies are stored as a one-element list.
@@ -5750,7 +5860,13 @@ class Window(QtWidgets.QMainWindow):
 
         'Link colors' needs channels to pair spots across; the shared-settings
         group links per-channel parameters and therefore applies to separate
-        channels only (split-FOV channels share one movie's parameters)."""
+        channels only (split-FOV channels share one movie's parameters).
+        'Identify on' needs channels to add together, so it follows the same
+        rule as 'Link colors'.
+
+        All three are hidden rather than disabled, and all three keep their
+        space while hidden (see ``_retain_size_when_hidden``), so opening or
+        closing channels never reflows the dialog."""
         separate_channels = len(self.channels) > 1
         multichannel = separate_channels or self.view.split_fov_mode
         pdialog = self.parameters_dialog
@@ -5763,6 +5879,16 @@ class Window(QtWidgets.QMainWindow):
             checkbox.setChecked(False)
             checkbox.blockSignals(False)
         checkbox.setVisible(multichannel)
+        combo = pdialog.identify_mode_combo
+        if not multichannel and combo.currentText() != IDENTIFY_MODE_SEPARATE:
+            # as above: leaving it on the sum while hidden would identify
+            # single-channel data in a mode that cannot be turned off
+            combo.blockSignals(True)
+            combo.setCurrentText(IDENTIFY_MODE_SEPARATE)
+            combo.blockSignals(False)
+            self.drop_channel_sum()
+        pdialog.identify_mode_label.setVisible(multichannel)
+        combo.setVisible(multichannel)
 
     def build_spline_calibration(self) -> None:
         """Prompt for the spline PSF calibration parameters and build the
@@ -7003,7 +7129,7 @@ class Window(QtWidgets.QMainWindow):
                                 self.parameters["Min. Net Gradient"],
                                 self.parameters["Box Size"],
                                 self.curr_frame_number,
-                                roi=self.view.rois,
+                                roi=self.identification_rois(),
                                 frame_bounds=self.frame_range,
                             )
                         )
@@ -7181,6 +7307,10 @@ class Window(QtWidgets.QMainWindow):
             return False
         if not pdialog.link_colors_checkbox.isChecked():
             return False
+        if self.sum_identifications is not None:
+            # the detections come from the channel sum, so every one of them
+            # is a cross-channel spot already - there is nothing to pair
+            return False
         cal = pdialog.spline_calibration or {}
         n_channels = int(cal.get("n_channels", 0))
         if n_channels >= 2:
@@ -7283,6 +7413,48 @@ class Window(QtWidgets.QMainWindow):
             ],
         }
 
+    def _channel_identification_inputs(
+        self,
+    ) -> tuple[list | None, list | None]:
+        """The per-channel detections the channels can be registered from,
+        and the regions they sit in.
+
+        Returns ``(ids_per_channel, regions)`` in the order the registration
+        expects (reference first), with ``regions`` None for separate channel
+        movies, or ``(None, None)`` when there is nothing to register. Shared
+        by the link-color preview and the channel-sum identification, so both
+        register the channels from exactly the same detections.
+        """
+        if self.view.split_fov_mode:
+            regions = [list(map(list, r)) for r in self.view.rois]
+            if len(regions) < 2 or self.identifications is None:
+                return None, None
+            # split-FOV: one table holds every region's detections
+            rects = [_normalize_rect(r) for r in regions]
+            return [
+                self._identifications_in_region(rect) for rect in rects
+            ], regions
+        if len(self.channels) < 2:
+            return None, None
+        # the active channel's live detections are not mirrored back into
+        # ``self.channels`` until the channel is switched
+        return [
+            (
+                self.identifications
+                if c == self.current_channel
+                else self.channels[c].identifications
+            )
+            for c in range(len(self.channels))
+        ], None
+
+    def _frame_shape_for_registration(self) -> tuple[int, int] | None:
+        """``(height, width)`` used to seed the mirror orientations when the
+        channels are separate movies; None for split-FOV, where the regions
+        supply the placement instead."""
+        if self.view.split_fov_mode or self.movie is None:
+            return None
+        return (int(self.movie.shape[1]), int(self.movie.shape[2]))
+
     def _estimated_link_calibration(self, box: int) -> dict | None:
         """A calibration-shaped dict whose inter-channel transforms are
         estimated from the identifications themselves, for link colouring
@@ -7298,30 +7470,10 @@ class Window(QtWidgets.QMainWindow):
         link.
         """
         split_fov = self.view.split_fov_mode
-        if split_fov:
-            regions = [list(map(list, r)) for r in self.view.rois]
-            if len(regions) < 2 or self.identifications is None:
-                return None
-            n_channels = len(regions)
-        else:
-            if len(self.channels) < 2:
-                return None
-            n_channels = len(self.channels)
-            regions = None
-        # the active channel's live detections are not mirrored back into
-        # ``self.channels`` until the channel is switched
-        ids_per_channel = (
-            None
-            if split_fov
-            else [
-                (
-                    self.identifications
-                    if c == self.current_channel
-                    else self.channels[c].identifications
-                )
-                for c in range(n_channels)
-            ]
-        )
+        ids_per_channel, regions = self._channel_identification_inputs()
+        if ids_per_channel is None:
+            return None
+        n_channels = len(ids_per_channel)
         key = (
             split_fov,
             int(box),
@@ -7331,10 +7483,7 @@ class Window(QtWidgets.QMainWindow):
                 if regions is not None
                 else None
             ),
-            tuple(
-                0 if ids is None else len(ids)
-                for ids in (ids_per_channel or [self.identifications])
-            ),
+            tuple(0 if ids is None else len(ids) for ids in ids_per_channel),
         )
         cached = getattr(self, "_link_cal_cache", None)
         if cached is not None and cached[0] == key:
@@ -7343,19 +7492,12 @@ class Window(QtWidgets.QMainWindow):
         identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
         if split_fov:
             region_rects = [_normalize_rect(r) for r in regions]
-            ids_per_channel = [
-                self._identifications_in_region(rect) for rect in region_rects
-            ]
         try:
             transforms = spline.estimate_transforms_from_identifications(
                 ids_per_channel,
                 box,
                 regions=regions,
-                frame_shape=(
-                    None
-                    if split_fov or self.movie is None
-                    else (int(self.movie.shape[1]), int(self.movie.shape[2]))
-                ),
+                frame_shape=self._frame_shape_for_registration(),
             )
         except Exception:
             transforms = None
@@ -7700,27 +7842,49 @@ class Window(QtWidgets.QMainWindow):
         view.roi_mngs = mngs
         return mngs
 
+    def identify_mode(self) -> str:
+        """Whether the channels are identified separately or added together,
+        see ``IDENTIFY_MODE_SEPARATE`` / ``IDENTIFY_MODE_SUM``.
+
+        Single-channel data always reports the separate mode: there is nothing
+        to sum, and the combo box is hidden then (see
+        ``_update_multichannel_widgets``)."""
+        try:
+            dialog = self.parameters_dialog
+            multichannel = len(self.channels) > 1 or self.view.split_fov_mode
+        except (AttributeError, RuntimeError):
+            # ``parameters`` is also read from a partially built window
+            return IDENTIFY_MODE_SEPARATE
+        if not multichannel:
+            return IDENTIFY_MODE_SEPARATE
+        return dialog.identify_mode_combo.currentText()
+
     @property
     def parameters(self) -> dict:
         """Dictionary with the identification settings: box size, min.
-        net gradient, the temporal median window (0 when disabled) and the
-        Gaussian filter sigma (0 when disabled).
+        net gradient, the temporal median window (0 when disabled), the
+        Gaussian filter sigma (0 when disabled) and the identification mode.
 
         In split-FOV mode "Min. Net Gradient" is the list of per-region
         thresholds (see ``region_mngs``) rather than a single number; every
         consumer passes it straight to ``localize.identify``, which accepts
-        one threshold per ROI.
+        one threshold per ROI. Identifying on the channel sum searches one
+        image, so it takes the single shared threshold instead.
 
         Every key is compared in ``identifications_outdated`` and stored
         in ``last_identification_info``, so adding one here is enough for
         it to invalidate stale identifications and reach the metadata.
         """
         dialog = self.parameters_dialog
+        mode = self.identify_mode()
         return {
             "Box Size": dialog.box_spinbox.value(),
             "Min. Net Gradient": (
-                self.region_mngs() or dialog.mng_slider.value()
+                dialog.mng_slider.value()
+                if mode == IDENTIFY_MODE_SUM
+                else (self.region_mngs() or dialog.mng_slider.value())
             ),
+            "Identification Mode": mode,
             "Temporal Median Window": (
                 dialog.temporal_median_spinbox.value()
                 if (
@@ -7771,16 +7935,177 @@ class Window(QtWidgets.QMainWindow):
             "itself. It is ignored for this movie."
         )
 
+    def identification_rois(self) -> list:
+        """The regions identification actually runs in.
+
+        These are the drawn ROIs, except on the channel sum of split-FOV data:
+        only the reference region of the summed canvas holds the sum (the other
+        regions have been mapped into it), so it alone is searched - and the
+        detections are then already in reference-channel coordinates."""
+        summed = self.channel_sum_view()
+        if (
+            summed is not None
+            and summed.regions is not None
+            and self.identify_mode() == IDENTIFY_MODE_SUM
+        ):
+            return [summed.regions[summed.reference]]
+        return self.view.rois
+
+    def drop_channel_sum(self) -> None:
+        """Forget the channel sum: its detections, its registration and the
+        summed view the display and the preview run on.
+
+        Called whenever the sum would no longer describe what is on screen -
+        the mode is switched off, the channels or the ROIs change, or the
+        identification settings go stale."""
+        try:
+            self.sum_identifications = None
+            self.sum_transforms = None
+            self.sum_transform_source = ""
+            self._sum_movie = None
+            # whatever made the sum stale may also have made the registration
+            # possible (or possible again), so let it be attempted once more
+            self._sum_registration_failed = False
+            # the filter stack is built on top of the summed view; comparing
+            # the source by identity in ``identification_movie`` rebuilds it,
+            # but dropping it here makes that explicit
+            self._temporal_movie = None
+            self._gaussian_movie = None
+        except (AttributeError, RuntimeError):
+            pass  # a partially built window has no channel sum to drop
+
+    def _reset_contrast_to_frame(self) -> None:
+        """Re-derive the display contrast from the frame now shown.
+
+        Appearing or disappearing, the channel sum moves the image onto a
+        different intensity scale (photons, summed over all channels), exactly
+        as the identification filters do."""
+        contrast_dialog = getattr(self, "contrast_dialog", None)
+        if contrast_dialog is not None:
+            contrast_dialog.reset_to_frame()
+
+    def channel_sum_view(self) -> object | None:
+        """The summed view the display and the identification currently run
+        on, or None when there is none.
+
+        ``parameters`` and ``identification_movie`` are also read from a
+        partially built window, where no channel sum can exist - hence the
+        guard rather than a plain attribute read."""
+        try:
+            return self._sum_movie
+        except (AttributeError, RuntimeError):
+            return None
+
+    def validate_channel_sum(self) -> None:
+        """Drop the channel sum if it no longer describes the loaded data.
+
+        The sum is built for one particular layout - these movies, these
+        regions - so moving a region, loading other channels or leaving
+        split-FOV mode invalidates it. Checking it here, where the sum is
+        used, keeps every one of those places from having to remember to."""
+        summed = self.channel_sum_view()
+        if summed is None:
+            return
+        if summed.regions is not None:
+            valid = self.view.split_fov_mode and summed.matches_regions(
+                self.view.rois
+            )
+        else:
+            valid = (
+                not self.view.split_fov_mode
+                and len(self.channels) == len(summed.movies)
+                and all(
+                    channel.movie is movie
+                    for channel, movie in zip(self.channels, summed.movies)
+                )
+            )
+        if not valid:
+            self.drop_channel_sum()
+            self._reset_contrast_to_frame()
+
+    def ensure_channel_sum(self, notify: bool = False) -> bool:
+        """Build the summed view for ``IDENTIFY_MODE_SUM`` without identifying
+        anything, so that the display and the identification preview run on it
+        as soon as the mode is selected.
+
+        The registration is the one ``identify_channel_sum`` would use, minus
+        the bootstrap: the loaded spline calibration, or the per-channel
+        identifications when they have already been made. Neither of those
+        needs a movie pass, so this is cheap enough to attempt from the draw
+        path - the sum itself is a lazy view (see
+        ``localize.SummedChannelsMovie``). When the channels cannot be
+        registered yet the attempt is remembered and not repeated until the
+        sum is dropped again, and the summed view only appears once
+        ``identify_channel_sum`` has identified the channels to register them.
+
+        Returns whether a summed view is in place.
+        """
+        try:
+            if self.identify_mode() != IDENTIFY_MODE_SUM:
+                return False
+            if self._sum_movie is not None:
+                return True
+            if self._sum_registration_failed or self._sum_identify is not None:
+                # already tried, or an identification is building one right now
+                return False
+            self._sum_registration_failed = True
+            transforms, regions, source = self._sum_channel_transforms(
+                estimate=True
+            )
+            if transforms is None:
+                if notify:
+                    where = (
+                        "regions" if self.view.split_fov_mode else "channels"
+                    )
+                    self.status_bar.showMessage(
+                        f"The {where} are not registered yet, so the summed "
+                        "view cannot be shown. Identify (Ctrl+I) registers "
+                        f"the {where} from their own detections first, or "
+                        "load a multichannel / split-FOV spline PSF "
+                        "calibration to use its registration."
+                    )
+                return False
+            self._build_channel_sum(transforms, regions, source)
+        except ValueError:
+            self.drop_channel_sum()
+            self._sum_registration_failed = True
+            return False
+        except (AttributeError, RuntimeError):
+            return False  # a partially built window has no channels to sum
+        self._sum_registration_failed = False
+        if notify:
+            self.status_bar.showMessage(
+                f"Showing the sum of {len(self.sum_transforms)} channels "
+                f"(registered from {source}). Note that it is in photons and "
+                "over all channels, so the minimum net gradient has to be "
+                "re-tuned for it."
+            )
+        return True
+
     def identification_movie(self) -> lib.IntArray3D:
         """The movie the display and the identification preview run on:
-        the raw movie, optionally temporal median filtered and then
-        Gaussian smoothed - built exactly the way ``localize.identify``
-        builds it, so that the preview and the batch run agree.
+        the raw movie (or the channel sum, in ``IDENTIFY_MODE_SUM``),
+        optionally temporal median filtered and then Gaussian smoothed -
+        built exactly the way ``localize.identify`` builds it, so that the
+        preview and the batch run agree.
 
         Never used for fitting - ``FitWorker`` and ``save_spots`` always
         cut spots out of ``self.movie``.
         """
+        self.validate_channel_sum()
+        # rebuild it here rather than only where the mode is switched, so that
+        # the summed view survives everything that invalidates it (moving a
+        # region, loading a calibration, changing the settings)
+        self.ensure_channel_sum()
         movie = self.movie
+        # The summed view replaces the raw movie as the *source* of the filter
+        # stack, exactly as ``identify_multichannel_sum`` does: it is the sum
+        # that is searched for maxima, so it is the sum that is background
+        # subtracted and smoothed. It only exists once the channels have been
+        # registered (see ``ensure_channel_sum`` / ``identify_channel_sum``).
+        summed = self.channel_sum_view()
+        if summed is not None and self.identify_mode() == IDENTIFY_MODE_SUM:
+            movie = summed
         if movie is None:
             self._temporal_movie = None
             self._gaussian_movie = None
@@ -7788,7 +8113,7 @@ class Window(QtWidgets.QMainWindow):
         parameters = self.parameters
         window = parameters["Temporal Median Window"]
         sigma = parameters["Gaussian Filter Sigma"]
-        rois = self.view.rois or None
+        rois = self.identification_rois() or None
         # grown by the Gaussian's kernel radius, see identification_roi_pad.
         # Without a ROI the pad has no effect (the median covers the whole
         # frame either way), and pinning it to 0 there keeps nudging the
@@ -7878,6 +8203,17 @@ class Window(QtWidgets.QMainWindow):
             identification (see ``build_spline_calibration``). Default is
             False.
         """
+        # The calibrations are built from bead stacks, one channel at a time,
+        # so they always identify the channels separately - only the
+        # experimental data can be identified on the sum.
+        if (
+            self.identify_mode() == IDENTIFY_MODE_SUM
+            and not calibrate_spline
+            and not calibrate_z
+        ):
+            self.identify_channel_sum(fit_afterwards=fit_afterwards)
+            return
+        self.drop_channel_sum()
         if len(self.channels) > 1:
             self._identify_all_channels(
                 fit_afterwards=fit_afterwards,
@@ -7925,6 +8261,10 @@ class Window(QtWidgets.QMainWindow):
         fitted jointly, everything else is dropped (see
         ``localize.filter_linked_identifications``).
         """
+        if self.sum_identifications is not None:
+            # identified on the channel sum: every detection is fitted, there
+            # is no linking step (see Window.identify_channel_sum)
+            return None
         cal = self.parameters_dialog.spline_calibration or {}
         box = self.parameters["Box Size"]
         split_fov = bool(cal.get("split_fov"))
@@ -8056,6 +8396,7 @@ class Window(QtWidgets.QMainWindow):
         fit_afterwards: bool = False,
         calibrate_z: bool = False,
         calibrate_spline: bool = False,
+        then: Callable[[], None] | None = None,
     ) -> None:
         """Identify spots in every channel in turn (multichannel Identify).
 
@@ -8065,7 +8406,11 @@ class Window(QtWidgets.QMainWindow):
         The originally active channel is restored when the batch finishes, and
         the requested follow-up (fit or calibration, as passed to
         :meth:`identify`) then runs once - so 'Localize (Identify && Fit)'
-        behaves like Identify-then-Fit over all channels."""
+        behaves like Identify-then-Fit over all channels.
+
+        ``then`` replaces that follow-up altogether: the channel-sum
+        identification uses it to continue with the registration once every
+        channel has been identified."""
         self._multi_identify = {
             "return_channel": self.current_channel,
             "queue": list(range(len(self.channels))),
@@ -8075,6 +8420,7 @@ class Window(QtWidgets.QMainWindow):
             "fit_afterwards": bool(fit_afterwards),
             "calibrate_z": bool(calibrate_z),
             "calibrate_spline": bool(calibrate_spline),
+            "then": then,
         }
         self.status_bar.showMessage("Identifying all channels...")
         self._identify_run_next()
@@ -8094,6 +8440,11 @@ class Window(QtWidgets.QMainWindow):
             self._active_worker = None
             self.abort_action.setEnabled(False)
             self.draw_frame()
+            if state["then"] is not None:
+                # a caller that drives this batch itself (the channel-sum
+                # identification) reports its own result
+                state["then"]()
+                return
             # the joint multichannel fit only fits molecules found in every
             # channel, so report those rather than the raw detection total
             counted = self._linked_count_phrase(state["sum"]) or (
@@ -8169,10 +8520,403 @@ class Window(QtWidgets.QMainWindow):
         """Abort the multichannel Identify batch and restore the view."""
         state = self._multi_identify
         self._multi_identify = None
+        self._sum_identify = None
         self._active_worker = None
         self.abort_action.setEnabled(False)
         if state is not None:
             self.set_current_channel(state["return_channel"])
+        self.draw_frame()
+        self.status_bar.showMessage("Aborted.")
+
+    def n_identification_channels(self) -> int:
+        """How many channels identification has to deal with: the loaded
+        channel movies, or the drawn regions in split-FOV mode."""
+        if self.view.split_fov_mode:
+            return len(self.view.rois)
+        return len(self.channels)
+
+    def _sum_transforms_from_calibration(
+        self, n_channels: int, regions: list | None
+    ) -> list | None:
+        """The loaded spline calibration's reference->channel transforms,
+        placed at the regions in use. None if no calibration describes this
+        data's layout."""
+        cal = self.parameters_dialog.spline_calibration or {}
+        if int(cal.get("n_channels", 0)) != n_channels:
+            return None
+        link_cal = self._link_calibration_for_mode(cal, n_channels)
+        if link_cal is None:
+            return None
+        try:
+            if regions is not None:
+                # re-place the stored inter-channel affine at the drawn ROIs
+                _, _, transforms = localize.split_fov_fit_geometry(
+                    link_cal, regions
+                )
+            else:
+                transforms = link_cal.get("channel_transforms")
+        except (ValueError, KeyError, IndexError):
+            return None
+        if not transforms or len(transforms) < n_channels:
+            return None
+        return [np.asarray(t, dtype=float) for t in transforms[:n_channels]]
+
+    def _sum_channel_transforms(
+        self, estimate: bool = True
+    ) -> tuple[list | None, list | None, str]:
+        """The registration the channel sum is built with.
+
+        The loaded multichannel / split-FOV spline calibration is the source
+        whenever one describes this data - the sum is then built with exactly
+        the transforms the fit will use. Without one, the channels are
+        registered from their own detections (``estimate``), which is why the
+        sum mode identifies every channel first.
+
+        Returns ``(transforms, regions, source)``: one ``(2, 3)``
+        reference->channel affine per channel, the split-FOV regions (None for
+        separate channel movies) and a phrase naming where the transforms came
+        from. ``transforms`` is None when the channels could not be registered;
+        a channel that could not be registered is never silently replaced by
+        the identity, since summing it in at the wrong place would smear the
+        very spots this mode is meant to recover.
+        """
+        n_channels = self.n_identification_channels()
+        if n_channels < 2:
+            return None, None, ""
+        regions = (
+            [_normalize_rect(r) for r in self.view.rois]
+            if self.view.split_fov_mode
+            else None
+        )
+        transforms = self._sum_transforms_from_calibration(n_channels, regions)
+        if transforms is not None:
+            return transforms, regions, "the loaded spline calibration"
+        if not estimate:
+            return None, regions, ""
+        ids_per_channel, _ = self._channel_identification_inputs()
+        if ids_per_channel is None:
+            return None, regions, ""
+        try:
+            transforms, n_pairs = (
+                spline.estimate_transforms_from_identifications(
+                    ids_per_channel[:n_channels],
+                    self.parameters["Box Size"],
+                    regions=regions,
+                    frame_shape=self._frame_shape_for_registration(),
+                    max_frames=_SUM_REGISTRATION_MAX_FRAMES,
+                    return_diagnostics=True,
+                )
+            )
+        except Exception:
+            return None, regions, ""
+        if transforms is None or any(t is None for t in transforms):
+            return None, regions, ""
+        return (
+            [np.asarray(t, dtype=float) for t in transforms],
+            regions,
+            "the per-channel identifications "
+            f"({min(n_pairs[1:]):,} pairs or more per channel)",
+        )
+
+    def identify_channel_sum(self, fit_afterwards: bool = False) -> None:
+        """Identify spots on the channels added together
+        (``IDENTIFY_MODE_SUM``).
+
+        The channels are mapped onto the reference channel and summed in
+        photons, and the spots are identified in that sum, so a molecule too
+        dim to be detected in any single channel is still found (see
+        ``localize.SummedChannelsMovie``). The registration comes from the
+        loaded spline calibration; without one every channel is identified
+        first and the transforms are estimated from those detections, and only
+        then is the sum built.
+
+        The summed view shown while the mode is selected (see
+        ``ensure_channel_sum``) is registered the same way, so when one is on
+        screen it is identified as it stands - the identification then searches
+        exactly the image the preview showed.
+        """
+        n_channels = self.n_identification_channels()
+        if n_channels < 2:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Identify on the channel sum",
+                "Summing needs at least two channels. Load them with "
+                "'File > Open channels from several movies' / 'Open one "
+                "multichannel movie', or enable 'Regions = channels' and draw "
+                "one region per channel (reference first).",
+            )
+            return
+        self.validate_channel_sum()
+        if self.channel_sum_view() is not None:
+            # already registered and on screen: identify on it as it stands
+            self.sum_identifications = None  # the ones about to be replaced
+            self._sum_identify = {"fit_afterwards": bool(fit_afterwards)}
+            self._start_sum_identification()
+            return
+        self.drop_channel_sum()
+        self._sum_identify = {"fit_afterwards": bool(fit_afterwards)}
+        transforms, regions, source = self._sum_channel_transforms(
+            estimate=False
+        )
+        if transforms is not None:
+            self._run_sum_identification(transforms, regions, source)
+            return
+        # no calibration for this layout: register the channels from their own
+        # detections, which have to be made first
+        self.status_bar.showMessage(
+            "Identifying every channel to register them for the sum..."
+        )
+        if self.view.split_fov_mode:
+            self._identify_regions_for_sum()
+        else:
+            self._identify_all_channels(then=self._sum_after_bootstrap)
+
+    def _channel_camera_info(self, channel: "Channel") -> dict:
+        """One channel's camera info.
+
+        Only the active channel's camera parameters are in the dialog at any
+        time, so summing the channels in photons - the whole point of doing it
+        in photons - has to read the other channels' stored snapshots (see
+        ``_capture_params``). Channels that carry no snapshot fall back to the
+        dialog's current values."""
+        if self.channels and channel is self.channels[self.current_channel]:
+            return self.camera_info
+        params = getattr(channel, "params", None) or {}
+        keys = {
+            "Baseline": "baseline",
+            "Gain": "gain",
+            "Sensitivity": "sensitivity",
+            "Qe": "qe",
+            "Pixelsize": "pixelsize",
+        }
+        if not all(key in params for key in keys.values()):
+            return self.camera_info
+        return {name: params[key] for name, key in keys.items()}
+
+    def _identify_regions_for_sum(self) -> None:
+        """Split-FOV: one ordinary whole-movie identification pass over the
+        drawn regions, whose detections register the regions against each
+        other before they are summed."""
+        parameters = dict(self.parameters)
+        # the regions are identified as the channels they are, each with its
+        # own threshold - the single summed threshold applies to the sum only
+        parameters["Identification Mode"] = IDENTIFY_MODE_SEPARATE
+        parameters["Min. Net Gradient"] = (
+            self.region_mngs() or self.parameters_dialog.mng_slider.value()
+        )
+        worker = IdentificationWorker(
+            self,
+            False,
+            False,
+            False,
+            rois=list(self.view.rois),
+            parameters=parameters,
+        )
+        worker.progressMade.connect(self.on_identify_progress)
+        worker.finished.connect(self._on_sum_bootstrap_finished)
+        worker.aborted.connect(self._on_sum_identify_aborted)
+        self.identification_worker = worker
+        self._active_worker = worker
+        self.abort_action.setEnabled(True)
+        worker.start()
+
+    def _on_sum_bootstrap_finished(
+        self,
+        parameters: dict,
+        roi: list,
+        elapsed_time: float,
+        identifications: pd.DataFrame,
+        *_: object,
+    ) -> None:
+        """Split-FOV: keep the per-region detections and continue with the
+        registration and the sum."""
+        self._active_worker = None
+        self.identifications = identifications
+        self.last_identification_info = parameters.copy()
+        self.last_identification_info["ROI"] = roi
+        self.last_identification_info["Frame bounds"] = self.frame_range
+        self.ready_for_fit = bool(len(identifications))
+        self._sum_after_bootstrap()
+
+    def _sum_after_bootstrap(self) -> None:
+        """Register the channels from the identifications just made, then
+        identify on their sum."""
+        state = self._sum_identify
+        if state is None:  # aborted meanwhile
+            return
+        transforms, regions, source = self._sum_channel_transforms(
+            estimate=True
+        )
+        if transforms is None:
+            self._sum_identify = None
+            self._active_worker = None
+            self.abort_action.setEnabled(False)
+            self.status_bar.showMessage("")
+            where = "regions" if self.view.split_fov_mode else "channels"
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Identify on the channel sum",
+                f"The {where} could not be registered against each other, so "
+                "they cannot be summed. Every channel needs enough detections "
+                "for the transform to be estimated: lower the minimum net "
+                f"gradient of the dim {where} until spots appear in them, or "
+                "load a multichannel / split-FOV spline PSF calibration, "
+                "whose registration is used directly.",
+            )
+            self.draw_frame()
+            return
+        self._run_sum_identification(transforms, regions, source)
+
+    def _build_channel_sum(
+        self, transforms: list, regions: list | None, source: str
+    ) -> None:
+        """Put the summed view built from ``transforms`` in place of the raw
+        movie for the display, the preview and the identification.
+
+        Raises ``ValueError`` (from ``localize.SummedChannelsMovie``) when the
+        channels cannot be summed; the caller decides how loudly to say so."""
+        if regions is None:
+            channels = self.channels[: len(transforms)]
+            movies = [c.movie for c in channels]
+            camera_infos = [self._channel_camera_info(c) for c in channels]
+        else:
+            # split-FOV: the regions are channels of the one loaded movie
+            movies = [self.movie] * len(transforms)
+            camera_infos = [self.camera_info] * len(transforms)
+        # As in the multichannel fit, the GUI holds a single sCMOS calibration
+        # and applies it to every channel (split-FOV really is one sensor).
+        camera_calibration = self.parameters_dialog.camera_calibration or None
+        camera_calibrations = (
+            None
+            if camera_calibration is None
+            else [camera_calibration] * len(movies)
+        )
+        summed = localize.SummedChannelsMovie(
+            movies,
+            transforms,
+            camera_infos=camera_infos,
+            regions=regions,
+            camera_calibrations=camera_calibrations,
+        )
+        self._sum_movie = summed
+        self.sum_transforms = list(summed.transforms)
+        self.sum_transform_source = source
+        # the filter stack now sits on top of the sum
+        self._temporal_movie = None
+        self._gaussian_movie = None
+        # ... and so does the display, on the sum's intensity scale
+        self._reset_contrast_to_frame()
+
+    def _run_sum_identification(
+        self, transforms: list, regions: list | None, source: str
+    ) -> None:
+        """Build the summed view from ``transforms`` and identify on it."""
+        try:
+            self._build_channel_sum(transforms, regions, source)
+        except ValueError as error:
+            self._sum_identify = None
+            self._active_worker = None
+            self.abort_action.setEnabled(False)
+            self.status_bar.showMessage("")
+            QtWidgets.QMessageBox.warning(
+                self, "Identify on the channel sum", str(error)
+            )
+            return
+        self._start_sum_identification()
+
+    def _start_sum_identification(self) -> None:
+        """Identify on the summed view now in place."""
+        summed = self._sum_movie
+        worker = IdentificationWorker(
+            self,
+            False,
+            False,
+            False,
+            movie=summed,
+            rois=self.identification_rois(),
+            parameters=dict(self.parameters),
+        )
+        worker.progressMade.connect(self.on_identify_progress)
+        worker.finished.connect(self._on_sum_identify_finished)
+        worker.aborted.connect(self._on_sum_identify_aborted)
+        self.identification_worker = worker
+        self._active_worker = worker
+        self.abort_action.setEnabled(True)
+        self.status_bar.showMessage(
+            f"Identifying on the sum of {len(summed.movies)} channels "
+            f"(registered from {self.sum_transform_source})..."
+        )
+        worker.start()
+
+    def _on_sum_identify_finished(
+        self,
+        parameters: dict,
+        roi: list,
+        elapsed_time: float,
+        identifications: pd.DataFrame,
+        *_: object,
+    ) -> None:
+        """Store the channel sum's detections as the reference channel's
+        identifications and run the queued follow-up.
+
+        They are already in reference-channel coordinates and already the
+        cross-channel consensus, so the joint fit takes them as they are - see
+        ``MultichannelSplineFitWorker(link_identifications=False)``."""
+        self._active_worker = None
+        self.abort_action.setEnabled(False)
+        state = self._sum_identify
+        self._sum_identify = None
+        if not len(identifications):
+            self.sum_identifications = None
+            self.ready_for_fit = False
+            self.status_bar.showMessage(
+                "No spots identified on the channel sum. Note that the sum is "
+                "in photons and over all channels, so the minimum net "
+                "gradient has to be re-tuned for it."
+            )
+            self.draw_frame()
+            return
+        if not self.view.split_fov_mode and self.current_channel != 0:
+            # the sum lives in the reference channel's coordinates
+            self.set_current_channel(0)
+        self.locs = None
+        self.locs_display = None
+        self.identifications = identifications
+        self.sum_identifications = identifications
+        self.ready_for_fit = True
+        self.last_identification_info = parameters.copy()
+        self.last_identification_info["ROI"] = roi
+        self.last_identification_info["Frame bounds"] = self.frame_range
+        self.last_identification_info["Channel sum registration"] = (
+            self.sum_transform_source
+        )
+        if not self.view.split_fov_mode:
+            reference = self.channels[0]
+            reference.identifications = identifications
+            reference.ready_for_fit = True
+            reference.last_identification_info = self.last_identification_info
+        box = parameters["Box Size"]
+        mng = _format_mng(parameters["Min. Net Gradient"])
+        self.status_bar.showMessage(
+            f"Identified {len(identifications):,} spots on the sum of "
+            f"{len(self.sum_transforms)} channels in "
+            f"{elapsed_time:.2f} seconds. (Box Size: {box}; Min. Net "
+            f"Gradient: {mng}; registered from {self.sum_transform_source}). "
+            "Ready for fit."
+        )
+        self.draw_frame()
+        if elapsed_time > lib.SOUND_NOTIFICATION_DURATION:
+            sound_path = lib.get_sound_notification_path()
+            if sound_path is not None:
+                playsound(sound_path, block=False)
+        if state is not None and state["fit_afterwards"]:
+            self.fit()
+
+    def _on_sum_identify_aborted(self) -> None:
+        """Abort a channel-sum identification and drop the partial sum."""
+        self._sum_identify = None
+        self.drop_channel_sum()
+        self.on_worker_aborted()
         self.draw_frame()
         self.status_bar.showMessage("Aborted.")
 
@@ -8213,6 +8957,9 @@ class Window(QtWidgets.QMainWindow):
             Whether to perform z-calibration during fitting. Default is
             False.
         """
+        # a sum built for a layout that has since changed must not decide
+        # whether the fit links its identifications across channels
+        self.validate_channel_sum()
         if self.movie is None:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -8361,10 +9108,15 @@ class Window(QtWidgets.QMainWindow):
             getattr(self.channels[c], "identifications", None)
             for c in range(n_channels)
         ]
+        # Identifications made on the channel sum are the linked set already
+        # (see Window.identify_channel_sum), so they go into the fit as they
+        # are - requiring a detection in every channel on top of that would
+        # drop precisely the dim-channel molecules the sum recovered.
+        link_identifications = self.sum_identifications is None
         n_missing = sum(
             1 for ids in ids_per_channel[1:] if ids is None or len(ids) == 0
         )
-        if n_missing:
+        if n_missing and link_identifications:
             QtWidgets.QMessageBox.information(
                 self,
                 "Multichannel spline fit",
@@ -8385,6 +9137,7 @@ class Window(QtWidgets.QMainWindow):
             use_gpu=method.endswith("-gpu"),
             link_photons=self.parameters_dialog._link_photons_enabled(),
             identifications_per_channel=ids_per_channel,
+            link_identifications=link_identifications,
             eps=eps,
             max_it=max_it,
             camera_calibration=(
@@ -8468,6 +9221,7 @@ class Window(QtWidgets.QMainWindow):
             split_fov=True,
             regions=regions,
             link_photons=self.parameters_dialog._link_photons_enabled(),
+            link_identifications=self.sum_identifications is None,
             eps=eps,
             max_it=max_it,
             camera_calibration=(
@@ -8612,6 +9366,11 @@ class Window(QtWidgets.QMainWindow):
             return
         QtWidgets.QApplication.restoreOverrideCursor()
         self.status_bar.showMessage("")
+
+        # A channel sum was built with the registration that has just been
+        # replaced
+        self.drop_channel_sum()
+        self._reset_contrast_to_frame()
 
         # split-FOV: reflect the (possibly re-ordered) regions in the view
         if split_fov:
@@ -9258,13 +10017,26 @@ class IdentificationWorker(QtCore.QThread):
         fit_afterwards: bool,
         calibrate_z: bool,
         calibrate_spline: bool = False,
+        *,
+        movie: object | None = None,
+        rois: list | None = None,
+        parameters: dict | None = None,
     ) -> None:
+        """``movie`` / ``rois`` / ``parameters`` default to the window's, i.e.
+        to identifying the active channel as displayed. The channel-sum
+        identification overrides them to identify the summed view instead
+        (see ``Window.identify_channel_sum``)."""
         super().__init__()
         self.window = window
-        self.movie = window.movie
-        self.rois = window.view.rois
+        self.movie = window.movie if movie is None else movie
+        self.rois = list(window.view.rois) if rois is None else rois
         self.frame_range = window.frame_range
-        self.parameters = dict(window.parameters)
+        if parameters is None:
+            parameters = window.parameters
+            # this worker identifies one movie, whatever mode the window is in
+            parameters = dict(parameters)
+            parameters["Identification Mode"] = IDENTIFY_MODE_SEPARATE
+        self.parameters = dict(parameters)
         if calibrate_z or calibrate_spline:
             # bead calibration stacks: the beads are static and do not
             # blink, so a temporal median would subtract them away
@@ -9430,6 +10202,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         regions: list | None = None,
         link_photons: bool = True,
         identifications_per_channel: list | None = None,
+        link_identifications: bool = True,
         use_gpu: bool | None = None,
         eps: float | None = None,
         max_it: int | None = None,
@@ -9450,6 +10223,12 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         )
         self.identifications = identifications
         self.identifications_per_channel = identifications_per_channel
+        # Identifications made on the channel sum are already the
+        # cross-channel consensus (every one of them was found in the summed
+        # signal of all channels), so pairing them against per-channel
+        # detections again would throw away exactly the dim-channel molecules
+        # the sum recovered.
+        self.link_identifications = link_identifications
         self.box = box
         self.calibration = calibration
         self.mle = mle
@@ -9481,7 +10260,12 @@ class MultichannelSplineFitWorker(QtCore.QThread):
 
         ``self.N`` - the denominator of the fit progress - is set to the number
         of spots that are actually fitted, i.e. the linked molecules (one fit
-        per molecule across all channels), not the raw detection count."""
+        per molecule across all channels), not the raw detection count.
+
+        Does nothing when the identifications come from the channel sum
+        (``link_identifications=False``): they are the linked set already."""
+        if not self.link_identifications:
+            return True
         if self.split_fov:
             return self._link_across_regions()
         ids_per_channel = self.identifications_per_channel
