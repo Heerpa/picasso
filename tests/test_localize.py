@@ -7489,6 +7489,7 @@ class TestPerRegionMinNetGradientGui:
             movie = None
             region_mngs = localize_gui.Window.region_mngs
             parameters = localize_gui.Window.parameters
+            identify_mode = localize_gui.Window.identify_mode
 
             def __init__(self):
                 super().__init__()
@@ -10013,3 +10014,874 @@ class TestCameraCalibrationDialogs:
             assert dialog.bright_paths() == ["/b.raw"]
         finally:
             dialog.close()
+
+
+# ---------------------------------------------------------------------------
+# Channel-sum identification
+# ---------------------------------------------------------------------------
+
+IDENTITY_AFFINE = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+UNIT_CAMERA = {"Baseline": 0.0, "Sensitivity": 1.0, "Gain": 1.0, "Qe": 1.0}
+
+
+def _spots_frame(shape, spots, sigma=1.2, background=0.0):
+    """A frame with a Gaussian at every ``(x, y, amplitude)`` in ``spots``."""
+    yy, xx = np.indices(shape, dtype=np.float64)
+    frame = np.full(shape, float(background))
+    for x, y, amplitude in spots:
+        frame += amplitude * np.exp(
+            -((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma**2)
+        )
+    return frame.astype(np.float32)
+
+
+def _channel_pair(
+    positions,
+    transform,
+    shape=(48, 48),
+    n_frames=3,
+    amplitudes=(200.0, 200.0),
+    background=0.0,
+):
+    """Two synthetic channel movies of the same molecules, the second one
+    seen through ``transform`` (reference -> channel)."""
+    reference, channel = [], []
+    for _ in range(n_frames):
+        reference.append(
+            _spots_frame(
+                shape,
+                [(x, y, amplitudes[0]) for x, y in positions],
+                background=background,
+            )
+        )
+        mapped = localize.apply_affine_transform(
+            np.asarray(positions, dtype=float), transform
+        )
+        channel.append(
+            _spots_frame(
+                shape,
+                [(x, y, amplitudes[1]) for x, y in mapped],
+                background=background,
+            )
+        )
+    return np.stack(reference), np.stack(channel)
+
+
+class TestChannelWarp:
+    """The ``(2, 3)`` reference->channel affine as scipy expects it."""
+
+    def test_axes_are_swapped_not_inverted(self):
+        transform = np.array([[2.0, 0.5, 3.0], [0.25, 1.5, -2.0]])
+        matrix, offset = localize._channel_warp(transform)
+        # matrix @ (row, col) + offset must equal the transform applied to
+        # (x, y) = (col, row), read back as (row, col)
+        for row, col in [(0.0, 0.0), (3.0, 7.0), (11.0, 2.0)]:
+            expected = localize.apply_affine_transform(
+                np.array([[col, row]]), transform
+            )[0]
+            got = matrix @ np.array([row, col]) + offset
+            assert got == pytest.approx(expected[::-1])
+
+    def test_rejects_a_wrongly_shaped_affine(self):
+        with pytest.raises(ValueError, match=r"\(2, 3\) affine"):
+            localize._channel_warp(np.eye(3))
+
+
+class TestSummedChannelsMovie:
+    """The identification-only view of the registered channels added up."""
+
+    def test_shifted_channel_lands_on_the_reference_spots(self):
+        positions = [(12.0, 15.0), (30.0, 22.0)]
+        transform = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+        reference, channel = _channel_pair(positions, transform)
+        summed = localize.SummedChannelsMovie(
+            [reference, channel],
+            [IDENTITY_AFFINE, transform],
+            camera_infos=[UNIT_CAMERA] * 2,
+        )
+        frame = summed[0]
+        assert frame.shape == reference[0].shape
+        assert summed.shape == (len(reference), *reference[0].shape)
+        assert summed.dtype == np.float32
+        for x, y in positions:
+            # both channels contribute their full amplitude at the same place
+            assert frame[int(y), int(x)] == pytest.approx(400.0, rel=1e-3)
+
+    def test_mirrored_channel_is_mapped_back(self):
+        positions = [(12.0, 15.0), (30.0, 22.0)]
+        # flip in x about a 48 px wide frame
+        transform = np.array([[-1.0, 0.0, 47.0], [0.0, 1.0, 0.0]])
+        reference, channel = _channel_pair(positions, transform)
+        summed = localize.SummedChannelsMovie(
+            [reference, channel],
+            [IDENTITY_AFFINE, transform],
+            camera_infos=[UNIT_CAMERA] * 2,
+        )
+        frame = summed[0]
+        for x, y in positions:
+            assert frame[int(y), int(x)] == pytest.approx(400.0, rel=1e-3)
+
+    def test_reference_channel_is_not_resampled(self):
+        positions = [(12.5, 15.5)]
+        transform = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+        reference, channel = _channel_pair(positions, transform)
+        summed = localize.SummedChannelsMovie(
+            [reference, np.zeros_like(channel)],
+            [IDENTITY_AFFINE, transform],
+            camera_infos=[UNIT_CAMERA] * 2,
+        )
+        # the identity channel is copied straight through, interpolation and
+        # all its smoothing kept out of the reference signal
+        np.testing.assert_allclose(summed[0], reference[0])
+
+    def test_photon_conversion_weights_the_channels_equally(self):
+        """Two channels carrying the same photons contribute the same amount,
+        whatever their baseline and sensitivity - a raw count sum would not."""
+        positions = [(20.0, 20.0)]
+        reference, channel = _channel_pair(
+            positions, IDENTITY_AFFINE, amplitudes=(100.0, 200.0)
+        )
+        # channel 1 records twice the counts per photon and sits on an offset
+        camera_infos = [
+            {"Baseline": 0.0, "Sensitivity": 1.0, "Gain": 1.0, "Qe": 1.0},
+            {"Baseline": 500.0, "Sensitivity": 0.5, "Gain": 1.0, "Qe": 1.0},
+        ]
+        summed = localize.SummedChannelsMovie(
+            [reference, channel + 500.0],
+            [IDENTITY_AFFINE, IDENTITY_AFFINE],
+            camera_infos=camera_infos,
+        )
+        assert summed[0][20, 20] == pytest.approx(200.0, rel=1e-4)
+        # without camera infos the raw counts are summed, and the brighter
+        # camera dominates by its gain and drags its baseline along
+        raw = localize.SummedChannelsMovie(
+            [reference, channel + 500.0],
+            [IDENTITY_AFFINE, IDENTITY_AFFINE],
+        )
+        assert raw[0][20, 20] == pytest.approx(800.0, rel=1e-4)
+
+    def test_split_fov_fills_only_the_reference_region(self):
+        regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
+        # the same molecule in both halves of one frame
+        transform = np.array([[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]])
+        positions = [(12.0, 15.0), (30.0, 22.0)]
+        frames = []
+        for _ in range(3):
+            spots = [(x, y, 200.0) for x, y in positions]
+            spots += [(x + 48.0, y, 200.0) for x, y in positions]
+            frames.append(_spots_frame((48, 96), spots))
+        movie = np.stack(frames)
+        summed = localize.SummedChannelsMovie(
+            [movie, movie],
+            [IDENTITY_AFFINE, transform],
+            camera_infos=[UNIT_CAMERA] * 2,
+            regions=regions,
+        )
+        frame = summed[0]
+        assert frame.shape == (48, 96)
+        # the non-reference region has been mapped into the reference one
+        assert np.all(frame[:, 48:] == 0)
+        for x, y in positions:
+            assert frame[int(y), int(x)] == pytest.approx(400.0, rel=1e-3)
+
+    def test_unregistered_channel_is_refused(self):
+        movie = np.zeros((2, 8, 8), np.float32)
+        with pytest.raises(ValueError, match=r"Channel\(s\) \[1\]"):
+            localize.SummedChannelsMovie(
+                [movie, movie], [IDENTITY_AFFINE, None]
+            )
+
+    def test_needs_at_least_two_channels(self):
+        movie = np.zeros((2, 8, 8), np.float32)
+        with pytest.raises(ValueError, match="at least two channels"):
+            localize.SummedChannelsMovie([movie], [IDENTITY_AFFINE])
+
+    def test_transform_count_must_match(self):
+        movie = np.zeros((2, 8, 8), np.float32)
+        with pytest.raises(ValueError, match="channel transforms"):
+            localize.SummedChannelsMovie(
+                [movie, movie, movie], [IDENTITY_AFFINE, IDENTITY_AFFINE]
+            )
+
+    def test_channels_of_different_length_warn_and_are_truncated(self):
+        long_movie = np.zeros((5, 8, 8), np.float32)
+        short_movie = np.zeros((3, 8, 8), np.float32)
+        with pytest.warns(UserWarning, match="different lengths"):
+            summed = localize.SummedChannelsMovie(
+                [long_movie, short_movie], [IDENTITY_AFFINE, IDENTITY_AFFINE]
+            )
+        assert len(summed) == 3
+
+
+class TestIdentifyMultichannelSum:
+    """Identification on the summed channels."""
+
+    def test_finds_a_molecule_too_dim_for_any_single_channel(self):
+        """The regression this mode exists for: a molecule below threshold in
+        every channel on its own, but above it in the sum."""
+        positions = [(16.0, 20.0), (32.0, 28.0)]
+        transform = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
+        reference, channel = _channel_pair(
+            positions, transform, amplitudes=(300.0, 300.0), n_frames=4
+        )
+        # a threshold no single channel reaches (one channel's spot has a net
+        # gradient of ~5000 here, the sum's ~10000)
+        minimum_ng = 7000
+        alone, _ = localize.identify(
+            reference, minimum_ng, BOX, threaded=False
+        )
+        assert len(alone) == 0
+        ids, info = localize.identify_multichannel_sum(
+            [reference, channel],
+            minimum_ng,
+            BOX,
+            [IDENTITY_AFFINE, transform],
+            camera_infos=[UNIT_CAMERA] * 2,
+            threaded=False,
+        )
+        assert len(ids) == 2 * len(reference)
+        found = set(zip(ids["x"].tolist(), ids["y"].tolist()))
+        assert found == {(16, 20), (32, 28)}
+        assert info["Identification Mode"] == "sum"
+        assert info["Sum Regions"] is None
+        assert info["Sum Reference Channel"] == 0
+        assert np.allclose(info["Sum Channel Transforms"][1], transform)
+
+    def test_split_fov_detections_are_in_reference_coordinates(self):
+        regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
+        transform = np.array([[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]])
+        positions = [(12.0, 15.0), (30.0, 22.0)]
+        frames = []
+        for _ in range(3):
+            spots = [(x, y, 300.0) for x, y in positions]
+            spots += [(x + 48.0, y, 300.0) for x, y in positions]
+            frames.append(_spots_frame((48, 96), spots))
+        movie = np.stack(frames)
+        ids, info = localize.identify_multichannel_sum(
+            [movie, movie],
+            800,
+            BOX,
+            [IDENTITY_AFFINE, transform],
+            camera_infos=[UNIT_CAMERA] * 2,
+            regions=regions,
+            threaded=False,
+        )
+        found = set(zip(ids["x"].tolist(), ids["y"].tolist()))
+        assert found == {(12, 15), (30, 22)}
+        # nothing is reported in the non-reference region
+        assert ids["x"].max() < 48
+        assert info["Sum Regions"] == regions
+
+    def test_rejects_an_unregistered_channel(self):
+        movie = np.zeros((3, 16, 16), np.float32)
+        with pytest.raises(ValueError, match="cannot be mapped"):
+            localize.identify_multichannel_sum(
+                [movie, movie], 100, BOX, [IDENTITY_AFFINE, None]
+            )
+
+
+def _sum_mode_window(reference, channel):
+    """A Localize window with two channel movies loaded and the channel-sum
+    identification mode selected."""
+    window = localize_gui.Window()
+    dialog = window.parameters_dialog
+    # a unit camera, so the summed photons are the summed counts; set before
+    # the channels are built, so every channel's snapshot carries it
+    dialog.baseline.setValue(0)
+    dialog.sensitivity.setValue(1.0)
+    dialog.gain.setValue(1)
+    window._set_channels(
+        [reference, channel],
+        [_info("Channel 0"), _info("Channel 1")],
+        ["ref.tif", "ch1.tif"],
+        ["Channel 0", "Channel 1"],
+    )
+    dialog.identify_mode_combo.setCurrentText(localize_gui.IDENTIFY_MODE_SUM)
+    return window
+
+
+class TestIdentifyModeParameter:
+    """The 'Identify on' setting and how it reaches the identification."""
+
+    def test_hidden_for_single_channel_data(self):
+        """Hidden, like every other multichannel-only widget - not merely
+        greyed out."""
+        window = localize_gui.Window()
+        dialog = window.parameters_dialog
+        try:
+            window._update_multichannel_widgets()
+            assert dialog.identify_mode_combo.isHidden()
+            assert dialog.identify_mode_label.isHidden()
+            assert (
+                window.parameters["Identification Mode"]
+                == localize_gui.IDENTIFY_MODE_SEPARATE
+            )
+        finally:
+            window.close()
+
+    def test_every_multichannel_widget_keeps_its_space_while_hidden(self):
+        dialog = localize_gui.Window().parameters_dialog
+        try:
+            for widget in (
+                dialog.identify_mode_label,
+                dialog.identify_mode_combo,
+                dialog.link_colors_checkbox,
+                dialog.link_groupbox,
+            ):
+                assert widget.sizePolicy().retainSizeWhenHidden()
+        finally:
+            dialog.window.close()
+
+    def test_the_dialog_does_not_reflow_when_channels_are_loaded(self):
+        """The complaint this guards against: the identification group used to
+        shift everything below it down the moment multichannel data was
+        opened, because the 'Identify on' row appeared."""
+        movie = np.zeros((2, 8, 8), np.float32)
+        window = localize_gui.Window()
+        dialog = window.parameters_dialog
+        # widget geometry is only laid out once the dialog is shown
+        dialog.show()
+
+        def rows_y():
+            QtWidgets.QApplication.processEvents()
+            return (
+                dialog.roi_field.geometry().y(),
+                dialog.frames_edit.geometry().y(),
+            )
+
+        try:
+            window._update_multichannel_widgets()
+            before = rows_y()
+            window._set_channels(
+                [movie, movie],
+                [_info("Channel 0"), _info("Channel 1")],
+                ["a.tif", "b.tif"],
+                ["Channel 0", "Channel 1"],
+            )
+            window._update_multichannel_widgets()
+            assert not dialog.identify_mode_combo.isHidden()
+            assert rows_y() == before
+            # ... and back again when the channels are closed
+            window._set_channels([movie], [_info()], ["a.tif"], ["Channel 0"])
+            window._update_multichannel_widgets()
+            assert dialog.identify_mode_combo.isHidden()
+            assert rows_y() == before
+
+            # the measurement is sensitive: it is the retained size that keeps
+            # the rows in place, not the layout being insensitive to the row
+            policy = dialog.identify_mode_combo.sizePolicy()
+            policy.setRetainSizeWhenHidden(False)
+            dialog.identify_mode_combo.setSizePolicy(policy)
+            dialog.identify_mode_label.setSizePolicy(policy)
+            assert rows_y() < before
+        finally:
+            dialog.close()
+            window.close()
+
+    def test_reaches_the_parameters_for_multichannel_data(self):
+        movie = np.zeros((2, 8, 8), np.float32)
+        window = _sum_mode_window(movie, movie)
+        try:
+            assert (
+                window.parameters["Identification Mode"]
+                == localize_gui.IDENTIFY_MODE_SUM
+            )
+            window.parameters_dialog.identify_mode_combo.setCurrentText(
+                localize_gui.IDENTIFY_MODE_SEPARATE
+            )
+            assert (
+                window.parameters["Identification Mode"]
+                == localize_gui.IDENTIFY_MODE_SEPARATE
+            )
+        finally:
+            window.close()
+
+    def test_switching_back_to_single_channel_resets_the_mode(self):
+        movie = np.zeros((2, 8, 8), np.float32)
+        window = _sum_mode_window(movie, movie)
+        try:
+            window._set_channels(
+                [movie], [_info()], ["ref.tif"], ["Channel 0"]
+            )
+            window._update_multichannel_widgets()
+            assert (
+                window.parameters_dialog.identify_mode_combo.currentText()
+                == localize_gui.IDENTIFY_MODE_SEPARATE
+            )
+        finally:
+            window.close()
+
+    def test_the_sum_takes_the_shared_threshold_in_split_fov_mode(self):
+        """One summed image means one threshold, not the per-region list."""
+        movie = np.zeros((2, 32, 64), np.float32)
+        window = localize_gui.Window()
+        try:
+            window._set_channels([movie], [_info()], ["a.tif"], ["Channel 0"])
+            window.set_split_fov_mode(True)
+            window.view.rois = [[[0, 0], [32, 32]], [[0, 32], [32, 64]]]
+            window.view.roi_mngs = [1000, 2000]
+            dialog = window.parameters_dialog
+            dialog.identify_mode_combo.setCurrentText(
+                localize_gui.IDENTIFY_MODE_SEPARATE
+            )
+            assert window.parameters["Min. Net Gradient"] == [1000, 2000]
+            dialog.identify_mode_combo.setCurrentText(
+                localize_gui.IDENTIFY_MODE_SUM
+            )
+            assert (
+                window.parameters["Min. Net Gradient"]
+                == dialog.mng_slider.value()
+            )
+        finally:
+            window.close()
+
+
+class TestChannelSumRegistration:
+    """Where the channel sum takes its registration from, and what it does
+    when a channel cannot be registered."""
+
+    def test_a_loaded_calibration_is_preferred(self):
+        movie = np.zeros((2, 8, 8), np.float32)
+        window = _sum_mode_window(movie, movie)
+        try:
+            calibration = _fake_spline_calibration(
+                model="spline-3d-multichannel"
+            )
+            calibration["channel_transforms"] = [
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                [[1.0, 0.0, 7.0], [0.0, 1.0, -3.0]],
+            ]
+            window.parameters_dialog.spline_calibration = calibration
+            transforms, regions, source = window._sum_channel_transforms(
+                estimate=False
+            )
+            assert regions is None
+            assert source == "the loaded spline calibration"
+            np.testing.assert_allclose(
+                transforms[1], [[1.0, 0.0, 7.0], [0.0, 1.0, -3.0]]
+            )
+        finally:
+            window.close()
+
+    def test_estimated_from_the_per_channel_identifications(self):
+        """Without a calibration the channels register from their own
+        detections - which is why the sum mode identifies them first."""
+        transform = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
+        rng = np.random.default_rng(3)
+        positions = rng.uniform(8, 40, size=(40, 2))
+        frames = np.repeat(np.arange(8), 5)
+        ref_xy = positions[: len(frames)]
+        chan_xy = localize.apply_affine_transform(ref_xy, transform)
+        ids_ref = pd.DataFrame(
+            {
+                "frame": frames,
+                "x": ref_xy[:, 0],
+                "y": ref_xy[:, 1],
+                "net_gradient": 1.0,
+            }
+        )
+        ids_chan = pd.DataFrame(
+            {
+                "frame": frames,
+                "x": chan_xy[:, 0],
+                "y": chan_xy[:, 1],
+                "net_gradient": 1.0,
+            }
+        )
+        movie = np.zeros((8, 48, 48), np.float32)
+        window = _sum_mode_window(movie, movie)
+        try:
+            window.channels[0].identifications = ids_ref
+            window.channels[1].identifications = ids_chan
+            window.identifications = ids_ref
+            transforms, regions, source = window._sum_channel_transforms(
+                estimate=True
+            )
+            assert regions is None
+            assert "per-channel identifications" in source
+            np.testing.assert_allclose(transforms[1], transform, atol=1e-6)
+        finally:
+            window.close()
+
+    def test_an_unregisterable_channel_is_reported_not_assumed(self):
+        """A channel that cannot be registered must never fall back to the
+        identity: summing it in at the wrong place would smear the sum."""
+        movie = np.zeros((4, 48, 48), np.float32)
+        window = _sum_mode_window(movie, movie)
+        try:
+            ids = pd.DataFrame(
+                {
+                    "frame": [0, 1, 2],
+                    "x": [10.0, 20.0, 30.0],
+                    "y": [10.0, 20.0, 30.0],
+                    "net_gradient": 1.0,
+                }
+            )
+            window.channels[0].identifications = ids
+            window.channels[1].identifications = None
+            window.identifications = ids
+            transforms, _, source = window._sum_channel_transforms(
+                estimate=True
+            )
+            assert transforms is None
+            assert source == ""
+        finally:
+            window.close()
+
+
+class TestChannelSumState:
+    """The summed view behind the display, the preview and the fit."""
+
+    def _windowed_sum(self):
+        positions = [(12.0, 15.0), (30.0, 22.0)]
+        transform = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+        reference, channel = _channel_pair(positions, transform)
+        window = _sum_mode_window(reference, channel)
+        window._run_sum_identification(
+            [IDENTITY_AFFINE, transform], None, "a test"
+        )
+        window._active_worker.wait()
+        return window, positions
+
+    def test_the_display_and_the_preview_run_on_the_sum(self):
+        window, positions = self._windowed_sum()
+        try:
+            frame = window.identification_movie()[0]
+            for x, y in positions:
+                # both channels' photons, in reference coordinates
+                assert frame[int(y), int(x)] == pytest.approx(400.0, rel=1e-3)
+        finally:
+            window.close()
+
+    def test_the_sum_is_dropped_when_the_layout_changes(self):
+        window, _ = self._windowed_sum()
+        try:
+            assert window._sum_movie is not None
+            movie = np.zeros((2, 8, 8), np.float32)
+            window._set_channels(
+                [movie, movie],
+                [_info("Channel 0"), _info("Channel 1")],
+                ["a.tif", "b.tif"],
+                ["Channel 0", "Channel 1"],
+            )
+            window.validate_channel_sum()
+            assert window._sum_movie is None
+            assert window.sum_identifications is None
+        finally:
+            window.close()
+
+    def test_split_fov_identifies_the_reference_region_only(self):
+        movie = np.zeros((2, 32, 64), np.float32)
+        window = localize_gui.Window()
+        try:
+            window._set_channels([movie], [_info()], ["a.tif"], ["Channel 0"])
+            window.set_split_fov_mode(True)
+            window.view.rois = [[[0, 0], [32, 32]], [[0, 32], [32, 64]]]
+            window.parameters_dialog.identify_mode_combo.setCurrentText(
+                localize_gui.IDENTIFY_MODE_SUM
+            )
+            transform = np.array([[1.0, 0.0, 32.0], [0.0, 1.0, 0.0]])
+            window._run_sum_identification(
+                [IDENTITY_AFFINE, transform],
+                [[[0, 0], [32, 32]], [[0, 32], [32, 64]]],
+                "a test",
+            )
+            window._active_worker.wait()
+            assert window.identification_rois() == [[[0, 0], [32, 32]]]
+            # the drawn regions still describe the sum, so it survives
+            window.validate_channel_sum()
+            assert window._sum_movie is not None
+            # nudging a region does not: the sum was built at the old place
+            window.view.rois[1] = [[0, 30], [32, 62]]
+            window.validate_channel_sum()
+            assert window._sum_movie is None
+        finally:
+            window.close()
+
+
+class TestChannelSumPreview:
+    """The summed view is on screen as soon as the mode is selected, so the
+    display and the identification preview show the image the identification
+    will search - without having to identify first."""
+
+    def _reselect_sum_mode(self, window):
+        """Re-pick 'Sum of channels', as the user would after loading a
+        calibration or identifying the channels."""
+        combo = window.parameters_dialog.identify_mode_combo
+        combo.setCurrentText(localize_gui.IDENTIFY_MODE_SEPARATE)
+        combo.setCurrentText(localize_gui.IDENTIFY_MODE_SUM)
+
+    def test_a_calibration_puts_the_sum_up_without_identifying(self):
+        """The complaint this guards against: the summed movie only appeared
+        once identification had run, which made the preview useless."""
+        positions = [(12.0, 15.0), (30.0, 22.0)]
+        transform = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+        reference, channel = _channel_pair(positions, transform)
+        window = _sum_mode_window(reference, channel)
+        try:
+            calibration = _fake_spline_calibration(
+                model="spline-3d-multichannel"
+            )
+            calibration["channel_transforms"] = [
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                transform.tolist(),
+            ]
+            window.parameters_dialog.spline_calibration = calibration
+            self._reselect_sum_mode(window)
+            assert window._sum_movie is not None
+            # nothing was identified to get there
+            assert window.sum_identifications is None
+            assert window.identifications is None
+            frame = window.identification_movie()[0]
+            for x, y in positions:
+                # both channels' photons, in reference coordinates
+                assert frame[int(y), int(x)] == pytest.approx(400.0, rel=1e-3)
+        finally:
+            window.close()
+
+    def test_the_per_channel_identifications_register_the_preview(self):
+        """Without a calibration the detections already made are enough: only
+        a layout that cannot be registered at all has to wait for Identify."""
+        transform = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
+        rng = np.random.default_rng(3)
+        frames = np.repeat(np.arange(8), 5)
+        ref_xy = rng.uniform(8, 40, size=(len(frames), 2))
+        chan_xy = localize.apply_affine_transform(ref_xy, transform)
+        ids = [
+            pd.DataFrame(
+                {
+                    "frame": frames,
+                    "x": xy[:, 0],
+                    "y": xy[:, 1],
+                    "net_gradient": 1.0,
+                }
+            )
+            for xy in (ref_xy, chan_xy)
+        ]
+        movie = np.zeros((8, 48, 48), np.float32)
+        window = _sum_mode_window(movie, movie)
+        try:
+            window.channels[0].identifications = ids[0]
+            window.channels[1].identifications = ids[1]
+            window.identifications = ids[0]
+            self._reselect_sum_mode(window)
+            assert window._sum_movie is not None
+            assert "per-channel identifications" in window.sum_transform_source
+            np.testing.assert_allclose(
+                window.sum_transforms[1], transform, atol=1e-6
+            )
+        finally:
+            window.close()
+
+    def test_unregisterable_channels_keep_the_raw_movie_and_are_not_retried(
+        self,
+    ):
+        """Nothing to register the channels with: the display stays on the raw
+        movie, and the attempt is not repeated on every redraw."""
+        movie = np.zeros((2, 8, 8), np.float32)
+        window = _sum_mode_window(movie, movie)
+        attempts = []
+        original = window._sum_channel_transforms
+
+        def counted(*args, **kwargs):
+            attempts.append(1)
+            return original(*args, **kwargs)
+
+        window._sum_channel_transforms = counted
+        try:
+            # selecting the mode already tried once and failed
+            window.drop_channel_sum()  # ... and a drop lets it try again
+            assert window.ensure_channel_sum() is False
+            assert window._sum_movie is None
+            # the display falls back to the raw movie, unfiltered
+            assert window.identification_movie() is window.movie
+            assert window.identification_movie() is window.movie
+            assert len(attempts) == 1
+            # ... until something that could make it possible happens
+            window.drop_channel_sum()
+            assert window.ensure_channel_sum() is False
+            assert len(attempts) == 2
+        finally:
+            window.close()
+
+    def test_identifying_searches_the_previewed_sum(self):
+        """The identification takes the summed view already on screen rather
+        than registering the channels a second time."""
+        positions = [(12.0, 15.0), (30.0, 22.0)]
+        transform = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+        reference, channel = _channel_pair(positions, transform)
+        window = _sum_mode_window(reference, channel)
+        try:
+            window._build_channel_sum(
+                [IDENTITY_AFFINE, transform], None, "a test"
+            )
+            previewed = window._sum_movie
+            window.identify_channel_sum()
+            window._active_worker.wait()
+            QtWidgets.QApplication.processEvents()
+            assert window._sum_movie is previewed
+            assert window.sum_transform_source == "a test"
+            found = set(
+                zip(
+                    window.identifications["x"].tolist(),
+                    window.identifications["y"].tolist(),
+                )
+            )
+            assert found == {(12, 15), (30, 22)}
+        finally:
+            window.close()
+
+    def test_a_loaded_calibration_refreshes_the_summed_view(self):
+        """Loading (or clearing) a calibration replaces the registration the
+        sum was built with, so the view has to be built again."""
+        source = inspect.getsource(
+            localize_gui.ParametersDialog.update_spline_calib
+        )
+        assert "self.window.drop_channel_sum()" in source
+
+
+class TestSumIdentificationsSkipLinking:
+    """Identifications made on the sum go into the joint fit as they are."""
+
+    def _worker(self, link_identifications):
+        ids_ref = pd.DataFrame({"frame": [0, 0], "x": [10, 20], "y": [10, 20]})
+        # channel 1 only saw one of the two molecules
+        ids_chan = pd.DataFrame({"frame": [0], "x": [10], "y": [10]})
+        calibration = _fake_spline_calibration(model="spline-3d-multichannel")
+        movie = np.zeros((1, 32, 32), np.float32)
+        return localize_gui.MultichannelSplineFitWorker(
+            [movie, movie],
+            [CAMERA_INFO, CAMERA_INFO],
+            ids_ref,
+            BOX,
+            calibration,
+            identifications_per_channel=[ids_ref, ids_chan],
+            link_identifications=link_identifications,
+        )
+
+    def test_linking_drops_the_unmatched_molecule_by_default(self):
+        worker = self._worker(True)
+        assert worker._link_across_channels(2)
+        assert len(worker.identifications) == 1
+
+    def test_the_channel_sum_keeps_every_detection(self):
+        worker = self._worker(False)
+        assert worker._link_across_channels(2)
+        assert len(worker.identifications) == 2
+
+
+class TestEstimateTransformsDiagnostics:
+    """``spline.estimate_transforms_from_identifications`` reporting how well
+    each channel registered - what tells the channel sum which channel it
+    could not place."""
+
+    def _identifications(self, transform, n_frames=8, per_frame=5, seed=4):
+        rng = np.random.default_rng(seed)
+        frames = np.repeat(np.arange(n_frames), per_frame)
+        ref_xy = rng.uniform(8, 40, size=(len(frames), 2))
+        chan_xy = localize.apply_affine_transform(ref_xy, transform)
+        make = lambda xy: pd.DataFrame(  # noqa: E731
+            {
+                "frame": frames,
+                "x": xy[:, 0],
+                "y": xy[:, 1],
+                "net_gradient": 1.0,
+            }
+        )
+        return [make(ref_xy), make(chan_xy)]
+
+    def test_pair_counts_are_returned_alongside_the_transforms(self):
+        transform = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
+        ids = self._identifications(transform)
+        transforms, n_pairs = spline.estimate_transforms_from_identifications(
+            ids, BOX, frame_shape=(48, 48), return_diagnostics=True
+        )
+        np.testing.assert_allclose(transforms[1], transform, atol=1e-6)
+        assert n_pairs[0] == 0  # the reference registers against itself
+        assert n_pairs[1] >= 10
+
+    def test_a_failed_channel_reports_zero_pairs(self):
+        ids = self._identifications(IDENTITY_AFFINE)
+        ids[1] = None
+        transforms, n_pairs = spline.estimate_transforms_from_identifications(
+            ids, BOX, frame_shape=(48, 48), return_diagnostics=True
+        )
+        assert transforms is None
+        assert n_pairs == [0, 0]
+
+    def test_the_default_return_value_is_unchanged(self):
+        transform = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
+        ids = self._identifications(transform)
+        transforms = spline.estimate_transforms_from_identifications(
+            ids, BOX, frame_shape=(48, 48)
+        )
+        assert isinstance(transforms, list)
+        np.testing.assert_allclose(transforms[1], transform, atol=1e-6)
+
+
+class TestChannelSumAfterRealignment:
+    """``Calibration > Re-align channels (current signal)`` updates the loaded
+    calibration in place, so the channel sum has to follow it."""
+
+    def _window_with_calibration(self):
+        movie = np.zeros((2, 8, 8), np.float32)
+        window = _sum_mode_window(movie, movie)
+        calibration = _fake_spline_calibration(model="spline-3d-multichannel")
+        calibration["channel_transforms"] = [
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [[1.0, 0.0, 7.0], [0.0, 1.0, -3.0]],
+        ]
+        window.parameters_dialog.spline_calibration = calibration
+        return window, calibration
+
+    def test_the_refined_transforms_are_the_ones_summed(self):
+        window, calibration = self._window_with_calibration()
+        try:
+            # what a re-alignment does: mutate the loaded calibration
+            calibration["channel_transforms"][1] = [
+                [1.0, 0.0, 7.4],
+                [0.0, 1.0, -2.6],
+            ]
+            transforms, _, source = window._sum_channel_transforms(
+                estimate=False
+            )
+            assert source == "the loaded spline calibration"
+            np.testing.assert_allclose(
+                transforms[1], [[1.0, 0.0, 7.4], [0.0, 1.0, -2.6]]
+            )
+        finally:
+            window.close()
+
+    def test_a_sum_built_before_the_realignment_is_dropped(self):
+        """The layout need not change when the channels are re-aligned, so the
+        stale sum has to be dropped explicitly - otherwise the display, the
+        preview and the fit would keep using the old registration."""
+        positions = [(12.0, 15.0)]
+        transform = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+        reference, channel = _channel_pair(positions, transform)
+        window = _sum_mode_window(reference, channel)
+        try:
+            window._run_sum_identification(
+                [IDENTITY_AFFINE, transform], None, "a test"
+            )
+            window._active_worker.wait()
+            window.sum_identifications = pd.DataFrame(
+                {"frame": [0], "x": [12], "y": [15]}
+            )
+            assert window._sum_movie is not None
+            # the layout is untouched, so the layout check alone keeps it
+            window.validate_channel_sum()
+            assert window._sum_movie is not None
+            # a re-alignment must drop it anyway
+            window.drop_channel_sum()
+            assert window._sum_movie is None
+            assert window.sum_identifications is None
+        finally:
+            window.close()
+
+    def test_the_realignment_drops_the_channel_sum(self):
+        """The real call path: re-aligning invalidates the sum."""
+        source = inspect.getsource(
+            localize_gui.Window.reregister_channels_from_signal
+        )
+        assert "self.drop_channel_sum()" in source

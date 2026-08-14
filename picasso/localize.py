@@ -43,7 +43,6 @@ from numba import cuda
 import dask.array as da
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.special import erf
 from tqdm import tqdm
 from sqlalchemy import create_engine
 import matplotlib.gridspec as gridspec
@@ -1098,6 +1097,284 @@ class GaussianFilteredMovie:
         self.close()
 
 
+def _channel_warp(
+    transform: lib.FloatArray2D,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(matrix, offset)`` for ``scipy.ndimage.affine_transform`` from a
+    ``(2, 3)`` reference->channel affine.
+
+    The affine is in ``(x, y)``: ``[x', y'] = A @ [x, y] + b`` (see
+    :func:`apply_affine_transform`). ``affine_transform`` evaluates
+    ``output[o] = input[matrix @ o + offset]`` in ``(row, col)`` order, and
+    ``o`` is a *reference* pixel here - so the matrix it needs is exactly this
+    reference->channel affine with the two axes swapped, no inversion.
+    """
+    t = np.asarray(transform, dtype=np.float64)
+    if t.shape != (2, 3):
+        raise ValueError(
+            f"A channel transform must be a (2, 3) affine, got {t.shape}."
+        )
+    return t[:, :2][::-1, ::-1], t[:, 2][::-1]
+
+
+class SummedChannelsMovie:
+    """Lazily evaluated, read-only view of several registered channels added
+    together in the reference channel's coordinates.
+
+    Frame ``t`` is ``sum_c warp(photons(movies[c][t]), transforms[c])``: every
+    channel is converted to photons, mapped into the reference channel through
+    its affine and accumulated. A molecule that is too dim to be detected in
+    any single channel can still stand out in that sum, which is the point -
+    identifying on the sum finds the molecules a per-channel identification
+    would lose, and the resulting detections are already the cross-channel
+    consensus that a joint multichannel fit needs (no linking step).
+
+    Photons, not raw counts, are summed: the channels' baselines would
+    otherwise pile up as a pedestal and their gains would weight the channels
+    against each other, so a dim channel would contribute by its camera's gain
+    rather than by its signal.
+
+    This class is meant for spot identification only - fitting, spot cutting
+    and photon conversion must always use the raw movie of the channel in
+    question. Like ``GaussianFilteredMovie`` it deliberately does not implement
+    the ``io.AbstractPicassoMovie`` interface, so that accidentally handing it
+    to ``fit`` trips that function's input assertion instead of silently
+    returning wrong photon numbers.
+
+    Note that the minimum net gradient has to be re-tuned for the sum: adding
+    ``n`` channels scales the net gradient roughly by ``n``, and the counts to
+    photons conversion rescales it again.
+
+    Parameters
+    ----------
+    movies : list of MovieLike
+        One movie per channel, reference first (or at ``reference``). For
+        split-FOV data the single movie is repeated once per region, exactly
+        as :func:`fit_spline_split_fov` does.
+    transforms : list of lib.FloatArray2D
+        One ``(2, 3)`` affine per channel, mapping reference-channel
+        coordinates into that channel (the calibration's
+        ``channel_transforms``; the reference's is the identity). None entries
+        are rejected: a channel that could not be registered must not be summed
+        in at the identity, since that would smear the sum.
+    camera_infos : list of dict, optional
+        One camera info per channel, used to convert counts to photons. If
+        None, the raw counts are summed instead (only sensible when the
+        channels share a camera and a baseline).
+    regions : list, optional
+        Split-FOV: one ``[[y_min, x_min], [y_max, x_max]]`` rectangle per
+        channel. Only the reference region of the canvas is filled (the rest
+        stays zero), so the identified coordinates remain absolute frame
+        coordinates and only the reference region is ever analyzed. If None,
+        the channels are separate movies and the whole frame is filled.
+    reference : int, optional
+        Index of the reference channel in ``movies``/``transforms``/
+        ``regions``. Default is 0.
+    order : int, optional
+        Spline order of the resampling, see ``scipy.ndimage.affine_transform``.
+        Default is 1 (bilinear): higher orders overshoot on noisy
+        single-molecule data, which shows up directly in the net gradient.
+    camera_calibrations : list of dict, optional
+        One sCMOS camera calibration per channel (``offset``, ``gain`` full
+        frame maps). Applied before warping, since the maps live in each
+        channel's own coordinates.
+
+    Attributes
+    ----------
+    movies, transforms, camera_infos, regions, reference, order : as above
+    frame_shape : tuple
+        ``(Y, X)`` of the reference channel, i.e. of the summed frames.
+    """
+
+    # Summing a frame is stateless (there is no cache, and scipy.ndimage is
+    # re-entrant), so reads never have to be serialized on the identification
+    # lock. The wrapped movies serialize their own reads if they need to.
+    supports_concurrent_reads = True
+
+    def __init__(
+        self,
+        movies: list,
+        transforms: list,
+        *,
+        camera_infos: list | None = None,
+        regions: list | None = None,
+        reference: int = 0,
+        order: int = 1,
+        camera_calibrations: list | None = None,
+    ) -> None:
+        n_channels = len(movies)
+        if n_channels < 2:
+            raise ValueError(
+                "Summing channels needs at least two channels; identify on "
+                "the movie itself to not sum at all."
+            )
+        if len(transforms) != n_channels:
+            raise ValueError(
+                f"Got {n_channels} channels but {len(transforms)} channel "
+                "transforms."
+            )
+        unregistered = [c for c, t in enumerate(transforms) if t is None]
+        if unregistered:
+            raise ValueError(
+                f"Channel(s) {unregistered} have no affine transform, so they "
+                "cannot be mapped onto the reference channel. Register them "
+                "(load a multichannel spline calibration or identify every "
+                "channel so the transforms can be estimated) before summing."
+            )
+        if not 0 <= reference < n_channels:
+            raise ValueError(
+                f"The reference channel {reference} is not one of the "
+                f"{n_channels} channels."
+            )
+        if regions is not None and len(regions) != n_channels:
+            raise ValueError(
+                f"Got {n_channels} channels but {len(regions)} regions."
+            )
+        self.movies = list(movies)
+        self.transforms = [np.asarray(t, dtype=np.float64) for t in transforms]
+        self.camera_infos = (
+            None if camera_infos is None else list(camera_infos)
+        )
+        self.camera_calibrations = (
+            None if camera_calibrations is None else list(camera_calibrations)
+        )
+        self.regions = (
+            None if regions is None else [_normalize_rect(r) for r in regions]
+        )
+        self.reference = int(reference)
+        self.order = int(order)
+        lengths = [len(m) for m in self.movies]
+        self.n_frames = int(min(lengths))
+        if self.n_frames == 0:
+            raise ValueError("Cannot sum an empty movie.")
+        if len(set(lengths)) > 1:
+            warnings.warn(
+                f"The channels have different lengths ({lengths}); the sum "
+                f"covers their common {self.n_frames} frames.",
+                stacklevel=2,
+            )
+        # one read to learn the frame geometry; movies do not agree on
+        # whether they expose .shape (TiffMap does not)
+        self.frame_shape = np.asarray(self.movies[self.reference][0]).shape
+        # the window of the canvas that is filled: the reference region for
+        # split-FOV data, the whole frame for separate channel movies
+        if self.regions is None:
+            self._window = [[0, 0], list(self.frame_shape)]
+        else:
+            self._window = self.regions[self.reference]
+
+    def clear_cache(self) -> None:
+        """Do nothing; this view caches nothing. Kept so that callers can
+        treat all identification views alike."""
+
+    def matches_regions(self, regions: list | None) -> bool:
+        """Whether this sum was built for these region rectangles.
+
+        The sum is only valid for the layout it was built for, and the corners
+        of a rectangle may be given in any order - so callers compare through
+        this rather than against ``regions`` directly."""
+        if self.regions is None or regions is None:
+            return self.regions is None and regions is None
+        if len(regions) != len(self.regions):
+            return False
+        return all(
+            _normalize_rect(rect) == mine
+            for rect, mine in zip(regions, self.regions)
+        )
+
+    def _channel_photons(self, channel: int, index: int) -> np.ndarray:
+        """One channel's frame in photons, in that channel's own
+        coordinates."""
+        frame = np.asarray(self.movies[channel][index])
+        if self.camera_infos is None:
+            return frame.astype(np.float32, copy=False)
+        calibration = (
+            None
+            if self.camera_calibrations is None
+            else self.camera_calibrations[channel]
+        )
+        offset = gain = None
+        if calibration is not None:
+            offset = calibration.get("offset")
+            gain = calibration.get("gain")
+        return _to_photons(frame, self.camera_infos[channel], offset, gain)
+
+    def __getitem__(self, it):
+        if isinstance(it, tuple):
+            if len(it) == 1:
+                return self[it[0]]
+            return self[it[0]][tuple(it[1:])]
+        if isinstance(it, slice):
+            return np.stack(
+                [self[i] for i in range(*it.indices(self.n_frames))]
+            )
+        index = int(it)
+        if index < 0:
+            index += self.n_frames
+        if not 0 <= index < self.n_frames:
+            raise IndexError(
+                f"Frame {it} is out of range for a movie with "
+                f"{self.n_frames} frames."
+            )
+        canvas = np.zeros(self.frame_shape, dtype=np.float32)
+        (y0, x0), (y1, x1) = self._window
+        origin = np.array([float(y0), float(x0)])
+        out_shape = (y1 - y0, x1 - x0)
+        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        for c in range(len(self.movies)):
+            image = self._channel_photons(c, index)
+            if np.array_equal(self.transforms[c], identity):
+                # the channel already is in reference coordinates: take its
+                # pixels as they are rather than resampling them
+                canvas[y0:y1, x0:x1] += image[y0:y1, x0:x1]
+                continue
+            matrix, offset = _channel_warp(self.transforms[c])
+            # sample only the window, i.e. shift the output origin into it
+            canvas[y0:y1, x0:x1] += affine_transform(
+                image,
+                matrix,
+                offset=matrix @ origin + offset,
+                output_shape=out_shape,
+                order=self.order,
+                mode="constant",
+                cval=0.0,
+                output=np.float32,
+            )
+        return canvas
+
+    def __iter__(self):
+        for i in range(self.n_frames):
+            yield self[i]
+
+    def __len__(self) -> int:
+        return self.n_frames
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self.n_frames, *self.frame_shape)
+
+    @property
+    def dtype(self) -> np.dtype:
+        return np.dtype(np.float32)
+
+    def close(self) -> None:
+        closed = []
+        for movie in self.movies:
+            # split-FOV repeats one movie per channel; close it once
+            if any(movie is other for other in closed):
+                continue
+            closed.append(movie)
+            close = getattr(movie, "close", None)
+            if close is not None:
+                close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
 def identify_in_frame(
     frame: lib.IntArray2D,
     minimum_ng: float | list | np.ndarray,
@@ -1642,6 +1919,118 @@ def identify(
         return ids, info
     else:
         return ids
+
+
+def identify_multichannel_sum(
+    movies: list,
+    minimum_ng: float,
+    box: int,
+    transforms: list,
+    *,
+    camera_infos: list | None = None,
+    regions: list | None = None,
+    reference: int = 0,
+    camera_calibrations: list | None = None,
+    roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
+    frame_bounds: tuple[int, int] | list | None = None,
+    threaded: bool = True,
+    temporal_median_window: int | None = None,
+    temporal_median_stride: int | None = None,
+    gaussian_filter_sigma: float | None = None,
+    order: int = 1,
+    progress_callback: (
+        Callable[[list[int]], None] | Literal["console"] | None
+    ) = None,
+    abort_callback: Callable[[], bool] | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Identify spots on the *sum* of registered channels rather than in each
+    channel on its own.
+
+    Every channel is converted to photons, mapped into the reference channel
+    through its affine transform and added up (see
+    :class:`SummedChannelsMovie`); the summed movie is then identified exactly
+    as a single-channel movie is. This is the mode for data where a channel is
+    too dim to detect in by itself: the molecule is found from the combined
+    signal, and the resulting detections are the reference-channel positions a
+    joint multichannel fit takes directly - they are already the cross-channel
+    consensus, so a :func:`filter_linked_identifications` step would only throw
+    away exactly the molecules this mode is meant to recover.
+
+    The temporal median and Gaussian filters apply to the *sum*, matching the
+    "identify on the sum" semantics: it is the summed image that is being
+    searched for maxima, so it is the summed image that is background
+    subtracted and smoothed.
+
+    Parameters
+    ----------
+    movies : list of MovieLike
+        One movie per channel, reference first (or at ``reference``). For
+        split-FOV data pass the single movie repeated once per region.
+    minimum_ng : float
+        Minimum net gradient, a single value: there is one summed image. It has
+        to be re-tuned relative to the per-channel thresholds, since the sum is
+        in photons and over all channels (see :class:`SummedChannelsMovie`).
+    box : int
+        The size of the box to extract around each spot.
+    transforms : list of lib.FloatArray2D
+        One ``(2, 3)`` reference->channel affine per channel; see
+        :class:`SummedChannelsMovie`.
+    camera_infos, regions, reference, camera_calibrations, order
+        Passed to :class:`SummedChannelsMovie`.
+    roi : tuple or list of tuples, optional
+        Region(s) to identify in, in reference-channel coordinates. Defaults to
+        the reference region for split-FOV data (the only part of the canvas
+        that is filled) and to the whole frame otherwise.
+    frame_bounds, threaded, temporal_median_window, temporal_median_stride, \
+gaussian_filter_sigma, progress_callback, abort_callback
+        As in :func:`identify`.
+
+    Returns
+    -------
+    ids : pd.DataFrame
+        The identified spots in *reference-channel* coordinates, with fields
+        `frame`, `x`, `y` and `net_gradient` (the latter measured on the sum).
+    info : dict
+        Identification metadata, with the summing recorded under
+        ``"Identification Mode"``, ``"Sum Channel Transforms"`` and
+        ``"Sum Regions"``.
+    """
+    summed = SummedChannelsMovie(
+        movies,
+        transforms,
+        camera_infos=camera_infos,
+        regions=regions,
+        reference=reference,
+        order=order,
+        camera_calibrations=camera_calibrations,
+    )
+    if roi is None and regions is not None:
+        # only the reference region of the canvas holds the sum
+        roi = [summed.regions[summed.reference]]
+    result = identify(
+        summed,
+        minimum_ng,
+        box,
+        roi=roi,
+        frame_bounds=frame_bounds,
+        threaded=threaded,
+        temporal_median_window=temporal_median_window,
+        temporal_median_stride=temporal_median_stride,
+        gaussian_filter_sigma=gaussian_filter_sigma,
+        progress_callback=progress_callback,
+        abort_callback=abort_callback,
+    )
+    if result is None:  # aborted
+        return None
+    ids, info = result
+    info["Generated by"] = f"Picasso: v{__version__} Identify"
+    info["Identification Mode"] = "sum"
+    info["Sum Channel Transforms"] = [
+        np.asarray(t, dtype=float).tolist() for t in summed.transforms
+    ]
+    info["Sum Regions"] = summed.regions
+    info["Sum Reference Channel"] = summed.reference
+    return ids, info
 
 
 def picks_to_identifications(
