@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 14-AUG-2026 CEST
+Last change: 17-AUG-2026 CEST
 
 ## 0.11.0
 
@@ -66,6 +66,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Rendering rotated Gaussians
 - More user-friendly measure tool
 - Faster AIM through smarter implementation
+- Localization files now load on a background thread, so the Render window (including the file dialogs) stays responsive while files are read; a progress dialog with a `Cancel` button is shown
 - Faster and more memory efficient (especially for large datasets) SMLM clusterer + progress bar
 - Progress bar for finding cluster centers
 - SMAP localization file reading, see "Other improvements" below
