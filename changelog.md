@@ -101,6 +101,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 
 #### SPINNA
 - Adjustable font sizes and names for the NND plot's title, labels and ticks
+- Default NND plot title changed from "Nearest Neighbor Distances" to "NNDs"
 - Fixed incorrect density of plotted molecules when using LE fitting
 - Fixed verbose for batch analysis
 - Batch analysis allows for specifying fitting mode (brute force/coarse to fine/bayesian)
