@@ -40,7 +40,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Accept multiple rectangular ROIs
 - Remove a ROI by double-clicking it in the preview
 - 3D calibration allows for multiple FOVs per z position (thanks to Aditya Ajay Chhatre for the suggestion)
-- Movies now load on a background thread, so the Localize window stays responsive (and other windows are no longer blocked) while files are read; a progress dialog with a `Cancel` button is shown
+- Movies now load on a background thread, so the Localize window stays responsive (and other windows are no longer blocked) while files are read; a progress dialog with a `Cancel` button is shown.
 - Slider at the bottom of the app was added to allow easy navigation across frames
 - Contrast slider below it, with a black-point and a white-point handle
 - New keyboard shortcuts for navigating movies (move by 10/100/1,000 frames)

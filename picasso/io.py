@@ -2615,6 +2615,35 @@ class _PerThreadFileHandles:
         self._local = threading.local()
 
 
+def _index_pages(pages, progress=None) -> int:
+    """Return the number of IFDs in ``pages``, walking the IFD chain in
+    chunks so that a long scan stays reportable and abortable.
+
+    ``len(pages)`` walks the whole chain of a TIFF in one uninterrupt-
+    ible call - minutes for a movie with many frames on network storage,
+    where every IFD costs a round trip. Reading a page only extends the
+    chain up to that index (see ``tifffile.TiffPages._seek``), so the
+    walk is done here one chunk of pages at a time, calling
+    ``progress(done, 0)`` in between. The total is 0 because the frame
+    count is precisely what is not known yet; raising inside ``progress``
+    aborts the scan.
+    """
+    CHUNK = 2000  # IFDs walked per progress report
+    if progress is None or not isinstance(pages, tifffile.TiffPages):
+        return len(pages)
+    if getattr(pages, "_indexed", False):  # chain already walked
+        return len(pages)
+    done = 0
+    while True:
+        try:
+            pages[done + CHUNK - 1]  # extends the chain up to this page
+        except IndexError:  # the chain ended within the last chunk
+            break
+        done += CHUNK
+        progress(done, 0)
+    return len(pages)
+
+
 class TiffMap(_PerThreadFileHandles):
     """Read a single TIFF file and provide array-like access to its frames.
 
@@ -2796,7 +2825,10 @@ class TiffMap(_PerThreadFileHandles):
         keyframe" RuntimeError surfaces; __init__ catches it and retries
         with full-page parsing, where the stray IFD has its real shape
         and is dropped below."""
-        n_pages = len(self._pages)
+        # Counting the pages walks the IFD chain, which is the whole cost
+        # of opening a compressed movie (the branch below returns without
+        # touching the pages again), so it is reported in chunks too.
+        n_pages = _index_pages(self._pages, progress)
 
         # Throttle progress reports to at most ~200 per file so a
         # multi-thousand-frame movie does not flood the GUI event queue

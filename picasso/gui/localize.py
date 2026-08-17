@@ -5224,9 +5224,10 @@ class Window(QtWidgets.QMainWindow):
         self._load_thread = None
         self._load_worker = None
         self._load_progress = None
-        # Load request made while a cancelled load is still winding down;
-        # started as soon as the old worker thread is torn down.
-        self._pending_load = None
+        self._load_filename = ""
+        # Cancelled loads, winding down on their own (see
+        # ``_on_load_canceled``); kept referenced until their thread ends.
+        self._detached_loads = []
         self._load_t0 = 0.0
         self._load_multi_file = False
         # Make sure a running loader thread is stopped before the
@@ -5295,7 +5296,6 @@ class Window(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         """Close the application, save user settings."""
-        self._stop_movie_load()
         settings = io.load_user_settings()
         if self.movie_path != []:
             settings["Localize"]["PWD"] = os.path.dirname(self.movie_path)
@@ -5327,6 +5327,17 @@ class Window(QtWidgets.QMainWindow):
             )
         }
         io.save_user_settings(settings)
+        # Settings are safely on disk before the loader threads are dealt
+        # with, so a slow file read can never cost the user their
+        # settings, however the process ends below.
+        self._stop_movie_load()
+        if self._loads_still_running():
+            # A loader is stuck in an io call that cannot be interrupted
+            # (a hung network share, say). Waiting for it would freeze
+            # the quit, and letting Qt destroy a live QThread aborts the
+            # process with a crash report, so leave right here instead.
+            # Nothing is being written, so there is nothing to lose.
+            os._exit(0)
         QtWidgets.QApplication.instance().closeAllWindows()
 
     def init_menu_bar(self) -> None:
@@ -6375,23 +6386,9 @@ class Window(QtWidgets.QMainWindow):
         through the files in the given order.
         """
         if self._load_thread is not None:
-            if self._load_worker is not None and self._load_worker._cancelled:
-                # The previous load was cancelled but its worker is still
-                # finishing the blocking io call. Remember this request
-                # and start it as soon as the old thread is torn down.
-                self._pending_load = (
-                    paths,
-                    prompt_for_path,
-                    load_all,
-                    multi_file,
-                    concat,
-                )
-                self.status_bar.showMessage(
-                    "Finishing cancelled load, the new file will open "
-                    "right after..."
-                )
-            # Otherwise a load is already in progress; ignore re-entrant
-            # requests.
+            # A load is already in progress; ignore re-entrant requests.
+            # (A cancelled one is detached immediately, see
+            # ``_on_load_canceled``, so it never blocks a new load.)
             return
 
         self._load_t0 = time.time()
@@ -6444,10 +6441,11 @@ class Window(QtWidgets.QMainWindow):
         """Update the progress dialog as each file starts loading.
 
         The bar cannot move yet: before per-page reporting begins, the
-        loader indexes the whole file (opening it and counting frames),
-        which happens inside a single tifffile call with no sub-steps.
-        Say so, so the user does not think the load has stalled."""
+        loader indexes the file's frames, and their number - the total
+        the bar needs - is only known when that is done. Say so, so the
+        user does not think the load has stalled."""
         self._load_index = index
+        self._load_filename = filename
         if self._load_progress is not None:
             self._load_progress.setLabelText(
                 f"Opening {filename}...\n"
@@ -6457,46 +6455,135 @@ class Window(QtWidgets.QMainWindow):
 
     def _on_load_subprogress(self, done: int, total: int) -> None:
         """Advance the bar within the current file from the worker's
-        per-page reports (see ``MovieLoadWorker.subprogress``)."""
-        if self._load_progress is not None and total > 0:
+        per-page reports (see ``MovieLoadWorker.subprogress``).
+
+        A total of 0 means the frames are still being counted (see
+        ``io._index_pages``), so there is nothing to advance towards -
+        report the running count in the label instead."""
+        if self._load_progress is None:
+            return
+        if total > 0:
             fraction = min(done / total, 1.0)
             value = int((self._load_index + fraction) * PROGRESS_RESOLUTION)
             self._load_progress.setValue(value)
+        else:
+            self._load_progress.setLabelText(
+                f"Opening {self._load_filename}...\n"
+                f"Indexing frames — {done} counted so far."
+            )
 
     def _on_load_prompt_requested(
         self, callback, args_kwargs, holder: dict
     ) -> None:
         """Run a worker-requested metadata prompt on the GUI thread and
         hand the result back, then unblock the worker."""
+        # the asking worker, which is not necessarily the current one
+        # anymore (it may have been cancelled and detached meanwhile)
+        worker = self.sender()
+        if not isinstance(worker, MovieLoadWorker):
+            worker = self._load_worker
         args, kwargs = args_kwargs
         try:
             holder["result"] = callback(*args, **kwargs)
         finally:
-            self._load_worker._prompt_event.set()
+            if worker is not None:
+                worker._prompt_event.set()
 
     def _on_load_canceled(self) -> None:
-        """Discard the progress dialog as soon as the user cancels. The
-        worker keeps emitting progress while it finishes the current
-        (uninterruptible) io call, and ``setValue()`` on a cancelled
-        ``QProgressDialog`` re-shows it."""
-        if self._load_progress is not None:
-            self._load_progress.close()
-            self._load_progress = None
-        self.status_bar.showMessage("Cancelling load...")
+        """Give the GUI back to the user the moment they cancel.
+
+        The worker stops at its next cancellation check, but the io call
+        it is inside cannot be interrupted, so that can still take a
+        while on a slow file system. Instead of waiting for it, the
+        worker is *detached*: its signals are disconnected (its result is
+        no longer wanted) and it is left to wind down on its own, so a
+        new movie can be opened right away. Dropping the progress dialog
+        is part of that - ``setValue()`` re-shows a cancelled one."""
+        progress, self._load_progress = self._load_progress, None
+        if progress is not None:
+            # disconnect first: closing re-emits ``canceled``
+            try:
+                progress.canceled.disconnect()
+            except TypeError:  # nothing connected
+                pass
+            progress.close()
+        thread, worker = self._load_thread, self._load_worker
+        self._load_thread = None
+        self._load_worker = None
+        if worker is None or thread is None:
+            return
+        # cancel() also releases a worker blocked on a metadata prompt
+        worker.cancel()
+        for signal in (
+            worker.progress,
+            worker.subprogress,
+            worker.prompt_requested,
+            worker.finished,
+            worker.failed,
+        ):
+            try:
+                signal.disconnect()  # no more progress/results wanted
+            except TypeError:  # nothing connected
+                pass
+        # Keep a reference until the thread has really stopped: a QThread
+        # destroyed while still running aborts the process.
+        self._detached_loads.append((thread, worker))
+        thread.finished.connect(
+            lambda t=thread: self._on_detached_load_done(t)
+        )
+        # Ask the thread's event loop to exit; it does so as soon as the
+        # worker returns from the io call it is in. Requesting it here
+        # rather than from ``worker.finished`` also covers the worker
+        # having finished already, just before this cancellation.
+        thread.quit()
+        self.status_bar.showMessage(
+            "Load cancelled (the file is still being released in the "
+            "background)."
+        )
+
+    def _on_detached_load_done(self, thread: QtCore.QThread) -> None:
+        """Drop a cancelled load's worker thread once it has stopped."""
+        for i, (detached, worker) in enumerate(self._detached_loads):
+            if detached is thread:
+                del self._detached_loads[i]
+                worker.deleteLater()
+                thread.deleteLater()
+                break
 
     def _stop_movie_load(self) -> None:
-        """Cancel any in-progress load and block until the worker thread
-        has stopped. Called before the window/app is destroyed, because
-        destroying a still-running QThread aborts the process."""
-        if self._load_worker is not None:
-            self._load_worker.cancel()
-        if self._load_thread is not None:
-            self._load_thread.quit()
-            self._load_thread.wait()
+        """Cancel any in-progress load before the window/app is
+        destroyed, because destroying a live QThread aborts the process.
+
+        Waits only briefly: a worker stuck in an uninterruptible io call
+        must not hold up quitting. ``_loads_still_running`` then reports
+        that one is left over, so ``closeEvent`` can leave the process
+        without destroying it."""
+        WAIT_MS = 2000
+        for thread, worker in [
+            (self._load_thread, self._load_worker),
+            *self._detached_loads,
+        ]:
+            if worker is not None:
+                worker.cancel()
+            if thread is not None:
+                thread.quit()
+                thread.wait(WAIT_MS)
+
+    def _loads_still_running(self) -> bool:
+        """True if a loader thread is still inside an io call."""
+        threads = [self._load_thread, *(t for t, _ in self._detached_loads)]
+        return any(t is not None and t.isRunning() for t in threads)
 
     def _finish_load(self) -> None:
         """Tear down the worker thread and progress dialog."""
         if self._load_progress is not None:
+            # closing a QProgressDialog emits ``canceled``, which would
+            # detach the worker that just finished (see
+            # ``_on_load_canceled``)
+            try:
+                self._load_progress.canceled.disconnect()
+            except TypeError:  # nothing connected
+                pass
             self._load_progress.close()
             self._load_progress = None
         if self._load_thread is not None:
@@ -6507,11 +6594,6 @@ class Window(QtWidgets.QMainWindow):
         if self._load_worker is not None:
             self._load_worker.deleteLater()
             self._load_worker = None
-        if self._pending_load is not None:
-            # A load requested while the cancelled one was winding down;
-            # start it now that the old thread is gone.
-            pending, self._pending_load = self._pending_load, None
-            self._start_movie_load(*pending)
 
     def _on_load_finished(
         self, movies: list, infos: list, paths: list
