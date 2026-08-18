@@ -117,7 +117,15 @@ _REFERENCE_WORK = 20
 
 
 def max_rows_reference() -> int:
-    """Row ceiling for a launch of the reference per-row cost."""
+    """Row ceiling for a launch of the reference per-row cost.
+
+    Returns
+    -------
+    max_rows : int
+        :data:`_MAX_ROWS_REFERENCE`, or the value of the
+        ``PICASSO_FIT_CUDA_MAX_ROWS`` environment variable when it is set to a
+        valid integer (a warning is issued and the default kept otherwise).
+    """
     override = os.environ.get("PICASSO_FIT_CUDA_MAX_ROWS")
     if override:
         try:
@@ -135,10 +143,23 @@ def max_rows_reference() -> int:
 def chunk_rows(bytes_per_row: int, work_per_row: int) -> int:
     """Fits per kernel launch, bounded by device memory *and* by runtime.
 
-    ``work_per_row`` is the number of model evaluations one fit can cost, i.e.
-    ``n_seeds * max_iterations``. Scaling the ceiling by it keeps a long
-    multi-start launch roughly as short in wall-clock as a cheap single-start
-    one, which is what keeps a display-attached GPU under its watchdog timeout.
+    Parameters
+    ----------
+    bytes_per_row : int
+        Device memory one fit occupies, summed over every array chunked with
+        it.
+    work_per_row : int
+        The number of model evaluations one fit can cost, i.e.
+        ``n_seeds * max_iterations``. Scaling the ceiling by it keeps a long
+        multi-start launch roughly as short in wall-clock as a cheap
+        single-start one, which is what keeps a display-attached GPU under its
+        watchdog timeout.
+
+    Returns
+    -------
+    n_rows : int
+        Fits per launch, at least 1024, the smaller of the memory and runtime
+        bounds.
     """
     by_memory = max(1024, CUDA_CHUNK_BYTES // max(bytes_per_row, 1))
     by_runtime = max(
@@ -158,7 +179,13 @@ def warn_gpu_fallback(exc: Exception) -> None:
     kernels are simply used. This is for the other case: a device is present but
     the attempt failed (out of memory, driver error), where the results are still
     correct but a silent fallback would hide a broken device path indefinitely.
-    Warned once per process so a per-chunk failure cannot spam the log."""
+    Warned once per process so a per-chunk failure cannot spam the log.
+
+    Parameters
+    ----------
+    exc : Exception
+        The exception that triggered the fallback; included in the warning.
+    """
     global _gpu_fallback_warned
     if _gpu_fallback_warned:
         return
@@ -380,30 +407,44 @@ def _lm_solve_step_device(hess, grad, scaling, lam, damped, delta, n, ipiv):
 def make_lm_driver(accumulate, n_params: int, z_col: int, seedable: bool):
     """Build the per-fit LM driver device function for one model.
 
-    ``accumulate(spots, index, variance, use_variance, coeff, jac, res, theta,
-    mle, hess, grad)`` must return ``(chi_square, ok)`` and fill the full
-    symmetric ``hess`` and ``grad``, exactly like the
-    ``picasso.fitting.splinefit._accumulate_*`` family.
-
-    ``variance`` is laid out exactly like ``spots`` and holds the per-pixel
-    sCMOS readout variance in photoelectrons squared; ``use_variance`` is False
-    when no camera calibration is in use, and ``variance`` is then a
-    ``(1, 1, 1, 1)`` dummy that exists only to keep the kernel's argument types
-    stable across both states.
-
     The driver is generated rather than shared because ``cuda.local.array``
     needs a compile-time shape, so ``n_params`` has to be a closure constant.
     That also lets each model get scratch sized to itself: compiling one driver
     at the widest parameter count would give the common single-channel fit the
     register and local-memory profile of the six-channel one.
 
-    ``z_col`` is the parameter index the axial multi-start seeds, and
-    ``seedable`` is False for models with no axial coordinate - the 2D model's
-    parameter 3 is the *background*, so seeding it would silently corrupt the
-    fit rather than move it in z.
-
     This mirrors ``splinefit._fit_spline_spot`` line for line, including the
     seed ranking, so that the two devices agree on which seed wins.
+
+    Parameters
+    ----------
+    accumulate : callable
+        A ``cuda.jit(device=True)`` function
+        ``accumulate(spots, index, variance, use_variance, coeff, jac, res,
+        theta, mle, hess, grad)`` returning ``(chi_square, ok)`` and filling
+        the full symmetric ``hess`` and ``grad``, exactly like the
+        ``picasso.fitting.splinefit._accumulate_*`` family. Its ``variance`` is
+        laid out exactly like ``spots`` and holds the per-pixel sCMOS readout
+        variance in photoelectrons squared; ``use_variance`` is False when no
+        camera calibration is in use, and ``variance`` is then a
+        ``(1, 1, 1, 1)`` dummy that exists only to keep the kernel's argument
+        types stable across both states.
+    n_params : int
+        Parameter count of the model; the compile-time size of the driver's
+        local scratch.
+    z_col : int
+        The parameter index the axial multi-start seeds. Ignored when
+        ``seedable`` is False.
+    seedable : bool
+        False for models with no axial coordinate - the 2D model's parameter 3
+        is the *background*, so seeding it would silently corrupt the fit
+        rather than move it in z.
+
+    Returns
+    -------
+    driver : callable
+        A ``cuda.jit(device=True)`` function that fits the spot at ``index``
+        and writes its outputs in place. Pass it to :func:`make_fit_kernel`.
     """
     n = n_params
     z_column = z_col
@@ -630,13 +671,26 @@ def make_lm_driver(accumulate, n_params: int, z_col: int, seedable: bool):
 def make_fit_kernel(driver, cache: bool = False):
     """Wrap a driver from :func:`make_lm_driver` in a one-thread-per-fit kernel.
 
-    ``cache`` is False by default and must stay False for kernels produced by a
-    parameterized factory. Numba's on-disk cache keys on qualified name, code
-    location and signature; two kernels generated from the same factory at
-    different parameter counts agree on all three and differ only by a closure
-    variable, which is exactly the case where the cache either refuses to store
-    or returns the wrong artifact. Models whose driver is built once at a fixed
-    size may pass True.
+    Parameters
+    ----------
+    driver : callable
+        The device function returned by :func:`make_lm_driver`.
+    cache : bool, optional
+        Whether to let Numba cache the compiled kernel on disk. False by
+        default and must stay False for kernels produced by a parameterized
+        factory: Numba's on-disk cache keys on qualified name, code location
+        and signature; two kernels generated from the same factory at
+        different parameter counts agree on all three and differ only by a
+        closure variable, which is exactly the case where the cache either
+        refuses to store or returns the wrong artifact. Models whose driver is
+        built once at a fixed size may pass True.
+
+    Returns
+    -------
+    kernel : callable
+        A ``cuda.jit`` kernel taking ``(spots, variance, use_variance, coeff,
+        jac, res, init, z_seeds, apply_seeds, mle, tolerance, max_iterations,
+        thetas, chi_squares, states, iterations)``, one thread per spot.
     """
 
     @cuda.jit(cache=cache)

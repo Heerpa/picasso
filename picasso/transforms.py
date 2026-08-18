@@ -92,8 +92,21 @@ def _monomial_powers(degree: int) -> list[tuple[int, int]]:
 def min_points(model: Model) -> int:
     """Minimum number of correspondences needed to fit ``model``.
 
-    3 for affine, 4 for projective, 6 for ``polynomial2`` and 10 for
-    ``polynomial3``.
+    Parameters
+    ----------
+    model : {"affine", "projective", "polynomial2", "polynomial3"}
+        The transform model. See the module docstring.
+
+    Returns
+    -------
+    n_points : int
+        3 for affine, 4 for projective, 6 for ``polynomial2`` and 10 for
+        ``polynomial3``.
+
+    Raises
+    ------
+    ValueError
+        If ``model`` is not one of :data:`MODELS`.
     """
     _validate_model(model)
     degree = _polynomial_degree(model)
@@ -195,23 +208,49 @@ class Transform:
     # -- to be implemented by the models ---------------------------------
 
     def apply(self, xy) -> np.ndarray:
-        """Map ``(n, 2)`` source coordinates to destination coordinates."""
+        """Map source coordinates to destination coordinates.
+
+        Parameters
+        ----------
+        xy : array
+            ``(n, 2)`` source coordinates. A single ``(2,)`` point is
+            accepted and treated as ``(1, 2)``.
+
+        Returns
+        -------
+        dst_xy : np.ndarray
+            ``(n, 2)`` destination coordinates, in the same units as ``xy``.
+        """
         raise NotImplementedError
 
     def jacobian(self, xy) -> np.ndarray:
-        """Local ``(n, 2, 2)`` linear part at each of the ``(n, 2)`` points.
+        """Local linear part of the transform at each of the given points.
 
-        ``J[k] = [[du/dx, du/dy], [dv/dx, dv/dy]]`` at ``xy[k]``. Constant for
-        an affine, position-dependent otherwise.
+        Parameters
+        ----------
+        xy : array
+            ``(n, 2)`` source coordinates.
+
+        Returns
+        -------
+        jacobian : np.ndarray
+            ``(n, 2, 2)``, with ``J[k] = [[du/dx, du/dy], [dv/dx, dv/dy]]``
+            at ``xy[k]``. Constant for an affine, position-dependent
+            otherwise.
         """
         raise NotImplementedError
 
     def inverse(self) -> "Transform":
         """The destination -> source transform.
 
-        Exact for affine and projective. For a polynomial it is the
-        *independently fitted* reverse map, so the round trip is approximate;
-        :attr:`PolynomialTransform.roundtrip_rms_px` reports by how much.
+        Returns
+        -------
+        inverse : Transform
+            A transform of the same model mapping destination coordinates
+            back to source coordinates. Exact for affine and projective. For
+            a polynomial it is the *independently fitted* reverse map, so the
+            round trip is approximate;
+            :attr:`PolynomialTransform.roundtrip_rms_px` reports by how much.
         """
         raise NotImplementedError
 
@@ -222,17 +261,34 @@ class Transform:
         split-FOV region bookkeeping in ``picasso.localize``
         (``decompose_region_transforms`` / ``compose_region_transforms``),
         which factors a region origin in and out of a channel transform.
+
+        Parameters
+        ----------
+        pre : tuple
+            ``(x, y)`` shift applied to the input before the transform.
+        post : tuple
+            ``(x, y)`` shift applied to the output after the transform.
+
+        Returns
+        -------
+        transform : Transform
+            A new transform of the same model, with :attr:`domain` shifted by
+            ``-pre`` if it was set.
         """
         raise NotImplementedError
 
     def to_dict(self) -> dict:
         """A JSON- and YAML-serializable description.
 
-        Contains builtin types only: ``picasso.io.save_calibration`` uses
-        ``yaml.dump`` (not ``safe_dump``), which would otherwise emit
-        ``!!python/object/apply:numpy...`` tags for numpy scalars, and the
-        spline calibration path JSON-encodes the same dict into an HDF5
-        attribute.
+        Returns
+        -------
+        data : dict
+            The model name, its parameters and its domain, using builtin
+            types only: ``picasso.io.save_calibration`` uses ``yaml.dump``
+            (not ``safe_dump``), which would otherwise emit
+            ``!!python/object/apply:numpy...`` tags for numpy scalars, and the
+            spline calibration path JSON-encodes the same dict into an HDF5
+            attribute. Round-trips through :func:`from_dict`.
         """
         raise NotImplementedError
 
@@ -272,6 +328,34 @@ class Transform:
         The translation is the transform's displacement at ``at``, reported in
         pixels as ``tx_px``/``ty_px`` and, when ``pixelsize`` is given, in
         nanometres as ``tx_nm``/``ty_nm``.
+
+        Parameters
+        ----------
+        pixelsize : float, optional
+            Camera pixel size (nm). If given, the translation is additionally
+            reported in nanometres.
+        at : array, optional
+            ``(2,)`` point to linearize about. Defaults to the centre of
+            :attr:`domain`, or the origin if the transform has no domain.
+
+        Returns
+        -------
+        decomposition : dict
+            With keys:
+
+            * ``rotation_deg`` (float) - rotation of the orthogonal part, the
+              canonical axis flip removed if ``mirror``.
+            * ``scale_major``, ``scale_minor`` (float) - singular values of
+              the linear part.
+            * ``mirror`` (bool) - whether the linear part is orientation
+              reversing.
+            * ``flip_axis`` ({"x", "y"} or None) - the flip axis removed from
+              ``rotation_deg``; None unless ``mirror``.
+            * ``scale_x``, ``scale_y``, ``shear_deg`` (float) - the QR split.
+            * ``tx_px``, ``ty_px`` (float) - displacement at ``at``, in
+              pixels.
+            * ``tx_nm``, ``ty_nm`` (float) - the same in nanometres; present
+              only when ``pixelsize`` is given.
         """
         point = self._at(at)
         A = self.jacobian(point[None, :])[0]
@@ -318,7 +402,17 @@ class Transform:
         return out
 
     def is_identity(self, tol: float = 1e-12) -> bool:
-        """Whether the transform leaves every coordinate untouched."""
+        """Whether the transform leaves every coordinate untouched.
+
+        Parameters
+        ----------
+        tol : float
+            Absolute tolerance of the comparison.
+
+        Returns
+        -------
+        is_identity : bool
+        """
         raise NotImplementedError
 
     def allclose(self, other, tol: float = 1e-9) -> bool:
@@ -328,6 +422,18 @@ class Transform:
         Compared by parameters, not by identity or source path: the same
         correction saved twice under different names must count as one, since
         applying it twice would correct twice.
+
+        Parameters
+        ----------
+        other : Transform
+            The transform to compare against. Anything that is not a
+            ``Transform`` compares as False.
+        tol : float
+            Absolute tolerance of the comparison.
+
+        Returns
+        -------
+        allclose : bool
         """
         if not isinstance(other, Transform) or other.model != self.model:
             return False
@@ -357,7 +463,15 @@ def _matrix_3x3(matrix, name: str) -> np.ndarray:
 @dataclass(frozen=True, eq=False)
 class AffineTransform(Transform):
     """A 6-DOF affine, stored as a ``(3, 3)`` homogeneous matrix whose last
-    row is exactly ``[0, 0, 1]``."""
+    row is exactly ``[0, 0, 1]``.
+
+    Attributes
+    ----------
+    matrix : np.ndarray
+        The ``(3, 3)`` homogeneous matrix, always C-contiguous float64.
+    domain : np.ndarray or None
+        See :class:`Transform`.
+    """
 
     matrix: np.ndarray
     domain: np.ndarray | None = None
@@ -434,7 +548,15 @@ class AffineTransform(Transform):
 @dataclass(frozen=True, eq=False)
 class ProjectiveTransform(Transform):
     """An 8-DOF homography, stored as a ``(3, 3)`` matrix normalized so that
-    ``matrix[2, 2] == 1`` where that is possible."""
+    ``matrix[2, 2] == 1`` where that is possible.
+
+    Attributes
+    ----------
+    matrix : np.ndarray
+        The ``(3, 3)`` homogeneous matrix, always C-contiguous float64.
+    domain : np.ndarray or None
+        See :class:`Transform`.
+    """
 
     matrix: np.ndarray
     domain: np.ndarray | None = None
@@ -554,6 +676,29 @@ class PolynomialTransform(Transform):
     to ``roundtrip_rms_px``. No Picasso science path inverts a channel
     transform - the reverse map is used for image warping in the quality
     control figures - so that approximation never reaches a saved coordinate.
+
+    Attributes
+    ----------
+    degree : int
+        2 or 3.
+    forward : np.ndarray
+        ``(2, n_terms)`` source -> destination coefficients, one row per
+        output coordinate, ordered as :attr:`powers`.
+    center : np.ndarray
+        ``(2,)`` centre of the forward input normalization.
+    scale : float
+        Isotropic scale of the forward input normalization.
+    reverse : np.ndarray
+        ``(2, n_terms)`` destination -> source coefficients, fitted
+        independently of ``forward``.
+    reverse_center : np.ndarray
+        ``(2,)`` centre of the reverse input normalization.
+    reverse_scale : float
+        Isotropic scale of the reverse input normalization.
+    roundtrip_rms_px : float
+        RMS of ``inverse().apply(apply(x)) - x`` over :attr:`domain` (px).
+    domain : np.ndarray or None
+        See :class:`Transform`.
     """
 
     degree: int
@@ -608,6 +753,9 @@ class PolynomialTransform(Transform):
 
     @property
     def powers(self) -> list[tuple[int, int]]:
+        """The monomial exponents ``(p, q)`` of ``u**p * v**q``, in the column
+        order of :attr:`forward` and :attr:`reverse`. The constant term is
+        first."""
         return _monomial_powers(self.degree)
 
     def _evaluate(self, xy: np.ndarray, coeff, center, scale) -> np.ndarray:
@@ -933,6 +1081,8 @@ def estimate(
     Returns
     -------
     transform : Transform
+        The fitted transform, of the class matching ``model``, with
+        :attr:`Transform.domain` set to the bounding box of ``src_xy``.
 
     Raises
     ------
@@ -955,7 +1105,26 @@ def estimate(
 
 
 def identity(model: Model = "affine", domain=None) -> Transform:
-    """The identity transform of the requested model."""
+    """The identity transform of the requested model.
+
+    Parameters
+    ----------
+    model : {"affine", "projective", "polynomial2", "polynomial3"}
+        The transform model. See the module docstring.
+    domain : array, optional
+        ``[[xmin, ymin], [xmax, ymax]]`` to attach as
+        :attr:`Transform.domain`.
+
+    Returns
+    -------
+    transform : Transform
+        A transform of the requested model that maps every point onto itself.
+
+    Raises
+    ------
+    ValueError
+        If ``model`` is not one of :data:`MODELS`.
+    """
     _validate_model(model)
     domain = None if domain is None else np.asarray(domain, dtype=np.float64)
     if model == "affine":
@@ -984,7 +1153,21 @@ def identity(model: Model = "affine", domain=None) -> Transform:
 def from_dict(data) -> Transform:
     """Rebuild a transform from :meth:`Transform.to_dict`.
 
-    A ``Transform`` is passed through unchanged, so callers can accept either.
+    Parameters
+    ----------
+    data : dict or Transform
+        The dict produced by :meth:`Transform.to_dict`. A ``Transform`` is
+        passed through unchanged, so callers can accept either.
+
+    Returns
+    -------
+    transform : Transform
+
+    Raises
+    ------
+    ValueError
+        If ``data`` is neither a dict nor a ``Transform``, or if its
+        ``"model"`` entry is not one of :data:`MODELS`.
     """
     if isinstance(data, Transform):
         return data
@@ -1034,6 +1217,26 @@ def is_plausible(
 
     For an affine the Jacobian is constant, so this reduces exactly to the
     single determinant test it replaces.
+
+    Parameters
+    ----------
+    transform : Transform
+        The transform to check.
+    domain : array, optional
+        ``[[xmin, ymin], [xmax, ymax]]`` region to test over. Defaults to
+        ``transform.domain``; if that is None too, only the origin is tested.
+    det_range : tuple
+        ``(lo, hi)`` bounds on the magnitude of the Jacobian determinant, i.e.
+        on the local area change.
+    n_grid : int
+        The transform is sampled on an ``n_grid x n_grid`` grid spanning
+        ``domain``.
+
+    Returns
+    -------
+    is_plausible : bool
+        False if the determinant is non-finite anywhere, leaves
+        ``det_range``, or changes sign over the grid; True otherwise.
     """
     if domain is None:
         domain = transform.domain
@@ -1055,9 +1258,20 @@ def is_plausible(
 def channel_jacobians(transform_list, ref_xy) -> np.ndarray:
     """Per-point local Jacobians of several channel transforms.
 
-    Returns ``(n, n_channels, 4)`` float64 rows ``[a00, a01, a10, a11]`` - the
-    layout the multichannel spline kernels consume. See
-    ``picasso.localize.channel_roi_geometry``.
+    Parameters
+    ----------
+    transform_list : list
+        The reference -> channel transforms, each a ``Transform`` or a dict
+        accepted by :func:`from_dict`, one per channel.
+    ref_xy : array
+        ``(n, 2)`` points in the reference frame to linearize about.
+
+    Returns
+    -------
+    jacobians : np.ndarray
+        ``(n, n_channels, 4)`` float64 rows ``[a00, a01, a10, a11]`` - the
+        layout the multichannel spline kernels consume. See
+        ``picasso.localize.channel_roi_geometry``.
     """
     ref_xy = _as_xy(ref_xy)
     out = np.empty((len(ref_xy), len(transform_list), 4), dtype=np.float64)
@@ -1107,8 +1321,13 @@ def warp_image(
         Spline interpolation order.
     cval : float
         Value for samples that fall outside ``image``.
-    dtype : optional
+    dtype : dtype, optional
         Output dtype; the input's if omitted.
+
+    Returns
+    -------
+    warped : np.ndarray
+        ``(height, width)`` resampled image, indexed ``[row, col]``.
     """
     from scipy.ndimage import affine_transform, map_coordinates
 

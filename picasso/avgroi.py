@@ -34,7 +34,20 @@ def _sum(spot: lib.FloatArray2D, size: int) -> float:
 
 
 def fit_spot(spot: lib.FloatArray2D) -> list[float]:
-    """Fit a single spot and return fit parameters."""
+    """Fit a single spot, i.e. average its pixels.
+
+    Parameters
+    ----------
+    spot : lib.FloatArray2D
+        ``(box, box)`` photon counts of one spot.
+
+    Returns
+    -------
+    theta : list of float
+        ``[x, y, photons, bg, sx, sy]``, where ``x``/``y`` are 0 (the ROI is
+        not localized), ``photons`` and ``bg`` are both the ROI sum, and the
+        widths are 1.
+    """
     size = spot.shape[0]
     avg_roi = _sum(spot, size)
     # result is [x, y, photons, bg, sx, sy]
@@ -48,7 +61,21 @@ def fit_spots(
         Callable[[int], None] | Literal["console"] | None
     ) = None,
 ) -> lib.FloatArray2D:
-    """Fit spots and return fit parameters."""
+    """Fit several spots, one after another.
+
+    Parameters
+    ----------
+    spots : lib.FloatArray3D
+        ``(n_spots, box, box)`` photon counts.
+    progress_callback : callable, "console" or None, optional
+        ``"console"`` shows a tqdm bar; a callable is invoked with the index
+        of the spot just fitted. Default None.
+
+    Returns
+    -------
+    theta : lib.FloatArray2D
+        ``(n_spots, 6)`` fit parameters, each row as :func:`fit_spot`.
+    """
     theta = np.empty((len(spots), 6), dtype=np.float32)
     theta.fill(np.nan)
     use_tqdm = progress_callback == "console"
@@ -68,7 +95,22 @@ def fit_spots_parallel(
     spots: lib.FloatArray3D,
     asynch: bool = False,
 ) -> lib.FloatArray2D | list[futures.Future]:
-    """Fit spots in parallel (if ``asynch`` is True)."""
+    """Fit spots in a pool of worker processes.
+
+    Parameters
+    ----------
+    spots : lib.FloatArray3D
+        ``(n_spots, box, box)`` photon counts.
+    asynch : bool, optional
+        If True, return the pending futures immediately instead of waiting.
+        Default False.
+
+    Returns
+    -------
+    theta : lib.FloatArray2D or list of futures.Future
+        ``(n_spots, 6)`` fit parameters, or the list of futures if
+        ``asynch``; pass those to :func:`fits_from_futures`.
+    """
     n_workers = min(
         60, max(1, int(0.75 * multiprocessing.cpu_count()))
     )  # Python crashes when using >64 cores
@@ -96,7 +138,19 @@ def fit_spots_parallel(
 
 
 def fits_from_futures(futures: list[futures.Future]) -> lib.FloatArray2D:
-    """Collect fit results from futures."""
+    """Collect fit results from futures.
+
+    Parameters
+    ----------
+    futures : list of futures.Future
+        The futures returned by :func:`fit_spots_parallel` with
+        ``asynch=True``.
+
+    Returns
+    -------
+    theta : lib.FloatArray2D
+        ``(n_spots, 6)`` fit parameters of every task, stacked in order.
+    """
     theta = [_.result() for _ in futures]
     return np.vstack(theta)
 
@@ -108,11 +162,28 @@ def locs_from_fits(
     em: float,
     readout_variance: lib.FloatArray1D | float = 0.0,
 ) -> pd.DataFrame:
-    """Convert fit results to localization DataFrame.
+    """Convert fit results into a data frame of localizations.
 
-    ``readout_variance`` is the mean sCMOS readout variance over each spot's
-    box, in photoelectrons squared; it adds to the background term of the
-    closed-form precision. See ``picasso.fitting.precision``."""
+    Parameters
+    ----------
+    identifications : pd.DataFrame
+        The identifications the spots were cut from.
+    theta : lib.FloatArray2D
+        ``(n_spots, 6)`` fit parameters from :func:`fit_spots`.
+    box : int
+        Box side length (camera pixels).
+    em : float
+        Whether EMCCD was used, which doubles the variance.
+    readout_variance : lib.FloatArray1D or float, optional
+        Mean sCMOS readout variance over each spot's box, in photoelectrons
+        squared; it adds to the background term of the closed-form precision.
+        See ``picasso.fitting.precision``. Default 0.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        The localizations, sorted by frame.
+    """
     x = theta[:, 0] + identifications["x"]
     y = theta[:, 1] + identifications["y"]
     lpx = precision.localization_precision(

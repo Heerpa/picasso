@@ -224,7 +224,9 @@ def sigma_uncertainty_mle(
     sigma : lib.SeriesOrFloatArray1D
         Fitted sigma values in camera pixels.
     sigma_orth : lib.SeriesOrFloatArray1D
-        Unused; see above.
+        Unused. Accepted so that the signature matches
+        :func:`sigma_uncertainty_lsq`; the Rieger and Stallinga
+        approximation does not use the orthogonal sigma.
     photons : lib.SeriesOrFloatArray1D
         Number of photons.
     bg : lib.SeriesOrFloatArray1D

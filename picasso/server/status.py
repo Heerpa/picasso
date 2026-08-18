@@ -7,6 +7,18 @@ import os
 
 
 def check_file(file):
+    """Whether a movie has been localized, i.e. has a ``_locs.hdf5`` next to
+    it.
+
+    Parameters
+    ----------
+    file : str
+        Path to the movie.
+
+    Returns
+    -------
+    exists : bool
+    """
     base, ext = os.path.splitext(file)
     file_hdf = base + "_locs.hdf5"
 
@@ -14,11 +26,17 @@ def check_file(file):
 
 
 def escape_markdown(text: str) -> str:
-    """Helper function to escape markdown in text.
-    Args:
-        text (str): Input text.
-    Returns:
-        str: Converted text to be used in markdown.
+    """Escape the markdown special characters in a text.
+
+    Parameters
+    ----------
+    text : str
+        Input text.
+
+    Returns
+    -------
+    text : str
+        Converted text, safe to embed in markdown.
     """
     MD_SPECIAL_CHARS = r"\`*_{}[]()#+-.!"
     for char in MD_SPECIAL_CHARS:

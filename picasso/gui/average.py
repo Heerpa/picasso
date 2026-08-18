@@ -63,7 +63,17 @@ class Worker(QtCore.QThread):
         group: int,
         n_groups: int,
     ) -> None:
-        """Callback for progress updates from averaging process."""
+        """Callback for progress updates from the averaging process.
+
+        Parameters
+        ----------
+        it, total_it : int
+            Iteration just finished and the total number of iterations.
+        locs_current : pd.DataFrame
+            The localizations as they stand after this iteration.
+        group, n_groups : int
+            Group just finished and the total number of groups.
+        """
         self.locs = locs_current.copy()
         self.progressMade.emit(it, total_it, self.locs, True, group, n_groups)
 
@@ -177,6 +187,8 @@ class View(QtWidgets.QLabel):
         self.avg_history = []
 
     def average(self):
+        """Start the averaging in a worker thread, reading the parameters
+        from the parameters dialog."""
         if not self.running:
             self.running = True
             display_px_size = (
@@ -204,12 +216,26 @@ class View(QtWidgets.QLabel):
             self.window.abort_action.setEnabled(False)
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        """Accept a drag that carries file URLs.
+
+        Parameters
+        ----------
+        event : QtGui.QDragEnterEvent
+            The Qt drag event.
+        """
         if event.mimeData().hasUrls():
             event.accept()
         else:
             event.ignore()
 
     def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        """Open the first dropped file, if it is an ``.hdf5``.
+
+        Parameters
+        ----------
+        event : QtGui.QDropEvent
+            The Qt drop event.
+        """
         urls = event.mimeData().urls()
         path = urls[0].toLocalFile()
         ext = os.path.splitext(path)[1].lower()
@@ -217,6 +243,7 @@ class View(QtWidgets.QLabel):
             self.open(path)
 
     def on_finished(self) -> None:
+        """Record the finished run in the history and re-enable the UI."""
         if self.thread is not None and self.thread.was_aborted:
             self.window.statusBar().showMessage("Aborted.")
         else:
@@ -245,6 +272,19 @@ class View(QtWidgets.QLabel):
         group: int,
         n_groups: int,
     ) -> None:
+        """Show the intermediate result of one averaging iteration.
+
+        Parameters
+        ----------
+        it, total_it : int
+            Iteration just finished and the total number of iterations.
+        locs : pd.DataFrame
+            The localizations as they stand after this iteration.
+        update_image : bool
+            Whether to redraw the rendered average.
+        group, n_groups : int
+            Group just finished and the total number of groups.
+        """
         self.locs = locs.copy()
         if update_image:
             self.update_image()
@@ -284,6 +324,13 @@ class View(QtWidgets.QLabel):
         self.window.statusBar().showMessage("Ready for processing!")
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        """Rescale the displayed image to the new widget size.
+
+        Parameters
+        ----------
+        event : QtGui.QResizeEvent
+            The Qt resize event.
+        """
         if self._pixmap is not None:
             self.set_pixmap(self._pixmap)
 
@@ -337,6 +384,14 @@ class View(QtWidgets.QLabel):
         self.set_pixmap(self._pixmap)
 
     def set_pixmap(self, pixmap: QtGui.QPixmap) -> None:
+        """Display a pixmap, scaled into the widget and keeping its aspect
+        ratio.
+
+        Parameters
+        ----------
+        pixmap : QtGui.QPixmap
+            The image to show.
+        """
         self.setPixmap(
             pixmap.scaled(
                 self.width(),
@@ -348,7 +403,14 @@ class View(QtWidgets.QLabel):
 
     def update_image(self, *args) -> None:
         """Update the displayed image based on the changed display
-        parameters."""
+        parameters.
+
+        Parameters
+        ----------
+        *args
+            Ignored; accepted so the method can be wired directly to Qt
+            signals that pass a value.
+        """
         oversampling = self.window.parameters_dialog.oversampling
         t_min = -self.r
         t_max = self.r
@@ -459,7 +521,7 @@ class Window(QtWidgets.QMainWindow):
 
 
 def main() -> None:
-
+    """Start Picasso: Average, load its plugins and run the Qt event loop."""
     app = QtWidgets.QApplication(sys.argv)
     window = Window()
 

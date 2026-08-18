@@ -2937,6 +2937,14 @@ def _g5m(
 
 
 def main():  # noqa: C901
+    """Entry point of the ``picasso`` command line interface.
+
+    Builds the argument parser for every subcommand - the GUIs, the
+    calibrations, ``localize``, ``render``, the undrift, clustering and
+    file-conversion tools - parses ``sys.argv`` and dispatches to the matching
+    handler. Called by the ``picasso`` console script and by
+    ``python -m picasso``. Run ``picasso -h`` for the full list.
+    """
     # Main parser
     parser = argparse.ArgumentParser("picasso")
     subparsers = parser.add_subparsers(dest="command")

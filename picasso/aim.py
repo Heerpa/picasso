@@ -542,11 +542,12 @@ def intersection_max_z(
     aim_round: int = 1,
     progress: lib.ProgressType | None = None,
 ) -> tuple[lib.FloatArray1D, lib.FloatArray1D]:
-    """Maximize intersection (undrift) for 3D localizations. Assumes
-    that x and y coordinates were already undrifted. x and y are in
-    units of camera pixels, z is in nm.
+    """Maximize intersection (undrift) for 3D localizations.
 
-    See ``intersection_max`` for more details."""
+    Assumes that x and y coordinates were already undrifted. See
+    :func:`intersection_max` for the algorithm and parameters
+    explanation (its 2D counterpart).
+    """
     # convert z to camera pixels
     z = z.copy() / pixelsize
     ref_z = ref_z.copy() / pixelsize

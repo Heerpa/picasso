@@ -569,7 +569,19 @@ class G5M(metaclass=ABCMeta):
         self.n_locs = np.zeros(n_components, dtype=int)
 
     def bic(self, X: lib.FloatArray2D) -> float:
-        """Bayesian Information Criterion (BIC) for the G5M."""
+        """Bayesian Information Criterion (BIC) for the G5M.
+
+        Parameters
+        ----------
+        X : lib.FloatArray2D
+            ``(n_locs, n_dim)`` localization coordinates.
+
+        Returns
+        -------
+        bic : float
+            The lower, the better the model explains ``X`` for its number of
+            parameters.
+        """
         # shift coordinates by their mean (numerical stability)
         bic = (
             self.n_parameters() * np.log(X.shape[0])
@@ -585,14 +597,36 @@ class G5M(metaclass=ABCMeta):
     @abstractmethod
     def estimate_log_prob(self, X: lib.FloatArray2D) -> lib.FloatArray2D:
         """Calculate the log probabilities of the data X under the G5M,
-        without weights."""
+        without weights.
+
+        Parameters
+        ----------
+        X : lib.FloatArray2D
+            ``(n_locs, n_dim)`` localization coordinates.
+
+        Returns
+        -------
+        log_prob : lib.FloatArray2D
+            ``(n_locs, n_valid_components)`` log probabilities.
+        """
         pass
 
     def estimate_weighted_log_prob(
         self, X: lib.FloatArray2D
     ) -> lib.FloatArray2D:
         """Calculate the log probabilities of the data X under the G5M,
-        with weights."""
+        with weights.
+
+        Parameters
+        ----------
+        X : lib.FloatArray2D
+            ``(n_locs, n_dim)`` localization coordinates.
+
+        Returns
+        -------
+        log_prob : lib.FloatArray2D
+            ``(n_locs, n_valid_components)`` weighted log probabilities.
+        """
         return self.estimate_log_prob(X) + np.log(self.weights)
 
     def fit(
@@ -739,14 +773,38 @@ class G5M(metaclass=ABCMeta):
         return np.sqrt(det_xy) * np.sqrt(covariances[:, 2, 2])
 
     def predict(self, X: lib.FloatArray2D) -> lib.IntArray1D:
-        """Predict the cluster labels for the data X."""
+        """Predict the cluster labels for the data X.
+
+        Parameters
+        ----------
+        X : lib.FloatArray2D
+            ``(n_locs, n_dim)`` localization coordinates.
+
+        Returns
+        -------
+        labels : lib.IntArray1D
+            Index of the most likely component for each localization.
+        """
         return self.estimate_weighted_log_prob(X).argmax(axis=1)
 
     @abstractmethod
     def sample(
         self, n_samples: int = 1
     ) -> tuple[lib.FloatArray2D, lib.IntArray1D]:
-        """Sample data points from the G5M."""
+        """Sample data points from the G5M.
+
+        Parameters
+        ----------
+        n_samples : int, optional
+            Number of points to draw. Default 1.
+
+        Returns
+        -------
+        X : lib.FloatArray2D
+            ``(n_samples, n_dim)`` sampled coordinates.
+        y : lib.IntArray1D
+            Index of the component each point was drawn from.
+        """
         pass
 
     def set_parameters(
@@ -758,7 +816,24 @@ class G5M(metaclass=ABCMeta):
         converged: bool,
         valid_idx: lib.IntArray1D | None = None,
     ) -> None:
-        """Set the G5M parameters, used after fitting."""
+        """Set the G5M parameters, used after fitting.
+
+        Parameters
+        ----------
+        weights : lib.FloatArray1D
+            Mixture weights; normalized to sum to 1.
+        means : lib.FloatArray2D
+            ``(n_components, n_dim)`` component centers.
+        covs : lib.FloatArray1D or lib.FloatArray2D
+            Component covariances, in the model's own layout.
+        precisions_cholesky : lib.FloatArray1D or lib.FloatArray2D
+            Cholesky factors of the precision matrices.
+        converged : bool
+            Whether the fit converged.
+        valid_idx : lib.IntArray1D, optional
+            Indices of the components that passed the ``min_locs`` filter.
+            None keeps every component.
+        """
         self.weights_ = weights / weights.sum()
         self.means_ = means
         self.covariances_ = covs
@@ -770,7 +845,18 @@ class G5M(metaclass=ABCMeta):
             self.valid_idx = np.arange(len(weights))
 
     def score_samples(self, X: lib.FloatArray2D) -> lib.FloatArray1D:
-        """Compute the log-likelihood of the data X under the G5M."""
+        """Compute the log-likelihood of the data X under the G5M.
+
+        Parameters
+        ----------
+        X : lib.FloatArray2D
+            ``(n_locs, n_dim)`` localization coordinates.
+
+        Returns
+        -------
+        log_likelihood : lib.FloatArray1D
+            Per-localization log-likelihood.
+        """
         weighted_log_prob = self.estimate_weighted_log_prob(X)
         final_shape = (weighted_log_prob.shape[0],)
         return _logsumexp_axis1(weighted_log_prob, final_shape)
@@ -1182,7 +1268,18 @@ class G5M_2D(G5M):
 
     def estimate_log_prob(self, X: lib.FloatArray2D) -> lib.FloatArray2D:
         """Calculate the log probabilities of the data X under the G5M,
-        without weights."""
+        without weights.
+
+        Parameters
+        ----------
+        X : lib.FloatArray2D
+            ``(n_locs, n_dim)`` localization coordinates.
+
+        Returns
+        -------
+        log_prob : lib.FloatArray2D
+            ``(n_locs, n_valid_components)`` log probabilities.
+        """
         return _estimate_log_gaussian_prob_2D(
             X,
             self.means,
@@ -1190,7 +1287,14 @@ class G5M_2D(G5M):
         )
 
     def n_parameters(self) -> int:
-        """Find the number of parameters in the G5M."""
+        """Find the number of parameters in the G5M.
+
+        Returns
+        -------
+        n_params : int
+            Free parameters of the valid components: their means, covariances
+            and weights.
+        """
         n_valid = len(self.valid_idx)
         cov_params = n_valid
         mean_params = 2 * n_valid
@@ -1200,7 +1304,20 @@ class G5M_2D(G5M):
     def sample(
         self, n_samples: int = 1
     ) -> tuple[lib.FloatArray2D, lib.IntArray1D]:
-        """Sample data points from the G5M."""
+        """Sample data points from the G5M.
+
+        Parameters
+        ----------
+        n_samples : int, optional
+            Number of points to draw. Default 1.
+
+        Returns
+        -------
+        X : lib.FloatArray2D
+            ``(n_samples, n_dim)`` sampled coordinates.
+        y : lib.IntArray1D
+            Index of the component each point was drawn from.
+        """
         rng = check_random_state(self.random_state)
         n_samples_comp = rng.multinomial(n_samples, self.weights)
 
@@ -1801,7 +1918,7 @@ def _find_optimal_G5M_3D(
         components. If local loc. prec. is used, the bounds specify the
         margin of error in units of localization precision. Else,
         absolute bounds on sigma.
-    calibration: dict or None
+    calibration : dict or None
         Astigmatism calibration dictionary with the keys "X
         Coefficients", "Y Coefficients" and "Magnification factor".
         Required for ``mode="astigmatism"``, may be None for spline.
@@ -2112,7 +2229,18 @@ class G5M_3D(G5M):
 
     def estimate_log_prob(self, X: lib.FloatArray2D) -> lib.FloatArray2D:
         """Calculate the log probabilities of the data X under the G5M,
-        without weights."""
+        without weights.
+
+        Parameters
+        ----------
+        X : lib.FloatArray2D
+            ``(n_locs, n_dim)`` localization coordinates.
+
+        Returns
+        -------
+        log_prob : lib.FloatArray2D
+            ``(n_locs, n_valid_components)`` log probabilities.
+        """
         if self.covariance_type == "rotated":
             return _estimate_log_gaussian_prob_3D_rot(
                 X,
@@ -2126,10 +2254,17 @@ class G5M_3D(G5M):
         )
 
     def n_parameters(self) -> int:
-        """Return the number of free parameters in the model. Note that
-        in astigmatism mode the modification reduces the number of free
-        parameters for each component by one (cov. in y depends on cov.
-        in x), whereas in spline mode all three covariances are free."""
+        """Return the number of free parameters in the model.
+
+        Note that in astigmatism mode the modification reduces the number of
+        free parameters for each component by one (cov. in y depends on cov.
+        in x), whereas in spline mode all three covariances are free.
+
+        Returns
+        -------
+        n_params : int
+            Free parameters of the valid components.
+        """
         n_valid = len(self.valid_idx)
         # astigmatism: cov. in y depends on cov. in x (2 free per comp.);
         # spline: x/y/z covariances are independent (3 free per comp.)
@@ -2141,7 +2276,20 @@ class G5M_3D(G5M):
     def sample(
         self, n_samples: int = 1
     ) -> tuple[lib.FloatArray2D, lib.IntArray1D]:
-        """Sample data points from the G5M."""
+        """Sample data points from the G5M.
+
+        Parameters
+        ----------
+        n_samples : int, optional
+            Number of points to draw. Default 1.
+
+        Returns
+        -------
+        X : lib.FloatArray2D
+            ``(n_samples, n_dim)`` sampled coordinates.
+        y : lib.IntArray1D
+            Index of the component each point was drawn from.
+        """
         rng = check_random_state(self.random_state)
         n_samples_comp = rng.multinomial(n_samples, self.weights)
 

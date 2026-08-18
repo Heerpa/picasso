@@ -726,7 +726,21 @@ def _get_kernel(kind: int, n_channels: int, single_precision: bool):
 
 
 def n_parameters(kind: int, n_channels: int) -> int:
-    """Parameter count of a model."""
+    """Parameter count of a model.
+
+    Parameters
+    ----------
+    kind : int
+        :data:`KIND_2D`, :data:`KIND_3D` or :data:`KIND_LINK_XYZ`.
+    n_channels : int
+        Number of channels; only used by :data:`KIND_LINK_XYZ`.
+
+    Returns
+    -------
+    n_params : int
+        4 for :data:`KIND_2D`, 5 for :data:`KIND_3D` and ``3 + 2 *
+        n_channels`` for :data:`KIND_LINK_XYZ`.
+    """
     if kind == KIND_2D:
         return _N_PARAMS_2D
     if kind == KIND_3D:
@@ -760,12 +774,21 @@ def fit_spots(
 ) -> tuple:
     """Fit spots with a cubic-spline PSF model on the GPU.
 
-    Array-for-array the same contract as ``splinefit.fit_spots`` - see its
-    docstring for the layouts of ``spots``, ``coefficients``, ``jacobians``,
-    ``residuals``, ``initial_parameters`` and ``z_seeds`` - plus:
+    Array-for-array the same contract as ``splinefit.fit_spots``, which the
+    parameters below defer to for their layouts and meanings.
 
     Parameters
     ----------
+    kind, spots, coefficients, jacobians, residuals : array
+        As in ``splinefit.fit_spots``.
+    initial_parameters, z_seeds, apply_seeds, mle : array and bool
+        As in ``splinefit.fit_spots``.
+    tolerance, max_iterations, variance : optional
+        As in ``splinefit.fit_spots``.
+    progress_callback : callable, "console" or None, optional
+        ``"console"`` shows a tqdm bar; a callable is invoked with the
+        cumulative number of spots fitted. Updated once per chunk, not once
+        per spot.
     abort_callback : callable or None, optional
         Polled between chunks; returning True stops the fit. A launched kernel
         cannot be cancelled, so chunk boundaries are the only points at which an
@@ -777,8 +800,14 @@ def fit_spots(
 
     Returns
     -------
-    thetas, chi_squares, states, iterations
-        As ``splinefit.fit_spots``, using Gpufit's state codes.
+    thetas : np.ndarray
+        ``(n_spots, n_params)`` fitted parameters.
+    chi_squares : np.ndarray
+        ``(n_spots,)`` chi-square at the optimum.
+    states : np.ndarray
+        ``(n_spots,)`` per-spot fit state, using Gpufit's codes.
+    iterations : np.ndarray
+        ``(n_spots,)`` iterations used by the seed that won.
     """
     lmfit_cuda.require_cuda()
     _check_inputs(

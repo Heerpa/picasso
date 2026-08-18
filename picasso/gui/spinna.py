@@ -124,7 +124,7 @@ def split_name(name: str) -> tuple[str, int]:
     characters followed by an integer.
 
     Parameters
-    ---------
+    ----------
     name : str
         Name to be processed.
 
@@ -4737,6 +4737,12 @@ class SimulationsTab(lib.Dialog):
             considered. If 'dummy', no numbers of structures are
             considered and the mixer is only initialized for basic
             operations.
+
+        Returns
+        -------
+        mixer : spinna.StructureMixer or None
+            The initialized mixer, or None when the ROI is undefined or the
+            dimensionality check failed (a warning is shown in that case).
         """
         assert mode in [
             "fit",

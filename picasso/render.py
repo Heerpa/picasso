@@ -1056,8 +1056,10 @@ def render_hist3d(
 
     Parameters
     ----------
-    locs : pd.DataFrame
-        Localizations to be rendered.
+    x, y : lib.FloatArray1D
+        Lateral coordinates of the localizations (camera pixels).
+    z : lib.FloatArray1D
+        Axial coordinates of the localizations (nm).
     oversampling : float (default=1)
         Number of super-resolution pixels per camera pixel.
     y_min, x_min : float
@@ -1122,8 +1124,10 @@ def render_hist3d_anisotropic(
 
     Parameters
     ----------
-    locs : pd.DataFrame
-        Localizations to be rendered.
+    x, y : lib.FloatArray1D
+        Lateral coordinates of the localizations (camera pixels).
+    z : lib.FloatArray1D
+        Axial coordinates of the localizations (nm).
     oversampling_x, oversampling_y, oversampling_z : float (default=1)
         Number of super-resolution pixels per camera pixel in x, y, and
         z directions.
@@ -1733,6 +1737,20 @@ def locs_rotation(
 def export_qimage_to_pdf(
     image: QtGui.QImage, path: str, dpi: int = 96
 ) -> None:
+    """Write a rendered image to a PDF at its original physical size.
+
+    The page is sized so that one image pixel is 1/96 inch regardless of
+    ``dpi``, which only sets the resolution the image is rasterized at.
+
+    Parameters
+    ----------
+    image : QtGui.QImage
+        The rendered image.
+    path : str
+        Where to write the PDF.
+    dpi : int, optional
+        Resolution of the PDF writer. Default 96.
+    """
     writer = QtGui.QPdfWriter(path)
 
     # Fixed physical page size (1 image pixel = 1/96 inch, regardless of dpi)
@@ -1757,6 +1775,15 @@ def export_qimage_to_pdf(
 
 
 def export_qimage_to_svg(image: QtGui.QImage, path: str):
+    """Write a rendered image to an SVG, embedded at its pixel size.
+
+    Parameters
+    ----------
+    image : QtGui.QImage
+        The rendered image.
+    path : str
+        Where to write the SVG.
+    """
     generator = QtSvg.QSvgGenerator()
     generator.setFileName(path)
     generator.setSize(image.size())
@@ -2135,7 +2162,22 @@ def map_to_view(
     image_size: QtCore.QSize,
     viewport: tuple[tuple[float, float], tuple[float, float]],
 ) -> tuple[int, int]:
-    """Convert (x, y) from camera pixels to display pixels."""
+    """Convert (x, y) from camera pixels to display pixels.
+
+    Parameters
+    ----------
+    x, y : float
+        Coordinates in camera pixels.
+    image_size : QtCore.QSize
+        Size of the displayed image in display pixels.
+    viewport : tuple
+        ``((y_min, x_min), (y_max, x_max))`` in camera pixels.
+
+    Returns
+    -------
+    cx, cy : int
+        Coordinates in display pixels.
+    """
     image_width = image_size.width()
     image_height = image_size.height()
     cx = image_width * (x - viewport[0][1]) / viewport_width(viewport)
@@ -2154,10 +2196,24 @@ def get_rectangle_pick_polygon(
     """Find QtGui.QPolygonF object used for drawing a rectangular
     pick.
 
+    Parameters
+    ----------
+    start_x, start_y : float
+        One end of the rectangle's centre line.
+    end_x, end_y : float
+        The other end of the centre line.
+    width : float
+        Width of the rectangle, perpendicular to the centre line.
+    return_most_right : bool, optional
+        Also return the rightmost corner, where the GUI anchors the pick
+        label. Default False.
+
     Returns
     -------
     p : QtGui.QPolygonF
         The polygon.
+    most_right : tuple
+        Only if ``return_most_right``: the ``(x, y)`` of the rightmost corner.
     """
     X, Y = lib.get_pick_rectangle_corners(
         start_x, start_y, end_x, end_y, width
@@ -2348,9 +2404,9 @@ def draw_picks(
     viewport : tuple
         Current field of view in camera pixels, ((y_min, y_max), (x_min,
         x_max)).
-    pick_shape: {"Circle", "Rectangle", "Polygon", "Square"}
+    pick_shape : {"Circle", "Rectangle", "Polygon", "Square"}
         Shape of the picks to be drawn.
-    picks: list of tuples
+    picks : list of tuples
         List of picks, where each pick is a tuple specifying the pick
         coordinates. Note: this must match the format of the given pick
         shape.
@@ -2548,6 +2604,8 @@ def draw_scalebar(
         Color of the scalebar and text. Default is white.
     display_length : bool, optional
         Whether to display scalebar length in nm. Default is True.
+    display_height : int, optional
+        Thickness of the scalebar in display pixels. Default is 10.
     margin : tuple of int, optional
         Margins from the right and bottom edges in display pixels.
         Default is (35, 20).
@@ -2906,7 +2964,7 @@ def render_scene(
 
     Parameters
     ----------
-    locs: pd.DataFrame or list of pd.DataFrame
+    locs : pd.DataFrame or list of pd.DataFrame
         Localizations to be rendered. Can be either one localization
         file or a list thereof. If a single DataFrame is provided,
         localizations will be rendered in a single channel, i.e., using
@@ -2914,7 +2972,7 @@ def render_scene(
         DataFrames is provided, localizations will be rendered in
         multiple channels, and the color of each channel can be
         specified by `colors`.
-    info: list of dict or list of list of dict
+    info : list of dict or list of list of dict
         List of info dictionaries corresponding to the localization
         file(s).
     disp_px_size : float, optional
@@ -2972,7 +3030,7 @@ def render_scene(
         localizations, while bright regions keep their true channel
         colors. Default is None (equivalent to a black background, i.e.
         the image is left unchanged).
-    raw_image_cache: lib.FloatArray2D or lib.FloatArray3D, optional
+    raw_image_cache : lib.FloatArray2D or lib.FloatArray3D, optional
         If provided, this raw grayscale image of localizations, i.e.,
         obtained with ``render.render`` (2D array for single-channel
         data, 3D array for multi-channel data) is used instead of
@@ -3293,8 +3351,8 @@ def scale_intensities(
 
     Parameters
     ----------
-    image : FloatArray3D
-        Image(s) to be intensity scaled.
+    images : FloatArray3D
+        Images to be intensity scaled, one per channel. Scaled in place.
     relative_intensities : list of float, optional
         List of relative intensities for each channel. If None, all
         channels are rendered with the same intensity. Default is None.
@@ -3318,7 +3376,19 @@ def to_8bit(
     image: lib.FloatArray2D | lib.FloatArray3D,
 ) -> lib.IntArray2D | lib.IntArray3D:
     """Convert a float image with values between 0 and 1 to an 8-bit image
-    with values between 0 and 255."""
+    with values between 0 and 255.
+
+    Parameters
+    ----------
+    image : FloatArray2D or FloatArray3D
+        Image(s) with values between 0 and 1. Normalized in place so that the
+        maximum is 1 before the conversion.
+
+    Returns
+    -------
+    image : IntArray2D or IntArray3D
+        The image as ``uint8``.
+    """
     # normalize to max value of 1 and convert to 8-bit
     image /= image.max() if image.max() > 0 else 1.0
     return np.round(image * 255).astype(np.uint8)
@@ -3340,6 +3410,11 @@ def apply_colormap(
         array, a 256x4 or 256x3 array is expected with values between 0
         and 1. Note: the alpha channel (if present) is ignored and the
         colormap is applied as if all values were fully opaque.
+
+    Returns
+    -------
+    image : IntArray3D
+        RGB image of shape ``(height, width, 3)``, ``uint8``.
     """
     if isinstance(colormap, str):
         cmap = np.uint8(np.round(255 * plt.get_cmap(colormap)(np.arange(256))))
@@ -3421,6 +3496,12 @@ def split_locs_by_group(
     group_color : IntArray1D or None, optional
         If provided, specifies the group color ids (up to `n_colors`)
         for each localization.
+
+    Returns
+    -------
+    locs_groups : list of pd.DataFrame
+        One data frame per group; a single-element list when there is no
+        grouping to apply.
     """
     if group_color is not None:
         assert len(group_color) == len(

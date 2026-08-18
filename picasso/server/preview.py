@@ -12,10 +12,19 @@ import matplotlib.pyplot as plt
 
 @st.cache_data
 def load_file(path: str):
-    """Loads localization from files. Cached version.
+    """Load localizations from a file. Cached version.
 
-    Args:
-        path (str): Path to file.
+    Parameters
+    ----------
+    path : str
+        Path to the localizations file.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        The localizations.
+    info : list of dicts
+        Localizations metadata.
     """
     locs, info = io.load_locs(path)
     return locs, info
@@ -25,12 +34,23 @@ def load_file(path: str):
 def picasso_render(
     locs: pd.DataFrame, info: list[dict], viewport: tuple, disp_px_size: float
 ):
-    """Helper function to render a viewport. Cached.
+    """Render a viewport. Cached.
 
-    Args:
-        locs (pd.DataFrame): Localizations.
-        viewport (tuple): Viewport as tuple.
-        disp_px_size (int): Display pixel size of the rendered image in nm.
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations.
+    info : list of dicts
+        Localizations metadata.
+    viewport : tuple
+        ``((y_min, x_min), (y_max, x_max))`` in camera pixels.
+    disp_px_size : float
+        Display pixel size of the rendered image in nm.
+
+    Returns
+    -------
+    image : np.ndarray
+        The rendered image.
     """
     len_x, image = render.render(
         locs,

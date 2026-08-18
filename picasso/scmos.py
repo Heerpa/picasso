@@ -564,7 +564,18 @@ def _plot_histogram(ax, values, title, unit) -> None:
 
 
 def plot_path(calibration_path: str) -> str:
-    """Where the diagnostic plot of a calibration file belongs."""
+    """Where the diagnostic plot of a calibration file belongs.
+
+    Parameters
+    ----------
+    calibration_path : str
+        Path of the saved camera calibration.
+
+    Returns
+    -------
+    path : str
+        The same path with its extension replaced by ``_maps.png``.
+    """
     base, _ = os.path.splitext(calibration_path)
     return base + "_maps.png"
 

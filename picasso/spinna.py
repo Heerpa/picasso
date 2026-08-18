@@ -417,7 +417,7 @@ def coords_to_locs(
 
     Parameters
     ----------
-    coords: lib.FloatArray2D
+    coords : lib.FloatArray2D
         Coordinates of localizations to be converted. All coordinates
         are in nm. Shape (N, 2) or (N, 3), where N is the number of
         localizations.
@@ -524,6 +524,9 @@ def plot_NN(  # noqa: C901
     figsize : tuple of ints
         Figure size, used when new fig and ax are created. Default is
         (6, 6).
+    dpi : int
+        Resolution of the figure, used when a new fig and ax are created.
+        Default is 300.
     binsize : float
         Binsize used for histograming NNDs. Only used when hist_data is
         None. Default is 4.0.
@@ -561,6 +564,13 @@ def plot_NN(  # noqa: C901
         Path to save the plot. If '', the plot is not saved. If a list
         of strings is given, several paths can be specified (with
         different extensions). Default is ''.
+
+    Returns
+    -------
+    fig : plt.Figure
+        The figure drawn into. Only returned if ``return_fig``.
+    ax : plt.Axes
+        Its axes. Only returned if ``return_fig``.
     """
     plt.style.use("default")
     # initiate figure and axis
@@ -841,7 +851,7 @@ def NND_score(
 
     Parameters
     ----------
-    dists1, dists2: list of lib.FloatArray2D
+    dists1, dists2 : list of lib.FloatArray2D
         Lists of arrays of shape (N, n_neighbors) where N is the
         number of distances measured and n_neighbors is the number
         of neighbors considered. See get_NN_dist_simulated and
@@ -1034,7 +1044,7 @@ class MaskGenerator:
 
         Parameters
         ----------
-        binsize: int or tuple
+        binsize : int or tuple
             Binsize used for histograming localizations (nm). If an
             integer is given, the same binsize is used for all
             dimensions. For a 3D mask, different bin sizes in xy and z
@@ -1063,7 +1073,7 @@ class MaskGenerator:
 
         Parameters
         ----------
-        sigma: int or tuple
+        sigma : int or tuple
             Sigma used for gaussian filtering (nm). If an integer is
             given, the same sigma is used for all dimensions. For a 3D
             mask, different sigmas in xy and z can be specified by
@@ -1090,7 +1100,13 @@ class MaskGenerator:
     def render_locs(self) -> lib.FloatArray2D:
         """Render localizations histogram (2D or 3D), no blur.
 
-        Uses ``picasso.render`` after preparing inputs."""
+        Uses ``picasso.render`` after preparing inputs.
+
+        Returns
+        -------
+        image : lib.FloatArray2D
+            The histogrammed localizations, at the mask's own bin size.
+        """
         # prepare inputs for picasso.render
         oversampling = [self.pixelsize / _ for _ in self.binsize]
         self.x_min = 0
@@ -1153,6 +1169,9 @@ class MaskGenerator:
         thresh : float, optional
             Threshold value to apply. If None, Otsu thresholding is used.
             Default is None.
+        verbose : bool, optional
+            Print the progress of the three mask-building steps. Default is
+            False.
 
         Returns
         -------
@@ -1200,6 +1219,10 @@ class MaskGenerator:
         If .npy is saved, it is accompanied by a metadata .yaml file
         used for reading the mask in StructureSimulator.
 
+        Parameters
+        ----------
+        path : str
+            Where to save the mask; must end with ``.npy``.
         save_png : bool, optional
             Whether or not save the mask as .png (3D mask will be
             summed along z axis). Default is False.
@@ -1360,7 +1383,7 @@ class Structure:
 
         Returns
         -------
-        self: Structure
+        self : Structure
         """
         if z is not None:  # 3D
             # assert equal lengths
@@ -1477,7 +1500,13 @@ class Structure:
 
     def restart(self) -> Structure:
         """Delete all molecular targets, reset the structure but keep
-        its title."""
+        its title.
+
+        Returns
+        -------
+        self : Structure
+            The emptied structure, so calls can be chained.
+        """
         self.targets = []
         self.x = {}
         self.y = {}
@@ -1637,7 +1666,22 @@ class StructureSimulator:
         """Read mask and/or ROI.
 
         By default, one of the two must be specified. If both are
-        given, mask overwrites the ROI."""
+        given, mask overwrites the ROI.
+
+        Parameters
+        ----------
+        mask : lib.FloatArray2D, optional
+            Probability mass function of finding a molecule in each
+            pixel/voxel, from :class:`MaskGenerator`. Default None.
+        mask_info : dict, optional
+            The mask's metadata, giving the camera pixel size and the ROI
+            bounds it was built on. Required with ``mask``. Default None.
+        width, height : float, optional
+            Extent of the ROI in nm, used when no mask is given.
+        depth : float, optional
+            Axial extent of the ROI in nm, used when no mask is given. None
+            simulates in 2D.
+        """
         # ROI: width, height and depth #
         if mask is None:
             self.mask = None
@@ -2776,7 +2820,13 @@ class StructureMixer:
         return neighbor_idx
 
     def get_structure_names(self) -> list[str]:
-        """Return names of all structures in a list."""
+        """Return names of all structures in a list.
+
+        Returns
+        -------
+        names : list of str
+            The title of each structure, in mixer order.
+        """
         return [m.title for m in self.structures]
 
     def convert_props_for_target(
@@ -3181,7 +3231,28 @@ class SPINNA:
         tuple[lib.IntArray1D, float]
         | tuple[tuple[lib.IntArray1D, ...], tuple[float, ...]]
     ):
-        """Alias for ``self.fit()``."""
+        """Find the stoichiometry that best explains the ground truth.
+
+        The implementation behind :meth:`fit`, which is the alias most
+        callers use.
+
+        Parameters
+        ----------
+        N_structures, fitting_mode, save, asynch, bootstrap, return_scores
+            As in :meth:`fit`.
+        callback
+            As in :meth:`fit`.
+
+        Returns
+        -------
+        opt_proportions : lib.FloatArray1D or tuple of lib.FloatArray1D
+            The stoichiometry of structures that gives the best fit.
+        score : float or tuple of floats
+            KS2 score of the best fit.
+        scores : lib.FloatArray1D or tuple of lib.FloatArray1D, optional
+            KS2 scores of every combination tested. Only returned if
+            ``return_scores``.
+        """
         callback = lib.normalize_progress(callback)
         assert fitting_mode in [
             "coarse-to-fine",
@@ -3330,6 +3401,13 @@ class SPINNA:
             BOOTSTRAP_DISTANCE.
         save, asynch, bootstrap, callback
             Same as in ``fit``.
+
+        Returns
+        -------
+        opt_proportions : lib.IntArray1D or tuple of lib.IntArray1D
+            The structure counts that gave the best fit.
+        score : float or tuple of floats
+            KS2 score of that fit.
         """
         callback = lib.normalize_progress(callback)
         if isinstance(N_structures, dict):
@@ -3954,6 +4032,12 @@ class SPINNA:
         Parameters
         ----------
         fs : list of concurrent.Futures
+            The futures to poll.
+
+        Returns
+        -------
+        n_done : int
+            How many of them have completed.
         """
         return sum([_.done() for _ in fs])
 
@@ -3965,7 +4049,7 @@ class SPINNA:
 
         Parameters
         ----------
-        futures : list of concurrent.Futures
+        fs : list of concurrent.Futures
             Futures provided from ProcessPoolExecutor after NN fitting.
 
         Returns
@@ -4158,7 +4242,7 @@ def compare_models(
         Dictionary of the form {"mask": mask, "info": mask_info}, where
         mask and mask_info are defined as in StructureMixer. Only used
         when masking is used in simulations. Default is None
-    width, height, depth: float, optional
+    width, height, depth : float, optional
         Width, height and depth of the simulated ROI in nm. If mask is
         provided, ROI is overwritten using the mask metadata. If width,
         height and depth are None, mask_dict must be specified. If
@@ -4344,7 +4428,7 @@ def compare_models_given_label_unc(
         Dictionary of the form {"mask": mask, "info": mask_info}, where
         mask and mask_info are defined as in StructureMixer. Only used
         when masking is used in simulations. Default is None.
-    width, height, depth: float, optional
+    width, height, depth : float, optional
         Width, height and depth of the simulated ROI in nm. If mask is
         provided, ROI is overwritten using the mask metadata. If width,
         height and depth are None, mask_dict must be specified. If
@@ -4381,6 +4465,15 @@ def compare_models_given_label_unc(
     progress_title : str, optional
         Title of the progress bar displayed during fitting simulations.
         Default is "Spinning structures".
+    fitting_mode : {"coarse-to-fine", "bayesian", "brute-force"}, optional
+        How the stoichiometry search space is explored; see
+        :meth:`SPINNA.fit`. Default is "coarse-to-fine".
+    round_counter : list, optional
+        One-element list counting the rounds run so far across several calls;
+        incremented per model and shown in the progress title. Default None.
+    total_rounds : int, optional
+        Total number of rounds, shown alongside ``round_counter``. Both must
+        be given for the round prefix to appear. Default None.
 
     Returns
     -------
@@ -4593,9 +4686,14 @@ def check_structures_valid_for_fitting(structures: list[Structure]) -> bool:
         * The structures loaded are: monomer A, monomer B,
             heterodimer.
 
+    Parameters
+    ----------
+    structures : list of Structure
+        The loaded structures.
+
     Returns
     -------
-    bool
+    valid : bool
         True if structures loaded can be used for finding LE.
     """
     targets = list(set([structure.targets[0] for structure in structures]))

@@ -170,6 +170,12 @@ def load_plugins(window, app_name: str) -> list:
         The GUI main window; must expose ``plugin_menu``.
     app_name : str
         The GUI app name to filter by (e.g. ``"render"``).
+
+    Returns
+    -------
+    plugins : list
+        The ``Plugin`` instances that matched ``app_name`` and executed
+        successfully; also assigned to ``window.plugins``.
     """
     plugins: list = []
     state = load_state()
