@@ -1400,6 +1400,13 @@ class ViewRotation(QtWidgets.QLabel):
         get_viewport : bool, optional
             If True, returns the found viewport. Otherwise updates
             scene with the found viewport.
+
+        Returns
+        -------
+        viewport : list or None
+            ``[(y_min, x_min), (y_max, x_max)]`` bounding the pick. Only
+            returned if ``get_viewport``; otherwise the scene is updated and
+            None is returned.
         """
         if self.pick_shape == "Circle":
             d = self.pick_size

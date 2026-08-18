@@ -724,7 +724,18 @@ def _fit_gauss_spot(
 
 
 def n_parameters(model: int) -> int:
-    """Parameter count of a model."""
+    """Parameter count of a model.
+
+    Parameters
+    ----------
+    model : int
+        :data:`SPHERICAL`, :data:`ELLIPTIC` or :data:`ROTATED`.
+
+    Returns
+    -------
+    n_params : int
+        5, 6 or 7 respectively.
+    """
     return _N_PARAMS[model]
 
 
@@ -832,17 +843,29 @@ def fit_spots(
         ``localize._initial_parameters_gauss``.
     mle : bool, optional
         Use the Poisson maximum-likelihood estimator instead of least squares.
-    tolerance, max_iterations : optional
-        ``None`` uses :data:`TOLERANCE` / :data:`MAX_ITERATIONS`.
+    tolerance, max_iterations : float and int, optional
+        Convergence schedule. ``None`` (the default) uses :data:`TOLERANCE` /
+        :data:`MAX_ITERATIONS`.
     progress_callback : callable, "console" or None, optional
         ``"console"`` shows a tqdm bar; a callable is invoked with the
         cumulative number of spots fitted.
+    variance : np.ndarray, optional
+        Per-pixel sCMOS readout variance in photoelectrons squared, laid out
+        exactly like ``spots``. ``None`` (the default) fits the plain Poisson
+        model.
 
     Returns
     -------
-    thetas, chi_squares, states, iterations
-        Using Gpufit's state codes (see
+    thetas : np.ndarray
+        ``(n_spots, n_params)`` fitted parameters.
+    chi_squares : np.ndarray
+        ``(n_spots,)`` chi-square at the optimum (twice the negative Poisson
+        log-likelihood for ``mle``).
+    states : np.ndarray
+        ``(n_spots,)`` per-spot fit state, using Gpufit's codes (see
         ``picasso.fitting.splinefit.FIT_STATE_CONVERGED``).
+    iterations : np.ndarray
+        ``(n_spots,)`` iterations used.
     """
     (
         spots,
@@ -902,14 +925,30 @@ def fit_spots_async(
 ) -> AsyncFit:
     """Fit spots with a 2D Gaussian model on several CPU threads.
 
-    Returns immediately with an
-    :class:`picasso.fitting.splinefit.AsyncFit` the caller polls for progress,
-    aborts, or checks for worker errors. See :func:`fit_spots` for the
-    arguments.
+    Returns immediately, so the caller can poll for progress, abort, or check
+    for worker errors while the fit runs.
 
     The kernels are ``nogil``, so this is *threads*, not processes - unlike
     the ``gausslq.fit_spots_parallel`` it replaces, which forked up to 60
     worker processes and pickled the spots into each of them.
+
+    Parameters
+    ----------
+    model, spots, initial_parameters, mle, tolerance, max_iterations, variance
+        As in :func:`fit_spots`.
+    n_threads : int, optional
+        Number of worker threads. ``None`` (the default) uses
+        ``picasso.fitting.splinefit.n_workers``, and the count is clipped to
+        at most one thread per spot.
+
+    Returns
+    -------
+    async_fit : picasso.fitting.splinefit.AsyncFit
+        Handle on the running fit. Its result arrays are filled in place; call
+        ``finished()`` to poll, ``results()`` for
+        ``(thetas, chi_squares, states, iterations)`` once done,
+        ``raise_errors()`` to surface worker exceptions and ``stop()`` to
+        abort.
     """
     (
         spots,

@@ -3736,6 +3736,8 @@ class TestClustererDialog(lib.Dialog):
         locs : pd.DataFrame
             Clustered localizations. Cluster label is saved in 'group'
             field.
+        centers : pd.DataFrame
+            The cluster centers.
         """
         # for converting z coordinates
         pixelsize = self.window.view.pixelsize
@@ -7730,7 +7732,7 @@ class View(QtWidgets.QLabel):
 
         Parameters
         ----------
-        paths: list of strs
+        paths : list of strs
             Contains the paths to the files to be loaded.
         on_finished : callable or None, optional
             Called (with no arguments) on the GUI thread once all files
@@ -13208,6 +13210,12 @@ class Window(QtWidgets.QMainWindow):
         blur_method : str, optional
             Blur method to be used. If None, the method selected in
             Display Settings Dialog is taken. Default is None.
+
+        Returns
+        -------
+        info : list of dicts or None
+            The metadata that would be written; returned instead of saved
+            when ``path`` is None.
         """
         if viewport is None:
             fov_info = [

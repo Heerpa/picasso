@@ -42,6 +42,11 @@ def config_filename() -> str:
     localize.html#camera-config). Keeping it next to the other
     ``~/.picasso`` files means it no longer hides inside the installed
     package directory, where it was hard to find.
+
+    Returns
+    -------
+    path : str
+        ``~/.picasso/config.yaml``.
     """
     return os.path.join(_user_config_dir(), "config.yaml")
 
@@ -73,8 +78,13 @@ def load_config() -> dict:
     """Load the camera configuration used by Picasso Localize.
 
     Reads ``~/.picasso/config.yaml`` if present, otherwise the legacy
-    in-package ``config.yaml`` (see ``_resolve_config_path``). If
-    neither exists (or it cannot be parsed), an empty dict is returned.
+    in-package ``config.yaml`` (see ``_resolve_config_path``).
+
+    Returns
+    -------
+    config : dict
+        The parsed configuration; an empty dict if neither file exists, it
+        cannot be read, or it parses to nothing.
     """
     path = _resolve_config_path()
     if path is None:

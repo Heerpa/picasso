@@ -145,7 +145,21 @@ def convergence_schedule(apply_seeds: bool) -> tuple:
     it in two is how the devices silently drift apart - the convergence test is
     *relative* (``|dchi2| < tol * max(1, chi2)``), so a factor of 100 in the
     tolerance is a real difference in where the fit stops, felt most by the
-    multi-start, which ranks its axial seeds on that chi-square."""
+    multi-start, which ranks its axial seeds on that chi-square.
+
+    Parameters
+    ----------
+    apply_seeds : bool
+        Whether the fit runs the axial multi-start.
+
+    Returns
+    -------
+    tolerance : float
+        :data:`TOLERANCE_MULTI_START` or :data:`TOLERANCE_SINGLE_START`.
+    max_iterations : int
+        :data:`MAX_ITERATIONS_MULTI_START` or
+        :data:`MAX_ITERATIONS_SINGLE_START`.
+    """
     if apply_seeds:
         return TOLERANCE_MULTI_START, MAX_ITERATIONS_MULTI_START
     return TOLERANCE_SINGLE_START, MAX_ITERATIONS_SINGLE_START
@@ -158,9 +172,22 @@ def resolve_schedule(
 ) -> tuple:
     """:func:`convergence_schedule`, with explicit values taking precedence.
 
-    ``None`` means "whatever this fit would use by default", which is the
-    idiom the spline API uses throughout (``n_z_starts=None``,
-    ``use_gpu=None``)."""
+    Parameters
+    ----------
+    apply_seeds : bool
+        Whether the fit runs the axial multi-start; selects the defaults.
+    tolerance : float, optional
+        Relative chi-square tolerance. ``None`` means "whatever this fit would
+        use by default", which is the idiom the spline API uses throughout
+        (``n_z_starts=None``, ``use_gpu=None``).
+    max_iterations : int, optional
+        Iteration cap per seed. ``None`` as for ``tolerance``.
+
+    Returns
+    -------
+    tolerance : float
+    max_iterations : int
+    """
     default_tolerance, default_max_iterations = convergence_schedule(
         apply_seeds
     )
@@ -1184,10 +1211,32 @@ def resolve_variance(
 ) -> tuple:
     """``(variance, use_variance)`` for a kernel argument list.
 
-    ``None`` yields the dummy of :func:`_dummy_variance` and False. Anything
-    else must match ``expected_shape`` - the variance patch is cut from the
-    same ROIs as the spots, so a mismatch is a plumbing bug, not a user
-    error."""
+    Parameters
+    ----------
+    variance : np.ndarray or None
+        Per-pixel sCMOS readout variance in photoelectrons squared. ``None``
+        yields the dummy of :func:`_dummy_variance` and False. Anything else
+        must match ``expected_shape`` - the variance patch is cut from the
+        same ROIs as the spots, so a mismatch is a plumbing bug, not a user
+        error.
+    expected_shape : tuple
+        The shape of the ``spots`` array the variance rides along with.
+    ndim : int, optional
+        Dimensionality of the dummy array to return when ``variance`` is
+        ``None``, so its type matches the kernel's argument signature.
+
+    Returns
+    -------
+    variance : np.ndarray
+        Contiguous float32 variance, or the dummy.
+    use_variance : bool
+        Whether the kernels should read it.
+
+    Raises
+    ------
+    ValueError
+        If ``variance`` is given and does not match ``expected_shape``.
+    """
     if variance is None:
         return _dummy_variance(ndim), False
     variance = np.ascontiguousarray(variance, dtype=np.float32)
@@ -1346,8 +1395,21 @@ class AsyncFit(NamedTuple):
     stop_flag: np.ndarray
 
     def results(self) -> tuple:
-        """``(theta, chi_squares, states, iterations)``. Only meaningful once
-        :meth:`finished` is True."""
+        """The result arrays of the fit.
+
+        Returns
+        -------
+        theta : np.ndarray
+            As returned by :func:`fit_spots`.
+        chi_squares : np.ndarray
+            As returned by :func:`fit_spots`.
+        states : np.ndarray
+            As returned by :func:`fit_spots`.
+        iterations : np.ndarray
+            As returned by :func:`fit_spots`. All four are only meaningful
+            once :meth:`finished` is True; until then they are being filled in
+            place by the workers.
+        """
         return self.theta, self.chi_squares, self.states, self.iterations
 
     def stop(self) -> None:
@@ -1359,7 +1421,12 @@ class AsyncFit(NamedTuple):
         self.stop_flag[0] = 1
 
     def finished(self) -> bool:
-        """Whether every worker has exited."""
+        """Whether every worker has exited.
+
+        Returns
+        -------
+        finished : bool
+        """
         return lib.n_futures_done(self.futures) == len(self.futures)
 
     def raise_errors(self) -> None:
@@ -1376,7 +1443,13 @@ class AsyncFit(NamedTuple):
 
 
 def n_workers() -> int:
-    """Number of fitting threads, by the formula every CPU fitter uses."""
+    """Number of fitting threads, by the formula every CPU fitter uses.
+
+    Returns
+    -------
+    n_threads : int
+        75% of the CPU count, clipped to ``[1, 60]``.
+    """
     # Python crashes when using >64 cores.
     return min(60, max(1, int(0.75 * multiprocessing.cpu_count())))
 
@@ -1417,8 +1490,7 @@ def fit_spots(
         ``[a00, a01, a10, a11]`` of the channel transform
         (``precision._spline_channel_jacobians``); the identity for a
         single-channel fit, and constant across spots for an affine
-        registration, whose Jacobian does not vary over the field
-        registration.
+        registration, whose Jacobian does not vary over the field.
     residuals : np.ndarray
         ``(n_spots, n_channels, 2)`` sub-pixel ROI offsets
         (``precision._spline_crlb_residuals``); zeros for a single-channel fit.
@@ -1513,9 +1585,27 @@ def fit_spots_async(
 ) -> AsyncFit:
     """Fit spots with a cubic-spline PSF model on several CPU threads.
 
-    Returns immediately with an :class:`AsyncFit` the caller polls for
-    progress, aborts, or checks for worker errors. See :func:`fit_spots` for
-    the arguments."""
+    Returns immediately, so the caller can poll for progress, abort, or check
+    for worker errors while the fit runs.
+
+    Parameters
+    ----------
+    kind, spots, coefficients, jacobians, residuals : array
+        As in :func:`fit_spots`.
+    initial_parameters, z_seeds, apply_seeds, mle : array and bool
+        As in :func:`fit_spots`.
+    tolerance, max_iterations, variance : optional
+        As in :func:`fit_spots`.
+    n_threads : int, optional
+        Number of worker threads. ``None`` (the default) uses
+        :func:`n_workers`, and the count is clipped to at most one thread per
+        spot.
+
+    Returns
+    -------
+    async_fit : AsyncFit
+        Handle on the running fit, whose result arrays are filled in place.
+    """
     _check_inputs(
         kind, spots, coefficients, jacobians, residuals, initial_parameters
     )
@@ -1575,12 +1665,35 @@ def model_and_jacobian(
 ) -> tuple:
     """Model image and analytic Jacobian of one spot at ``theta``.
 
-    Returns ``(mu, jacobian)`` with ``mu`` of shape ``(n_channels, box, box)``
-    indexed ``[channel, y, x]`` and ``jacobian`` of shape
-    ``(n_channels, box, box, n_params)``. This is the readable counterpart of
-    what the fitting kernels accumulate; the tests use it to check the
-    Jacobian against finite differences of ``mu``, which is what pins the sign
-    convention of the position derivatives."""
+    This is the readable counterpart of what the fitting kernels accumulate;
+    the tests use it to check the Jacobian against finite differences of
+    ``mu``, which is what pins the sign convention of the position
+    derivatives.
+
+    Parameters
+    ----------
+    kind : int
+        :data:`KIND_2D`, :data:`KIND_3D` or :data:`KIND_LINK_XYZ`.
+    coefficients : np.ndarray
+        Spline coefficients, laid out as in :func:`fit_spots`.
+    jacobians_row : np.ndarray
+        ``(n_channels, 4)`` local Jacobian ``[a00, a01, a10, a11]`` of this
+        spot's channel transforms.
+    residuals_row : np.ndarray
+        ``(n_channels, 2)`` sub-pixel ROI offsets of this spot.
+    theta : np.ndarray
+        ``(n_params,)`` parameters to evaluate the model at.
+    box : int
+        ROI side length in pixels.
+
+    Returns
+    -------
+    mu : np.ndarray
+        ``(n_channels, box, box)`` model image, indexed ``[channel, y, x]``.
+    jacobian : np.ndarray
+        ``(n_channels, box, box, n_params)`` derivative of ``mu`` with respect
+        to each parameter.
+    """
     coefficients = np.ascontiguousarray(coefficients, dtype=np.float64)
     jacobians_row = np.ascontiguousarray(jacobians_row, dtype=np.float64)
     residuals_row = np.ascontiguousarray(residuals_row, dtype=np.float64)

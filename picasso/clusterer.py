@@ -604,7 +604,7 @@ def dbscan(
     as ``cluster_3D``).
 
     Parameters
-    ---------
+    ----------
     locs : pd.DataFrame
         Localizations to be clustered.
     radius : float

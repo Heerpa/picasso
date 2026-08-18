@@ -1771,8 +1771,26 @@ def get_block_locs_at_numba(
     K: int,
     L: int,
 ) -> lib.FloatArray2D:
-    """Return the localizations in the blocks around the given
-    coordinates."""
+    """Return the localizations in the blocks around the given coordinates.
+
+    Parameters
+    ----------
+    x_index, y_index : int
+        Block indices of the block whose 3x3 neighbourhood is collected.
+    locs_xy : lib.FloatArray2D
+        ``(2, n_locs)`` block-sorted x and y coordinates.
+    block_starts, block_ends : lib.IntArray2D
+        ``(K, L)`` first and one-past-last index of each block in
+        ``locs_xy``.
+    K, L : int
+        Number of blocks along y and x.
+
+    Returns
+    -------
+    locs_xy : lib.FloatArray2D
+        ``(2, n_neighbours)`` coordinates of the localizations in the
+        neighbourhood.
+    """
     indices = _get_block_locs_at_numba(
         x_index,
         y_index,
@@ -2267,7 +2285,7 @@ def _frc(
     ----------
     locs1, locs2 : pd.DataFrame
         Localization lists already split to render images.
-    pixelsize: float
+    pixelsize : float
         Camera pixel size in nm.
     lp : float
         Average localization precision (NeNA), used for bin size of the
@@ -4251,7 +4269,7 @@ def align(
         localization array in `locs`.
     display : bool, optional
         Not used.
-    apply_shifts: bool, optional
+    apply_shifts : bool, optional
         If True, applies the calculated shifts to the 'x' and 'y'
         coordinates of the localizations. If False, returns the original
         localizations without applying the shifts. Default is True.
@@ -4263,6 +4281,9 @@ def align(
     locs : list of pd.DataFrames
         Aligned localizations with the shifts applied to the 'x' and
         'y' coordinates.
+    shifts : tuple
+        ``(shift_x, shift_y)`` per channel, in camera pixels. Returned only
+        if ``return_shifts`` is True.
     """
     images = []
     disp_px_size = 100  # nm
@@ -4324,6 +4345,9 @@ def align_rcc(
     locs : list of pd.DataFrames
         Aligned localizations with the shifts applied to the 'x' and
         'y' coordinates.
+    shifts : tuple
+        ``(shift_x, shift_y)`` per channel, in camera pixels. Returned only
+        if ``return_shifts`` is True.
     """
     locs = deepcopy(locs)
     max_iterations = 5
@@ -4600,8 +4624,26 @@ def calculate_fret(
     acc_locs: pd.DataFrame,
     don_locs: pd.DataFrame,
 ) -> tuple[dict, pd.DataFrame]:
-    """Calculate the FRET efficiency in picked regions, this is for one
-    trace."""
+    """Calculate the FRET efficiency in picked regions, for one trace.
+
+    Parameters
+    ----------
+    acc_locs : pd.DataFrame
+        Acceptor-channel localizations of the pick.
+    don_locs : pd.DataFrame
+        Donor-channel localizations of the pick.
+
+    Returns
+    -------
+    fret_dict : dict
+        With ``"fret_events"`` (the efficiencies in (0, 1)),
+        ``"fret_timepoints"`` (their frames), ``"acc_trace"`` and
+        ``"don_trace"`` (background-subtracted photons per frame),
+        ``"frames"`` (the frame axis) and ``"maxframes"``.
+    f_locs : pd.DataFrame or list
+        The donor localizations of the FRET frames, with an added ``fret``
+        column. An empty list when no frame shows FRET.
+    """
     fret_dict = {}
     if len(acc_locs) == 0:
         max_frames = don_locs["frame"].max()

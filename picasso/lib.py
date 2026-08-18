@@ -159,9 +159,22 @@ def normalize_frame_bounds(frame_bounds, n_frames):
 
 
 def frame_in_bounds(frame_number, frame_bounds, n_frames):
-    """Return True if ``frame_number`` falls within any segment of
-    ``frame_bounds`` (or if ``frame_bounds`` is None, i.e., all frames are
-    used). Bounds are inclusive. See ``normalize_frame_bounds``."""
+    """Whether a frame falls within any of the requested segments.
+
+    Parameters
+    ----------
+    frame_number : int
+        The frame to test.
+    frame_bounds : tuple, list of tuples or None
+        The requested frame ranges; None means all frames. Bounds are
+        inclusive. See ``normalize_frame_bounds``.
+    n_frames : int
+        Total number of frames, used to resolve open-ended bounds.
+
+    Returns
+    -------
+    in_bounds : bool
+    """
     segments = normalize_frame_bounds(frame_bounds, n_frames)
     if segments is None:
         return True
@@ -170,43 +183,87 @@ def frame_in_bounds(frame_number, frame_bounds, n_frames):
 
 class MockProgress:
     """Class to mock a progress bar or dialog, allowing for calling
-    the same methods but not displaying anything."""
+    the same methods but not displaying anything.
+
+    Every method accepts (and ignores) whatever the ``ProgressDialog``
+    interface passes, so a caller can drive progress unconditionally. See
+    :func:`normalize_progress`.
+    """
 
     def __init__(self, *args, **kwargs):
+        """Accept and ignore any arguments a real progress dialog takes."""
         self.description_base = ""
         self._maximum = 0
 
     def init(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
     def set_value(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
     def setMaximum(self, maximum, *args, **kwargs):
+        """Record the maximum, so :meth:`maximum` can report it back.
+
+        Parameters
+        ----------
+        maximum : int
+            The value progress runs up to.
+        """
         self._maximum = maximum
 
     def maximum(self):
+        """The maximum last set.
+
+        Returns
+        -------
+        maximum : int
+        """
         return self._maximum
 
     def update(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
     def closeEvent(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
     def zero_progress(self, description=None, *args, **kwargs):
+        """Do nothing.
+
+        Parameters
+        ----------
+        description : str, optional
+            Ignored; a real dialog would show it as the new phase's label.
+        """
         pass
 
     def close(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
     def setLabelText(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
     def play_sound_notification(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
     def get_iterator(self, start=0, end=100):
+        """A plain iterator, with no progress attached.
+
+        Parameters
+        ----------
+        start, end : int, optional
+            First and one-past-last value. Defaults 0 and 100.
+
+        Returns
+        -------
+        iterator : range
+        """
         return range(start, end)
 
 
@@ -221,6 +278,16 @@ class TqdmProgress:
     ``set_value`` starts a fresh one (a new phase)."""
 
     def __init__(self, *args, unit="it", **kwargs):
+        """Set up the (not yet armed) bar.
+
+        Parameters
+        ----------
+        unit : str, optional
+            Name of one iteration, shown by tqdm. Default "it".
+        **kwargs
+            ``description`` is used as the bar's label; anything else a real
+            progress dialog takes is accepted and ignored.
+        """
         self.description_base = (
             "" if "description" not in kwargs else kwargs["description"]
         )
@@ -229,9 +296,18 @@ class TqdmProgress:
         self._maximum = 0
 
     def init(self, *args, **kwargs):
+        """Do nothing; the bar is armed lazily on the first
+        :meth:`set_value`."""
         pass
 
     def set_value(self, value, *args, **kwargs):
+        """Advance the bar to ``value``, arming it on the first call.
+
+        Parameters
+        ----------
+        value : int
+            Cumulative progress so far.
+        """
         if self.iterator is None:
             self.iterator = tqdm(
                 total=self._maximum or None,
@@ -241,38 +317,78 @@ class TqdmProgress:
         self.iterator.update(value - self.iterator.n)
 
     def setMaximum(self, maximum, *args, **kwargs):
+        """Set the value progress runs up to, updating a live bar.
+
+        Parameters
+        ----------
+        maximum : int
+            The total the bar counts towards.
+        """
         self._maximum = maximum
         if self.iterator is not None:
             self.iterator.total = maximum
             self.iterator.refresh()
 
     def maximum(self):
+        """The maximum last set.
+
+        Returns
+        -------
+        maximum : int
+        """
         return self._maximum
 
     def update(self, *args, **kwargs):
+        """Do nothing; tqdm redraws itself."""
         pass
 
     def closeEvent(self, *args, **kwargs):
+        """Do nothing; accepted for interface compatibility with Qt."""
         pass
 
     def zero_progress(self, description=None, *args, **kwargs):
+        """Close the current bar so the next :meth:`set_value` starts a fresh
+        one, i.e. a new phase.
+
+        Parameters
+        ----------
+        description : str, optional
+            Label of the new phase. None keeps the current one.
+        """
         if description:
             self.description_base = description
         self.close()
 
     def close(self, *args, **kwargs):
+        """Close the bar, if one is running."""
         if self.iterator is not None:
             self.iterator.close()
             self.iterator = None
 
     def setLabelText(self, *args, **kwargs):
+        """Do nothing; the label is set through :meth:`zero_progress`."""
         pass
 
     def play_sound_notification(self, *args, **kwargs):
+        """Do nothing; there is no console equivalent."""
         pass
 
     def get_iterator(self, start=0, end=100, unit="segment"):
-        """Get an iterator for the progress bar."""
+        """Get an iterator that drives the progress bar.
+
+        Parameters
+        ----------
+        start, end : int, optional
+            First and one-past-last value of the iteration. Defaults 0 and
+            100.
+        unit : str, optional
+            Name of one iteration, shown by tqdm. Default "segment".
+
+        Returns
+        -------
+        iterator : tqdm.tqdm
+            Iterator over ``range(start, end)``, also stored on the instance.
+        """
         self.close()
         iterator = tqdm(
             range(start, end),
@@ -775,7 +891,26 @@ def cumulative_exponential(
     t: float,
     c: float,
 ) -> FloatArray1D:
-    """Used for binding kinetics estimation."""
+    """Cumulative exponential ``a * (1 - exp(-x / t)) + c``.
+
+    Used for binding kinetics estimation, see :func:`fit_cum_exp`.
+
+    Parameters
+    ----------
+    x : FloatArray1D
+        Points to evaluate at.
+    a : float
+        Amplitude, i.e. the plateau above ``c``.
+    t : float
+        Decay constant, in the units of ``x``.
+    c : float
+        Offset.
+
+    Returns
+    -------
+    y : FloatArray1D
+        The function evaluated at ``x``.
+    """
     return a * (1 - np.exp(-(x / t))) + c
 
 
@@ -1377,8 +1512,22 @@ def is_loc_at_numba(
     locs_xy: FloatArray2D,
     r: float,
 ) -> BoolArray1D:
-    """Numba implementation of ``locs_at``. Return the indices of
-    localizations at the given coordinates within radius ``r``."""
+    """Numba implementation of ``is_loc_at``.
+
+    Parameters
+    ----------
+    x, y : float
+        Center of the circular pick.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+    r : float
+        Pick radius.
+
+    Returns
+    -------
+    is_picked : BoolArray1D
+        True where a localization lies within ``r`` of ``(x, y)``.
+    """
     dx = locs_xy[0] - x
     dy = locs_xy[1] - y
     r2 = r**2
@@ -1393,16 +1542,40 @@ def locs_at_numba(
     locs_xy: FloatArray2D,
     r: float,
 ) -> FloatArray2D:
-    """Numba implementation of ``locs_at``. Return the localizations at
-    the given coordinates within radius ``r``."""
+    """Numba implementation of ``locs_at``.
+
+    Parameters
+    ----------
+    x, y : float
+        Center of the circular pick.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+    r : float
+        Pick radius.
+
+    Returns
+    -------
+    picked_xy : FloatArray2D
+        ``(2, n_picked)`` coordinates within ``r`` of ``(x, y)``.
+    """
     is_picked = is_loc_at_numba(x, y, locs_xy, r)
     return locs_xy[:, is_picked]
 
 
 @numba.jit(nopython=True, nogil=True)
 def rmsd_at_com(locs_xy: FloatArray2D) -> float:
-    """Calculate the RMSD of the localizations at the center of mass
-    (COM) of the localizations."""
+    """RMS distance of the localizations from their center of mass.
+
+    Parameters
+    ----------
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+
+    Returns
+    -------
+    rmsd : float
+        Root mean square distance from the center of mass.
+    """
     com_x = np.mean(locs_xy[0])
     com_y = np.mean(locs_xy[1])
     return np.sqrt(
@@ -1452,8 +1625,23 @@ def locs_in_square_numba(
     a: float,
 ) -> FloatArray2D:
     """Return localizations within the axis-aligned square of side
-    length ``a`` centered at ``(x, y)``. See
-    ``is_loc_in_square_numba``."""
+    length ``a`` centered at ``(x, y)``.
+
+    Parameters
+    ----------
+    x, y : float
+        Center of the square.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+    a : float
+        Side length of the square.
+
+    Returns
+    -------
+    picked_xy : FloatArray2D
+        ``(2, n_picked)`` coordinates inside the square. See
+        ``is_loc_in_square_numba``.
+    """
     is_picked = is_loc_in_square_numba(x, y, locs_xy, a)
     return locs_xy[:, is_picked]
 
@@ -1518,8 +1706,27 @@ def locs_in_rectangle_numba(
     width: float,
     locs_xy: FloatArray2D,
 ) -> FloatArray2D:
-    """Return localizations within an oriented rectangle. See
-    ``is_loc_in_rectangle_numba``."""
+    """Return localizations within an oriented rectangle.
+
+    Parameters
+    ----------
+    xc, yc : float
+        Center of the rectangle.
+    theta : float
+        Orientation of its center axis, in radians.
+    length : float
+        Extent along the center axis.
+    width : float
+        Extent perpendicular to it.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+
+    Returns
+    -------
+    picked_xy : FloatArray2D
+        ``(2, n_picked)`` coordinates inside the rectangle. See
+        ``is_loc_in_rectangle_numba``.
+    """
     is_picked = is_loc_in_rectangle_numba(
         xc, yc, theta, length, width, locs_xy
     )
@@ -1535,6 +1742,16 @@ def wrap_angle_pi(angle: float) -> float:
     rectangle). Wrapping is required whenever two orientations are
     compared, otherwise, e.g., +89 deg and -89 deg appear to differ by
     178 deg instead of 2 deg.
+
+    Parameters
+    ----------
+    angle : float
+        Angle in radians.
+
+    Returns
+    -------
+    angle : float
+        The equivalent angle in ``[-pi/2, pi/2)``.
     """
     return angle - np.pi * np.floor(angle / np.pi + 0.5)
 
@@ -1854,8 +2071,18 @@ def minimize_shifts(
 
 
 def n_futures_done(futures: list[Future]) -> int:
-    """Return the number of finished futures, used in
-    multiprocessing."""
+    """Return the number of finished futures, used in multiprocessing.
+
+    Parameters
+    ----------
+    futures : list of Future
+        The futures to poll.
+
+    Returns
+    -------
+    n_done : int
+        How many of them have completed.
+    """
     return sum([_.done() for _ in futures])
 
 
@@ -2168,7 +2395,7 @@ def plot_subclustering_check(
     ----------
     clustered_n_events : IntArray1D
         Number of events for clustered molecules.
-    sparse_n_eveents : IntArray1D
+    sparse_n_events : IntArray1D
         Number of events for sparse molecules.
     plot_path : str or list of strs, optional
         If provided, the plot is saved to this path. If a list of
@@ -2464,7 +2691,20 @@ def lateral_transforms(calibration: dict | list | None) -> list[dict]:
 
 def lateral_transform_models(calibration: dict | list | None) -> list:
     """The geometric transforms of ``lateral_transforms``, in the order they
-    must be applied. Accepts entries or bare transforms."""
+    must be applied.
+
+    Parameters
+    ----------
+    calibration : dict, list or None
+        A calibration carrying an ``"Affine transforms"`` list, that list
+        itself, or None. Its items may be entries (dicts with a
+        ``"Transform"`` key) or bare transforms.
+
+    Returns
+    -------
+    models : list of picasso.transforms.Transform
+        One transform per correction, in application order.
+    """
     from picasso import transforms as _tf
 
     models = []
@@ -2557,6 +2797,18 @@ def is_same_lateral_transform(
     Compared by the transform, not by identity or source path: the same
     correction saved twice under different names must count as one, since
     applying it twice would correct twice.
+
+    Parameters
+    ----------
+    a, b : dict or list
+        Lateral correction entries (dicts with a ``"Transform"`` key) or bare
+        transforms.
+    tol : float, optional
+        Absolute tolerance of the parameter comparison. Default 1e-9.
+
+    Returns
+    -------
+    is_same : bool
     """
     from picasso import transforms as _tf
 
@@ -2604,8 +2856,22 @@ def drop_duplicate_lateral_transforms(
 
 
 def describe_lateral_transforms(calibration: dict | list | None) -> list[str]:
-    """One human-readable line per lateral correction, for metadata and
-    GUI labels, e.g. ``"astigmatism, projective (25 bead pairs)"``."""
+    """One human-readable line per lateral correction.
+
+    For metadata and GUI labels, e.g.
+    ``"astigmatism, projective (25 bead pairs)"``.
+
+    Parameters
+    ----------
+    calibration : dict, list or None
+        A calibration carrying an ``"Affine transforms"`` list, that list
+        itself, or None.
+
+    Returns
+    -------
+    described : list of str
+        One line per correction, in application order.
+    """
     described = []
     for transform in lateral_transforms(calibration):
         purpose = transform.get("Type", "lateral")

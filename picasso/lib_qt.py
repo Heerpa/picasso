@@ -50,7 +50,13 @@ class Dialog(QtWidgets.QDialog):
     def showEvent(self, event):
         """Remove focus from any QPushButton when the dialog is shown,
         so that pressing Enter does not trigger any button by default
-        (unless it's called "OK")."""
+        (unless it's called "OK").
+
+        Parameters
+        ----------
+        event : QtGui.QShowEvent
+            The Qt show event.
+        """
         super().showEvent(event)
         for button in self.findChildren(QtWidgets.QPushButton):
             if button.text() in self._focus_buttons:
@@ -96,6 +102,13 @@ class UserSettingsDialog(Dialog):
         layout.addLayout(button_layout)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
+        """Re-read the settings from disk each time the dialog opens.
+
+        Parameters
+        ----------
+        event : QtGui.QShowEvent
+            The Qt show event.
+        """
         super().showEvent(event)
         self.load_settings()
 
@@ -288,6 +301,11 @@ class ProgressDialog(QtWidgets.QProgressDialog):
         self.initalized = None
 
     def init(self):
+        """Arm the dialog: register it, make it modal and start the clock.
+
+        Called lazily on the first :meth:`set_value` so that a fast operation
+        never flashes a dialog.
+        """
         _dialogs.append(self)
         self.setMinimumDuration(500)
         self.setModal(True)
@@ -300,6 +318,13 @@ class ProgressDialog(QtWidgets.QProgressDialog):
         self.sound_notification_path = get_sound_notification_path()
 
     def set_value(self, value):
+        """Advance the bar, arming the dialog and the time estimate as needed.
+
+        Parameters
+        ----------
+        value : int
+            Cumulative progress so far.
+        """
         if not self.initalized:
             self.init()
         self.setValue(value)
@@ -336,13 +361,27 @@ class ProgressDialog(QtWidgets.QProgressDialog):
         self.app.processEvents()
 
     def closeEvent(self, event):
+        """Unregister the dialog and play the finish sound if it was not
+        already played.
+
+        Parameters
+        ----------
+        event : QtGui.QCloseEvent
+            The Qt close event.
+        """
         _dialogs.remove(self)
         if self.finished is False:
             self.finished = True
             self.play_sound_notification()
 
     def zero_progress(self, description=None):
-        """Set progress dialog to zero and changes title if given."""
+        """Set progress dialog to zero and change the title if given.
+
+        Parameters
+        ----------
+        description : str, optional
+            Label of the new phase. None keeps the current one.
+        """
         if description:
             self.setLabelText(description)
             self.description_base = description
@@ -360,7 +399,18 @@ class ProgressDialog(QtWidgets.QProgressDialog):
                 playsound(self.sound_notification_path, block=False)
 
     def get_iterator(self, start=None, end=None):
-        """Get an iterator for the progress dialog."""
+        """Get an iterator that spans the dialog's remaining progress.
+
+        Parameters
+        ----------
+        start, end : int, optional
+            First and one-past-last value. None uses the dialog's current
+            value and maximum.
+
+        Returns
+        -------
+        iterator : range
+        """
         start = self.value() if start is None else start
         end = self.maximum() if end is None else end
         return range(start, end)
@@ -384,6 +434,14 @@ class StatusDialog(Dialog):
         QtCore.QCoreApplication.instance().processEvents()
 
     def closeEvent(self, event):
+        """Unregister the dialog and play the notification sound if the task
+        ran long enough to warrant one.
+
+        Parameters
+        ----------
+        event : QtGui.QCloseEvent
+            The Qt close event.
+        """
         _dialogs.remove(self)
         if self.sound_notification_path is not None:
             if time.time() - self.t0 > SOUND_NOTIFICATION_DURATION:
@@ -421,17 +479,37 @@ class ScrollableGroupBox(QtWidgets.QGroupBox):
         self.layout().addWidget(self.scroll_area, 0, 0, 1, 2)
 
     def add_widget(self, widget, row, column, height=1, width=1):
-        """Add a widget to the grid layout inside the scroll area."""
+        """Add a widget to the grid layout inside the scroll area.
+
+        Parameters
+        ----------
+        widget : QtWidgets.QWidget
+            The widget to add.
+        row, column : int
+            Where to place it in the grid.
+        height, width : int, optional
+            How many rows and columns it spans. Default 1.
+        """
         self.content_layout.addWidget(widget, row, column, height, width)
 
     def remove_widget(self, widget):
-        """Remove a widget from the grid layout inside the scroll
-        area."""
+        """Remove a widget from the grid layout inside the scroll area.
+
+        Parameters
+        ----------
+        widget : QtWidgets.QWidget
+            The widget to remove.
+        """
         self.content_layout.removeWidget(widget)
 
     def remove_all_widgets(self, keep_labels=False):
-        """Remove all widgets. If ``keep_labels`` is True, the QLabels
-        are kept."""
+        """Remove all widgets from the grid layout.
+
+        Parameters
+        ----------
+        keep_labels : bool, optional
+            If True, the QLabels are kept. Default False.
+        """
         for i in reversed(range(self.content_layout.count())):
             widget = self.content_layout.itemAt(i).widget()
             if keep_labels and isinstance(widget, QtWidgets.QLabel):
@@ -450,6 +528,14 @@ class LogDoubleSpinBox(QtWidgets.QDoubleSpinBox):
         self._factor = factor  # multiply/divide by this on each step
 
     def stepBy(self, steps: int) -> None:
+        """Step the value multiplicatively, so the arrows move it by a factor
+        rather than by a fixed amount.
+
+        Parameters
+        ----------
+        steps : int
+            Number of steps; negative steps divide instead of multiply.
+        """
         if steps > 0:
             if self.value() <= 10 ** (-self.decimals()):
                 self.setValue(2 * 10 ** (-self.decimals()))
@@ -501,7 +587,14 @@ class RangeSlider(QtWidgets.QWidget):
     # -- API ---------------------------------------------------------
 
     def setRange(self, minimum: float, maximum: float) -> None:
-        """Set the ends of the track, re-clamping the current values."""
+        """Set the ends of the track, re-clamping the current values.
+
+        Parameters
+        ----------
+        minimum, maximum : float
+            The new ends; ``maximum`` is raised to ``minimum`` if it is below
+            it.
+        """
         minimum = float(minimum)
         maximum = max(float(maximum), minimum)
         self._minimum = minimum
@@ -510,23 +603,36 @@ class RangeSlider(QtWidgets.QWidget):
         self.update()
 
     def range(self) -> tuple[float, float]:
+        """The ends of the track, as ``(minimum, maximum)``."""
         return self._minimum, self._maximum
 
     def minimum(self) -> float:
+        """The lower end of the track."""
         return self._minimum
 
     def maximum(self) -> float:
+        """The upper end of the track."""
         return self._maximum
 
     def setValues(
         self, low: float, high: float, moved: str | None = None
     ) -> bool:
         """Set both handles, clamped into the track and kept ``_min_gap``
-        apart. ``moved`` names the handle the user is dragging, which is
-        the one that gives way when the two would cross.
+        apart.
 
-        Returns whether anything changed (and, if so, emits
-        ``valuesChanged``).
+        Parameters
+        ----------
+        low, high : float
+            The requested handle positions.
+        moved : str, optional
+            Names the handle the user is dragging (``"low"`` or ``"high"``),
+            which is the one that gives way when the two would cross. Default
+            None.
+
+        Returns
+        -------
+        changed : bool
+            Whether anything changed; ``valuesChanged`` is emitted if so.
         """
         low = min(max(float(low), self._minimum), self._maximum)
         high = min(max(float(high), self._minimum), self._maximum)
@@ -552,26 +658,50 @@ class RangeSlider(QtWidgets.QWidget):
         return True
 
     def values(self) -> tuple[float, float]:
+        """The handle positions, as ``(low, high)``."""
         return self._low, self._high
 
     def setMinimumGap(self, gap: float) -> None:
+        """Set how far apart the two handles must stay.
+
+        Parameters
+        ----------
+        gap : float
+            Minimum distance, in track units; negative values are clipped to
+            0.
+        """
         self._min_gap = max(0.0, float(gap))
         self.setValues(self._low, self._high)
 
     def setValueLabels(self, low_label: str, high_label: str) -> None:
-        """Name the two handles, for the tooltip."""
+        """Name the two handles, for the tooltip.
+
+        Parameters
+        ----------
+        low_label, high_label : str
+            Names of the lower and upper handle.
+        """
         self._value_labels = (low_label, high_label)
         self._update_tooltip()
 
     # -- Painting ----------------------------------------------------
 
     def sizeHint(self) -> QtCore.QSize:
+        """The size the slider would like to have."""
         return QtCore.QSize(150, self.HANDLE_HEIGHT + 3)
 
     def minimumSizeHint(self) -> QtCore.QSize:
+        """The smallest size at which both handles still fit."""
         return QtCore.QSize(4 * self.HANDLE_WIDTH, self.HANDLE_HEIGHT + 3)
 
     def paintEvent(self, _event: QtGui.QPaintEvent) -> None:
+        """Draw the groove, the selected span and the two handles.
+
+        Parameters
+        ----------
+        _event : QtGui.QPaintEvent
+            The Qt paint event; unused.
+        """
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         painter.setPen(QtCore.Qt.PenStyle.NoPen)
@@ -619,6 +749,13 @@ class RangeSlider(QtWidgets.QWidget):
     # -- Interaction -------------------------------------------------
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        """Grab the handle nearest the click and move it there.
+
+        Parameters
+        ----------
+        event : QtGui.QMouseEvent
+            The Qt mouse event; anything but a left click is passed on.
+        """
         if event.button() != QtCore.Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
             return
@@ -629,6 +766,13 @@ class RangeSlider(QtWidgets.QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        """Drag the grabbed handle.
+
+        Parameters
+        ----------
+        event : QtGui.QMouseEvent
+            The Qt mouse event; passed on when no handle is grabbed.
+        """
         if self._pressed_handle is None:
             super().mouseMoveEvent(event)
             return
@@ -636,6 +780,13 @@ class RangeSlider(QtWidgets.QWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        """Release the grabbed handle.
+
+        Parameters
+        ----------
+        event : QtGui.QMouseEvent
+            The Qt mouse event; passed on when no handle is grabbed.
+        """
         if self._pressed_handle is None:
             super().mouseReleaseEvent(event)
             return
@@ -643,6 +794,13 @@ class RangeSlider(QtWidgets.QWidget):
         event.accept()
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        """Move the last-touched handle with the arrow keys.
+
+        Parameters
+        ----------
+        event : QtGui.QKeyEvent
+            The Qt key event; anything but the arrow keys is passed on.
+        """
         key = event.key()
         if key in (
             QtCore.Qt.Key.Key_Left,
@@ -662,8 +820,16 @@ class RangeSlider(QtWidgets.QWidget):
         super().keyPressEvent(event)
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
-        # the slider sits under a scrollable movie view; scrolling over it
-        # should not silently change the contrast
+        """Ignore the wheel, so that scrolling passes through to the parent.
+
+        The slider sits under a scrollable movie view; scrolling over it
+        should not silently change the contrast.
+
+        Parameters
+        ----------
+        event : QtGui.QWheelEvent
+            The Qt wheel event.
+        """
         event.ignore()
 
     # -- Helpers -----------------------------------------------------
@@ -853,8 +1019,16 @@ def cancel_dialogs():
 
 def install_excepthook(window) -> None:
     """Install a thread-safe excepthook that shows uncaught exceptions in a
-    QMessageBox. Safe to call from QThread workers because the error signal is
-    queued to the main thread by Qt's event loop."""
+    QMessageBox.
+
+    Safe to call from QThread workers because the error signal is queued to
+    the main thread by Qt's event loop.
+
+    Parameters
+    ----------
+    window : QtWidgets.QWidget
+        Parent of the message box.
+    """
 
     class _ErrorSignaler(QtCore.QObject):
         error = QtCore.pyqtSignal(str)

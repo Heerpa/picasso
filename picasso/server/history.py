@@ -19,24 +19,39 @@ DEFAULT_PLOTS = [
 
 @st.cache_data
 def convert_df(df: pd.DataFrame):
-    """
-    Helper function to encode a dataframe as utf-8
+    """Encode a dataframe as utf-8 CSV, for the download button.
 
-    Args:
-        df (pd.DataFrame): Dataframe to convert.
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Dataframe to convert.
+
+    Returns
+    -------
+    csv : bytes
+        The CSV, utf-8 encoded.
     """
 
     return df.to_csv().encode("utf-8")
 
 
 def parse_input(input_: str):
-    """
-    Parses an input string and looks for & and |.
-    Keywords with & will be added to an include list and keywords with
-    | to an exclude list.
+    """Parse a filter string, splitting it on ``&`` and ``|``.
 
-    Args:
-        input_ (str): Input string
+    Keywords following ``&`` are added to an include list, keywords following
+    ``|`` to an exclude list.
+
+    Parameters
+    ----------
+    input_ : str
+        The filter string.
+
+    Returns
+    -------
+    to_add : list of str
+        Keywords a filename must contain.
+    to_exclude : list of str
+        Keywords a filename must not contain.
     """
 
     token = ("&", "|")
@@ -75,11 +90,18 @@ def parse_input(input_: str):
 
 
 def filter_db(df_: pd.DataFrame):
-    """
-    Utility function to create a user interface to filter a dataframe.
+    """Draw the filter controls and apply them to a dataframe.
 
-    Args:
-        df_ (pd.DataFrame): Input dataframe.
+    Parameters
+    ----------
+    df_ : pd.DataFrame
+        Input dataframe; not modified.
+
+    Returns
+    -------
+    df : pd.DataFrame
+        The rows inside the chosen acquisition-date range whose filename
+        matches the tag filter.
     """
 
     df = df_.copy()
@@ -134,18 +156,21 @@ def filter_db(df_: pd.DataFrame):
 
 
 def filter_by_tags(df: pd.DataFrame, to_add: list, to_exclude: list):
-    """
-    Filters the entries of a dataframe according to an to_add and to_exclude
-    list.
-    Rows will be removed according to their filename.
+    """Filter the entries of a dataframe by keywords in their filename.
 
-    Args:
-        df (pd.DataFrame): Dataframe
-        to_add (list): keywords that should be in the filename.
-        to_exclude (list): keywords that should not be in the filename.
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataframe, with a ``filename`` column.
+    to_add : list
+        Keywords that should be in the filename.
+    to_exclude : list
+        Keywords that should not be in the filename.
 
-    Returns:
-        _type_: _description_
+    Returns
+    -------
+    df : pd.DataFrame
+        The matching rows.
     """
 
     add = df["filename"].apply(
@@ -167,11 +192,19 @@ def filter_by_tags(df: pd.DataFrame, to_add: list, to_exclude: list):
 
 
 def check_group(filename: str, groups: tuple):
-    """Check if a filename belongs to a group
+    """Check if a filename belongs to a group.
 
-    Args:
-        filename (str): filename
-        groups (tuple): tuple with groups as strings
+    Parameters
+    ----------
+    filename : str
+        The filename to classify.
+    groups : tuple
+        Group names to look for as substrings.
+
+    Returns
+    -------
+    found : str
+        The last matching group name, or ``"None"`` if none matched.
     """
     found = "None"
     for g in groups:

@@ -90,7 +90,7 @@ LOCS_BLOCK_SIZE = 1_000_000
 
 
 class NoMetadataFileError(FileNotFoundError):
-    pass
+    """Raised when a movie or localizations file has no metadata sidecar."""
 
 
 def _user_settings_filename() -> str:
@@ -106,6 +106,11 @@ def plugins_directory() -> str:
     ``~/.picasso/settings.yaml`` so that every install type (one-click
     installer, PyPI, source) shares one stable, user-writable location
     that survives uninstalling Picasso.
+
+    Returns
+    -------
+    directory : str
+        ``~/.picasso/plugins``.
     """
     home = os.path.expanduser("~")
     directory = os.path.join(home, ".picasso", "plugins")
@@ -121,7 +126,13 @@ def notification_sounds_directory() -> str:
     next to ``~/.picasso/settings.yaml`` and ``~/.picasso/plugins`` so
     that every install type (one-click installer, PyPI, source) shares
     one stable, user-writable location that survives uninstalling
-    Picasso. Users add their own ``.mp3`` or ``.wav`` files here."""
+    Picasso. Users add their own ``.mp3`` or ``.wav`` files here.
+
+    Returns
+    -------
+    directory : str
+        ``~/.picasso/notification_sounds``.
+    """
     home = os.path.expanduser("~")
     directory = os.path.join(home, ".picasso", "notification_sounds")
     os.makedirs(directory, exist_ok=True)
@@ -329,7 +340,15 @@ def save_raw(path: str, movie: lib.IntArray3D, info: dict) -> None:
 
 
 def save_calibration(path: str, calibration: dict) -> None:
-    """Save calibration file to a .yaml path."""
+    """Save calibration file to a .yaml path.
+
+    Parameters
+    ----------
+    path : str
+        Where to write the YAML.
+    calibration : dict
+        The calibration to save.
+    """
     with open(path, "w") as f:
         yaml.dump(calibration, f, default_flow_style=False)
 
@@ -1397,8 +1416,16 @@ def _to_dict_walk(node: dict) -> dict:
 
 
 def save_user_settings(settings: dict) -> None:
-    """Save user settings, for example, the default directory for
-    loading/saving files to a YAML file."""
+    """Save user settings to ``~/.picasso/settings.yaml``.
+
+    For example, the default directory for loading and saving files.
+
+    Parameters
+    ----------
+    settings : dict
+        The settings to save; nested mappings are converted to plain dicts
+        first so PyYAML does not tag them.
+    """
     settings = _to_dict_walk(settings)
     settings_filename = _user_settings_filename()
     os.makedirs(os.path.dirname(settings_filename), exist_ok=True)
@@ -1622,6 +1649,14 @@ class AbstractPicassoMovie(abc.ABC):
 
     @abc.abstractmethod
     def info(self):
+        """Read the movie's metadata.
+
+        Returns
+        -------
+        info : list of dicts or dict
+            Movie metadata, with at least "Byte Order", "Data Type",
+            "Frames", "Height" and "Width".
+        """
         pass
 
     @abc.abstractmethod
@@ -1669,19 +1704,43 @@ class AbstractPicassoMovie(abc.ABC):
         return self.n_frames
 
     def close(self):
+        """Release the file handle(s) the movie holds. A no-op by default."""
         pass
 
     @abc.abstractmethod
     def get_frame(self, index: int) -> lib.IntArray2D:
+        """Load one frame of the movie.
+
+        Parameters
+        ----------
+        index : int
+            Frame index.
+
+        Returns
+        -------
+        frame : lib.IntArray2D
+            ``(height, width)`` raw camera counts.
+        """
         pass
 
     @abc.abstractmethod
     def tofile(self, file_handle, byte_order=None):
+        """Write the whole movie to an open file as raw binary.
+
+        Parameters
+        ----------
+        file_handle : file object
+            Destination, opened in binary write mode.
+        byte_order : str, optional
+            Byte order to write in (``"<"`` or ``">"``). None keeps the
+            movie's own. Default None.
+        """
         pass
 
     @property
     @abc.abstractmethod
     def dtype(self):
+        """The dtype of the frames this movie yields."""
         return "u16"
 
 
@@ -2004,6 +2063,7 @@ class ND2Movie(AbstractPicassoMovie):
 
     @property
     def shape(self) -> tuple[int, int, int]:
+        """``(n_frames, height, width)`` of the movie."""
         return self._shape
 
     def close(self):
@@ -2231,6 +2291,7 @@ class _MultiDimMovie(AbstractPicassoMovie):
 
     @property
     def shape(self) -> tuple[int, int, int]:
+        """``(n_frames, height, width)`` of the movie."""
         return (self.n_frames, self.height, self.width)
 
     @property
@@ -2954,10 +3015,15 @@ class TiffMap(_PerThreadFileHandles):
         return self.n_frames
 
     def info(self) -> dict:
-        """Extract metadata from the TIFF file and return it as a
-        Picasso info dictionary: byte order, file path, height, width,
-        data type, number of frames, and - for MicroManager files - the
-        MicroManager metadata, camera name and acquisition comments."""
+        """Extract metadata from the TIFF file.
+
+        Returns
+        -------
+        info : dict
+            Byte order, file path, height, width, data type, number of
+            frames, and - for MicroManager files - the MicroManager metadata,
+            camera name and acquisition comments.
+        """
         info = {
             "Byte Order": self._tif_byte_order,
             "File": self.path,
@@ -2983,7 +3049,18 @@ class TiffMap(_PerThreadFileHandles):
         Uncompressed, contiguous, single-strip pages are read directly
         from their precomputed file offset with ``np.fromfile`` (one
         large sequential read, no decode overhead and no per-frame IFD
-        parse); all other layouts fall back to ``tifffile``'s decoder."""
+        parse); all other layouts fall back to ``tifffile``'s decoder.
+
+        Parameters
+        ----------
+        index : int
+            Frame index.
+
+        Returns
+        -------
+        frame : lib.IntArray2D
+            ``(height, width)`` raw camera counts.
+        """
         if self._offsets is not None:
             # Fast path: pure seek + read on this thread's own handle, no
             # tifffile access and no shared lock, so reads from different
@@ -3130,7 +3207,14 @@ class STKMovie(AbstractPicassoMovie, _PerThreadFileHandles):
         return self.n_frames
 
     def info(self) -> dict:
-        """Return Picasso-compatible metadata dictionary."""
+        """Read the STK file's metadata.
+
+        Returns
+        -------
+        info : dict
+            Byte order, file path, height, width, data type and number of
+            frames, plus whatever the STK header carries.
+        """
         info = {
             "Byte Order": "<",
             "File": self.path,
@@ -3169,7 +3253,23 @@ class STKMovie(AbstractPicassoMovie, _PerThreadFileHandles):
         }
 
     def get_frame(self, index: int) -> lib.IntArray2D:
-        """Load one frame from the STK file by binary offset."""
+        """Load one frame from the STK file by binary offset.
+
+        Parameters
+        ----------
+        index : int
+            Frame index; negative values count from the end.
+
+        Returns
+        -------
+        frame : lib.IntArray2D
+            ``(height, width)`` raw camera counts.
+
+        Raises
+        ------
+        IndexError
+            If ``index`` is out of range.
+        """
         if index < 0:
             index = self.n_frames + index
         if not (0 <= index < self.n_frames):
@@ -3501,7 +3601,8 @@ class TiffMultiMap(AbstractPicassoMovie):
         This code has been moved from localize to here, as it is file type
         specific (HG, April 2022).
 
-        Args:
+        Parameters
+        ----------
         config : dict
             Description of camera parameters (for all possible
             settings).
@@ -3731,12 +3832,22 @@ class MMSeparateTiffMovie(TiffMultiMap):
 
 def find_mm_separate_first(directory: str) -> str | None:
     """Return the first-frame path of a MicroManager "separate image
-    files" acquisition inside ``directory``, or ``None`` if the folder
-    holds no such sequence.
+    files" acquisition inside ``directory``.
 
     Passing the returned path to :func:`load_tif` (or :func:`load_movie`)
     assembles the whole folder into a single movie, because those loaders
     detect the separate-files layout via :func:`_mm_separate_files`.
+
+    Parameters
+    ----------
+    directory : str
+        Folder to inspect.
+
+    Returns
+    -------
+    path : str or None
+        The first frame's path, or ``None`` if the folder holds no such
+        sequence (or cannot be listed).
     """
     try:
         names = sorted(
@@ -3840,6 +3951,12 @@ class ConcatenatedTiffMovie(TiffMultiMap):
         saved localization metadata, so it stays reconstructable which
         folders went into the movie and which frame range came from
         which file - otherwise unrecoverable after the fact.
+
+        Returns
+        -------
+        info : dict
+            The first file's metadata, with ``Frames`` set to the total,
+            plus ``Concatenated Files`` and ``Frames per File``.
         """
         info = self.maps[0].info()
         info["Frames"] = self.n_frames
@@ -3851,7 +3968,18 @@ class ConcatenatedTiffMovie(TiffMultiMap):
 
 def natural_key(text: str) -> list:
     """Sort key that orders embedded numbers numerically, so ``file_2``
-    comes before ``file_10``."""
+    comes before ``file_10``.
+
+    Parameters
+    ----------
+    text : str
+        The string to build a key for.
+
+    Returns
+    -------
+    key : list
+        Alternating lower-cased text and integer parts.
+    """
     return [
         int(part) if part.isdigit() else part.lower()
         for part in re.split(r"(\d+)", text)
@@ -3860,7 +3988,18 @@ def natural_key(text: str) -> list:
 
 def natural_path_key(path: str) -> tuple:
     """Sort key ordering paths by folder, then file name, with numbers
-    compared numerically (see :func:`natural_key`)."""
+    compared numerically (see :func:`natural_key`).
+
+    Parameters
+    ----------
+    path : str
+        The path to build a key for.
+
+    Returns
+    -------
+    key : tuple
+        ``(key of the folder, key of the file name)``.
+    """
     return (
         natural_key(os.path.dirname(path)),
         natural_key(os.path.basename(path)),
@@ -3876,7 +4015,17 @@ _OME_CONTINUATION_RE = re.compile(r"_\d+\.ome\.tif$", re.IGNORECASE)
 def is_ome_continuation(path: str) -> bool:
     """Whether ``path`` is a continuation file of a multi-file OME set
     (``*_1.ome.tif``), i.e. part of another file's movie rather than a
-    movie of its own."""
+    movie of its own.
+
+    Parameters
+    ----------
+    path : str
+        The path to test.
+
+    Returns
+    -------
+    is_continuation : bool
+    """
     return _OME_CONTINUATION_RE.search(os.path.basename(path)) is not None
 
 

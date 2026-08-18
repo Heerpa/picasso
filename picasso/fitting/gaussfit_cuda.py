@@ -541,8 +541,9 @@ def fit_spots(
         ``localize._initial_parameters_gauss``.
     mle : bool, optional
         Use the Poisson maximum-likelihood estimator instead of least squares.
-    tolerance, max_iterations : optional
-        ``None`` uses :data:`TOLERANCE` / :data:`MAX_ITERATIONS`.
+    tolerance, max_iterations : float and int, optional
+        Convergence schedule. ``None`` (the default) uses :data:`TOLERANCE` /
+        :data:`MAX_ITERATIONS`.
     progress_callback, abort_callback, single_precision
         As :func:`picasso.fitting.splinefit_cuda.fit_spots`.
     variance : np.ndarray, optional
@@ -552,8 +553,15 @@ def fit_spots(
 
     Returns
     -------
-    thetas, chi_squares, states, iterations
-        Using Gpufit's state codes (see ``splinefit.FIT_STATE_CONVERGED``).
+    thetas : np.ndarray
+        ``(n_spots, n_params)`` fitted parameters.
+    chi_squares : np.ndarray
+        ``(n_spots,)`` chi-square at the optimum.
+    states : np.ndarray
+        ``(n_spots,)`` per-spot fit state, using Gpufit's codes (see
+        ``splinefit.FIT_STATE_CONVERGED``).
+    iterations : np.ndarray
+        ``(n_spots,)`` iterations used.
     """
     lmfit_cuda.require_cuda()
     spots = np.asarray(spots)

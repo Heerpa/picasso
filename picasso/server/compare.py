@@ -10,12 +10,21 @@ import plotly.express as px
 
 @st.cache_data
 def load_file(path: str):
-    """Loads a localization file and returns as pandas Dataframe.
+    """Load a localization file and return it as a pandas DataFrame.
+
     Adds a column with the filename.
 
-    Args:
-        path (str): Path to localization file.
-        file (str): filename
+    Parameters
+    ----------
+    path : str
+        Path to the localization file.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        The localizations, with an added ``file`` column.
+    info : list of dicts
+        Localizations metadata.
     """
 
     locs, info = io.load_locs(path)
@@ -25,12 +34,22 @@ def load_file(path: str):
 
 
 def get_file_family(file: str):
-    """Returns all files that belong to a parent file for picasso.
-    E.g. for a folder with 'file.hdf5' and 'file_undrift.hdf5',
-    when searching for 'file.hdf5', both files will be returned.
+    """Return all files that belong to a parent file for picasso.
 
-    Args:
-        file (str): Path to file.
+    E.g. for a folder with 'file.hdf5' and 'file_undrift.hdf5', when
+    searching for 'file.hdf5', both files will be returned.
+
+    Parameters
+    ----------
+    file : str
+        Path to the parent file.
+
+    Returns
+    -------
+    files : list of str
+        Names of the ``.hdf5`` files sharing its base name.
+    folder : str
+        The folder they live in.
     """
     base = os.path.split(file)[1].split(".")[0]
     folder = os.path.dirname(file)
@@ -42,10 +61,12 @@ def get_file_family(file: str):
 
 
 def locs_per_frame_plot(hdf_dict: dict):
-    """Plots the localizations per frame.
+    """Plot the localizations per frame.
 
-    Args:
-        hdf_dict (dict): Dictionary with hdf summary information
+    Parameters
+    ----------
+    hdf_dict : dict
+        Maps each file name to its localizations data frame.
     """
     smooth = st.number_input("Smooth", value=100, min_value=1, max_value=1000)
     summary = []
@@ -81,11 +102,14 @@ def locs_per_frame_plot(hdf_dict: dict):
 
 
 def hist_plot(hdf_dict: dict, locs: pd.DataFrame):
-    """Plots a histogram for a given hdf dictionary.
+    """Plot a histogram for a given hdf dictionary.
 
-    Args:
-        hdf_dict (dict): Dictionary with summary stats per file.
-        locs (pd.DataFrame): pandas Dataframe with localizations.
+    Parameters
+    ----------
+    hdf_dict : dict
+        Maps each file name to its localizations data frame.
+    locs : pd.DataFrame
+        Localizations, read for the list of selectable columns.
     """
 
     c1, c2, c3, c4 = st.columns(4)

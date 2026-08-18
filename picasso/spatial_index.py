@@ -151,8 +151,21 @@ def build_render_index(
 ) -> RenderIndexPyramid | None:
     """Build the pyramid for one channel's locs.
 
-    Returns ``None`` if required metadata is missing -- callers should
-    fall back to the existing brute-force viewport filter in that case.
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        The localizations to index, with ``x`` and ``y`` columns.
+    info : list of dicts
+        Localizations metadata; "Width" and "Height" are required.
+    n_levels : int, optional
+        Number of pyramid levels, each with blocks 4x larger than the last.
+        Default 3.
+
+    Returns
+    -------
+    pyramid : RenderIndexPyramid or None
+        ``None`` if required metadata is missing -- callers should fall back
+        to the existing brute-force viewport filter in that case.
     """
     width = lib.get_from_metadata(info, "Width")
     height = lib.get_from_metadata(info, "Height")
@@ -279,6 +292,19 @@ def query_viewport(
     DataFrame via ``iloc`` costs more than letting the renderer scan
     the full locs with its vectorised ``in_view`` mask. The caller
     treats ``None`` as "no pre-filter, use the full locs".
+
+    Parameters
+    ----------
+    pyramid : RenderIndexPyramid
+        The index built by :func:`build_render_index`.
+    viewport : tuple
+        ``((y_min, x_min), (y_max, x_max))`` in camera pixels.
+
+    Returns
+    -------
+    indices : lib.IntArray1D or None
+        Positions into the original locs DataFrame, or ``None`` for a
+        (near-)full-FOV viewport, as described above.
     """
     (y_min, x_min), (y_max, x_max) = viewport
     # Bypass for (near-)full-FOV viewports -- see module-level constant.

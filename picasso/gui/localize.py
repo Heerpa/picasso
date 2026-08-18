@@ -1186,9 +1186,7 @@ class CamSettingComboBoxDict(UserDict):
         cam : str
             Camera name to set.
         values : dict
-            keys: Sensitivity categories.
-
-            values: The values to set.
+            Maps a sensitivity category to the value to set for it.
         """
         for i, cat in enumerate(self.sensitivity_categories[cam]):
             if cat in values:

@@ -1033,28 +1033,74 @@ def build_psf_template(
     """Build a normalized PSF template volume from a bead z-stack.
 
     This is the template-building part of the calibration (no coefficient
-    computation), factored out so it can be unit-tested. Returns a dict with keys
-    ``template`` (box, box, n_steps), ``z_center``, ``effective_sigma``,
-    ``background``, ``amplitude``, ``photon_scale``, ``n_beads``,
-    ``n_beads_used`` (beads that survived the outlier filtering),
-    ``z_of_step``, ``gof``, ``registered`` (the 3D-registered individual
-    bead volumes, ``(n_used, box, box, n_steps)``, photon units, used for the
-    goodness-of-fit) and ``bead_quality`` (the per-bead accept/reject record
-    of that filtering with the central views of every bead, see
-    ``_bead_quality_summary``).
+    computation), factored out so it can be unit-tested.
 
-    If ``return_spots`` is True, the dict also carries ``spots`` (every
-    individual per-frame bead spot, ``(n_spots, box, box)``, photon units),
-    ``spot_step_idx`` (the index into the template z-axis of each spot's stage
-    step) and ``spot_bead_idx`` (the row of ``beads`` each spot came from),
-    which ``_axial_precision`` fits one by one to measure the axial precision
-    in the realistic single-frame regime.
+    Parameters
+    ----------
+    movie : localize.LoadedMovie
+        The bead z-stack movie (as loaded by ``picasso.io.load_movie``).
+    camera_info : dict
+        Camera information ("Baseline", "Sensitivity", "Gain", "Pixelsize").
+    box : int
+        Lateral ROI size (camera pixels).
+    minimum_ng : float
+        Minimum net gradient for bead detection. Ignored if ``beads`` is
+        given.
+    d : float
+        Step size in nm between consecutive z (stage) positions.
+    frames_per_step : int, optional
+        Number of frames acquired at each z position (multi-FOV). Default 1.
+    frame_bounds : tuple, list of tuples, optional
+        Frame numbers to consider (see ``zfit.calibrate_z``). Default None.
+    frame_order : {"fov", "z"}, optional
+        Acquisition order when ``frames_per_step`` > 1 (see
+        ``zfit.calibrate_z``). Default "fov".
+    threaded : bool, optional
+        Whether bead detection runs on several threads. Default True.
+    beads : pd.DataFrame, optional
+        Bead positions to use, with integer ``x``/``y`` columns. If given,
+        they are used instead of detecting beads on this movie - this lets the
+        multichannel calibration reuse the same physical beads, mapped into
+        each channel, across all channels. Otherwise beads are detected on
+        this movie (see ``_detect_bead_positions``). Default None.
+    return_spots : bool, optional
+        Whether to also return the individual per-frame bead spots (see
+        below). Default False.
+    roi : tuple or list of tuples, optional
+        Region(s) of interest for bead detection, in the same
+        ``[[y_min, x_min], [y_max, x_max]]`` form as ``localize.identify``.
+        Only beads inside the ROI(s) are used; None (or an empty list) uses
+        the whole frame. Ignored if ``beads`` is given. Default None.
 
-    If ``beads`` (a data frame with integer ``x``/``y`` columns) is given, it
-    is used instead of detecting beads on this movie - this lets the
-    multichannel calibration reuse the same physical beads, mapped into each
-    channel, across all channels. Otherwise beads are detected on this movie,
-    restricted to ``roi`` if given (see ``_detect_bead_positions``).
+    Returns
+    -------
+    built : dict
+        With keys:
+
+        * ``template`` - ``(box, box, n_steps)`` normalized PSF volume.
+        * ``z_center`` (int) - index of the in-focus (sharpest) slice.
+        * ``z_focus`` (float) - fractional slice of the axial intensity peak.
+        * ``effective_sigma`` (float) - Gaussian sigma at focus (px).
+        * ``background``, ``amplitude``, ``photon_scale`` (float) - the
+          normalization of the template.
+        * ``n_beads`` (int) - beads detected or supplied.
+        * ``n_beads_used`` (int) - beads that survived the outlier filtering.
+        * ``z_of_step`` - stage z (nm) of each template slice.
+        * ``gof`` (dict) - goodness of fit of the template to the individual
+          beads (see ``_goodness_of_fit``).
+        * ``registered`` - ``(n_used, box, box, n_steps)`` 3D-registered
+          individual bead volumes in photon units, used for the
+          goodness-of-fit.
+        * ``bead_quality`` - per-bead accept/reject record of the outlier
+          filtering, with the central views of every bead (see
+          ``_bead_quality_summary``).
+
+        If ``return_spots`` is True, the dict also carries ``spots`` (every
+        individual per-frame bead spot, ``(n_spots, box, box)``, photon
+        units), ``spot_step_idx`` (the index into the template z-axis of each
+        spot's stage step) and ``spot_bead_idx`` (the row of ``beads`` each
+        spot came from), which ``_axial_precision`` fits one by one to measure
+        the axial precision in the realistic single-frame regime.
     """
     n_frames = int(movie.shape[0])
     step_of_frame, z_of_step, step_range = _step_of_frame(
@@ -1227,6 +1273,9 @@ def calibrate_spline(
     calibration : dict
         The spline PSF calibration (see ``io.save_spline_calibration`` /
         ``io.load_spline_calibration`` and ``localize.fit_spots_spline``).
+    diagnostics : list
+        Only if ``return_diagnostics`` is True: a one-element list holding the
+        bead inspection record (see :func:`bead_inspection_data`).
     """
     assert model in (
         "spline-2d",
@@ -1387,8 +1436,18 @@ def registration_model_name(calibration: dict) -> str | None:
     """The model a multichannel calibration's channels were registered with.
 
     Read off the stored transforms themselves rather than a separate key, so
-    it cannot disagree with them. None if the calibration carries no channel
-    transforms (i.e. it is single-channel).
+    it cannot disagree with them.
+
+    Parameters
+    ----------
+    calibration : dict
+        A spline PSF calibration.
+
+    Returns
+    -------
+    model : str or None
+        One of ``picasso.transforms.MODELS``, or None if the calibration
+        carries no channel transforms (i.e. it is single-channel).
     """
     stored = calibration.get("channel_transforms")
     if not stored:
@@ -1897,28 +1956,108 @@ def calibrate_spline_multichannel(
     The transforms are stored in the calibration and reused at fit time by
     ``localize.fit_spline_multichannel`` / ``get_spots_multichannel``.
 
-    Parameters are as in ``calibrate_spline`` but per-channel lists; all movies
-    must share the same frame layout (z scan). ``minimum_ng`` may likewise be a
-    per-channel sequence (in the order of ``movies`` / ``regions``), since the
-    channels need not share a bead-brightness scale; a scalar applies to all.
-    ``roi`` (in reference-channel
-    coordinates) restricts which reference-channel beads are calibrated on; the
-    channel-to-channel transform is still estimated from all detected beads.
-    Returns a ``"spline-3d-multichannel"`` calibration dict - or, with
-    ``return_diagnostics``, ``(calibration, diagnostics)`` with one bead
-    inspection record per channel (see :func:`bead_inspection_data`).
-
     **Split-FOV mode** (``regions`` given): the channels are rectangular
     sub-regions of a *single* movie (all ``movies`` entries are the same movie).
-    ``regions`` is a list of ``[[y_min, x_min], [y_max, x_max]]`` rectangles,
-    one per channel, all the same size; ``regions[reference]`` is the reference
-    channel. Reference beads are detected inside the reference region and each
+    Reference beads are detected inside the reference region and each
     channel-to-channel transform is estimated from beads inside that channel's
     region, pre-aligned by the known region-origin offset (see
     :func:`_estimate_channel_transform`). The regions and reference index are
     stored in the calibration so the fit path can rebuild the single-movie
     channel stack. Prefer the :func:`calibrate_spline_split_fov` wrapper, which
     builds the repeated per-channel lists for you.
+
+    Parameters
+    ----------
+    movies : list of localize.LoadedMovie
+        One bead z-stack per channel, the reference channel first. All movies
+        must share the same frame layout (z scan). In split-FOV mode every
+        entry is the same movie.
+    infos : list of list of dicts
+        Movie metadata, one per channel.
+    camera_infos : list of dicts
+        Camera information ("Baseline", "Sensitivity", "Gain", "Pixelsize"),
+        one per channel.
+    box : int
+        Lateral ROI size (camera pixels). The resulting calibration expects
+        fits with this same box size.
+    minimum_ng : float or sequence of float
+        Minimum net gradient for bead detection. May be a per-channel sequence
+        (in the order of ``movies`` / ``regions``), since the channels need
+        not share a bead-brightness scale; a scalar applies to all.
+    d : float
+        Step size in nm between consecutive z (stage) positions.
+    frames_per_step : int, optional
+        Number of frames acquired at each z position (multi-FOV). Default 1.
+    frame_bounds : tuple, list of tuples, optional
+        Frame numbers to consider (see ``zfit.calibrate_z``). Default None.
+    frame_order : {"fov", "z"}, optional
+        Acquisition order when ``frames_per_step`` > 1 (see
+        ``zfit.calibrate_z``). Default "fov".
+    magnification_factor : float, optional
+        Ratio between the actual axial position and the stage travel of the
+        calibration scan (refractive-index mismatch). Stored in the
+        calibration. Default 0.79.
+    correct_z_bias : bool, optional
+        If True, define z = 0 at the axial intensity peak of the averaged PSF
+        instead of at the raw stage-scan center. See ``calibrate_spline``.
+        Default False.
+    max_match_distance : float, optional
+        Largest distance (camera pixels) at which a reference bead and a
+        channel bead may be paired during registration. None (the default)
+        uses ``box``.
+    photon_ratios : np.ndarray or list, optional
+        Per-channel photon splitting ratios of a ratiometric setup, stored in
+        the calibration for ``localize.fit_spline_multichannel_ratiometric``.
+        None (the default) stores none.
+    link_photons : bool, optional
+        Recorded in the calibration as the model its fits should use: True
+        (the default) links one photon count and background across all
+        channels, False lets each channel have its own (the photon-decoupled
+        model, see ``localize.fit_spline_multichannel``). Read back by the
+        calibration's own diagnostics and by the fit path.
+    roi : tuple or list of tuples, optional
+        Region(s) of interest in reference-channel coordinates, in the same
+        ``[[y_min, x_min], [y_max, x_max]]`` form as ``localize.identify``,
+        restricting which reference-channel beads are calibrated on; the
+        channel-to-channel transform is still estimated from all detected
+        beads. Default None.
+    regions : list, optional
+        Split-FOV mode: one ``[[y_min, x_min], [y_max, x_max]]`` rectangle per
+        channel, all the same size. None (the default) treats ``movies`` as
+        genuinely separate movies.
+    reference : int, optional
+        Split-FOV mode: index into ``regions`` of the reference channel; the
+        channels are reordered so that it comes first. Default 0.
+    path : str, optional
+        Where to save the calibration (HDF5) and the diagnostic PNGs. If None,
+        nothing is written. Default None.
+    progress_callback : callable, optional
+        Called with an integer step count as the calibration proceeds.
+    return_diagnostics : bool, optional
+        If True, return ``(calibration, diagnostics)``. Default False.
+    model : str, optional
+        Transform model for the channel registration, one of
+        ``picasso.transforms.MODELS``. Default "affine".
+
+    Returns
+    -------
+    calibration : dict
+        The ``"spline-3d-multichannel"`` calibration (see
+        ``io.save_spline_calibration`` and
+        ``localize.fit_spline_multichannel``), carrying the channel transforms
+        and, in split-FOV mode, ``split_fov``, ``regions`` and ``reference``.
+    diagnostics : list
+        Only if ``return_diagnostics`` is True: one bead inspection record per
+        channel (see :func:`bead_inspection_data`).
+
+    Raises
+    ------
+    ValueError
+        If fewer than two channels are given, if ``movies``, ``infos`` and
+        ``camera_infos`` disagree in length, if the split-FOV regions do not
+        match the channel count, do not share a size, or ``reference`` is out
+        of range, or if the bead correspondences are too few or the fitted
+        registration is geometrically implausible.
     """
     n_channels = len(movies)
     if n_channels < 2:
@@ -2661,13 +2800,32 @@ def calibrate_spline_split_fov(
         produced by the GUI ROI tool), all the same size.
     reference : int, optional
         Index into ``regions`` of the reference channel. Default 0.
-    minimum_ng : float or sequence of float, optional
+    minimum_ng : float or sequence of float
         Bead detection threshold, shared or one per region (in the order of
         ``regions``, i.e. before the reference-first reordering).
+    box, d, frames_per_step, frame_bounds, frame_order
+        As in :func:`calibrate_spline_multichannel`.
+    magnification_factor, correct_z_bias, max_match_distance
+        As in :func:`calibrate_spline_multichannel`.
+    photon_ratios, link_photons, path, progress_callback
+        As in :func:`calibrate_spline_multichannel`.
+    return_diagnostics, model
+        As in :func:`calibrate_spline_multichannel`.
 
-    Remaining parameters are as in :func:`calibrate_spline_multichannel`.
-    Returns a ``"spline-3d-multichannel"`` calibration with ``split_fov``,
-    ``regions`` and ``reference`` stored for the fit path.
+    Returns
+    -------
+    calibration : dict
+        A ``"spline-3d-multichannel"`` calibration with ``split_fov``,
+        ``regions`` and ``reference`` stored for the fit path.
+    diagnostics : list
+        Only if ``return_diagnostics`` is True: one bead inspection record per
+        channel (see :func:`bead_inspection_data`).
+
+    Raises
+    ------
+    ValueError
+        If fewer than two regions are given, plus everything
+        :func:`calibrate_spline_multichannel` raises.
     """
     n_channels = len(regions)
     if n_channels < 2:
@@ -2833,19 +2991,47 @@ def estimate_transforms_from_identifications(
     Mirrored channels (the common case for image splitters) are therefore picked
     up automatically, which an identity assumption cannot do.
 
-    ``identifications`` is one detection table per channel in **absolute**
-    coordinates, reference first; for split-FOV pass the detections of each
-    region plus the ``regions`` themselves. Returns one ``(2, 3)`` transform per
-    channel (the reference's is the identity) with ``None`` for channels that
-    could not be registered, or ``None`` if none of them could.
+    Parameters
+    ----------
+    identifications : list
+        One detection table (with ``frame``, ``x``, ``y`` columns) per
+        channel, in **absolute** coordinates, reference first. For split-FOV
+        pass the detections of each region plus the ``regions`` themselves.
+    box : int
+        Lateral ROI size (camera pixels); sets the ICP pairing radii, which
+        shrink from ``1.5 * box`` to about ``0.3 * box`` (never below 2 px).
+    regions : list, optional
+        Split-FOV mode: one ``[[y_min, x_min], [y_max, x_max]]`` rectangle per
+        channel, used to place the coarse mirror seeds. Default None.
+    frame_shape : tuple, optional
+        ``(height, width)`` of the frame, used to mirror about the frame
+        rather than about the detections themselves when no ``regions`` are
+        given. Default None.
+    max_frames : int, optional
+        How many frames are sampled. A dim channel yields few detections per
+        frame, so a caller that needs every channel registered (the
+        channel-sum identification, which must not fall back to the identity)
+        should raise it. Default 50.
+    n_iter : int, optional
+        Number of ICP iterations, i.e. of pairing radii. Default 4.
+    min_pairs : int, optional
+        Fewest correspondences at the tightest radius for a channel to count
+        as registered. Default 10.
+    return_diagnostics : bool, optional
+        If True, also return the per-channel correspondence counts. Default
+        False.
 
-    ``max_frames`` bounds how many frames are sampled; a dim channel yields few
-    detections per frame, so a caller that needs every channel registered (the
-    channel-sum identification, which must not fall back to the identity)
-    should raise it. With ``return_diagnostics`` the number of correspondences
-    each channel was registered on is returned alongside the transforms (0 for
-    the reference and for channels that failed), so the caller can say *which*
-    channel could not be registered.
+    Returns
+    -------
+    transforms : list or None
+        One ``picasso.transforms.Transform`` per channel (the reference's is
+        the identity), with ``None`` for channels that could not be
+        registered; ``None`` altogether if none of them could.
+    n_pairs : list
+        Only if ``return_diagnostics`` is True: the number of correspondences
+        each channel was registered on (0 for the reference and for channels
+        that failed), so the caller can say *which* channel could not be
+        registered.
     """
     n_channels = len(identifications)
 
@@ -2982,24 +3168,71 @@ def refine_split_fov_transforms_from_signal(
        iterations with a shrinking radius tighten it and a final robust trim
        drops the coincidental (non-physical) pairs.
 
-    ``regions`` are the channel ROIs in the current data (reference first, e.g.
-    freshly drawn in the GUI); ``minimum_ng`` may be a matching per-region
-    sequence. The PSF ``coefficients`` are untouched; only the
-    registration (``channel_registration`` / ``channel_transforms`` /
-    ``regions`` / ``region_size``) is updated. Requires channels that share
-    signal.
+    The PSF ``coefficients`` are untouched; only the registration
+    (``channel_registration`` / ``channel_transforms`` / ``regions`` /
+    ``region_size``) is updated. Requires channels that share signal.
 
-    ``model`` selects the transform model (see :mod:`picasso.transforms`);
-    it defaults to the one the calibration was registered with, so a plain
-    re-registration keeps it. Only the final ICP
-    iteration fits that model - see :func:`_fit_registration`.
+    Parameters
+    ----------
+    movie : localize.LoadedMovie
+        The single-molecule movie holding every region.
+    calibration : dict
+        A split-FOV multichannel spline calibration, as returned by
+        :func:`calibrate_spline_split_fov`.
+    regions : list
+        The channel ROIs in the current data (e.g. freshly drawn in the GUI),
+        one ``[[y_min, x_min], [y_max, x_max]]`` rectangle per channel, all
+        the same size.
+    minimum_ng : float or sequence of float
+        Minimum net gradient for single-molecule detection, shared or one per
+        region (in the order of ``regions``).
+    box : int, optional
+        Lateral ROI size (camera pixels). None (the default) uses the
+        calibration's own box.
+    reference : int, optional
+        Index into ``regions`` of the reference channel; the channels are
+        reordered so that it comes first. Default 0.
+    frame_bounds : tuple, list of tuples, optional
+        Frame numbers to consider (see :func:`localize.identify`). Default
+        None (all frames).
+    max_frames : int, optional
+        How many evenly-spaced frames are sampled. Default 50.
+    max_pair_distance : float, optional
+        Largest distance (camera pixels) at which a reference and a channel
+        detection may be paired. None (the default) uses ``1.5 * box``.
+    n_iter : int, optional
+        Number of ICP iterations. Default 4.
+    min_pairs : int, optional
+        Fewest surviving correspondences for a channel to be re-registered.
+        Default 20.
+    update : bool, optional
+        Whether to write the new registration into ``calibration`` (in place).
+        False only computes the transforms. Default True.
+    model : str, optional
+        The transform model (see :mod:`picasso.transforms`). None (the
+        default) uses the one the calibration was registered with, so a plain
+        re-registration keeps it. Only the final ICP iteration fits that model
+        - see :func:`_fit_registration`.
 
-    Returns ``(calibration, reg_info)`` where ``reg_info`` lists, per channel,
-    the number of matched pairs, their coordinates, the fitted transform, the
-    residual RMS (camera px) and the model actually fitted (``"model"``, which
-    falls back to affine when too few pairs survive for ``model_requested``).
-    With ``update=True`` the passed calibration is modified in place; set it
-    False to only compute the transforms.
+    Returns
+    -------
+    calibration : dict
+        The calibration, with the registration updated if ``update``.
+    reg_info : list
+        One dict per non-reference channel with the channel index
+        (``"channel"``), the number of matched pairs (``"n_matches"``), their
+        coordinates (``"ref_xy"``, ``"c_xy"``), the fitted transform
+        (``"transform"``), the residual RMS in camera pixels (``"rms"``), the
+        model actually fitted (``"model"``, which falls back to affine when
+        too few pairs survive) and the one asked for
+        (``"model_requested"``).
+
+    Raises
+    ------
+    ValueError
+        If the calibration is not split-FOV, if ``regions`` does not match its
+        channel count or the regions differ in size, if ``reference`` is out
+        of range, or if no frames fall inside ``frame_bounds``.
     """
     if not calibration.get("split_fov"):
         raise ValueError(
@@ -3235,13 +3468,57 @@ def refine_multichannel_transforms_from_signal(
 
     Unlike the split-FOV refinement this needs no ``regions`` - the channels are
     whole separate movies - so only ``channel_transforms`` is updated (the PSF
-    ``coefficients`` are untouched). ``movies`` are the loaded channel movies in
-    calibration order (reference first).
+    ``coefficients`` are untouched).
 
-    Returns ``(calibration, reg_info)`` where ``reg_info`` lists, per non-
-    reference channel, the number of matched pairs, their coordinates, the fitted
-    transform and the residual RMS (camera px). With ``update=True`` the passed
-    calibration is modified in place.
+    Parameters
+    ----------
+    movies : list
+        The loaded channel movies, in calibration order.
+    calibration : dict
+        A separate-movie multichannel spline calibration.
+    minimum_ng : float or sequence of float
+        Minimum net gradient for single-molecule detection, shared or one per
+        channel.
+    box : int, optional
+        Lateral ROI size (camera pixels). None (the default) uses the
+        calibration's own box.
+    reference : int, optional
+        Index of the reference channel; the channels are reordered so that it
+        comes first. Default 0.
+    frame_bounds : tuple, list of tuples, optional
+        Frame numbers to consider (see :func:`localize.identify`). Default
+        None (all frames).
+    max_frames : int, optional
+        How many evenly-spaced frames are sampled. Default 50.
+    max_pair_distance : float, optional
+        Largest distance (camera pixels) at which a reference and a channel
+        detection may be paired. None (the default) is derived from ``box``.
+    n_iter : int, optional
+        Number of ICP iterations. Default 4.
+    min_pairs : int, optional
+        Fewest surviving correspondences for a channel to be re-registered.
+        Default 20.
+    update : bool, optional
+        Whether to write the new transforms into ``calibration`` (in place).
+        Default True.
+    model : str, optional
+        The transform model (see :mod:`picasso.transforms`). None (the
+        default) uses the one the calibration was registered with.
+
+    Returns
+    -------
+    calibration : dict
+        The calibration, with ``channel_transforms`` updated if ``update``.
+    reg_info : list
+        One dict per non-reference channel, as in
+        :func:`refine_split_fov_transforms_from_signal`.
+
+    Raises
+    ------
+    ValueError
+        If the calibration is split-FOV, carries no ``channel_transforms``,
+        or its channel count disagrees with ``movies`` or with the stored
+        transforms, or if ``reference`` is out of range.
     """
     if calibration.get("split_fov"):
         raise ValueError(
@@ -4003,11 +4280,21 @@ def _save_diagnostic_plot(
 def n_beads_used(calibration: dict) -> int:
     """How many beads actually went into the calibration's PSF.
 
-    A multichannel calibration stores one count per channel; the reference
-    channel's is the meaningful single number, since it is the channel the
-    beads were detected on. Falls back to the detected bead count for a
-    calibration built before the filtering was recorded, so a caller can
-    always compare it against ``n_beads``."""
+    Parameters
+    ----------
+    calibration : dict
+        A spline PSF calibration.
+
+    Returns
+    -------
+    n_used : int
+        Beads that survived the outlier filtering. A multichannel calibration
+        stores one count per channel; the reference channel's is the
+        meaningful single number, since it is the channel the beads were
+        detected on. Falls back to the detected bead count for a calibration
+        built before the filtering was recorded, so a caller can always
+        compare it against ``n_beads``.
+    """
     detected = int(calibration.get("n_beads", 0))
     used = calibration.get("n_beads_used", detected)
     if isinstance(used, (list, tuple, np.ndarray)):
@@ -4028,8 +4315,28 @@ def bead_inspection_data(
     hand to the GUI (see the localize GUI's bead inspector) and to plot with
     :func:`plot_bead_gallery`.
 
-    Returns None for a ``built`` dict without the per-bead record (e.g. one
-    produced by an older version).
+    Parameters
+    ----------
+    built : dict
+        The template record from :func:`build_psf_template`, which must carry
+        ``bead_quality``.
+    calibration : dict
+        The calibration built from it; read for ``z_center`` and
+        ``pixelsize``.
+    label : str, optional
+        Name shown above the gallery, e.g. the channel. Default "".
+
+    Returns
+    -------
+    data : dict or None
+        With the per-bead accept flags (``keep``), the two dissimilarity
+        measures (``ncc``, ``mse``) and the thresholds applied (``ncc_min``,
+        ``mse_max``, ``fallback``), each bead's position (``x``, ``y``) and
+        central views (``xy``, ``xz``, ``yz``), the averaged PSF in the same
+        three views (``template_xy``, ``template_xz``, ``template_yz``), the
+        cross-section z axis in nm relative to the fitter's z = 0 (``z_nm``),
+        the ``pixelsize`` and the ``label``. None for a ``built`` dict without
+        the per-bead record (e.g. one produced by an older version).
     """
     quality = built.get("bead_quality")
     if not quality:
@@ -4112,11 +4419,23 @@ def plot_bead_gallery(
     the two dissimilarity measures shows every bead against the thresholds that
     were applied.
 
-    Rejected beads are laid out first and are never dropped by ``max_beads``
-    (which only caps how many *kept* beads are drawn), since they are what the
-    user is checking; each cell is labelled with the bead's index and its
-    position in the movie, so a suspicious one can be found in the raw
-    z-stack.
+    Rejected beads are laid out first, since they are what the user is
+    checking; each cell is labelled with the bead's index and its position in
+    the movie, so a suspicious one can be found in the raw z-stack.
+
+    Parameters
+    ----------
+    data : dict
+        A record from :func:`bead_inspection_data`.
+    fig : matplotlib.figure.Figure
+        The figure to draw into. It is resized to fit the gallery.
+    columns : int, optional
+        Beads per row. Default 6.
+    only_rejected : bool, optional
+        Draw only the rejected beads. Default False.
+    max_beads : int, optional
+        Cap on how many *kept* beads are drawn; rejected beads are never
+        dropped by it. None (the default) draws all of them.
     """
     keep = data["keep"]
     reasons = _rejection_reasons(data)

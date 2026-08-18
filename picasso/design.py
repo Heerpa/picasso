@@ -14,7 +14,16 @@ from . import io
 
 
 def saveInfo(filename: str, info: dict) -> None:
-    """Save information to a YAML file."""
+    """Save information to a YAML file.
+
+    Parameters
+    ----------
+    filename : str
+        Path of the file the metadata belongs to; the YAML is written next to
+        it (see ``io.save_info``).
+    info : dict
+        The metadata to save.
+    """
     io.save_info(filename, [info], default_flow_style=True)
 
 

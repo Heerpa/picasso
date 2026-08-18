@@ -75,6 +75,11 @@ def generate_image(
     blur : float
         Standard deviation of the Gaussian blur in nm applied to the
         histogrammed image.
+
+    Returns
+    -------
+    image_blur : lib.FloatArray2D
+        The blurred image, scaled so that its maximum is 1.
     """
     _, image = render.render(
         locs=locs,
@@ -659,6 +664,9 @@ def loess_smooth(arr: lib.FloatArray1D, span: int = 5) -> lib.FloatArray1D:
     ----------
     arr : lib.FloatArray1D
         Input array to be smoothed (1D).
+    span : int, optional
+        Width of the smoothing window in samples; rounded up to the next odd
+        number. Default 5.
 
     Returns
     -------
