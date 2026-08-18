@@ -1475,6 +1475,37 @@ def _similarity_from_two(
     return out
 
 
+def _fov_groups(
+    ref_fov: np.ndarray | None,
+    c_fov: np.ndarray | None,
+    n_ref: int,
+    n_c: int,
+) -> list[tuple[np.ndarray, np.ndarray]] | None:
+    """Row blocks of the reference / channel bead clouds that share a field of
+    view, as ``[(ref_idx, c_idx), ...]``, or None to treat them as one pooled
+    cloud.
+
+    Fields present in only one of the two clouds are dropped: a bead with no
+    counterpart to pair against cannot contribute a correspondence, and letting
+    it search the other fields is exactly the mis-pairing this prevents. None
+    is returned when either label array is missing or does not describe its
+    cloud, so callers without FOV information keep the pooled behaviour.
+    """
+    if ref_fov is None or c_fov is None:
+        return None
+    ref_fov = np.asarray(ref_fov)
+    c_fov = np.asarray(c_fov)
+    if len(ref_fov) != n_ref or len(c_fov) != n_c:
+        return None
+    groups = []
+    for k in np.unique(ref_fov):
+        ri = np.flatnonzero(ref_fov == k)
+        ci = np.flatnonzero(c_fov == k)
+        if len(ri) and len(ci):
+            groups.append((ri, ci))
+    return groups or None
+
+
 def _ransac_match(
     ref_xy: np.ndarray,
     c_xy: np.ndarray,
@@ -1482,6 +1513,8 @@ def _ransac_match(
     inlier_tol: float,
     radius: float,
     max_iter: int = 20000,
+    ref_fov: np.ndarray | None = None,
+    c_fov: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Robustly match beads across channels via RANSAC on a similarity
     transform.
@@ -1497,25 +1530,68 @@ def _ransac_match(
     overlay (e.g. an imperfectly placed split-FOV ROI) cannot mis-pair beads
     and corrupt the transform, which otherwise makes the calibration
     hypersensitive to ROI placement. Returns ``(ref_idx, c_idx)`` inliers.
+
+    ``ref_fov`` / ``c_fov`` are the field-of-view label of each bead. When both
+    are given, a correspondence may only pair beads of the **same** field, at
+    every stage: candidate proposal, the consensus count and the final
+    assignment. A multi-FOV stack images every field onto the same sensor
+    coordinates, so pooling the fields packs the cloud far denser than any one
+    field is - and a reference bead can then sit within ``inlier_tol`` of an
+    unrelated field's bead and be paired to it. Restricting the pairing removes
+    that ambiguity entirely; the transform itself stays global (one optical
+    mapping, identical at every stage position) and is still fitted by the
+    caller on the pooled inliers, so every field's beads constrain it. Without
+    the labels the pairing falls back to one pooled cloud.
     """
     ref_xy = np.asarray(ref_xy, dtype=np.float64)
     c_xy = np.asarray(c_xy, dtype=np.float64)
+    aligned_c = np.asarray(aligned_c, dtype=np.float64)
     empty = (np.array([], dtype=int), np.array([], dtype=int))
     if min(len(ref_xy), len(c_xy)) < 3:
         return empty
 
+    # per-field index blocks (ref rows, channel rows), or None to pool
+    groups = _fov_groups(ref_fov, c_fov, len(ref_xy), len(c_xy))
+
     # candidate (ref_i, c_j) pairs: c beads near ref_i in the coarse overlay
-    overlay_tree = KDTree(np.asarray(aligned_c, dtype=np.float64))
-    pairs = [
-        (i, j)
-        for i in range(len(ref_xy))
-        for j in overlay_tree.query_ball_point(ref_xy[i], radius)
-    ]
+    if groups is None:
+        overlay_tree = KDTree(aligned_c)
+        pairs = [
+            (i, j)
+            for i in range(len(ref_xy))
+            for j in overlay_tree.query_ball_point(ref_xy[i], radius)
+        ]
+    else:
+        pairs = []
+        for ri, ci in groups:
+            overlay_tree = KDTree(aligned_c[ci])
+            for i in ri:
+                pairs.extend(
+                    (int(i), int(ci[j]))
+                    for j in overlay_tree.query_ball_point(ref_xy[i], radius)
+                )
     if len(pairs) < 2:
         return empty
     pairs = np.asarray(pairs, dtype=int)
 
-    c_tree = KDTree(c_xy)
+    if groups is None:
+        c_tree = KDTree(c_xy)
+
+        def consensus(pred: np.ndarray) -> int:
+            dist, _ = c_tree.query(pred, k=1)
+            return int(np.count_nonzero(dist <= inlier_tol))
+
+    else:
+        # one tree per field, so a bead can only find partners in its own
+        group_trees = [(ri, KDTree(c_xy[ci])) for ri, ci in groups]
+
+        def consensus(pred: np.ndarray) -> int:
+            total = 0
+            for ri, tree in group_trees:
+                dist, _ = tree.query(pred[ri], k=1)
+                total += int(np.count_nonzero(dist <= inlier_tol))
+            return total
+
     n_samples = len(pairs) * (len(pairs) - 1) // 2
     if n_samples > max_iter:
         rs = np.random.RandomState(0)  # deterministic for reproducible calib
@@ -1530,19 +1606,30 @@ def _ransac_match(
         (i0, j0), (i1, j1) = pairs[a], pairs[b]
         if i0 == i1 or j0 == j1:  # need two distinct ref and channel beads
             continue
+        # the two sampled pairs may come from different fields - that is
+        # welcome, the transform is global and a longer baseline pins it down
+        # better; only the correspondences themselves stay within a field
         for M in _similarity_from_two(
             ref_xy[i0], ref_xy[i1], c_xy[j0], c_xy[j1]
         ):
-            pred = M.apply(ref_xy)
-            dist, _ = c_tree.query(pred, k=1)
-            count = int(np.count_nonzero(dist <= inlier_tol))
+            count = consensus(M.apply(ref_xy))
             if count > best_count:
                 best_count, best_M = count, M
 
     if best_M is None:
         return empty
     pred = best_M.apply(ref_xy)
-    return _match_beads(pred, c_xy, inlier_tol)
+    if groups is None:
+        return _match_beads(pred, c_xy, inlier_tol)
+    acc_ref, acc_c = [], []
+    for ri, ci in groups:
+        a, b = _match_beads(pred[ri], c_xy[ci], inlier_tol)
+        if len(a):
+            acc_ref.append(ri[a])
+            acc_c.append(ci[b])
+    if not acc_ref:
+        return empty
+    return np.concatenate(acc_ref), np.concatenate(acc_c)
 
 
 def _match_beads(
@@ -1588,6 +1675,7 @@ def _estimate_channel_transform(
     coarse_shift: tuple[float, float] | np.ndarray | None = None,
     return_matches: bool = False,
     model: str = "affine",
+    fov_of_frame: np.ndarray | None = None,
 ) -> tuple[np.ndarray, int] | tuple[np.ndarray, int, np.ndarray, np.ndarray]:
     """Estimate the transform mapping reference-channel coordinates to
     channel ``c``.
@@ -1612,14 +1700,36 @@ def _estimate_channel_transform(
       detected inside ``channel_roi`` and pre-aligned by the known region-origin
       offset ``coarse_shift`` (added to the channel beads to overlay them on the
       reference region). ``coarse_shift`` is ``(x0_ref - x0_c, y0_ref - y0_c)``.
+
+    ``fov_of_frame`` must be the same array the *reference* beads were detected
+    with, so both clouds are de-duplicated by the same rule. Grouped per FOV,
+    ``_dedupe_beads`` merges the same physical bead re-detected across frames;
+    pooled globally it also merges *different* beads from *different* fields
+    that land within ``box`` pixels of each other on the sensor - worst of all
+    in split-FOV, where every field images into the same region rectangle.
+
+    The labels are then carried into the matching, which pairs beads only
+    within their own field (see :func:`_ransac_match`). The transform itself
+    stays global and is fitted on the pooled inliers of all fields.
     """
     from . import imageprocess
 
     beads_c = _detect_bead_positions(
-        movie_c, minimum_ng, box, ref_bounds, roi=channel_roi
+        movie_c,
+        minimum_ng,
+        box,
+        ref_bounds,
+        roi=channel_roi,
+        fov_of_frame=fov_of_frame,
     )
     ref_xy = beads_ref[["x", "y"]].to_numpy(dtype=np.float64)
     c_xy = beads_c[["x", "y"]].to_numpy(dtype=np.float64)
+    # both clouds were detected with the same ``fov_of_frame``, so the labels
+    # index the same fields; absent on either side, matching stays pooled
+    ref_fov = (
+        beads_ref["fov"].to_numpy() if "fov" in beads_ref.columns else None
+    )
+    c_fov = beads_c["fov"].to_numpy() if "fov" in beads_c.columns else None
 
     # Coarse pre-alignment for bead matching only: the affine below is fit on the
     # original (untransformed) channel coordinates, so it absorbs whatever
@@ -1698,7 +1808,15 @@ def _estimate_channel_transform(
     inlier_tol = max(3.0, 0.25 * box)
     best_ref_idx, best_c_idx = np.array([], int), np.array([], int)
     for _label, aligned in candidates:
-        ri, ci = _ransac_match(ref_xy, c_xy, aligned, inlier_tol, radius)
+        ri, ci = _ransac_match(
+            ref_xy,
+            c_xy,
+            aligned,
+            inlier_tol,
+            radius,
+            ref_fov=ref_fov,
+            c_fov=c_fov,
+        )
         if len(ri) > len(best_ref_idx):
             best_ref_idx, best_c_idx = ri, ci
 
@@ -1712,6 +1830,25 @@ def _estimate_channel_transform(
             "choose a simpler model."
         )
     transform = tform.estimate(ref_xy[best_ref_idx], c_xy[best_c_idx], model)
+    # A consensus of exactly ``needed`` correspondences fits the model
+    # *exactly*, so its residual is zero however wrong the pairing was - the
+    # registration diagnostic then reports a reassuring "RMS 0.0 nm" for a
+    # transform that maps the field onto a speck. Geometry is the check the
+    # residual cannot be: a real channel registration is close to rigid, so an
+    # area change far from 1 means the matching locked onto coincidental pairs
+    # (see :func:`transforms.is_plausible`, used the same way when the signal
+    # re-registration picks a mirror orientation).
+    if not tform.is_plausible(transform):
+        raise ValueError(
+            f"The {model} registration fitted between the reference channel "
+            f"and another channel is geometrically implausible (it rescales "
+            f"areas by {abs(np.linalg.det(np.asarray(transform.matrix)[:2, :2])):.4g}x, "
+            f"expected about 1x), fitted on only {len(best_ref_idx)} bead "
+            "correspondences. The bead matching locked onto coincidental "
+            "pairs rather than the true ones. Check that the channel ROIs are "
+            "drawn on the right regions and that enough beads are detected in "
+            "every channel."
+        )
     n_matches = int(len(best_ref_idx))
     if return_matches:
         # the matched reference / channel bead coordinates, for the
@@ -1882,6 +2019,7 @@ def calibrate_spline_multichannel(
             coarse_shift=coarse_shifts[c] if split_fov else None,
             return_matches=True,
             model=model,
+            fov_of_frame=fov_of_frame,
         )
         transforms.append(transform)
         reg_info.append(
@@ -2040,7 +2178,7 @@ def calibrate_spline_multichannel(
                 coefficients,
                 reg_info,
                 path,
-                spot_residuals=_spot_roi_residuals(
+                spot_geometry=_spot_roi_geometry(
                     per_channel, ref_xy, transforms
                 ),
             )
@@ -2174,17 +2312,20 @@ def _save_multichannel_summary_plot(
     fig.savefig(base + "_summary.png", format="png", dpi=200)
 
 
-def _spot_roi_residuals(
+def _spot_roi_geometry(
     per_channel: list[dict], ref_xy: np.ndarray, transforms: list
-) -> np.ndarray | None:
-    """Per-spot, per-channel sub-pixel ROI residuals for the calibration's own
-    bead spots, ``(n_spots, n_channels, 2)``, or None when they cannot be
-    attributed.
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Per-spot ROI geometry for the calibration's own bead spots:
+    ``(residuals, jacobians)`` of shape ``(n_spots, n_channels, 2)`` and
+    ``(n_spots, n_channels, 4)``, or None when they cannot be attributed.
 
     The bead spots are cut at ``rint`` of each bead's mapped position, exactly
     as at fit time, so they carry the same residual and the axial-precision
     refit has to be told about it - otherwise it measures a model mismatch that
-    the real pipeline does not have. ``spot_bead_idx`` maps each spot back to
+    the real pipeline does not have. The local Jacobians are the other half of
+    the same linearization (see :func:`localize.channel_roi_geometry`); a
+    projective or polynomial registration has no single per-channel value, so
+    the refit cannot run without them. ``spot_bead_idx`` maps each spot back to
     its bead; it must agree across channels, since the caller stacks row *i* of
     every channel as one physical bead and frame."""
     idx = [p.get("spot_bead_idx") for p in per_channel]
@@ -2195,12 +2336,15 @@ def _spot_roi_residuals(
         # channels disagree on which bead each row is - the stacking the
         # caller does would be wrong too, so let it fall back
         return None
-    per_bead = localize.channel_roi_residuals(
+    per_bead_res, per_bead_jac = localize.channel_roi_geometry(
         pd.DataFrame({"x": ref_xy[:, 0], "y": ref_xy[:, 1]}), transforms
     )
-    if first.size and int(first.max()) >= len(per_bead):
+    if first.size and int(first.max()) >= len(per_bead_res):
         return None
-    return np.ascontiguousarray(per_bead[first])
+    return (
+        np.ascontiguousarray(per_bead_res[first]),
+        np.ascontiguousarray(per_bead_jac[first]),
+    )
 
 
 def _save_multichannel_diagnostics(
@@ -2209,7 +2353,7 @@ def _save_multichannel_diagnostics(
     coefficients: np.ndarray,
     reg_info: list[dict],
     path: str,
-    spot_residuals: np.ndarray | None = None,
+    spot_geometry: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> None:
     """Write the multichannel calibration diagnostics next to ``path``.
 
@@ -2240,9 +2384,16 @@ def _save_multichannel_diagnostics(
     # the summary figure, not repeated (misleadingly) on every channel's plot.
     try:
         joint_precision = _axial_precision_multichannel(
-            per_channel, calibration, spot_residuals=spot_residuals
+            per_channel, calibration, spot_geometry=spot_geometry
         )
-    except Exception:
+    except Exception as e:
+        # not fatal - the summary still shows the axial profiles - but the
+        # joint z-accuracy panels silently disappear, so say why.
+        warnings.warn(
+            f"Joint axial precision could not be computed, the calibration "
+            f"summary plot will omit its z-accuracy panels: {e}",
+            stacklevel=2,
+        )
         joint_precision = None
     for c in range(n_channels):
         # a standalone single-channel spline-3d calibration for channel c
@@ -3464,14 +3615,16 @@ def _axial_precision_from_theta(
 def _axial_precision_multichannel(
     per_channel: list[dict],
     calibration: dict,
-    spot_residuals: np.ndarray | None = None,
+    spot_geometry: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> dict | None:
     """Joint (all-channel) axial precision of a multichannel spline
     calibration.
 
-    ``spot_residuals`` (``(n_spots, n_channels, 2)``, see
-    :func:`_spot_roi_residuals`) are the sub-pixel ROI offsets of the bead
-    spots being refitted."""
+    ``spot_geometry`` (``(residuals, jacobians)``, see
+    :func:`_spot_roi_geometry`) describes how each bead spot's ROI sits: the
+    sub-pixel ROI offsets and the local transform Jacobians. The Jacobians are
+    mandatory for a projective or polynomial registration, whose Jacobian
+    varies across the field."""
     # only the plain multichannel spline fitter is used here
     if calibration.get("model") != "spline-3d-multichannel":
         return None
@@ -3499,10 +3652,15 @@ def _axial_precision_multichannel(
     # 2022): a single in-focus start leaves the biplane fit degenerate at
     # large |z|; several z seeds recover it. Same seed count as the fitting
     # path, so the precision reported here is the precision that path delivers.
+    spot_residuals, spot_jacobians = spot_geometry or (None, None)
     if spot_residuals is not None and (
         np.asarray(spot_residuals).shape != (n_spots, n_channels, 2)
     ):
         spot_residuals = None
+    if spot_jacobians is not None and (
+        np.asarray(spot_jacobians).shape != (n_spots, n_channels, 4)
+    ):
+        spot_jacobians = None
     try:
         # GPU when there is one, CPU otherwise (see ``_axial_precision``)
         theta = localize.fit_spots_spline(
@@ -3511,8 +3669,17 @@ def _axial_precision_multichannel(
             mle=True,
             use_gpu=None,
             residuals=spot_residuals,
+            jacobians=spot_jacobians,
         )
-    except Exception:
+    except Exception as e:
+        # the caller falls back to a summary plot without z-accuracy panels;
+        # that must not happen silently (it did, for projective registrations
+        # whose per-spot Jacobians were not being passed).
+        warnings.warn(
+            f"Joint {n_channels}-channel refit for the axial precision "
+            f"diagnostic failed: {e}",
+            stacklevel=2,
+        )
         return None
     result = _axial_precision_from_theta(
         theta,

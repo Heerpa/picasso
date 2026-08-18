@@ -673,8 +673,8 @@ class TestSpotBeadIndex:
         assert not np.allclose(peaks, positional, atol=250)
 
 
-class TestSpotRoiResiduals:
-    def test_expands_per_bead_residuals_onto_spots(self):
+class TestSpotRoiGeometry:
+    def test_expands_per_bead_geometry_onto_spots(self):
         import pandas as pd
 
         ref_xy = np.array([[10.0, 20.0], [31.0, 12.0], [7.0, 44.0]])
@@ -684,14 +684,39 @@ class TestSpotRoiResiduals:
         ]
         spot_bead_idx = np.array([2, 0, 1, 2, 0, 1])
         per_channel = [{"spot_bead_idx": spot_bead_idx} for _ in range(2)]
-        res = spline._spot_roi_residuals(per_channel, ref_xy, transforms)
+        res, jac = spline._spot_roi_geometry(per_channel, ref_xy, transforms)
         assert res.shape == (len(spot_bead_idx), 2, 2)
-        per_bead = localize.channel_roi_residuals(
+        assert jac.shape == (len(spot_bead_idx), 2, 4)
+        per_bead_res, per_bead_jac = localize.channel_roi_geometry(
             pd.DataFrame({"x": ref_xy[:, 0], "y": ref_xy[:, 1]}), transforms
         )
-        np.testing.assert_allclose(res, per_bead[spot_bead_idx])
+        np.testing.assert_allclose(res, per_bead_res[spot_bead_idx])
+        np.testing.assert_allclose(jac, per_bead_jac[spot_bead_idx])
         # the reference channel's box sits on the detection itself
         np.testing.assert_array_equal(res[:, 0, :], 0.0)
+
+    def test_projective_jacobians_vary_across_the_field(self):
+        # the whole point of carrying jacobians per spot: a projective
+        # registration has no single per-channel value, so the joint refit
+        # cannot run without them (it used to raise and silently drop the
+        # summary plot's z-accuracy panels)
+        ref_xy = np.array([[10.0, 20.0], [400.0, 380.0]])
+        transforms = [
+            affine([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            {
+                "model": "projective",
+                "matrix": [
+                    [1.002, 0.004, 1.4],
+                    [-0.004, 1.001, -0.6],
+                    [1e-4, -8e-5, 1.0],
+                ],
+                "domain": None,
+            },
+        ]
+        spot_bead_idx = np.array([0, 1])
+        per_channel = [{"spot_bead_idx": spot_bead_idx} for _ in range(2)]
+        _, jac = spline._spot_roi_geometry(per_channel, ref_xy, transforms)
+        assert not np.allclose(jac[0, 1], jac[1, 1])
 
     def test_returns_none_when_channels_disagree(self):
         ref_xy = np.array([[10.0, 20.0], [31.0, 12.0]])
@@ -704,11 +729,11 @@ class TestSpotRoiResiduals:
             {"spot_bead_idx": np.array([1, 0])},
         ]
         assert (
-            spline._spot_roi_residuals(per_channel, ref_xy, transforms) is None
+            spline._spot_roi_geometry(per_channel, ref_xy, transforms) is None
         )
         # and missing indices are simply "no information"
         assert (
-            spline._spot_roi_residuals(
+            spline._spot_roi_geometry(
                 [{"spot_bead_idx": np.array([0, 1])}, {}], ref_xy, transforms
             )
             is None
@@ -1256,6 +1281,254 @@ def _synthetic_split_fov_movie_flipped(axis="y"):
     movie[:, :, 48:] = flipped
     regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
     return movie, regions
+
+
+class TestChannelTransformMultiFov:
+    """The channel cloud must be de-duplicated by the same rule as the
+    reference cloud it is matched against."""
+
+    @staticmethod
+    def _movie(n_steps=11):
+        """Split-FOV, 2 fields, whose bead sets deliberately land within a box
+        of each other *across* fields - the case a global de-duplication
+        wrongly merges. Left half is the reference region, right half the
+        channel (a pure +48 px translation)."""
+        h = w = 48
+        # FOV 1's beads sit 4 px from FOV 0's: same physical field would never
+        # place them that close, different fields routinely do.
+        fov_beads = [[(12, 14), (30, 28)], [(16, 18), (34, 32)]]
+        s0, focus = 1.1, n_steps // 2
+        yy, xx = np.mgrid[0:h, 0:w]
+        frames = []
+        for beads in fov_beads:  # "z" order: a full z stack per field
+            for k in range(n_steps):
+                sigma = s0 * (1.0 + 0.07 * abs(k - focus))
+                img = np.full((h, w), 100.0, dtype=np.float32)
+                for bx, by in beads:
+                    img += 3000.0 * np.exp(
+                        -((xx - bx) ** 2 + (yy - by) ** 2) / (2 * sigma**2)
+                    )
+                frames.append(img)
+        half = np.stack(frames).astype(np.uint16)
+        movie = np.zeros((len(frames), h, 2 * w), dtype=np.uint16)
+        movie[:, :, :w] = half
+        movie[:, :, w:] = half
+        regions = [[[0, 0], [h, w]], [[0, w], [h, 2 * w]]]
+        return movie, regions, fov_beads
+
+    def test_channel_beads_are_deduped_per_fov(self):
+        movie, regions, fov_beads = self._movie()
+        n_fov = len(fov_beads)
+        n_physical = sum(len(b) for b in fov_beads)
+
+        step_of_frame, _, step_range = spline._step_of_frame(
+            movie.shape[0], 20.0, n_fov, "z", None
+        )
+        fov_of_frame = spline._fov_of_frame(movie.shape[0], n_fov, "z")
+        ref_bounds = spline._reference_frame_segments(
+            step_of_frame, step_range
+        )
+        mid = spline._reference_mid_frame(step_of_frame, step_range)
+        ref_roi = spline._normalized_region(regions[0])
+        chan_roi = spline._normalized_region(regions[1])
+
+        beads_ref = spline._detect_bead_positions(
+            movie,
+            2000.0,
+            BOX,
+            ref_bounds,
+            roi=ref_roi,
+            fov_of_frame=fov_of_frame,
+        )
+        assert len(beads_ref) == n_physical  # every field's beads survive
+
+        captured = {}
+        original = spline._detect_bead_positions
+
+        def spy(*args, **kwargs):
+            out = original(*args, **kwargs)
+            captured["beads_c"] = out
+            captured["fov_of_frame"] = kwargs.get("fov_of_frame")
+            return out
+
+        spline._detect_bead_positions = spy
+        try:
+            _, n_matches = spline._estimate_channel_transform(
+                movie,
+                movie,
+                beads_ref,
+                2000.0,
+                BOX,
+                ref_bounds,
+                mid,
+                max_distance=float(BOX),
+                channel_roi=chan_roi,
+                coarse_shift=(-48.0, 0.0),
+                fov_of_frame=fov_of_frame,
+            )
+        finally:
+            spline._detect_bead_positions = original
+
+        # the channel is detected with the very same FOV labels ...
+        assert captured["fov_of_frame"] is not None
+        np.testing.assert_array_equal(captured["fov_of_frame"], fov_of_frame)
+        # ... so it keeps as many beads as the reference, instead of losing
+        # the ones a global de-duplication merges across fields
+        assert len(captured["beads_c"]) == len(beads_ref) == n_physical
+        assert n_matches == n_physical
+
+    def test_matching_pairs_only_within_a_field(self):
+        """A reference bead whose own field holds no partner must stay
+        unmatched rather than be paired to a nearby *other* field's bead.
+
+        The registration is the identity, so every legitimate pair is exact.
+        Reference bead (100, 100) belongs to FOV 0, which has no counterpart
+        for it; FOV 1 has an unpaired channel bead 1.4 px away. Pooled, that
+        bead is the nearest neighbour and wins - a correspondence between two
+        different physical beads in two different fields.
+        """
+        ref_xy = np.array(
+            [
+                [10.0, 10.0],
+                [40.0, 40.0],
+                [70.0, 70.0],
+                [100.0, 100.0],
+                [11.0, 11.0],
+                [41.0, 41.0],
+                [71.0, 71.0],
+            ]
+        )
+        ref_fov = np.array([0, 0, 0, 0, 1, 1, 1])
+        c_xy = np.array(
+            [
+                [10.0, 10.0],
+                [40.0, 40.0],
+                [70.0, 70.0],
+                [11.0, 11.0],
+                [41.0, 41.0],
+                [71.0, 71.0],
+                [101.0, 101.0],
+            ]
+        )
+        c_fov = np.array([0, 0, 0, 1, 1, 1, 1])
+        lone_ref = 3  # ref (100, 100), FOV 0
+        lone_c = 6  # channel (101, 101), FOV 1
+
+        # pooled (no labels): the cross-field pair is made
+        ri, ci = spline._ransac_match(
+            ref_xy, c_xy, c_xy, inlier_tol=3.0, radius=15.0
+        )
+        pooled = dict(zip(ri.tolist(), ci.tolist()))
+        assert pooled.get(lone_ref) == lone_c
+        assert np.any(ref_fov[ri] != c_fov[ci])
+
+        # per field: it is refused, and every other pair is unaffected
+        ri, ci = spline._ransac_match(
+            ref_xy,
+            c_xy,
+            c_xy,
+            inlier_tol=3.0,
+            radius=15.0,
+            ref_fov=ref_fov,
+            c_fov=c_fov,
+        )
+        np.testing.assert_array_equal(ref_fov[ri], c_fov[ci])
+        assert lone_ref not in ri.tolist()
+        assert lone_c not in ci.tolist()
+        assert len(ri) == 6  # the six genuine correspondences, all of them
+        np.testing.assert_allclose(ref_xy[ri], c_xy[ci])
+
+    def test_fov_groups_drops_fields_missing_on_one_side(self):
+        # a field with no counterpart cannot yield a correspondence; letting
+        # its beads search other fields is the mis-pairing we are preventing
+        groups = spline._fov_groups(
+            np.array([0, 0, 2]), np.array([0, 0, 1]), 3, 3
+        )
+        assert len(groups) == 1
+        np.testing.assert_array_equal(groups[0][0], [0, 1])
+        np.testing.assert_array_equal(groups[0][1], [0, 1])
+        # missing / mismatched labels fall back to one pooled cloud
+        assert spline._fov_groups(None, np.array([0]), 1, 1) is None
+        assert (
+            spline._fov_groups(np.array([0, 1]), np.array([0]), 5, 1) is None
+        )
+
+    def test_degenerate_registration_is_rejected(self):
+        """A consensus of exactly min_points fits the model exactly, so its
+        residual is zero however wrong the pairing was. Only the geometry can
+        catch it, and it must be an error rather than a silent calibration."""
+        movie, regions, _ = self._movie()
+        n_fov = 2
+        step_of_frame, _, step_range = spline._step_of_frame(
+            movie.shape[0], 20.0, n_fov, "z", None
+        )
+        fov_of_frame = spline._fov_of_frame(movie.shape[0], n_fov, "z")
+        ref_bounds = spline._reference_frame_segments(
+            step_of_frame, step_range
+        )
+        mid = spline._reference_mid_frame(step_of_frame, step_range)
+        beads_ref = spline._detect_bead_positions(
+            movie,
+            2000.0,
+            BOX,
+            ref_bounds,
+            roi=spline._normalized_region(regions[0]),
+            fov_of_frame=fov_of_frame,
+        )
+        # Map 3 widely spread reference beads onto 3 nearly coincident channel
+        # beads: an exact affine fit, zero residual, and a linear part that
+        # collapses the whole field onto a speck - what the real failure did.
+        assert len(beads_ref) >= 3
+        clustered = pd.DataFrame(
+            {
+                "x": [60.0, 61.0, 60.0],
+                "y": [20.0, 20.0, 21.0],
+                "fov": [0, 0, 0],
+            }
+        )
+        orig_detect, orig_match = (
+            spline._detect_bead_positions,
+            spline._ransac_match,
+        )
+        spline._detect_bead_positions = lambda *a, **k: clustered
+        spline._ransac_match = lambda *a, **k: (
+            np.array([0, 1, 2]),
+            np.array([0, 1, 2]),
+        )
+        try:
+            with pytest.raises(ValueError, match="implausible"):
+                spline._estimate_channel_transform(
+                    movie,
+                    movie,
+                    beads_ref,
+                    2000.0,
+                    BOX,
+                    ref_bounds,
+                    mid,
+                    max_distance=float(BOX),
+                    channel_roi=spline._normalized_region(regions[1]),
+                    coarse_shift=(-48.0, 0.0),
+                    fov_of_frame=fov_of_frame,
+                )
+        finally:
+            spline._detect_bead_positions = orig_detect
+            spline._ransac_match = orig_match
+
+    def test_global_dedupe_would_have_merged_across_fields(self):
+        """Guards the premise of the test above: without the FOV labels the
+        channel cloud really is smaller, so the assertion is not vacuous."""
+        _, _, fov_beads = self._movie()
+        x = np.array([b[0] for f in fov_beads for b in f])
+        y = np.array([b[1] for f in fov_beads for b in f])
+        fov = np.concatenate(
+            [np.full(len(f), k) for k, f in enumerate(fov_beads)]
+        )
+        per_fov = sum(
+            len(spline._dedupe_beads(x[fov == k], y[fov == k], BOX)[0])
+            for k in range(len(fov_beads))
+        )
+        pooled, _ = spline._dedupe_beads(x, y, BOX)
+        assert len(pooled) < per_fov == len(x)
 
 
 class TestSplitFovTransform:
