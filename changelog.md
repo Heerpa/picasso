@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 14-AUG-2026 CEST
+Last change: 18-AUG-2026 CEST
 
 ## 0.11.0
 
@@ -35,7 +35,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Z fitting (Gaussian-fitted localizations using astigmatism) on CUDA GPU
 - Gaussian filtering for spot identification of multiple-peak single-emitter images
 - New temporal median filter for spot identification with adaptable background, see [Martens, et al, Frontiers in Bioinformatics, 2022](https://doi.org/10.3389/fbinf.2021.817254). It is applied to the identification only (spots are always fitted on the raw movie) and it changes the scale of the net gradient, so `Min. net gradient` needs re-tuning when it is switched on or off
-- Affine transform calibration for astigmatic imaging and chromatic abberation correction. A transform is fitted from two bead images and appended to any calibration (Gaussian astigmatism `.yaml`, spline PSF `.hdf5`) or saved as a standalone calibration for 2D data; several corrections stack in one ordered list and are applied to `x`/`y` one after another (e.g. cylindrical lens, then chromatic) ([#15](https://github.com/jungmannlab/picasso/issues/15))
+- Lateral transform calibration for astigmatic imaging and chromatic abberation correction. A transform is fitted from two bead images (outlier bead pairs are rejected automatically) and appended to any calibration (Gaussian astigmatism `.yaml`, spline PSF `.hdf5`) or saved as a standalone calibration for 2D data; several corrections stack in one ordered list and are applied to `x`/`y` one after another (e.g. cylindrical lens, then chromatic) ([#15](https://github.com/jungmannlab/picasso/issues/15)) The transform model is selectable: **affine** (6 DOF, the default), **projective** (8 DOF, the perspective/keystone term a tilted dichroic introduces) or **polynomial2** / **polynomial3** (a smooth warp of that degree, following genuine field distortion).
 - Accept multiple frame bounds
 - Accept multiple rectangular ROIs
 - Remove a ROI by double-clicking it in the preview

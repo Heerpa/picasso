@@ -301,7 +301,7 @@ def _make_eval_spline_3d(ftype):
 def _make_accumulate_2d(eval_spline_2d):
     """Accumulator for the 2D model, parameters ``[amplitude, x, y, offset]``.
 
-    There is no multichannel 2D model, so ``aff`` and ``res`` are accepted to
+    There is no multichannel 2D model, so ``jac`` and ``res`` are accepted to
     keep the signature uniform but unused. Transcription of
     ``splinefit._accumulate_2d``."""
 
@@ -312,7 +312,7 @@ def _make_accumulate_2d(eval_spline_2d):
         variance,
         use_variance,
         coeff,
-        aff,
+        jac,
         res,
         theta,
         mle,
@@ -398,7 +398,7 @@ def _make_accumulate_3d(eval_spline_3d):
 
     Parameters are ``[amplitude, x, y, z, offset]``, shared across every
     channel. The single-channel ``spline-3d`` model is the ``n_channels == 1``,
-    identity-affine, zero-residual case of the multichannel one. Transcription
+    identity-Jacobian, zero-residual case of the multichannel one. Transcription
     of ``splinefit._accumulate_3d``."""
 
     @cuda.jit(device=True)
@@ -408,7 +408,7 @@ def _make_accumulate_3d(eval_spline_3d):
         variance,
         use_variance,
         coeff,
-        aff,
+        jac,
         res,
         theta,
         mle,
@@ -441,13 +441,13 @@ def _make_accumulate_3d(eval_spline_3d):
         h33 = h34 = 0.0
         h44 = 0.0
         for ch in range(n_channels):
-            # Each channel sees the shared lateral shift through its own affine
+            # Each channel sees the shared lateral shift through its own local
             # and sits on its own sub-pixel ROI offset. Constant over the box,
             # so hoisted.
-            a00 = aff[ch, 0]
-            a01 = aff[ch, 1]
-            a10 = aff[ch, 2]
-            a11 = aff[ch, 3]
+            a00 = jac[index, ch, 0]
+            a01 = jac[index, ch, 1]
+            a10 = jac[index, ch, 2]
+            a11 = jac[index, ch, 3]
             sx = a00 * x_shift + a01 * y_shift + res[index, ch, 0]
             sy = a10 * x_shift + a11 * y_shift + res[index, ch, 1]
             for j in range(box):
@@ -460,7 +460,7 @@ def _make_accumulate_3d(eval_spline_3d):
                     value = amp * phi + offset
                     data = spots[index, ch, j, i]
                     # The lateral pair picks up the transpose of the channel
-                    # affine (shift = A @ theta), and the leading minus is the
+                    # Jacobian (shift = J @ theta), and the leading minus is the
                     # chain rule of position = pixel - shift. Unlike the CRLB,
                     # whose diagonal is sign-invariant, an LM step is not:
                     # dropping the minus sends x, y and z the wrong way.
@@ -550,7 +550,7 @@ def _make_accumulate_link_xyz(eval_spline_3d, n_channels: int):
         variance,
         use_variance,
         coeff,
-        aff,
+        jac,
         res,
         theta,
         mle,
@@ -582,10 +582,10 @@ def _make_accumulate_link_xyz(eval_spline_3d, n_channels: int):
             # background; the three shared position parameters are 0, 1, 2.
             ia = 3 + ch
             ib = 3 + n_ch + ch
-            a00 = aff[ch, 0]
-            a01 = aff[ch, 1]
-            a10 = aff[ch, 2]
-            a11 = aff[ch, 3]
+            a00 = jac[index, ch, 0]
+            a01 = jac[index, ch, 1]
+            a10 = jac[index, ch, 2]
+            a11 = jac[index, ch, 3]
             sx = a00 * x_shift + a01 * y_shift + res[index, ch, 0]
             sy = a10 * x_shift + a11 * y_shift + res[index, ch, 1]
             # This channel's own photon (a) and background (b) entries.
@@ -743,7 +743,7 @@ def fit_spots(
     kind: int,
     spots: np.ndarray,
     coefficients: np.ndarray,
-    affines: np.ndarray,
+    jacobians: np.ndarray,
     residuals: np.ndarray,
     initial_parameters: np.ndarray,
     z_seeds: np.ndarray,
@@ -761,7 +761,7 @@ def fit_spots(
     """Fit spots with a cubic-spline PSF model on the GPU.
 
     Array-for-array the same contract as ``splinefit.fit_spots`` - see its
-    docstring for the layouts of ``spots``, ``coefficients``, ``affines``,
+    docstring for the layouts of ``spots``, ``coefficients``, ``jacobians``,
     ``residuals``, ``initial_parameters`` and ``z_seeds`` - plus:
 
     Parameters
@@ -782,7 +782,7 @@ def fit_spots(
     """
     lmfit_cuda.require_cuda()
     _check_inputs(
-        kind, spots, coefficients, affines, residuals, initial_parameters
+        kind, spots, coefficients, jacobians, residuals, initial_parameters
     )
     variance, use_variance = resolve_variance(variance, spots.shape, ndim=4)
     tolerance, max_iterations = resolve_schedule(
@@ -805,7 +805,7 @@ def fit_spots(
     coeff_dtype = np.float32 if single_precision else np.float64
     spots = np.ascontiguousarray(spots, dtype=np.float32)
     coefficients = np.ascontiguousarray(coefficients, dtype=coeff_dtype)
-    affines = np.ascontiguousarray(affines, dtype=np.float64)
+    jacobians = np.ascontiguousarray(jacobians, dtype=np.float64)
     residuals = np.ascontiguousarray(residuals, dtype=np.float64)
     initial_parameters = np.ascontiguousarray(
         initial_parameters, dtype=np.float64
@@ -815,9 +815,9 @@ def fit_spots(
     kernel = _get_kernel(kind, n_channels, single_precision)
     threads = CUDA_THREADS_WIDE if n_params > 8 else CUDA_THREADS
 
-    # Constant over the whole run, so uploaded once.
+    # Constant over the whole run, so uploaded once. The channel Jacobians
+    # are per spot (like the residuals), so they are chunked below instead.
     d_coeff = cuda.to_device(coefficients)
-    d_aff = cuda.to_device(affines)
     d_seeds = cuda.to_device(z_seeds)
     # Without a noise model the variance is a four-byte dummy, uploaded once
     # rather than per chunk.
@@ -827,6 +827,7 @@ def fit_spots(
         4 * n_channels * box * box  # spots
         + (4 * n_channels * box * box if use_variance else 0)  # variance
         + 8 * 2 * n_channels  # residuals
+        + 8 * 4 * n_channels  # channel Jacobians
         + 8 * n_params  # initial parameters
         + 8 * n_params  # fitted parameters
         + 8  # chi-square
@@ -855,6 +856,7 @@ def fit_spots(
                 else d_dummy_variance
             )
             d_res = cuda.to_device(residuals[start:stop])
+            d_jac = cuda.to_device(jacobians[start:stop])
             d_init = cuda.to_device(initial_parameters[start:stop])
             d_thetas = cuda.device_array((n, n_params), dtype=np.float64)
             d_chi = cuda.device_array(n, dtype=np.float64)
@@ -866,7 +868,7 @@ def fit_spots(
                 d_variance,
                 use_variance,
                 d_coeff,
-                d_aff,
+                d_jac,
                 d_res,
                 d_init,
                 d_seeds,

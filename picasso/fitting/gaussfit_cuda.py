@@ -81,7 +81,7 @@ def _make_accumulate_spherical(ftype):
         variance,
         use_variance,
         coeff,
-        aff,
+        jac,
         res,
         theta,
         mle,
@@ -194,7 +194,7 @@ def _make_accumulate_elliptic(ftype):
         variance,
         use_variance,
         coeff,
-        aff,
+        jac,
         res,
         theta,
         mle,
@@ -332,7 +332,7 @@ def _make_accumulate_rotated(ftype):
         variance,
         use_variance,
         coeff,
-        aff,
+        jac,
         res,
         theta,
         mle,
@@ -597,11 +597,11 @@ def fit_spots(
     )
 
     kernel = _get_kernel(model, single_precision)
-    # The driver takes the spline models' coefficient, affine and residual
+    # The driver takes the spline models' coefficient, Jacobian and residual
     # arrays; a Gaussian has no channel geometry, so these are unused
     # placeholders of the right rank.
     d_unused_coeff = cuda.to_device(np.zeros((1, 1, 1, 4, 4)))
-    d_unused_aff = cuda.to_device(np.zeros((1, 4)))
+    d_unused_jac = cuda.to_device(np.zeros((1, 4)))
     d_seeds = cuda.to_device(np.zeros(1))
     # Without a noise model the variance is a four-byte dummy, uploaded once
     # rather than per chunk.
@@ -641,7 +641,7 @@ def fit_spots(
                 d_variance,
                 use_variance,
                 d_unused_coeff,
-                d_unused_aff,
+                d_unused_jac,
                 d_res,
                 d_init,
                 d_seeds,

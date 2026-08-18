@@ -301,7 +301,7 @@ ACCUMULATE_PARAMS = [
     "variance",
     "use_variance",
     "coeff",
-    "aff",
+    "jac",
     "res",
     "theta",
     "mle",

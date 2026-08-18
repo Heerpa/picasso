@@ -21,6 +21,8 @@ import pytest
 from scipy.interpolate import CubicSpline
 
 from picasso import localize
+
+from tests.conftest import affine, apply_transform
 from picasso.fitting import precision, splinefit
 
 BOX = 13
@@ -164,7 +166,7 @@ def _run(
     initial,
     mle,
     seeds=None,
-    affines=None,
+    jacobians=None,
     residuals=None,
     tolerance=None,
     max_iterations=None,
@@ -172,7 +174,14 @@ def _run(
     """Serial fit of ``spots`` with the given model."""
     coefficients = precision._spline_coeff_reshaped(calibration)
     n_spots, n_channels = spots.shape[0], spots.shape[1]
-    affines = IDENTITY if affines is None else affines
+    jacobians = IDENTITY if jacobians is None else jacobians
+    jacobians = np.asarray(jacobians, dtype=np.float64)
+    if jacobians.ndim == 2:
+        # (n_channels, 4) -> the per-spot (n_spots, n_channels, 4) the kernels
+        # take; an affine registration is the same Jacobian at every spot
+        jacobians = np.ascontiguousarray(
+            np.tile(jacobians, (max(n_spots, 1), 1, 1))
+        )
     if residuals is None:
         residuals = np.zeros((max(n_spots, 1), n_channels, 2))
     apply_seeds = seeds is not None
@@ -193,7 +202,7 @@ def _run(
         kind,
         spots,
         coefficients,
-        affines,
+        jacobians,
         residuals,
         initial,
         z_seeds,
@@ -302,14 +311,14 @@ class TestJacobian:
     way. It also covers the multichannel affine chain rule, which uses the
     transpose of the channel affine."""
 
-    AFFINES = np.array([[1.0, 0.0, 0.0, 1.0], [0.997, 0.035, -0.031, 1.006]])
+    JACOBIANS = np.array([[1.0, 0.0, 0.0, 1.0], [0.997, 0.035, -0.031, 1.006]])
     RESIDUALS = np.array([[0.0, 0.0], [0.31, -0.22]])
 
     @staticmethod
-    def _check(kind, calibration, theta, affines, residuals):
+    def _check(kind, calibration, theta, jacobians, residuals):
         coefficients = precision._spline_coeff_reshaped(calibration)
         _, jacobian = splinefit.model_and_jacobian(
-            kind, coefficients, affines, residuals, theta, BOX
+            kind, coefficients, jacobians, residuals, theta, BOX
         )
         for p in range(len(theta)):
             step = 1e-6 * max(abs(theta[p]), 1.0)
@@ -317,10 +326,10 @@ class TestJacobian:
             up[p] += step
             down[p] -= step
             mu_up = splinefit.model_and_jacobian(
-                kind, coefficients, affines, residuals, up, BOX
+                kind, coefficients, jacobians, residuals, up, BOX
             )[0]
             mu_down = splinefit.model_and_jacobian(
-                kind, coefficients, affines, residuals, down, BOX
+                kind, coefficients, jacobians, residuals, down, BOX
             )[0]
             numeric = (mu_up - mu_down) / (2 * step)
             scale = max(np.max(np.abs(numeric)), 1e-9)
@@ -356,7 +365,7 @@ class TestJacobian:
             splinefit.KIND_3D,
             calibration,
             np.array([500.0, 0.3, -0.2, -8.4, 20.0]),
-            self.AFFINES,
+            self.JACOBIANS,
             self.RESIDUALS,
         )
 
@@ -368,7 +377,7 @@ class TestJacobian:
             splinefit.KIND_LINK_XYZ,
             calibration,
             np.array([0.3, -0.2, -8.4, 400.0, 620.0, 18.0, 25.0]),
-            self.AFFINES,
+            self.JACOBIANS,
             self.RESIDUALS,
         )
 
@@ -596,7 +605,7 @@ class TestMultichannelFits:
     each channel sees the shared lateral shift through its own transform, minus
     its own ROI residual."""
 
-    AFFINES = np.array([[1.0, 0.0, 0.0, 1.0], [0.997, 0.035, -0.031, 1.006]])
+    JACOBIANS = np.array([[1.0, 0.0, 0.0, 1.0], [0.997, 0.035, -0.031, 1.006]])
     RESIDUALS = np.array([[[0.0, 0.0], [0.31, -0.22]]])
     Z_NATIVE = 7.6
 
@@ -606,7 +615,7 @@ class TestMultichannelFits:
         recover the shared reference-frame shift."""
         spots = np.zeros((1, len(per_channel), BOX, BOX))
         for ch, (amplitude, offset) in enumerate(per_channel):
-            a00, a01, a10, a11 = self.AFFINES[ch]
+            a00, a01, a10, a11 = self.JACOBIANS[ch]
             x = a00 * DX + a01 * DY + self.RESIDUALS[0, ch, 0]
             y = a10 * DX + a11 * DY + self.RESIDUALS[0, ch, 1]
             phi = _reference_model(terms, BOX, x, y, self.Z_NATIVE)[0]
@@ -638,7 +647,7 @@ class TestMultichannelFits:
             initial,
             mle,
             seeds=_default_seeds(calibration),
-            affines=self.AFFINES,
+            jacobians=self.JACOBIANS,
             residuals=self.RESIDUALS,
         )
         assert states[0] == splinefit.FIT_STATE_CONVERGED
@@ -670,7 +679,7 @@ class TestMultichannelFits:
             initial,
             mle,
             seeds=_default_seeds(calibration),
-            affines=self.AFFINES,
+            jacobians=self.JACOBIANS,
             residuals=self.RESIDUALS,
         )
         assert states[0] == splinefit.FIT_STATE_CONVERGED
@@ -725,7 +734,7 @@ class TestNoisyBatch:
             splinefit.KIND_3D,
             spots,
             coefficients,
-            IDENTITY,
+            np.tile(IDENTITY, (n_spots, 1, 1)),
             np.zeros((n_spots, 1, 2)),
             initial,
             _default_seeds(calibration),
@@ -777,7 +786,7 @@ class TestNoisyBatch:
             splinefit.KIND_3D,
             spots,
             coefficients,
-            IDENTITY,
+            np.tile(IDENTITY, (n_spots, 1, 1)),
             np.zeros((n_spots, 1, 2)),
             initial,
             _default_seeds(calibration),
@@ -800,7 +809,7 @@ class TestNoisyBatch:
             splinefit.KIND_3D,
             spots,
             precision._spline_coeff_reshaped(calibration),
-            IDENTITY,
+            np.tile(IDENTITY, (n_spots, 1, 1)),
             np.zeros((n_spots, 1, 2)),
             initial,
             _default_seeds(calibration),
@@ -820,7 +829,7 @@ class TestNoisyBatch:
             splinefit.KIND_3D,
             spots,
             precision._spline_coeff_reshaped(calibration),
-            IDENTITY,
+            np.tile(IDENTITY, (n_spots, 1, 1)),
             np.zeros((n_spots, 1, 2)),
             initial,
             np.zeros(1),
@@ -828,6 +837,111 @@ class TestNoisyBatch:
             progress_callback=seen.append,
         )
         assert seen == list(range(1, n_spots + 1))
+
+
+class TestPerSpotJacobians:
+    """The channel Jacobian is per spot, like the ROI residual.
+
+    An affine registration gives every spot the same Jacobian, so nothing
+    downstream would notice if a kernel silently read row 0 for all of them -
+    which is exactly the bug a projective or polynomial registration would hit.
+    These tests make the rows genuinely differ.
+    """
+
+    def _scene(self, n_spots=6):
+        calibration, terms = _astigmatic_calibration(
+            model="spline-3d-multichannel", n_channels=2
+        )
+        spots = np.repeat(
+            TestMultichannelFits()._spots(terms, [(5000.0, 30.0)] * 2),
+            n_spots,
+            axis=0,
+        ).astype(np.float32)
+        initial = np.tile(
+            np.array(
+                [
+                    [
+                        float(spots.max() - spots.min()),
+                        0.0,
+                        0.0,
+                        -calibration["z_center"],
+                        float(spots.min()),
+                    ]
+                ]
+            ),
+            (n_spots, 1),
+        )
+        residuals = np.tile(TestMultichannelFits.RESIDUALS, (n_spots, 1, 1))
+        return calibration, spots, initial, residuals
+
+    @staticmethod
+    def _ramped(n_spots):
+        """Per-spot Jacobians whose channel-1 x-scale ramps across the field."""
+        jac = np.tile(TestMultichannelFits.JACOBIANS, (n_spots, 1, 1)).astype(
+            np.float64
+        )
+        jac[:, 1, 0] += np.linspace(-0.05, 0.05, n_spots)
+        return np.ascontiguousarray(jac)
+
+    def test_each_spot_uses_its_own_jacobian(self):
+        """Rows that differ must give fits that differ; a kernel indexing
+        ``jac[0]`` would return identical results for every spot."""
+        n_spots = 6
+        calibration, spots, initial, residuals = self._scene(n_spots)
+        varying = self._ramped(n_spots)
+        constant = np.tile(
+            TestMultichannelFits.JACOBIANS, (n_spots, 1, 1)
+        ).astype(np.float64)
+
+        def fit(jac):
+            theta, _, _, _ = _run(
+                splinefit.KIND_3D,
+                calibration,
+                spots,
+                initial.copy(),
+                False,
+                seeds=_default_seeds(calibration),
+                jacobians=jac,
+                residuals=residuals,
+            )
+            return theta
+
+        theta_varying = fit(varying)
+        theta_constant = fit(constant)
+        # the middle row of the ramp is the constant value, so it must agree;
+        # the ends must not
+        assert np.allclose(
+            theta_varying[n_spots // 2 - 1 : n_spots // 2 + 1, 1],
+            theta_constant[n_spots // 2 - 1 : n_spots // 2 + 1, 1],
+            atol=5e-3,
+        )
+        assert abs(theta_varying[0, 1] - theta_constant[0, 1]) > 1e-3
+        assert abs(theta_varying[-1, 1] - theta_constant[-1, 1]) > 1e-3
+        # and the fitted x must move monotonically with the ramp
+        assert np.all(np.diff(theta_varying[:, 1]) < 0)
+
+    def test_serial_and_threaded_agree_with_varying_jacobians(self):
+        """The threaded path chunks the spots; a chunk that forgets to slice
+        the Jacobians reads another spot's row."""
+        n_spots = 6
+        calibration, spots, initial, residuals = self._scene(n_spots)
+        jac = self._ramped(n_spots)
+        coefficients = precision._spline_coeff_reshaped(calibration)
+        args = (
+            splinefit.KIND_3D,
+            spots,
+            coefficients,
+            jac,
+            residuals,
+            initial,
+            _default_seeds(calibration),
+            True,
+        )
+        serial = splinefit.fit_spots(*args, mle=False)
+        fit = splinefit.fit_spots_async(*args, mle=False)
+        _drain(fit)
+        theta, _, _, _ = fit.results()
+        np.testing.assert_array_equal(serial[0], theta)
 
 
 class TestInputValidation:
@@ -839,7 +953,7 @@ class TestInputValidation:
             "kind": splinefit.KIND_3D,
             "spots": np.zeros((2, 1, BOX, BOX), np.float32),
             "coefficients": precision._spline_coeff_reshaped(calibration),
-            "affines": IDENTITY,
+            "jacobians": np.tile(IDENTITY, (2, 1, 1)),
             "residuals": np.zeros((2, 1, 2)),
             "initial_parameters": np.zeros((2, 5)),
         }
@@ -855,7 +969,7 @@ class TestInputValidation:
             ({"spots": np.zeros((2, BOX, BOX), np.float32)}, "channel-major"),
             ({"spots": np.zeros((2, 1, BOX, BOX + 1), np.float32)}, "square"),
             ({"initial_parameters": np.zeros((2, 4))}, "initial_parameters"),
-            ({"affines": np.zeros((2, 4))}, "affines"),
+            ({"jacobians": np.zeros((2, 1, 5))}, "jacobians"),
             ({"residuals": np.zeros((2, 2, 2))}, "residuals"),
         ],
     )
@@ -880,7 +994,7 @@ class TestInputValidation:
                 kind=splinefit.KIND_2D,
                 spots=np.zeros((2, 2, BOX, BOX), np.float32),
                 coefficients=np.repeat(coefficients, 2, axis=0),
-                affines=np.tile(IDENTITY, (2, 1)),
+                jacobians=np.tile(IDENTITY, (2, 2, 1)),
                 residuals=np.zeros((2, 2, 2)),
                 initial_parameters=np.zeros((2, 4)),
             )
@@ -891,7 +1005,7 @@ class TestInputValidation:
             splinefit.KIND_3D,
             np.zeros((0, 1, BOX, BOX), np.float32),
             precision._spline_coeff_reshaped(calibration),
-            IDENTITY,
+            np.tile(IDENTITY, (1, 1, 1)),
             np.zeros((1, 1, 2)),
             np.zeros((0, 5)),
             np.zeros(1),
@@ -1154,8 +1268,8 @@ class TestMultichannelIntegration:
     """
 
     TRANSFORMS = [
-        np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
-        np.array([[0.998, 0.02, 7.3], [-0.018, 1.003, -4.6]]),
+        affine([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        affine([[0.998, 0.02, 7.3], [-0.018, 1.003, -4.6]]),
     ]
 
     @pytest.fixture
@@ -1175,7 +1289,7 @@ class TestMultichannelIntegration:
                 z_native = 6.0 + 5.0 * frame
                 truth.append((frame, x0, y0, z_native))
                 for channel in range(2):
-                    xc, yc = localize.apply_affine_transform(
+                    xc, yc = apply_transform(
                         np.array([[x0, y0]]), self.TRANSFORMS[channel]
                     )[0]
                     ix, iy = int(round(xc)), int(round(yc))

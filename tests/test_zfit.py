@@ -27,8 +27,7 @@ matplotlib.use("Agg")
 
 from picasso import io, lib, zfit  # noqa: E402
 
-from tests.conftest import CALIB_3D  # noqa: E402
-
+from tests.conftest import CALIB_3D, affine  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Numerical helpers
@@ -301,8 +300,9 @@ class TestZfitAffineCorrections:
     def _calibration(*matrices):
         calibration = dict(CALIB_3D)
         for kind, matrix in matrices:
-            lib.append_affine_transform(
-                calibration, {"Type": kind, "Matrix": matrix}
+            lib.append_lateral_transform(
+                calibration,
+                {"Type": kind, "Transform": affine(matrix).to_dict()},
             )
         return calibration
 
@@ -324,7 +324,9 @@ class TestZfitAffineCorrections:
         np.testing.assert_allclose(
             moved["z"].to_numpy(), plain["z"].to_numpy(), atol=1e-6
         )
-        assert new_info[-1]["Affine corrections applied"] == ["astigmatism"]
+        assert new_info[-1]["Lateral corrections applied"] == [
+            "astigmatism, affine"
+        ]
 
     def test_two_transforms_are_chained(self, locs, info):
         plain, _ = zfit.zfit(locs, info, calibration=dict(CALIB_3D), filter=0)

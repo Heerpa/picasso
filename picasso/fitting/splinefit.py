@@ -31,7 +31,7 @@ per-spot progress - the same arrangement as ``picasso.gaussmle``.
 This module deliberately knows nothing about calibration dicts: it takes
 plain arrays only, so that ``picasso.localize`` can import it without a
 circular dependency. ``localize`` owns the dict handling
-(``_spline_coeff_reshaped``, ``_spline_channel_affines``,
+(``_spline_coeff_reshaped``, ``_spline_channel_jacobians``,
 ``_initial_parameters_spline``, ``crop_spline_calibration``).
 
 References
@@ -523,7 +523,7 @@ def _accumulate_3d(
     variance: np.ndarray,
     use_variance: bool,
     coeff: np.ndarray,
-    aff: np.ndarray,
+    jac: np.ndarray,
     res: np.ndarray,
     theta: np.ndarray,
     mle: bool,
@@ -535,7 +535,7 @@ def _accumulate_3d(
     Parameters are ``[amplitude, x_shift, y_shift, z_shift, offset]``, the
     order the Gpufit models and ``localize._initial_parameters_spline`` use.
     The single-channel ``spline-3d`` model is the ``n_channels == 1``, identity
-    affine, zero residual case of the multichannel one.
+    Jacobian, zero residual case of the multichannel one.
 
     Returns ``(chi_square, ok)``. ``ok`` is False when the parameters or the
     model value are not finite, i.e. the fit has diverged; ``hess``/``grad``
@@ -568,13 +568,14 @@ def _accumulate_3d(
     h33 = h34 = 0.0
     h44 = 0.0
     for ch in range(n_channels):
-        # Each channel sees the shared lateral shift through its own affine and
+        # Each channel sees the shared lateral shift through its own local
+        # Jacobian and
         # sits on its own sub-pixel ROI offset, as in
-        # spline_3d_multichannel.cuh. Constant over the box, so hoisted.
-        a00 = aff[ch, 0]
-        a01 = aff[ch, 1]
-        a10 = aff[ch, 2]
-        a11 = aff[ch, 3]
+        # the CUDA kernels. Constant over the box, so hoisted.
+        a00 = jac[index, ch, 0]
+        a01 = jac[index, ch, 1]
+        a10 = jac[index, ch, 2]
+        a11 = jac[index, ch, 3]
         sx = a00 * x_shift + a01 * y_shift + res[index, ch, 0]
         sy = a10 * x_shift + a11 * y_shift + res[index, ch, 1]
         for j in range(box):
@@ -587,7 +588,7 @@ def _accumulate_3d(
                 value = amp * phi + offset
                 data = spots[index, ch, j, i]
                 # d(value)/d(parameter). The lateral pair picks up the
-                # transpose of the channel affine (shift = A @ theta, so
+                # transpose of the channel Jacobian (shift = J @ theta, so
                 # d(shift_x)/d(theta_x) = a00 and d(shift_y)/d(theta_x) = a10),
                 # and the leading minus is the chain rule of
                 # position = pixel - shift. Unlike the CRLB, whose diagonal is
@@ -661,7 +662,7 @@ def _accumulate_2d(
     variance: np.ndarray,
     use_variance: bool,
     coeff: np.ndarray,
-    aff: np.ndarray,
+    jac: np.ndarray,
     res: np.ndarray,
     theta: np.ndarray,
     mle: bool,
@@ -671,7 +672,7 @@ def _accumulate_2d(
     """Chi-square, gradient and Hessian of the 2D spline model.
 
     Parameters are ``[amplitude, x_shift, y_shift, offset]``. There is no
-    multichannel 2D model, so ``aff`` and ``res`` are accepted (to keep the
+    multichannel 2D model, so ``jac`` and ``res`` are accepted (to keep the
     kernel signatures uniform) but unused. See :func:`_accumulate_3d`."""
     box = spots.shape[2]
     amp = theta[0]
@@ -752,7 +753,7 @@ def _accumulate_link_xyz(
     variance: np.ndarray,
     use_variance: bool,
     coeff: np.ndarray,
-    aff: np.ndarray,
+    jac: np.ndarray,
     res: np.ndarray,
     theta: np.ndarray,
     mle: bool,
@@ -790,10 +791,10 @@ def _accumulate_link_xyz(
         # background; the three shared position parameters are 0, 1, 2.
         ia = 3 + ch
         ib = 3 + n_channels + ch
-        a00 = aff[ch, 0]
-        a01 = aff[ch, 1]
-        a10 = aff[ch, 2]
-        a11 = aff[ch, 3]
+        a00 = jac[index, ch, 0]
+        a01 = jac[index, ch, 1]
+        a10 = jac[index, ch, 2]
+        a11 = jac[index, ch, 3]
         sx = a00 * x_shift + a01 * y_shift + res[index, ch, 0]
         sy = a10 * x_shift + a11 * y_shift + res[index, ch, 1]
         for j in range(box):
@@ -860,7 +861,7 @@ def _fit_spline_spot(
     kind: int,
     coeff2d: np.ndarray,
     coeff3d: np.ndarray,
-    aff: np.ndarray,
+    jac: np.ndarray,
     res: np.ndarray,
     init: np.ndarray,
     z_seeds: np.ndarray,
@@ -942,7 +943,7 @@ def _fit_spline_spot(
                 variance,
                 use_variance,
                 coeff2d,
-                aff,
+                jac,
                 res,
                 theta,
                 mle,
@@ -956,7 +957,7 @@ def _fit_spline_spot(
                 variance,
                 use_variance,
                 coeff3d,
-                aff,
+                jac,
                 res,
                 theta,
                 mle,
@@ -970,7 +971,7 @@ def _fit_spline_spot(
                 variance,
                 use_variance,
                 coeff3d,
-                aff,
+                jac,
                 res,
                 theta,
                 mle,
@@ -1016,7 +1017,7 @@ def _fit_spline_spot(
                     variance,
                     use_variance,
                     coeff2d,
-                    aff,
+                    jac,
                     res,
                     theta,
                     mle,
@@ -1030,7 +1031,7 @@ def _fit_spline_spot(
                     variance,
                     use_variance,
                     coeff3d,
-                    aff,
+                    jac,
                     res,
                     theta,
                     mle,
@@ -1044,7 +1045,7 @@ def _fit_spline_spot(
                     variance,
                     use_variance,
                     coeff3d,
-                    aff,
+                    jac,
                     res,
                     theta,
                     mle,
@@ -1203,7 +1204,7 @@ def _kernel_args(
     use_variance: bool,
     kind: int,
     coefficients: np.ndarray,
-    affines: np.ndarray,
+    jacobians: np.ndarray,
     residuals: np.ndarray,
     initial_parameters: np.ndarray,
     z_seeds: np.ndarray,
@@ -1230,7 +1231,7 @@ def _kernel_args(
         kind,
         coeff2d,
         coeff3d,
-        affines,
+        jacobians,
         residuals,
         initial_parameters,
         z_seeds,
@@ -1258,7 +1259,7 @@ def _check_inputs(
     kind: int,
     spots: np.ndarray,
     coefficients: np.ndarray,
-    affines: np.ndarray,
+    jacobians: np.ndarray,
     residuals: np.ndarray,
     initial_parameters: np.ndarray,
 ) -> None:
@@ -1299,9 +1300,12 @@ def _check_inputs(
             f"initial_parameters must have shape {(n_spots, n_params)}, got "
             f"{initial_parameters.shape}."
         )
-    if affines.shape != (n_channels, 4):
+    if jacobians.shape[1:] != (n_channels, 4) or len(jacobians) < max(
+        n_spots, 1
+    ):
         raise ValueError(
-            f"affines must have shape {(n_channels, 4)}, got {affines.shape}."
+            f"jacobians must have shape {(n_spots, n_channels, 4)}, got "
+            f"{jacobians.shape}."
         )
     if residuals.shape[1:] != (n_channels, 2) or len(residuals) < max(
         n_spots, 1
@@ -1381,7 +1385,7 @@ def fit_spots(
     kind: int,
     spots: np.ndarray,
     coefficients: np.ndarray,
-    affines: np.ndarray,
+    jacobians: np.ndarray,
     residuals: np.ndarray,
     initial_parameters: np.ndarray,
     z_seeds: np.ndarray,
@@ -1408,10 +1412,13 @@ def fit_spots(
         ``(n_channels, niy, nix, 4, 4)`` (2D) or
         ``(n_channels, niz, niy, nix, 4, 4, 4)`` (3D), i.e. the output of
         ``precision._spline_coeff_reshaped``.
-    affines : np.ndarray
-        ``(n_channels, 4)`` per-channel lateral affine ``[a00, a01, a10, a11]``
-        (``precision._spline_channel_affines``); the identity for a
-        single-channel fit.
+    jacobians : np.ndarray
+        ``(n_spots, n_channels, 4)`` per-spot, per-channel local Jacobian
+        ``[a00, a01, a10, a11]`` of the channel transform
+        (``precision._spline_channel_jacobians``); the identity for a
+        single-channel fit, and constant across spots for an affine
+        registration, whose Jacobian does not vary over the field
+        registration.
     residuals : np.ndarray
         ``(n_spots, n_channels, 2)`` sub-pixel ROI offsets
         (``precision._spline_crlb_residuals``); zeros for a single-channel fit.
@@ -1450,7 +1457,7 @@ def fit_spots(
         Iterations used by the seed that won.
     """
     _check_inputs(
-        kind, spots, coefficients, affines, residuals, initial_parameters
+        kind, spots, coefficients, jacobians, residuals, initial_parameters
     )
     variance, use_variance = resolve_variance(variance, spots.shape, ndim=4)
     tolerance, max_iterations = resolve_schedule(
@@ -1465,7 +1472,7 @@ def fit_spots(
         use_variance,
         kind,
         coefficients,
-        affines,
+        jacobians,
         residuals,
         initial_parameters,
         z_seeds,
@@ -1493,7 +1500,7 @@ def fit_spots_async(
     kind: int,
     spots: np.ndarray,
     coefficients: np.ndarray,
-    affines: np.ndarray,
+    jacobians: np.ndarray,
     residuals: np.ndarray,
     initial_parameters: np.ndarray,
     z_seeds: np.ndarray,
@@ -1510,7 +1517,7 @@ def fit_spots_async(
     progress, aborts, or checks for worker errors. See :func:`fit_spots` for
     the arguments."""
     _check_inputs(
-        kind, spots, coefficients, affines, residuals, initial_parameters
+        kind, spots, coefficients, jacobians, residuals, initial_parameters
     )
     variance, use_variance = resolve_variance(variance, spots.shape, ndim=4)
     tolerance, max_iterations = resolve_schedule(
@@ -1525,7 +1532,7 @@ def fit_spots_async(
         use_variance,
         kind,
         coefficients,
-        affines,
+        jacobians,
         residuals,
         initial_parameters,
         z_seeds,
@@ -1561,7 +1568,7 @@ def fit_spots_async(
 def model_and_jacobian(
     kind: int,
     coefficients: np.ndarray,
-    affines: np.ndarray,
+    jacobians_row: np.ndarray,
     residuals_row: np.ndarray,
     theta: np.ndarray,
     box: int,
@@ -1575,7 +1582,7 @@ def model_and_jacobian(
     Jacobian against finite differences of ``mu``, which is what pins the sign
     convention of the position derivatives."""
     coefficients = np.ascontiguousarray(coefficients, dtype=np.float64)
-    affines = np.ascontiguousarray(affines, dtype=np.float64)
+    jacobians_row = np.ascontiguousarray(jacobians_row, dtype=np.float64)
     residuals_row = np.ascontiguousarray(residuals_row, dtype=np.float64)
     theta = np.ascontiguousarray(theta, dtype=np.float64)
     n_channels = coefficients.shape[0]
@@ -1583,7 +1590,7 @@ def model_and_jacobian(
     mu = np.zeros((n_channels, box, box))
     jacobian = np.zeros((n_channels, box, box, n_params))
     for ch in range(n_channels):
-        a00, a01, a10, a11 = affines[ch]
+        a00, a01, a10, a11 = jacobians_row[ch]
         if kind == KIND_LINK_XYZ:
             x_shift, y_shift, z_shift = theta[0], theta[1], theta[2]
             amplitude = theta[3 + ch]

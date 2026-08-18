@@ -380,7 +380,7 @@ def _lm_solve_step_device(hess, grad, scaling, lam, damped, delta, n, ipiv):
 def make_lm_driver(accumulate, n_params: int, z_col: int, seedable: bool):
     """Build the per-fit LM driver device function for one model.
 
-    ``accumulate(spots, index, variance, use_variance, coeff, aff, res, theta,
+    ``accumulate(spots, index, variance, use_variance, coeff, jac, res, theta,
     mle, hess, grad)`` must return ``(chi_square, ok)`` and fill the full
     symmetric ``hess`` and ``grad``, exactly like the
     ``picasso.fitting.splinefit._accumulate_*`` family.
@@ -416,7 +416,7 @@ def make_lm_driver(accumulate, n_params: int, z_col: int, seedable: bool):
         variance,
         use_variance,
         coeff,
-        aff,
+        jac,
         res,
         init,
         z_seeds,
@@ -487,7 +487,7 @@ def make_lm_driver(accumulate, n_params: int, z_col: int, seedable: bool):
                 variance,
                 use_variance,
                 coeff,
-                aff,
+                jac,
                 res,
                 theta,
                 mle,
@@ -523,7 +523,7 @@ def make_lm_driver(accumulate, n_params: int, z_col: int, seedable: bool):
                     variance,
                     use_variance,
                     coeff,
-                    aff,
+                    jac,
                     res,
                     theta,
                     mle,
@@ -645,7 +645,7 @@ def make_fit_kernel(driver, cache: bool = False):
         variance,
         use_variance,
         coeff,
-        aff,
+        jac,
         res,
         init,
         z_seeds,
@@ -667,7 +667,7 @@ def make_fit_kernel(driver, cache: bool = False):
             variance,
             use_variance,
             coeff,
-            aff,
+            jac,
             res,
             init,
             z_seeds,

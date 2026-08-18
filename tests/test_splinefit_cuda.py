@@ -70,7 +70,7 @@ _FP32 = dict(rtol=1e-4, atol=1e-6)
 
 
 def _link_xyz_case(n_channels, amplitude=800.0, offset=10.0, z=-6.0):
-    """Photon-decoupled calibration, spots, initial parameters and affines."""
+    """Photon-decoupled calibration, spots, initial parameters and jacobians."""
     calibration, terms = _astigmatic_calibration(
         n_channels=n_channels, model="spline-3d-multichannel"
     )
@@ -86,12 +86,12 @@ def _link_xyz_case(n_channels, amplitude=800.0, offset=10.0, z=-6.0):
             + [float(spots.min())] * n_channels
         ]
     )
-    affines = np.tile(np.array([1.0, 0.0, 0.0, 1.0]), (n_channels, 1))
-    return calibration, spots, initial, affines
+    jacobians = np.tile(np.array([1.0, 0.0, 0.0, 1.0]), (n_channels, 1))
+    return calibration, spots, initial, jacobians
 
 
 def _case(kind, n_channels=1):
-    """``(calibration, spots, initial, affines)`` for one model kind."""
+    """``(calibration, spots, initial, jacobians)`` for one model kind."""
     if kind == splinefit.KIND_2D:
         calibration, terms = _flat_calibration()
         spots = _spots_from_terms(terms, BOX, 700.0, 8.0, DX, DY, 0.0)
@@ -124,7 +124,7 @@ def _case(kind, n_channels=1):
     return _link_xyz_case(n_channels)
 
 
-def _args(kind, calibration, spots, initial, affines, seeds=None):
+def _args(kind, calibration, spots, initial, jacobians, seeds=None):
     coefficients = precision._spline_coeff_reshaped(calibration)
     n_spots, n_channels = spots.shape[0], spots.shape[1]
     residuals = np.zeros((max(n_spots, 1), n_channels, 2))
@@ -134,7 +134,7 @@ def _args(kind, calibration, spots, initial, affines, seeds=None):
         kind,
         spots,
         coefficients,
-        affines,
+        jacobians,
         residuals,
         initial,
         z_seeds,
@@ -169,8 +169,8 @@ def _multichannel_3d_case(n_channels):
             ]
         ]
     )
-    affines = np.tile(np.array([1.0, 0.0, 0.0, 1.0]), (n_channels, 1))
-    return calibration, spots, initial, affines
+    jacobians = np.tile(np.array([1.0, 0.0, 0.0, 1.0]), (n_channels, 1))
+    return calibration, spots, initial, jacobians
 
 
 def _build(kind, n_channels):
@@ -456,13 +456,13 @@ class TestDeviceBehaviour:
         assert seen == sorted(seen) and seen[-1] == len(spots)
 
     def test_empty_input(self):
-        calibration, spots, initial, affines = _build(splinefit.KIND_3D, 1)
+        calibration, spots, initial, jacobians = _build(splinefit.KIND_3D, 1)
         args = _args(
             splinefit.KIND_3D,
             calibration,
             spots[:0],
             initial[:0],
-            affines,
+            jacobians,
         )
         thetas, chi_squares, states, iterations = splinefit_cuda.fit_spots(
             *args
@@ -476,9 +476,9 @@ class TestDeviceBehaviour:
         Seeding it would corrupt the fit rather than move it in z, so the
         multi-start must be a no-op here - the same guard the CPU kernel has.
         """
-        calibration, spots, initial, affines = _build(splinefit.KIND_2D, 1)
+        calibration, spots, initial, jacobians = _build(splinefit.KIND_2D, 1)
         without = splinefit_cuda.fit_spots(
-            *_args(splinefit.KIND_2D, calibration, spots, initial, affines)
+            *_args(splinefit.KIND_2D, calibration, spots, initial, jacobians)
         )
         with_seeds = splinefit_cuda.fit_spots(
             *_args(
@@ -486,7 +486,7 @@ class TestDeviceBehaviour:
                 calibration,
                 spots,
                 initial,
-                affines,
+                jacobians,
                 seeds=np.linspace(-(NZ - 1), 0.0, 5),
             ),
             tolerance=splinefit.TOLERANCE_SINGLE_START,
@@ -581,18 +581,18 @@ class TestInputValidation:
     """Shape checking is shared with the CPU backend, so it must still fire."""
 
     def test_rejects_a_channel_mismatch(self):
-        calibration, spots, initial, affines = _build(splinefit.KIND_3D, 1)
+        calibration, spots, initial, jacobians = _build(splinefit.KIND_3D, 1)
         args = list(
-            _args(splinefit.KIND_3D, calibration, spots, initial, affines)
+            _args(splinefit.KIND_3D, calibration, spots, initial, jacobians)
         )
         args[3] = np.tile(np.array([1.0, 0.0, 0.0, 1.0]), (2, 1))
-        with pytest.raises(ValueError, match="affines"):
+        with pytest.raises(ValueError, match="jacobians"):
             splinefit_cuda.fit_spots(*args)
 
     def test_rejects_wrong_coefficient_rank(self):
-        calibration2d, spots, initial, affines = _build(splinefit.KIND_2D, 1)
+        calibration2d, spots, initial, jacobians = _build(splinefit.KIND_2D, 1)
         args = list(
-            _args(splinefit.KIND_2D, calibration2d, spots, initial, affines)
+            _args(splinefit.KIND_2D, calibration2d, spots, initial, jacobians)
         )
         calibration3d, _ = _astigmatic_calibration()
         args[2] = precision._spline_coeff_reshaped(calibration3d)

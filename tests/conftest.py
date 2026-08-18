@@ -20,7 +20,54 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from picasso import io
+from picasso import io, transforms
+
+# ---------------------------------------------------------------------------
+# Geometric transforms
+# ---------------------------------------------------------------------------
+
+
+def affine(matrix) -> transforms.AffineTransform:
+    """An ``AffineTransform`` from a ``(2, 3)`` or ``(3, 3)`` matrix.
+
+    Most tests write channel registrations as the bare ``(2, 3)`` they used to
+    be stored as; this lifts them into the transform objects the code now
+    passes around.
+    """
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.shape == (2, 3):
+        matrix = np.vstack([matrix, [0.0, 0.0, 1.0]])
+    return transforms.AffineTransform(matrix=matrix)
+
+
+def apply_transform(xy, transform):
+    """Map ``(n, 2)`` points through a transform, its serialized dict, or a
+    bare matrix."""
+    if not isinstance(transform, (transforms.Transform, dict)):
+        transform = affine(transform)
+    return transforms.from_dict(transform).apply(xy)
+
+
+def affine_matrix(transform) -> np.ndarray:
+    """The ``(2, 3)`` matrix of an affine transform (or its serialized dict) -
+    what a channel registration used to be stored as."""
+    return transforms.from_dict(transform).matrix[:2]
+
+
+def affine_matrix_3x3(transform) -> np.ndarray:
+    """The ``(3, 3)`` homogeneous matrix of an affine or projective transform
+    (or its serialized dict)."""
+    return transforms.from_dict(transform).matrix
+
+
+def linear_part(transform) -> np.ndarray:
+    """The ``(2, 2)`` local linear part of a transform at its domain centre -
+    what the old ``transform[:, :2]`` slice used to be."""
+    return transforms.from_dict(transform).jacobian([[0.0, 0.0]])[0]
+
+
+IDENTITY = transforms.identity().to_dict()
+
 
 # ---------------------------------------------------------------------------
 # Loaded test data (shared across files to avoid repeated I/O)

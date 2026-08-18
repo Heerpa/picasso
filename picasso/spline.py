@@ -51,6 +51,7 @@ References
 from __future__ import annotations
 
 import os
+import warnings
 from itertools import combinations
 from typing import Callable, Literal
 
@@ -63,6 +64,10 @@ from scipy.ndimage import shift as _ndi_shift, zoom as _ndi_zoom
 from scipy.spatial import KDTree
 
 from . import io, lib, localize, __version__
+
+# aliased: `transforms` is used as a local name for lists of channel
+# transforms throughout this module
+from . import transforms as tform
 from .fitting import gaussfit, precision, splinefit
 
 
@@ -1367,19 +1372,81 @@ def _normalized_region(
     return (y0, x0), (y1, x1)
 
 
+def _resolve_model(calibration: dict, model: str | None) -> str:
+    """The model to register with: the one asked for, else the one the
+    calibration already uses, else affine."""
+    if model is not None:
+        return model
+    stored = calibration.get("channel_transforms")
+    for entry in (stored or [])[1:] or (stored or [])[:1]:
+        return tform.from_dict(entry).model
+    return "affine"
+
+
+def registration_model_name(calibration: dict) -> str | None:
+    """The model a multichannel calibration's channels were registered with.
+
+    Read off the stored transforms themselves rather than a separate key, so
+    it cannot disagree with them. None if the calibration carries no channel
+    transforms (i.e. it is single-channel).
+    """
+    stored = calibration.get("channel_transforms")
+    if not stored:
+        return None
+    for entry in stored[1:] or stored[:1]:  # skip the identity reference
+        return tform.from_dict(entry).model
+    return None
+
+
+def _fit_registration(
+    src: np.ndarray,
+    dst: np.ndarray,
+    model: str,
+    final: bool = True,
+) -> tuple[tform.Transform, str]:
+    """Fit one ICP iteration's transform. Returns ``(transform, model_name)``.
+
+    Intermediate iterations (``final=False``) always fit an affine, however
+    flexible ``model`` is: the early pairing is deliberately loose and contains
+    cross-molecule mismatches, and a flexible model bends to accommodate them,
+    locking in the wrong correspondence field on the next pass - a failure an
+    affine cannot have. Only the final iteration, which pairs at the tightest
+    radius, fits the model the user asked for.
+
+    If too few correspondences survive for that model, an affine is fitted
+    instead and *named in the return value*, so the caller can report the
+    fallback rather than hide it.
+    """
+    if final and len(src) >= tform.min_points(model):
+        return tform.estimate(src, dst, model), model
+    with warnings.catch_warnings():
+        # An intermediate ICP pass is an internal step towards the pairing,
+        # not a registration anyone keeps, so its "thin data" warning would
+        # only be noise; the final fit above still warns.
+        if not final:
+            warnings.simplefilter("ignore")
+        return tform.estimate(src, dst, "affine"), "affine"
+
+
 def _similarity_from_two(
     a0: np.ndarray, a1: np.ndarray, b0: np.ndarray, b1: np.ndarray
-) -> list[np.ndarray]:
+) -> list[tform.AffineTransform]:
     """Candidate similarity transforms mapping ``a -> b`` from two point pairs.
 
     A similarity (translation + rotation + isotropic scale, optionally a
     reflection) is fixed by two correspondences up to the reflection ambiguity,
-    so both the proper-rotation and the reflected solution are returned as
-    ``(2, 3)`` affines. Using a *similarity* (4 DOF) as the RANSAC minimal model -
-    rather than a full 6-DOF affine, which three points always fit exactly - keeps
+    so both the proper-rotation and the reflected solution are returned. Using a
+    *similarity* (4 DOF) as the RANSAC minimal model - rather than a full 6-DOF
+    affine, which three points always fit exactly - keeps
     a spare bead to validate the sample, so correct correspondences can be told
     from wrong ones even with only three beads. Empty if the two reference
-    points coincide."""
+    points coincide.
+
+    This stays a similarity whatever model the registration is finally fitted
+    with: matching only needs a hypothesis good enough to rank correspondences,
+    and a higher-DOF minimal model would defeat the consensus vote - a degree-3
+    polynomial fits *any* 10 points exactly, so every sample would score the
+    maximum."""
     va, vb = a1 - a0, b1 - b0
     na = float(np.hypot(va[0], va[1]))
     if na < 1e-9:
@@ -1401,7 +1468,10 @@ def _similarity_from_two(
     for r in (r_rot, r_ref):
         A = s * r
         t = b0 - A @ a0
-        out.append(np.hstack([A, t[:, None]]))
+        matrix = np.eye(3)
+        matrix[:2, :2] = A
+        matrix[:2, 2] = t
+        out.append(tform.AffineTransform(matrix=matrix))
     return out
 
 
@@ -1463,7 +1533,7 @@ def _ransac_match(
         for M in _similarity_from_two(
             ref_xy[i0], ref_xy[i1], c_xy[j0], c_xy[j1]
         ):
-            pred = localize.apply_affine_transform(ref_xy, M)
+            pred = M.apply(ref_xy)
             dist, _ = c_tree.query(pred, k=1)
             count = int(np.count_nonzero(dist <= inlier_tol))
             if count > best_count:
@@ -1471,7 +1541,7 @@ def _ransac_match(
 
     if best_M is None:
         return empty
-    pred = localize.apply_affine_transform(ref_xy, best_M)
+    pred = best_M.apply(ref_xy)
     return _match_beads(pred, c_xy, inlier_tol)
 
 
@@ -1517,13 +1587,20 @@ def _estimate_channel_transform(
     channel_roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
     coarse_shift: tuple[float, float] | np.ndarray | None = None,
     return_matches: bool = False,
+    model: str = "affine",
 ) -> tuple[np.ndarray, int] | tuple[np.ndarray, int, np.ndarray, np.ndarray]:
-    """Estimate the affine transform mapping reference-channel coordinates to
+    """Estimate the transform mapping reference-channel coordinates to
     channel ``c``.
 
     Beads are detected in channel ``c``, coarsely aligned to the reference,
-    matched to the reference beads and an affine transform is fitted to the
-    correspondences. Returns ``(transform (2, 3), n_matches)``.
+    matched to the reference beads and a transform of the requested ``model``
+    (see :mod:`picasso.transforms`) is fitted to the correspondences. Returns
+    ``(transform, n_matches)``.
+
+    The matching itself is always done with a similarity minimal model
+    regardless of ``model`` - only the final fit on the inliers uses it, so a
+    flexible model cannot bend to accommodate wrong correspondences (see
+    :func:`_ransac_match`).
 
     Two coarse-alignment paths:
 
@@ -1625,15 +1702,16 @@ def _estimate_channel_transform(
         if len(ri) > len(best_ref_idx):
             best_ref_idx, best_c_idx = ri, ci
 
-    if len(best_ref_idx) < 3:
+    needed = tform.min_points(model)
+    if len(best_ref_idx) < needed:
         raise ValueError(
             f"Only {len(best_ref_idx)} bead correspondences found between the "
-            "reference channel and another channel; cannot estimate an affine "
-            "transform. Increase the bead count or the match distance."
+            "reference channel and another channel; a "
+            f"{model} registration needs at least "
+            f"{needed}. Increase the bead count, the match distance, or "
+            "choose a simpler model."
         )
-    transform = localize.estimate_affine_transform(
-        ref_xy[best_ref_idx], c_xy[best_c_idx]
-    )
+    transform = tform.estimate(ref_xy[best_ref_idx], c_xy[best_c_idx], model)
     n_matches = int(len(best_ref_idx))
     if return_matches:
         # the matched reference / channel bead coordinates, for the
@@ -1663,6 +1741,7 @@ def calibrate_spline_multichannel(
     path: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
     return_diagnostics: bool = False,
+    model: str = "affine",
 ) -> dict | tuple[dict, list]:
     """Generate a multichannel cubic-spline PSF calibration from registered
     bead z-stacks (one movie per channel).
@@ -1784,7 +1863,7 @@ def calibrate_spline_multichannel(
     )
 
     # channel transforms (channel 0 is the identity reference)
-    identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    identity = tform.identity()
     transforms = [identity]
     reg_info = (
         []
@@ -1802,6 +1881,7 @@ def calibrate_spline_multichannel(
             channel_roi=region_rects[c] if split_fov else None,
             coarse_shift=coarse_shifts[c] if split_fov else None,
             return_matches=True,
+            model=model,
         )
         transforms.append(transform)
         reg_info.append(
@@ -1824,7 +1904,7 @@ def calibrate_spline_multichannel(
         if c == 0:
             beads_c = beads_ref
         else:
-            mapped = localize.apply_affine_transform(ref_xy, transforms[c])
+            mapped = transforms[c].apply(ref_xy)
             beads_c = pd.DataFrame(
                 {
                     "x": np.rint(mapped[:, 0]).astype(int),
@@ -1882,7 +1962,7 @@ def calibrate_spline_multichannel(
         "n_data": [int(s) for s in templates[0].shape],
         "n_intervals": n_intervals,
         "n_channels": n_channels,
-        "channel_transforms": [t.tolist() for t in transforms],
+        "channel_transforms": [t.to_dict() for t in transforms],
         "oversampling": 1.0,
         # every channel's template is centred on its own box, so the channels
         # share one lateral origin and the linked fit is free of the constant
@@ -1938,10 +2018,12 @@ def calibrate_spline_multichannel(
         # the region origins so the channels can be re-placed at fit time by
         # re-drawing the ROIs (the ``regions`` above are only the defaults). The
         # absolute ``channel_transforms`` are recomputed from these + the ROIs.
-        channel_affines = localize.decompose_region_affines(
+        channel_registration = localize.decompose_region_transforms(
             region_rects, transforms
         )
-        calibration["channel_affines"] = [a.tolist() for a in channel_affines]
+        calibration["channel_registration"] = [
+            a.to_dict() for a in channel_registration
+        ]
         h = region_rects[0][1][0] - region_rects[0][0][0]
         w = region_rects[0][1][1] - region_rects[0][0][1]
         calibration["region_size"] = [int(h), int(w)]
@@ -1994,49 +2076,6 @@ _CHANNEL_COLORS = [
     "tab:olive",
     "tab:cyan",
 ]
-
-
-def _decompose_affine(transform, pixelsize: float) -> dict:
-    """Human-readable decomposition of a ``(2, 3)`` registration affine.
-
-    Splits the linear part (via SVD) into a rotation, two principal scales and a
-    mirror flag, plus the translation in nm. A reflected channel (biplane /
-    spectral splitters) has ``mirror=True``; the reported rotation then has the
-    canonical axis flip removed (the axis that minimizes the residual rotation is
-    named in ``flip_axis``) so a pure mirror reads as ~0 degrees, not ~180.
-    """
-    M = np.asarray(transform, dtype=float)
-    A = M[:, :2]
-    tx = float(M[0, 2]) * pixelsize
-    ty = float(M[1, 2]) * pixelsize
-    det = float(np.linalg.det(A))
-    mirror = det < 0
-    U, S, Vt = np.linalg.svd(A)
-    scale_major, scale_minor = float(S[0]), float(S[1])
-    R = U @ Vt  # orthogonal part (determinant +/-1)
-    flip_axis = None
-    if mirror:
-        best = None
-        for axis, D in (
-            ("x", np.array([[-1.0, 0.0], [0.0, 1.0]])),
-            ("y", np.array([[1.0, 0.0], [0.0, -1.0]])),
-        ):
-            Rr = R @ D
-            ang = float(np.degrees(np.arctan2(Rr[1, 0], Rr[0, 0])))
-            if best is None or abs(ang) < abs(best[0]):
-                best = (ang, axis)
-        rotation, flip_axis = best
-    else:
-        rotation = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
-    return {
-        "tx_nm": tx,
-        "ty_nm": ty,
-        "rotation_deg": rotation,
-        "scale_major": scale_major,
-        "scale_minor": scale_minor,
-        "mirror": mirror,
-        "flip_axis": flip_axis,
-    }
 
 
 def _save_multichannel_summary_plot(
@@ -2266,7 +2305,8 @@ def _save_registration_diagnostic_plot(
     field of view (magnified for visibility) and summarized as an RMS bar chart.
     A footer table lists, per channel, the matched-bead count, RMS, the affine
     decomposed into rotation / principal scales / mirror (see
-    :func:`_decompose_affine`) - so a reflected channel or an unexpected
+    :meth:`picasso.transforms.Transform.decompose`) - so a reflected
+    channel or an unexpected
     rotation/scale is obvious - plus the focus (plane) offset and photon scale. A
     tight, structure-free residual field with small RMS means the channels are
     well registered; a systematic pattern reveals a rotation/scale the affine
@@ -2295,8 +2335,7 @@ def _save_registration_diagnostic_plot(
     for r in reg_info:
         ref = np.asarray(r["ref_xy"], dtype=float)
         cxy = np.asarray(r["c_xy"], dtype=float)
-        M = np.asarray(r["transform"], dtype=float)
-        pred = ref @ M[:, :2].T + M[:, 2]
+        pred = tform.from_dict(r["transform"]).apply(ref)
         resid = cxy - pred  # (n, 2), camera px
         r["_resid"] = resid
         r["_ref"] = ref
@@ -2380,7 +2419,7 @@ def _save_registration_diagnostic_plot(
     ax2.set_ylim(bottom=0.0)
 
     # full-width text summary footer (so wide columns never clip). The affine is
-    # decomposed into rotation / scale / mirror (see _decompose_affine) so a
+    # decomposed into rotation / scale / mirror (see Transform.decompose) so a
     # reflected channel or an unexpected rotation/scale is obvious at a glance
     # rather than hidden in a raw 2x3 matrix.
     cols = (
@@ -2399,7 +2438,7 @@ def _save_registration_diagnostic_plot(
         c = r["channel"]
         po = plane_offsets[c] if c < plane_offsets.size else float("nan")
         pscale = photon_scale[c] if c < photon_scale.size else float("nan")
-        dec = _decompose_affine(r["transform"], ps)
+        dec = tform.from_dict(r["transform"]).decompose(ps)
         mirror_s = f"yes ({dec['flip_axis']})" if dec["mirror"] else "no"
         fields = [
             f"ch{c}",
@@ -2445,6 +2484,7 @@ def calibrate_spline_split_fov(
     path: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
     return_diagnostics: bool = False,
+    model: str = "affine",
 ) -> dict | tuple[dict, list]:
     """Build a multichannel spline calibration from a *single* bead z-stack in
     which several rectangular field-of-view regions are the channels (split-FOV
@@ -2504,28 +2544,27 @@ def calibrate_spline_split_fov(
         path=path,
         progress_callback=progress_callback,
         return_diagnostics=return_diagnostics,
+        model=model,
     )
 
 
 def _split_fov_local_affines(
     calibration: dict, region_rects: list
-) -> list[np.ndarray]:
-    """The stored region-local channel affines (reference first), decomposed
-    from ``channel_transforms`` if ``channel_affines`` is absent."""
-    affines = calibration.get("channel_affines")
+) -> list[tform.Transform]:
+    """The stored region-local channel registration (reference first),
+    decomposed from ``channel_transforms`` if ``channel_registration`` is
+    absent."""
+    affines = calibration.get("channel_registration")
     if affines is None:
-        affines = [
-            a.tolist()
-            for a in localize.decompose_region_affines(
-                calibration["regions"], calibration["channel_transforms"]
-            )
-        ]
+        affines = localize.decompose_region_transforms(
+            calibration["regions"], calibration["channel_transforms"]
+        )
     if len(affines) != len(region_rects):
         raise ValueError(
-            f"Calibration has {len(affines)} channel affines but "
+            f"Calibration has {len(affines)} channel registrations but "
             f"{len(region_rects)} regions were given."
         )
-    return [np.asarray(a, dtype=np.float64) for a in affines]
+    return [tform.from_dict(a) for a in affines]
 
 
 def _frames_in_bounds(
@@ -2562,30 +2601,27 @@ def _flip_seed_transforms(
     frame_shape: tuple[int, int] | None,
     ref_xy: np.ndarray,
     chan_xy: np.ndarray,
-) -> list[np.ndarray]:
+) -> list[tform.AffineTransform]:
     """Coarse reference->channel seed transforms, one per mirror orientation.
 
     Split-FOV (``region_rects`` given): the mirror is taken about the channel's
     region and the region origins supply the placement. Separate movies
     (``frame_shape`` given): the mirror is taken about the frame and the
     translation comes from aligning the pooled detection centroids.
+
+    Seeds are always affine, whatever the registration is finally fitted with:
+    they only have to get the pairing started.
     """
     seeds = []
-    identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    identity = tform.identity()
     if region_rects is not None:
         (cy0, cx0), (cy1, cx1) = region_rects[channel]
         h, w = float(cy1 - cy0), float(cx1 - cx0)
         for sx, sy in _FLIP_SIGNS:
-            local = np.array(
-                [
-                    [sx, 0.0, w if sx < 0 else 0.0],
-                    [0.0, sy, h if sy < 0 else 0.0],
-                ]
-            )
             seeds.append(
                 localize.compose_region_transforms(
                     [region_rects[0], region_rects[channel]],
-                    [identity, local],
+                    [identity, _flip_affine(sx, sy, w, h)],
                 )[1]
             )
         return seeds
@@ -2597,16 +2633,28 @@ def _flip_seed_transforms(
         else (0.0, 0.0)
     )
     for sx, sy in _FLIP_SIGNS:
-        seed = np.array(
-            [
-                [sx, 0.0, w if sx < 0 else 0.0],
-                [0.0, sy, h if sy < 0 else 0.0],
-            ]
+        seed = _flip_affine(sx, sy, w, h)
+        pred = seed.apply(ref_xy)
+        seeds.append(
+            seed.compose_translations(
+                post=chan_xy.mean(axis=0) - pred.mean(axis=0)
+            )
         )
-        pred = localize.apply_affine_transform(ref_xy, seed)
-        seed[:, 2] += chan_xy.mean(axis=0) - pred.mean(axis=0)
-        seeds.append(seed)
     return seeds
+
+
+def _flip_affine(
+    sx: float, sy: float, w: float, h: float
+) -> tform.AffineTransform:
+    """A pure mirror about a ``w`` x ``h`` box, per axis sign."""
+    matrix = np.array(
+        [
+            [sx, 0.0, w if sx < 0 else 0.0],
+            [0.0, sy, h if sy < 0 else 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    return tform.AffineTransform(matrix=matrix)
 
 
 def estimate_transforms_from_identifications(
@@ -2700,7 +2748,7 @@ def estimate_transforms_from_identifications(
     tols = np.linspace(
         1.5 * float(box), max(2.0, 0.3 * float(box)), max(1, int(n_iter))
     )
-    transforms: list = [np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])]
+    transforms: list = [tform.identity()]
     n_pairs_per_channel: list = [0]
     for c in range(1, n_channels):
         chan_by_frame = per_channel[c]
@@ -2715,13 +2763,13 @@ def estimate_transforms_from_identifications(
         for seed in _flip_seed_transforms(
             c, region_rects, frame_shape, ref_pool, chan_pool
         ):
-            transform = np.asarray(seed, dtype=np.float64)
+            transform = seed
             n_pairs = 0
             for tol in tols:
                 acc_ref, acc_c = [], []
                 for f in common:
                     rxy, cxy = ref_by_frame[f], chan_by_frame[f]
-                    pred = localize.apply_affine_transform(rxy, transform)
+                    pred = transform.apply(rxy)
                     ri, ci = _match_beads(pred, cxy, tol)
                     if len(ri):
                         acc_ref.append(rxy[ri])
@@ -2734,13 +2782,10 @@ def estimate_transforms_from_identifications(
                 n_pairs = len(matched_ref)
                 if n_pairs < 3:
                     break
-                transform = localize.estimate_affine_transform(
-                    matched_ref, matched_c
-                )
+                transform = tform.estimate(matched_ref, matched_c)
             # a wrong orientation converges onto coincidental pairs, which are
             # few at the tightest radius and usually imply an absurd scale
-            scale = abs(float(np.linalg.det(transform[:, :2])))
-            if n_pairs > best_pairs and 0.5 <= scale <= 2.0:
+            if n_pairs > best_pairs and tform.is_plausible(transform):
                 best_pairs, best_transform = n_pairs, transform
         registered = best_pairs >= min_pairs
         transforms.append(best_transform if registered else None)
@@ -2763,6 +2808,7 @@ def refine_split_fov_transforms_from_signal(
     n_iter: int = 4,
     min_pairs: int = 20,
     update: bool = True,
+    model: str | None = None,
 ) -> tuple[dict, list]:
     """Re-register a split-FOV spline calibration from the experimental
     (blinking) data.
@@ -2788,13 +2834,21 @@ def refine_split_fov_transforms_from_signal(
     ``regions`` are the channel ROIs in the current data (reference first, e.g.
     freshly drawn in the GUI); ``minimum_ng`` may be a matching per-region
     sequence. The PSF ``coefficients`` are untouched; only the
-    registration (``channel_affines`` / ``channel_transforms`` / ``regions`` /
-    ``region_size``) is updated. Requires channels that share signal.
+    registration (``channel_registration`` / ``channel_transforms`` /
+    ``regions`` / ``region_size``) is updated. Requires channels that share
+    signal.
+
+    ``model`` selects the transform model (see :mod:`picasso.transforms`);
+    it defaults to the one the calibration was registered with, so a plain
+    re-registration keeps it. Only the final ICP
+    iteration fits that model - see :func:`_fit_registration`.
 
     Returns ``(calibration, reg_info)`` where ``reg_info`` lists, per channel,
-    the number of matched pairs, their coordinates, the fitted transform and the
-    residual RMS (camera px). With ``update=True`` the passed calibration is
-    modified in place; set it False to only compute the transforms.
+    the number of matched pairs, their coordinates, the fitted transform, the
+    residual RMS (camera px) and the model actually fitted (``"model"``, which
+    falls back to affine when too few pairs survive for ``model_requested``).
+    With ``update=True`` the passed calibration is modified in place; set it
+    False to only compute the transforms.
     """
     if not calibration.get("split_fov"):
         raise ValueError(
@@ -2833,20 +2887,23 @@ def refine_split_fov_transforms_from_signal(
     # drawn regions
     h = region_rects[0][1][0] - region_rects[0][0][0]
     w = region_rects[0][1][1] - region_rects[0][0][1]
-    identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    identity = tform.identity()
     seed_local_affines = [identity]
     for c in range(1, n_channels):
-        dec = _decompose_affine(affines[c], pixelsize=1.0)
+        # at the region centre: the only place the question is well posed
+        # for a non-linear map (identical everywhere for an affine)
+        dec = affines[c].decompose(pixelsize=1.0, at=(w / 2.0, h / 2.0))
         if dec["mirror"] and dec["flip_axis"] == "x":
             seed_local_affines.append(
-                np.array([[-1.0, 0.0, float(w)], [0.0, 1.0, 0.0]])
+                _flip_affine(-1.0, 1.0, float(w), float(h))
             )
         elif dec["mirror"] and dec["flip_axis"] == "y":
             seed_local_affines.append(
-                np.array([[1.0, 0.0, 0.0], [0.0, -1.0, float(h)]])
+                _flip_affine(1.0, -1.0, float(w), float(h))
             )
         else:
-            seed_local_affines.append(identity.copy())
+            # transforms are immutable, so the identity can be shared
+            seed_local_affines.append(identity)
     seed_transforms = localize.compose_region_transforms(
         region_rects, seed_local_affines
     )
@@ -2889,13 +2946,16 @@ def refine_split_fov_transforms_from_signal(
             "gradient or check the drawn ROIs / frame range."
         )
 
+    # keep the calibration's own model unless the caller asks for another
+    model = _resolve_model(calibration, model)
+
     # match radii shrink from generous (absorb the seed's residual drift) to
     # tight (sub-box) over the ICP iterations
     tol_hi = float(max_pair_distance)
     tol_lo = max(2.0, 0.3 * box)
     tols = np.linspace(tol_hi, tol_lo, max(1, int(n_iter)))
 
-    transforms = [np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])]
+    transforms = [tform.identity()]
     reg_info = []
     for c in range(1, n_channels):
         chan_by_frame = _by_frame(region_rects[c], minimum_ngs[c])
@@ -2906,14 +2966,15 @@ def refine_split_fov_transforms_from_signal(
                 f"{c} regions; the channels may not share signal (needs "
                 "biplane / ratiometric data)."
             )
-        transform = np.asarray(seed_transforms[c], dtype=np.float64)
+        transform = tform.from_dict(seed_transforms[c])
+        fitted_model = "affine"
         matched_ref = matched_c = np.empty((0, 2))
-        for tol in tols:
+        for k, tol in enumerate(tols):
             acc_ref, acc_c = [], []
             for f in common:
                 rxy = ref_by_frame[f]
                 cxy = chan_by_frame[f]
-                pred = localize.apply_affine_transform(rxy, transform)
+                pred = transform.apply(rxy)
                 ri, ci = _match_beads(pred, cxy, tol)
                 if len(ri):
                     acc_ref.append(rxy[ri])
@@ -2924,22 +2985,23 @@ def refine_split_fov_transforms_from_signal(
             matched_c = np.vstack(acc_c)
             if len(matched_ref) < 3:
                 break
-            transform = localize.estimate_affine_transform(
-                matched_ref, matched_c
+            transform, fitted_model = _fit_registration(
+                matched_ref,
+                matched_c,
+                model,
+                final=k == len(tols) - 1,
             )
         # robust trim: drop coincidental pairs far from the converged transform,
         # then re-fit once on the inliers
         if len(matched_ref) >= 3:
-            resid = matched_c - localize.apply_affine_transform(
-                matched_ref, transform
-            )
+            resid = matched_c - transform.apply(matched_ref)
             dist = np.sqrt(np.sum(resid**2, axis=1))
             keep = dist <= max(tol_lo, 3.0 * np.median(dist))
             if keep.sum() >= 3:
                 matched_ref = matched_ref[keep]
                 matched_c = matched_c[keep]
-                transform = localize.estimate_affine_transform(
-                    matched_ref, matched_c
+                transform, fitted_model = _fit_registration(
+                    matched_ref, matched_c, model
                 )
         n_pairs = int(len(matched_ref))
         if n_pairs < min_pairs:
@@ -2948,9 +3010,7 @@ def refine_split_fov_transforms_from_signal(
                 f"(need >= {min_pairs}); use a longer / denser movie, lower the "
                 "minimum net gradient, or re-register on beads instead."
             )
-        resid = matched_c - localize.apply_affine_transform(
-            matched_ref, transform
-        )
+        resid = matched_c - transform.apply(matched_ref)
         rms = float(np.sqrt(np.mean(np.sum(resid**2, axis=1))))
         transforms.append(transform)
         reg_info.append(
@@ -2961,13 +3021,21 @@ def refine_split_fov_transforms_from_signal(
                 "c_xy": matched_c,
                 "transform": transform,
                 "rms": rms,
+                # what was actually fitted, and what was asked for: they
+                # differ when too few pairs survived for the chosen model
+                "model": fitted_model,
+                "model_requested": model,
             }
         )
 
-    new_affines = localize.decompose_region_affines(region_rects, transforms)
+    new_affines = localize.decompose_region_transforms(
+        region_rects, transforms
+    )
     if update:
-        calibration["channel_affines"] = [a.tolist() for a in new_affines]
-        calibration["channel_transforms"] = [t.tolist() for t in transforms]
+        calibration["channel_registration"] = [
+            a.to_dict() for a in new_affines
+        ]
+        calibration["channel_transforms"] = [t.to_dict() for t in transforms]
         calibration["regions"] = [
             [[int(r[0][0]), int(r[0][1])], [int(r[1][0]), int(r[1][1])]]
             for r in region_rects
@@ -2991,6 +3059,7 @@ def refine_multichannel_transforms_from_signal(
     n_iter: int = 4,
     min_pairs: int = 20,
     update: bool = True,
+    model: str | None = None,
 ) -> tuple[dict, list]:
     """Re-register a separate-movie multichannel spline calibration from the
     experimental (blinking) data.
@@ -3053,7 +3122,7 @@ def refine_multichannel_transforms_from_signal(
         # cross-molecule pairs
         max_pair_distance = float(box)
 
-    seed_transforms = [np.asarray(t, dtype=np.float64) for t in stored]
+    seed_transforms = [tform.from_dict(t) for t in stored]
 
     # detect on a bounded, evenly-spaced sample of frames shared by every movie,
     # so per-frame pairing across the synchronized movies stays aligned
@@ -3092,13 +3161,16 @@ def refine_multichannel_transforms_from_signal(
             "gradient or check the frame range."
         )
 
+    # keep the calibration's own model unless the caller asks for another
+    model = _resolve_model(calibration, model)
+
     # match radii shrink from generous (absorb the seed's residual drift) to
     # tight (sub-box) over the ICP iterations
     tol_hi = float(max_pair_distance)
     tol_lo = max(2.0, 0.3 * box)
     tols = np.linspace(tol_hi, tol_lo, max(1, int(n_iter)))
 
-    identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    identity = tform.identity()
     transforms = [
         identity if c == reference else None for c in range(n_channels)
     ]
@@ -3114,14 +3186,15 @@ def refine_multichannel_transforms_from_signal(
                 f"{c} movies; the channels may not share signal, or the movies "
                 "are not frame-synchronized."
             )
-        transform = np.asarray(seed_transforms[c], dtype=np.float64)
+        transform = tform.from_dict(seed_transforms[c])
+        fitted_model = "affine"
         matched_ref = matched_c = np.empty((0, 2))
-        for tol in tols:
+        for k, tol in enumerate(tols):
             acc_ref, acc_c = [], []
             for f in common:
                 rxy = ref_by_frame[f]
                 cxy = chan_by_frame[f]
-                pred = localize.apply_affine_transform(rxy, transform)
+                pred = transform.apply(rxy)
                 ri, ci = _match_beads(pred, cxy, tol)
                 if len(ri):
                     acc_ref.append(rxy[ri])
@@ -3132,22 +3205,23 @@ def refine_multichannel_transforms_from_signal(
             matched_c = np.vstack(acc_c)
             if len(matched_ref) < 3:
                 break
-            transform = localize.estimate_affine_transform(
-                matched_ref, matched_c
+            transform, fitted_model = _fit_registration(
+                matched_ref,
+                matched_c,
+                model,
+                final=k == len(tols) - 1,
             )
         # robust trim: drop coincidental pairs far from the converged transform,
         # then re-fit once on the inliers
         if len(matched_ref) >= 3:
-            resid = matched_c - localize.apply_affine_transform(
-                matched_ref, transform
-            )
+            resid = matched_c - transform.apply(matched_ref)
             dist = np.sqrt(np.sum(resid**2, axis=1))
             keep = dist <= max(tol_lo, 3.0 * np.median(dist))
             if keep.sum() >= 3:
                 matched_ref = matched_ref[keep]
                 matched_c = matched_c[keep]
-                transform = localize.estimate_affine_transform(
-                    matched_ref, matched_c
+                transform, fitted_model = _fit_registration(
+                    matched_ref, matched_c, model
                 )
         n_pairs = int(len(matched_ref))
         if n_pairs < min_pairs:
@@ -3156,9 +3230,7 @@ def refine_multichannel_transforms_from_signal(
                 f"(need >= {min_pairs}); use a longer / denser movie, lower the "
                 "minimum net gradient, or re-calibrate on beads instead."
             )
-        resid = matched_c - localize.apply_affine_transform(
-            matched_ref, transform
-        )
+        resid = matched_c - transform.apply(matched_ref)
         rms = float(np.sqrt(np.mean(np.sum(resid**2, axis=1))))
         transforms[c] = transform
         reg_info.append(
@@ -3169,11 +3241,15 @@ def refine_multichannel_transforms_from_signal(
                 "c_xy": matched_c,
                 "transform": transform,
                 "rms": rms,
+                # what was actually fitted, and what was asked for: they
+                # differ when too few pairs survived for the chosen model
+                "model": fitted_model,
+                "model_requested": model,
             }
         )
 
     if update:
-        calibration["channel_transforms"] = [t.tolist() for t in transforms]
+        calibration["channel_transforms"] = [t.to_dict() for t in transforms]
     return calibration, reg_info
 
 

@@ -456,8 +456,8 @@ def load_any_calibration(path: str) -> dict:
     (HDF5), a Gaussian astigmatism calibration or a standalone affine
     calibration (both YAML).
 
-    Used wherever a calibration is only handled as a carrier of affine
-    corrections (see ``picasso.lib.affine_transforms``), so no format is
+    Used wherever a calibration is only handled as a carrier of lateral
+    corrections (see ``picasso.lib.lateral_transforms``), so no format is
     assumed. Unlike ``load_calibration`` this does not require the
     astigmatism polynomial coefficients to be present.
 

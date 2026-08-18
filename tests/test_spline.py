@@ -12,20 +12,31 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from picasso import localize, spline
+from picasso import localize, spline, transforms
 from picasso.fitting import precision
 
-from tests.conftest import BOX, CAMERA_INFO
+from tests.conftest import (
+    BOX,
+    CAMERA_INFO,
+    IDENTITY,
+    affine,
+    affine_matrix,
+    apply_transform,
+    linear_part,
+)
 
 # ---------------------------------------------------------------------------
 # Synthetic bead z-stack
 # ---------------------------------------------------------------------------
 
 
-def _synthetic_bead_movie(n_frames=21, h=48, w=48, box=BOX):
+def _synthetic_bead_movie(n_frames=21, h=48, w=48, box=BOX, bead_xy=None):
     """A movie of a few static beads with a Gaussian PSF whose width is
-    minimal at the central frame (focus) and grows away from it."""
-    bead_xy = [(12, 14), (30, 28), (16, 33)]
+    minimal at the central frame (focus) and grows away from it.
+
+    ``bead_xy`` overrides the default three beads - the richer registration
+    models need more correspondences than an affine does."""
+    bead_xy = bead_xy or [(12, 14), (30, 28), (16, 33)]
     s0 = 1.1
     focus = n_frames // 2
     yy, xx = np.mgrid[0:h, 0:w]
@@ -668,8 +679,8 @@ class TestSpotRoiResiduals:
 
         ref_xy = np.array([[10.0, 20.0], [31.0, 12.0], [7.0, 44.0]])
         transforms = [
-            np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
-            np.array([[1.002, 0.004, 1.4], [-0.004, 1.001, -0.6]]),
+            affine([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            affine([[1.002, 0.004, 1.4], [-0.004, 1.001, -0.6]]),
         ]
         spot_bead_idx = np.array([2, 0, 1, 2, 0, 1])
         per_channel = [{"spot_bead_idx": spot_bead_idx} for _ in range(2)]
@@ -908,9 +919,9 @@ class TestRansacMatch:
         assert ref_idx[order].tolist() == list(range(len(ref)))
         assert c_idx[order].tolist() == list(range(len(ref)))
         # and the transform fit on them matches the truth (mirror -> det < 0)
-        M = localize.estimate_affine_transform(ref[ref_idx], c[c_idx])
-        np.testing.assert_allclose(M[:, :2], linear, atol=0.02)
-        assert np.linalg.det(M[:, :2]) < 0
+        M = transforms.estimate(ref[ref_idx], c[c_idx])
+        np.testing.assert_allclose(linear_part(M), linear, atol=0.02)
+        assert np.linalg.det(linear_part(M)) < 0
 
     def test_rejects_decoy_and_is_overlay_independent(self):
         """Extra unmatched channel beads (decoys) are rejected, and two very
@@ -958,7 +969,7 @@ class TestRansacMatch:
         assert n_matches >= 3
         # transform maps reference (x, y) -> channel (x + dx, y + dy)
         np.testing.assert_allclose(
-            transform,
+            transform.matrix[:2],
             np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]]),
             atol=0.6,
         )
@@ -994,11 +1005,11 @@ class TestRansacMatch:
         )
         assert n_matches == n_ref
         # a pure translation could never register a mirror: reflection -> det < 0
-        assert np.linalg.det(np.asarray(transform)[:, :2]) < 0
+        assert np.linalg.det(linear_part(transform)) < 0
         # ref (x, y) -> channel (x, H - 1 - y)
         h = movie_ref.shape[1]
         ref_xy = beads_ref[["x", "y"]].to_numpy(float)
-        mapped = localize.apply_affine_transform(ref_xy, transform)
+        mapped = apply_transform(ref_xy, transform)
         np.testing.assert_allclose(mapped[:, 0], ref_xy[:, 0], atol=1.0)
         np.testing.assert_allclose(
             mapped[:, 1], h - 1 - ref_xy[:, 1], atol=1.0
@@ -1008,6 +1019,47 @@ class TestRansacMatch:
 class TestCalibrateSplineMultichannel:
     """Full multichannel calibration including the spline-coefficient
     step (CPU)."""
+
+    @pytest.mark.parametrize("model", transforms.MODELS)
+    def test_registration_model_is_used_and_recorded(self, tmp_path, model):
+        """The chosen model is fitted, stored, and survives the HDF5 JSON
+        round-trip - and the fit path can still read it back."""
+        from picasso import io
+
+        # a degree-3 polynomial needs 10 well-spread correspondences, so
+        # this test uses a denser bead field than the shared fixture
+        # jittered off a perfect rectangular grid: an exact grid is rank
+        # deficient for a degree-3 polynomial (only 10 distinct monomials)
+        rng = np.random.RandomState(3)
+        beads = [
+            (x + rng.uniform(-3, 3), y + rng.uniform(-3, 3))
+            for x in (9, 20, 31, 40)
+            for y in (10, 22, 34)
+        ]
+        movie_ref, _, _ = _synthetic_bead_movie(bead_xy=beads)
+        movie_c = np.roll(movie_ref, shift=(2, -1), axis=(1, 2))
+        info = [{"Frames": int(movie_ref.shape[0])}]
+        path = str(tmp_path / f"mc_{model}.hdf5")
+        calib = spline.calibrate_spline_multichannel(
+            [movie_ref, movie_c],
+            infos=[info, info],
+            camera_infos=[CAMERA_INFO, CAMERA_INFO],
+            box=BOX,
+            minimum_ng=2000.0,
+            d=20.0,
+            path=path,
+            model=model,
+        )
+        stored = calib["channel_transforms"][1]
+        assert stored["model"] == model
+        assert spline.registration_model_name(calib) == model
+        loaded = io.load_spline_calibration(path)
+        reloaded = transforms.from_dict(loaded["channel_transforms"][1])
+        # the shift the channel was built with, whatever the model
+        probe = np.array([[20.0, 20.0], [30.0, 25.0]])
+        np.testing.assert_allclose(
+            reloaded.apply(probe), probe + [-1.0, 2.0], atol=0.6
+        )
 
     def test_calibrate_multichannel(self, tmp_path):
         from picasso import io
@@ -1094,8 +1146,8 @@ class TestCalibrateSplineMultichannel:
         assert calib["n_channels"] == 2
         # channel-1 transform is a reflection (negative determinant), not the
         # garbage a translation-only match would have produced
-        t1 = np.asarray(calib["channel_transforms"][1])
-        assert np.linalg.det(t1[:, :2]) < 0
+        t1 = affine_matrix(calib["channel_transforms"][1])
+        assert np.linalg.det(linear_part(calib["channel_transforms"][1])) < 0
         # the transform maps into the mirrored frame: y -> H - 1 - y
         h = movie_ref.shape[1]
         assert abs(t1[1, 1] + 1.0) < 0.1  # y scale ~ -1
@@ -1138,7 +1190,7 @@ class TestCalibrateSplineMultichannel:
             if c == 0:
                 beads_c = beads_ref
             else:
-                mp = localize.apply_affine_transform(ref_xy, transforms[c])
+                mp = apply_transform(ref_xy, transforms[c])
                 beads_c = pd.DataFrame(
                     {
                         "x": np.rint(mp[:, 0]).astype(int),
@@ -1241,7 +1293,7 @@ class TestSplitFovTransform:
         assert n_matches >= 3
         # ref (x, y) -> region-1 (x + 48 + dx, y + dy)
         np.testing.assert_allclose(
-            transform,
+            transform.matrix[:2],
             np.array([[1.0, 0.0, 48 + dx], [0.0, 1.0, dy]]),
             atol=0.6,
         )
@@ -1281,10 +1333,10 @@ class TestSplitFovTransform:
         # all reference beads are matched (a pure translation would find few)
         assert n_matches == n_ref
         # the linear part is a reflection -> negative determinant
-        assert np.linalg.det(np.asarray(transform)[:, :2]) < 0
+        assert np.linalg.det(linear_part(transform)) < 0
         # applying the transform maps ref beads into the channel region, mirrored
         ref_xy = beads_ref[["x", "y"]].to_numpy(float)
-        mapped = localize.apply_affine_transform(ref_xy, transform)
+        mapped = apply_transform(ref_xy, transform)
         if axis == "y":
             np.testing.assert_allclose(
                 mapped[:, 0], ref_xy[:, 0] + 48, atol=1.0
@@ -1326,7 +1378,7 @@ class TestCalibrateSplitFov:
         assert len(calib["regions"]) == 2
         # region-1 transform is the known translation (absolute coords)
         np.testing.assert_allclose(
-            calib["channel_transforms"][1],
+            affine_matrix(calib["channel_transforms"][1]),
             [[1.0, 0.0, 48 + dx], [0.0, 1.0, dy]],
             atol=0.6,
         )
@@ -1354,7 +1406,7 @@ class TestCalibrateSplitFov:
         # reference region stored first, transform now maps region-1 -> region-0
         assert calib["regions"][0] == [[0, 48], [48, 96]]
         np.testing.assert_allclose(
-            calib["channel_transforms"][1],
+            affine_matrix(calib["channel_transforms"][1]),
             [[1.0, 0.0, -(48 + dx)], [0.0, 1.0, -dy]],
             atol=0.7,
         )
@@ -1410,9 +1462,8 @@ class TestRefineSplitFovTransformsFromSignal:
         H, W = 48, 96
         ref_rect = [[0, 0], [48, 48]]
         c_rect = [[0, 48], [48, 96]]
-        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
         t_true = localize.compose_region_transforms(
-            [ref_rect, c_rect], [identity, true_affine]
+            [ref_rect, c_rect], [affine(np.eye(3)), affine(true_affine)]
         )[1]
 
         def render(frame, x, y, amp, sigma=1.2):
@@ -1432,9 +1483,7 @@ class TestRefineSplitFovTransformsFromSignal:
                 y = rng.uniform(10, 38)
                 amp = rng.uniform(2500, 4000)
                 render(movie[f], x, y, amp)
-                cx, cy = localize.apply_affine_transform(
-                    np.array([[x, y]]), t_true
-                )[0]
+                cx, cy = apply_transform(np.array([[x, y]]), t_true)[0]
                 render(movie[f], cx, cy, amp)
         movie = rng.poisson(np.maximum(movie, 0) + 100).astype(np.uint16)
         return movie, [ref_rect, c_rect]
@@ -1449,7 +1498,7 @@ class TestRefineSplitFovTransformsFromSignal:
             ]
         )
         movie, regions = self._blinking_movie(true_affine)
-        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        identity = IDENTITY
         # stale calibration: identity fine registration (drifted from truth)
         calib = {
             "split_fov": True,
@@ -1457,10 +1506,10 @@ class TestRefineSplitFovTransformsFromSignal:
             "box": BOX,
             "n_data": [BOX, BOX, 1],
             "regions": [[[0, 0], [48, 48]], [[0, 48], [48, 96]]],
-            "channel_affines": [identity, identity],
+            "channel_registration": [identity, identity],
             "channel_transforms": [
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                [[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]],
+                affine([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]).to_dict(),
+                affine([[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]]).to_dict(),
             ],
         }
         updated, reg_info = spline.refine_split_fov_transforms_from_signal(
@@ -1471,7 +1520,9 @@ class TestRefineSplitFovTransformsFromSignal:
         assert reg_info[0]["rms"] < 1.0
         # the region-local affine now matches the true fine registration
         np.testing.assert_allclose(
-            updated["channel_affines"][1], true_affine, atol=0.15
+            affine_matrix(updated["channel_registration"][1]),
+            true_affine,
+            atol=0.15,
         )
 
     def test_recovers_true_affine_with_mirror(self):
@@ -1482,21 +1533,21 @@ class TestRefineSplitFovTransformsFromSignal:
         w = 48
         true_affine = np.array([[-1.0, 0.0, w + 0.6], [0.0, 1.0, -0.4]])
         movie, regions = self._blinking_movie(true_affine)
-        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        identity = IDENTITY
         mirror = [[-1.0, 0.0, float(w)], [0.0, 1.0, 0.0]]
         regs = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
         mirror_transform = localize.compose_region_transforms(
-            regs, [np.array(identity), np.array(mirror)]
-        )[1].tolist()
+            regs, [identity, affine(mirror)]
+        )[1].to_dict()
         calib = {
             "split_fov": True,
             "n_channels": 2,
             "box": BOX,
             "n_data": [BOX, BOX, 1],
             "regions": regs,
-            "channel_affines": [identity, mirror],
+            "channel_registration": [identity, affine(mirror).to_dict()],
             "channel_transforms": [
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                IDENTITY,
                 mirror_transform,
             ],
         }
@@ -1507,10 +1558,12 @@ class TestRefineSplitFovTransformsFromSignal:
         assert reg_info[0]["rms"] < 1.0
         # the fitted affine stays mirrored (negative determinant) and recovers
         # the true fine registration on top of the flip
-        linear = np.array(updated["channel_affines"][1])[:, :2]
+        linear = linear_part(updated["channel_registration"][1])
         assert np.linalg.det(linear) < 0
         np.testing.assert_allclose(
-            updated["channel_affines"][1], true_affine, atol=0.2
+            affine_matrix(updated["channel_registration"][1]),
+            true_affine,
+            atol=0.2,
         )
 
     def test_raises_without_shared_signal(self):
@@ -1523,17 +1576,17 @@ class TestRefineSplitFovTransformsFromSignal:
                 x, y = rng.uniform(10, 38), rng.uniform(10, 38)
                 xi, yi = int(round(x)), int(round(y))
                 movie[f, yi - 1 : yi + 2, xi - 1 : xi + 2] += 3000
-        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        identity = IDENTITY
         calib = {
             "split_fov": True,
             "n_channels": 2,
             "box": BOX,
             "n_data": [BOX, BOX, 1],
             "regions": [[[0, 0], [48, 48]], [[0, 48], [48, 96]]],
-            "channel_affines": [identity, identity],
+            "channel_registration": [identity, identity],
             "channel_transforms": [
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                [[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]],
+                affine([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]).to_dict(),
+                affine([[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]]).to_dict(),
             ],
         }
         with pytest.raises(ValueError):
@@ -1578,9 +1631,7 @@ class TestRefineMultichannelTransformsFromSignal:
                 y = rng.uniform(16, 48)
                 amp = rng.uniform(2500, 4000)
                 render(ref_movie[f], x, y, amp)
-                cx, cy = localize.apply_affine_transform(
-                    np.array([[x, y]]), true_transform
-                )[0]
+                cx, cy = apply_transform(np.array([[x, y]]), true_transform)[0]
                 render(c_movie[f], cx, cy, amp)
         ref_movie = rng.poisson(np.maximum(ref_movie, 0) + 100).astype(
             np.uint16
@@ -1604,11 +1655,11 @@ class TestRefineMultichannelTransformsFromSignal:
             "box": BOX,
             "n_data": [BOX, BOX, 1],
             "channel_transforms": [
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+                IDENTITY,
+                affine([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]).to_dict(),
             ],
         }
-        seed = np.array(calib["channel_transforms"][1])
+        seed = affine_matrix(calib["channel_transforms"][1])
         updated, reg_info = spline.refine_multichannel_transforms_from_signal(
             movies, calib, minimum_ng=800.0, box=BOX
         )
@@ -1617,7 +1668,7 @@ class TestRefineMultichannelTransformsFromSignal:
         assert reg_info[0]["rms"] < 1.0
         # the refined transform recovers the truth (a residual sub-pixel bias
         # remains because identify uses a centroid, not a Gaussian fit) ...
-        fitted = np.array(updated["channel_transforms"][1])
+        fitted = affine_matrix(updated["channel_transforms"][1])
         np.testing.assert_allclose(fitted, true_transform, atol=0.35)
         # ... and is much closer to the truth than the stale stored seed
         assert (
@@ -1633,8 +1684,8 @@ class TestRefineMultichannelTransformsFromSignal:
             "split_fov": True,
             "n_channels": 2,
             "channel_transforms": [
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+                IDENTITY,
+                affine([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]).to_dict(),
             ],
         }
         with pytest.raises(ValueError):
@@ -1660,8 +1711,8 @@ class TestRefineMultichannelTransformsFromSignal:
             "box": BOX,
             "n_data": [BOX, BOX, 1],
             "channel_transforms": [
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+                IDENTITY,
+                affine([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]).to_dict(),
             ],
         }
         with pytest.raises(ValueError):

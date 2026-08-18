@@ -354,36 +354,44 @@ Fitting z
 For each localization, sigma_x and sigma_y is determined. Similar to the Science paper, the following equation is used to minimize the Distance D:  ``D = (sx0.5 - wx0.5)^2 + (sy0.5 - wy0.5)^2`` with w being ``c[6]z0 +
 c[5]z1 .. + c[0]z6``.
 
-Affine corrections of x and y
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Lateral corrections of x and y
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Two things distort the lateral coordinates of a measurement: a cylindrical lens inserted for astigmatic 3D imaging shifts, rotates and stretches the image relative to the unmodified light path, and chromatic aberration displaces one color channel relative to another. Both are corrected the same way, by an affine transform fitted from two bead images and applied to ``x`` / ``y`` after fitting.
+Two things distort the lateral coordinates of a measurement: a cylindrical lens inserted for astigmatic 3D imaging shifts, rotates and stretches the image relative to the unmodified light path, and chromatic aberration displaces one color channel relative to another. Both are corrected the same way, by a geometric transform fitted from two bead images and applied to ``x`` / ``y`` after fitting.
 
-Open ``3D`` > ``Calibrate affine transform (astigmatism / chromatic)`` and choose what to correct:
+Open ``3D`` > ``Calibrate lateral transform (astigmatism / chromatic)`` and choose what to correct:
 
 - **Astigmatism (cylindrical lens)** — a reference image of in-focus beads *without* the cylindrical lens, and an image of the same beads *with* it.
 - **Chromatic aberration** — an image of in-focus beads in the reference color channel, and an image of the same beads in the channel to be corrected.
 
-Beads are detected with the current ``Box side length`` and ``Min. net gradient`` (use ``Show`` to tune them on either image with a live preview), refined by a 2D Gaussian fit, matched by mutual nearest neighbour, and a 6-DOF affine transform mapping the second image onto the reference is fitted by least squares. A diagnostic figure is shown and saved next to the calibration as ``<base>_affine.png``: overlays before and after the correction, and the mean per-bead cross-correlation before and after, whose peak should sit at the origin once the correction is applied.
+Beads are detected with the current ``Box side length`` and ``Min. net gradient`` (use ``Show`` to tune them on either image with a live preview), refined by a 2D Gaussian fit, matched by mutual nearest neighbour, and a transform mapping the second image onto the reference is fitted by least squares. Bead pairs whose residual is far from the median are dropped and the transform is refitted, so a single mismatched bead cannot warp the result.
+
+``Transform model`` chooses how the two frames are related:
+
+- **Affine** (6 DOF, at least 3 bead pairs) — translation, rotation, scale and shear. The default, and what a well-aligned optical path does to first order.
+- **Projective** (8 DOF, at least 4 pairs) — adds the perspective (keystone) term that a tilted dichroic or an unequal path length introduces. The residual an affine leaves grows towards the edges of the field, which is exactly what this removes.
+- **Polynomial2 / Polynomial3** (at least 6 / 10 pairs) — a smooth warp of that degree that follows genuine field distortion. This is not an optical model, and it extrapolates badly outside the region the beads span, so use it only with many, well-spread beads. Its reverse map is fitted independently rather than inverted algebraically, so round-tripping a coordinate is accurate only to the round-trip RMS reported with the calibration; no fitted coordinate depends on that reverse map.
+
+The stated minima are hard requirements — fitting fails below them — but about three times as many pairs are wanted, otherwise the transform interpolates the noise in the bead positions instead of averaging it out. A diagnostic figure is shown and saved next to the calibration as ``<base>_affine.png``: overlays before and after the correction, and the mean per-bead cross-correlation before and after, whose peak should sit at the origin once the correction is applied.
 
 After the fit, the bead pairing is drawn in the main window as color-coded identification boxes: load either bead image (the ``Show`` buttons in the calibration dialog) and every detected bead is boxed — a bead and the bead it was matched with carry the **same color** in the reference and in the target image, while detections that stayed unmatched are grey. Hovering a box says which pair it belongs to. This is the same reading as the cross-channel link colors used for multichannel data, and it makes a wrong or missing match visible on the data itself.
 
-The transform is stored as one entry of an ordered ``Affine transforms`` list in the calibration file you select, which can be:
+The transform is stored as one entry of an ordered ``Lateral transforms`` list in the calibration file you select, which can be:
 
 - an existing Gaussian 3D calibration (``.yaml``) or spline PSF calibration (``.hdf5``) — the transform is appended to it and applied automatically whenever that calibration is used to fit, whether the fit is Gaussian astigmatism or cubic spline;
-- a standalone affine calibration (``New``, a ``.yaml`` holding only affine corrections) — for 2D data, where there is no 3D calibration to append to.
+- a standalone lateral calibration (``New``, a ``.yaml`` holding only lateral corrections) — for 2D data, where there is no 3D calibration to append to.
 
 Corrections accumulate: calibrating both an astigmatism and a chromatic transform into the same file stores them as a list, and they are applied one after another in that order. Re-running a calibration of the same type replaces its entry rather than adding a second copy.
 
 For **3D data there is nothing to load**: the correction lives in the 3D or spline calibration and is applied automatically whenever that calibration is used to fit.
 
-For **2D data** there is no such calibration to attach it to, so the standalone file is loaded through the ``2D affine correction (x, y)`` box in the ``Parameters`` dialog: ``Load 2D correction`` takes one or more files (applied in the order listed) and ``Clear`` drops them. The setting belongs to the loaded movie, so several movies opened side by side can each carry their own correction.
+For **2D data** there is no such calibration to attach it to, so the standalone file is loaded through the ``2D lateral correction (x, y)`` box in the ``Parameters`` dialog: ``Load 2D correction`` takes one or more files (applied in the order listed) and ``Clear`` drops them. The setting belongs to the loaded movie, so several movies opened side by side can each carry their own correction.
 
 A correction is never applied twice. Loading a file whose transform the currently loaded 3D or spline calibration already carries is refused by Picasso.
 
-**Affine corrections apply to single-channel data only.** They correct one movie into a reference frame, which is what a 2D or astigmatic 3D measurement of a single channel needs. The multichannel (global) spline fit is a different mechanism: it fits all channels jointly and registers them itself from the per-channel transforms in its own calibration, so a lateral correction on top of that would be applied twice. Picasso therefore refuses to append an affine transform to a multichannel spline calibration, and ignores loaded affine corrections when a multichannel fit runs.
+**Lateral corrections apply to single-channel data only.** They correct one movie into a reference frame, which is what a 2D or astigmatic 3D measurement of a single channel needs. The multichannel (global) spline fit is a different mechanism: it fits all channels jointly and registers them itself from the per-channel transforms in its own calibration, so a lateral correction on top of that would be applied twice. Picasso therefore refuses to append a lateral transform to a multichannel spline calibration, and ignores loaded lateral corrections when a multichannel fit runs.
 
-On the command line, ``picasso localize`` takes ``--affine-calibration <file>`` (repeat the flag to chain several).
+On the command line, ``picasso localize`` takes ``--affine-calibration <file>`` (repeat the flag to chain several); whichever model the file stores is used as saved.
 
 Incorporating calibrations in config file
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -504,7 +512,7 @@ If photon counts are not linked, the resulting localizations contain per-channel
 - ``photons_ch<c>`` and ``bg_ch<c>`` — that channel's photon count and background. ``photons`` and ``bg`` are their sums.
 - ``rel_photons_ch<c>`` — that channel's share of the total photons, so the values sum to 1 per localization.
 
-Picasso builds a PSF for every channel and registers each non-reference channel to the reference by an affine transform estimated from matching beads; the per-channel PSFs and transforms are stored in one calibration ``.hdf5``. Alongside the usual diagnostic plot, a ``<base>_registration.png`` is written showing how well the channels align (residuals and the decomposed shift / rotation / scale / mirror) — check it before fitting.
+Picasso builds a PSF for every channel and registers each non-reference channel to the reference by a transform estimated from matching beads; the per-channel PSFs and transforms are stored in one calibration ``.hdf5``. ``Channel registration`` in the calibration dialog chooses the model — ``affine`` (the default), ``projective``, ``polynomial2`` or ``polynomial3`` — with the same trade-offs as the lateral corrections above; the choice is recorded in the calibration and used automatically at fit time, where each spot is linearized about its own position. Alongside the usual diagnostic plot, a ``<base>_registration.png`` is written showing how well the channels align (residuals and the decomposed shift / rotation / scale / mirror) — check it before fitting.
 
 To fit, load the same channels, load the multichannel calibration under **Experimental PSF (spline)**, and run the fit with the ``Experimental PSF (cubic spline)`` model. Only spots detected in *every* channel are fitted, so identify each channel first.
 
@@ -529,6 +537,6 @@ A few things to be aware of in this mode:
 - The temporal median and Gaussian identification filters apply to the sum.
 - The mode applies to the experimental data only. ``Calibrate spline PSF`` and the z-calibration are built from bead stacks one channel at a time and always identify the channels separately.
 
-If the loaded calibration's registration is off, re-align it first: ``Calibration`` > ``Re-align channels (current signal)`` re-fits the inter-channel affine from the current blinking data (use a high ``Min. net gradient``, so only bright spots are paired) and updates the loaded calibration in memory. The channel sum is then built from the refined transforms — any sum made before the re-alignment is discarded, so run ``Identify`` again afterwards. This is worth doing whenever the bead stack and the measurement were not acquired one after another, since the sum is only as sharp as the registration: a misaligned channel smears the summed spot and lowers its net gradient, which is exactly the signal the mode relies on.
+If the loaded calibration's registration is off, re-align it first: ``Calibration`` > ``Re-align channels (current signal)`` re-fits the inter-channel transform from the current blinking data (use a high ``Min. net gradient``, so only bright spots are paired) and updates the loaded calibration in memory. It keeps the calibration's own model unless another is picked in the dialog, and reports the model it actually fitted — if too few pairs survive for the model asked for, it falls back to an affine and says so. The channel sum is then built from the refined transforms — any sum made before the re-alignment is discarded, so run ``Identify`` again afterwards. This is worth doing whenever the bead stack and the measurement were not acquired one after another, since the sum is only as sharp as the registration: a misaligned channel smears the summed spot and lowers its net gradient, which is exactly the signal the mode relies on.
 
 The same is available from a script via :func:`picasso.localize.identify_multichannel_sum` (and :class:`picasso.localize.SummedChannelsMovie` for the summed view itself).

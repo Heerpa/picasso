@@ -16,6 +16,7 @@ import argparse
 from typing import Literal
 import pandas as pd
 from . import __version__
+from .transforms import MODELS as TRANSFORM_MODELS
 
 
 def picasso_logo():
@@ -1133,7 +1134,7 @@ def _localize_process_file(
     z_params,
     spline_calibration: dict | None = None,
     camera_calibration: dict | None = None,
-    affine_transforms: list | None = None,
+    lateral_transforms: list | None = None,
 ) -> None:
     """Identify, fit, save and optionally undrift one movie.
 
@@ -1149,7 +1150,7 @@ def _localize_process_file(
     spline_calibration : dict or None
         Cubic-spline PSF calibration when the fit method is a spline method;
         else ``None``. A 3D spline fit recovers z directly (no ``zfit``).
-    affine_transforms : list or None
+    lateral_transforms : list or None
         Extra lateral affine corrections (see ``--affine-calibration``),
         applied to x/y after fitting and, for 3D astigmatism, after ``zfit``
         applied the ones stored in the 3D calibration.
@@ -1229,12 +1230,12 @@ def _localize_process_file(
         print("3D fitting complete.")
         print("------------------------------------------")
 
-    if affine_transforms:
+    if lateral_transforms:
         from . import lib
 
-        locs = lib.apply_affine_transforms(locs, affine_transforms)
-        info[-1]["Affine corrections applied"] = (
-            lib.describe_affine_transforms(affine_transforms)
+        locs = lib.apply_lateral_transforms(locs, lateral_transforms)
+        info[-1]["Lateral corrections applied"] = (
+            lib.describe_lateral_transforms(lateral_transforms)
         )
 
     base, ext = splitext(path)
@@ -1414,22 +1415,22 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
 
     # Extra lateral affine corrections, applied after fitting on top of any
     # the 3D / spline calibration carries.
-    affine_transforms = []
+    lateral_transforms = []
     for affine_path in getattr(args, "affine_calibration", []) or []:
         from . import lib
         from .io import load_any_calibration
 
-        found = lib.affine_transforms(load_any_calibration(affine_path))
+        found = lib.lateral_transforms(load_any_calibration(affine_path))
         if not found:
             raise Exception(
-                f"No affine corrections found in {affine_path}. Build one "
-                "with the 'Calibrate affine transform' dialog in "
+                f"No lateral corrections found in {affine_path}. Build one "
+                "with the 'Calibrate lateral transform' dialog in "
                 "'picasso localize'."
             )
-        affine_transforms.extend(found)
+        lateral_transforms.extend(found)
         print(
-            f"Loaded {len(found)} affine correction(s) from {affine_path}: "
-            + ", ".join(lib.describe_affine_transforms(found))
+            f"Loaded {len(found)} lateral correction(s) from {affine_path}: "
+            + ", ".join(lib.describe_lateral_transforms(found))
         )
 
     camera_calibration = None
@@ -1468,7 +1469,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             max_iterations,
             z_params,
             spline_calibration=spline_calibration,
-            affine_transforms=affine_transforms,
+            lateral_transforms=lateral_transforms,
             camera_calibration=camera_calibration,
         )
 
@@ -1607,6 +1608,7 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
         "Gain": args.gain,
         "Pixelsize": args.pixelsize,
     }
+    registration = getattr(args, "registration_model", None) or "affine"
     files = args.files
     if args.output:
         out_path = args.output
@@ -1660,6 +1662,7 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
             magnification_factor=args.magnification_factor,
             correct_z_bias=args.correct_z_bias,
             photon_ratios=_parse_photon_ratios(),
+            model=registration,
             path=out_path,
             progress_callback=lambda i: print(f"  step {i}/3"),
         )
@@ -1700,6 +1703,7 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
             magnification_factor=args.magnification_factor,
             correct_z_bias=args.correct_z_bias,
             photon_ratios=_parse_photon_ratios(),
+            model=registration,
             path=out_path,
             progress_callback=lambda i: print(f"  step {i}/3"),
         )
@@ -1719,6 +1723,53 @@ def _spline_calibrate(args: argparse.Namespace) -> None:
         f"Spline PSF calibration built from {built_from} "
         f"and saved to {out_path}"
     )
+
+
+def _lateral_calibrate(args: argparse.Namespace) -> None:
+    """Fit a lateral (astigmatism / chromatic) correction from two bead
+    images and append it to a calibration file."""
+    from . import localize
+    from .io import load_any_calibration, load_movie, save_any_calibration
+
+    picasso_logo()
+    print("Lateral transform calibration")
+    print("------------------------------------------")
+
+    movie_ref, _ = load_movie(args.reference)
+    movie_target, _ = load_movie(args.target)
+    calibration = (
+        load_any_calibration(args.calibration) if args.calibration else {}
+    )
+    out_path = args.output or args.calibration
+    if not out_path:
+        raise Exception(
+            "Pass --calibration (to append to an existing calibration) or "
+            "--output (to write a standalone lateral calibration)."
+        )
+
+    calibration, qc = localize.fit_lateral_transform(
+        movie_ref,
+        movie_target,
+        calibration,
+        box=args.box_side_length,
+        minimum_ng=args.gradient,
+        pixelsize=args.pixelsize,
+        transform_type=args.type,
+        ref_path=args.reference,
+        target_path=args.target,
+        model=args.model,
+    )
+    if args.plot:
+        localize.plot_lateral_calibration(qc, save_path=args.plot)
+    save_any_calibration(out_path, calibration)
+    print("------------------------------------------")
+    from . import lib
+
+    print(
+        f"{args.type} correction fitted on {qc['n_pairs']} bead pairs "
+        f"and saved to {out_path}"
+    )
+    print("  " + ", ".join(lib.describe_lateral_transforms(calibration)))
 
 
 def _render_many(
@@ -2968,9 +3019,11 @@ def main():  # noqa: C901
         action="append",
         default=[],
         help=(
-            "path to a calibration file (.yaml or .hdf5) whose affine"
+            "path to a calibration file (.yaml or .hdf5) whose lateral"
             " corrections are applied to the fitted x/y, e.g. a standalone"
-            " chromatic-aberration calibration. Repeat the flag to chain"
+            " chromatic-aberration calibration. The transform model stored in"
+            " the file (affine, projective or polynomial) is used as saved."
+            " Repeat the flag to chain"
             " several; they are applied in the order given, after any"
             " corrections stored in the 3D or spline calibration itself"
         ),
@@ -3236,6 +3289,20 @@ def main():  # noqa: C901
         help="acquisition order when frames-per-step > 1",
     )
     spline_calib_parser.add_argument(
+        "-rm",
+        "--registration-model",
+        choices=list(TRANSFORM_MODELS),
+        default="affine",
+        help=(
+            "how the channels are registered to the reference in a"
+            " multichannel or split-FOV calibration: affine (6 DOF, the"
+            " default), projective (8 DOF, adds the perspective term) or"
+            " polynomial2 / polynomial3 (a smooth field-distortion warp,"
+            " needing 6 / 10 well-spread beads). Ignored for a"
+            " single-channel calibration"
+        ),
+    )
+    spline_calib_parser.add_argument(
         "-m",
         "--model",
         choices=["spline-3d", "spline-2d"],
@@ -3309,6 +3376,86 @@ def main():  # noqa: C901
     )
     spline_calib_parser.add_argument(
         "-px", "--pixelsize", type=int, default=130, help="pixelsize in nm"
+    )
+
+    lateral_parser = subparsers.add_parser(
+        "lateral-calibrate",
+        help=(
+            "fit a lateral (astigmatism / chromatic) x-y correction from two "
+            "bead images"
+        ),
+    )
+    lateral_parser.add_argument(
+        "reference",
+        type=str,
+        help=(
+            "reference bead image: without the cylindrical lens"
+            " (astigmatism), or in the reference color channel (chromatic)"
+        ),
+    )
+    lateral_parser.add_argument(
+        "target",
+        type=str,
+        help="bead image to be mapped onto the reference",
+    )
+    lateral_parser.add_argument(
+        "-t",
+        "--type",
+        choices=["astigmatism", "chromatic"],
+        default="astigmatism",
+        help="what the transform corrects",
+    )
+    lateral_parser.add_argument(
+        "-m",
+        "--model",
+        choices=list(TRANSFORM_MODELS),
+        default="affine",
+        help=(
+            "transform model: affine (6 DOF, the default), projective (8 DOF),"
+            " polynomial2 or polynomial3, needing at least 3 / 4 / 6 / 10"
+            " bead pairs respectively"
+        ),
+    )
+    lateral_parser.add_argument(
+        "-c",
+        "--calibration",
+        type=str,
+        default="",
+        help=(
+            "existing calibration (.yaml or .hdf5) to append the correction"
+            " to; omit to write a standalone one with --output"
+        ),
+    )
+    lateral_parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default="",
+        help="where to write the calibration; defaults to --calibration",
+    )
+    lateral_parser.add_argument(
+        "-b", "--box-side-length", type=int, default=7, help="box side length"
+    )
+    lateral_parser.add_argument(
+        "-g",
+        "--gradient",
+        type=int,
+        default=5000,
+        help="minimum net gradient for bead detection",
+    )
+    lateral_parser.add_argument(
+        "-px",
+        "--pixelsize",
+        type=float,
+        default=None,
+        help="camera pixel size in nm, for the reported shift in nm",
+    )
+    lateral_parser.add_argument(
+        "-p",
+        "--plot",
+        type=str,
+        default="",
+        help="write the diagnostic figure to this path",
     )
 
     subparsers.add_parser("filter", help="filter raw files based on SNR (GUI)")
@@ -4093,6 +4240,8 @@ def main():  # noqa: C901
             _camera_validate(args)
         elif args.command == "spline-calibrate":
             _spline_calibrate(args)
+        elif args.command == "lateral-calibrate":
+            _lateral_calibrate(args)
         elif args.command == "filter":
             from .gui import filter
 

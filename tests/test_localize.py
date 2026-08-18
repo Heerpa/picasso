@@ -25,11 +25,23 @@ from scipy import ndimage
 from scipy.interpolate import CubicSpline
 from PyQt6 import QtWidgets
 
-from picasso import gaussmle, gausslq, io, lib, localize, spline
+from picasso import gaussmle, gausslq, io, lib, localize, spline, transforms
 from picasso.fitting import gaussfit_cuda, precision, splinefit
 from picasso.gui import localize as localize_gui
 
-from tests.conftest import BOX, CALIB_3D, CAMERA_INFO, MIN_NG, PIXELSIZE
+from tests.conftest import (
+    BOX,
+    CALIB_3D,
+    CAMERA_INFO,
+    IDENTITY,
+    MIN_NG,
+    PIXELSIZE,
+    affine,
+    affine_matrix,
+    affine_matrix_3x3,
+    apply_transform,
+    linear_part,
+)
 
 CAMERA_INFO_WITH_PIXELSIZE = {**CAMERA_INFO, "Pixelsize": PIXELSIZE}
 
@@ -2400,8 +2412,7 @@ def _fake_spline_calibration(model="spline-3d", box=BOX, n_channels=2):
     }
     if model == "spline-3d-multichannel":
         calib["n_channels"] = n_channels
-        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
-        calib["channel_transforms"] = [identity for _ in range(n_channels)]
+        calib["channel_transforms"] = [IDENTITY] * n_channels
     return calib
 
 
@@ -2758,8 +2769,9 @@ class TestSplineHelpers:
         shifts = (("astigmatism", 3.0, -1.5), ("chromatic", 5.0, 2.0))
         for kind, dx, dy in shifts:
             matrix = [[1.0, 0.0, dx], [0.0, 1.0, dy], [0.0, 0.0, 1.0]]
-            lib.append_affine_transform(
-                corrected_calib, {"Type": kind, "Matrix": matrix}
+            lib.append_lateral_transform(
+                corrected_calib,
+                {"Type": kind, "Transform": affine(matrix).to_dict()},
             )
         moved = localize.locs_from_fits_spline(
             ids, theta, BOX, False, corrected_calib
@@ -2789,11 +2801,13 @@ class TestSplineHelpers:
 
         plain = localize.locs_from_fits_spline(ids, theta, BOX, False, calib)
         with_affine = dict(calib)
-        lib.append_affine_transform(
+        lib.append_lateral_transform(
             with_affine,
             {
                 "Type": "chromatic",
-                "Matrix": [[1.0, 0.0, 9.0], [0.0, 1.0, 9.0], [0.0, 0.0, 1.0]],
+                "Transform": affine(
+                    [[1.0, 0.0, 9.0], [0.0, 1.0, 9.0], [0.0, 0.0, 1.0]]
+                ).to_dict(),
             },
         )
         moved = localize.locs_from_fits_spline(
@@ -2965,15 +2979,13 @@ class TestSplineHelpers:
     def test_affine_transform_roundtrip(self):
         src = np.array([[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [5.0, 7.0]])
         m_true = np.array([[1.02, -0.03, 3.0], [0.01, 0.98, -2.0]])
-        dst = localize.apply_affine_transform(src, m_true)
-        m_est = localize.estimate_affine_transform(src, dst)
-        np.testing.assert_allclose(m_est, m_true, atol=1e-9)
+        dst = apply_transform(src, m_true)
+        m_est = transforms.estimate(src, dst)
+        np.testing.assert_allclose(affine_matrix(m_est), m_true, atol=1e-9)
 
     def test_estimate_affine_needs_three_points(self):
         with pytest.raises(ValueError):
-            localize.estimate_affine_transform(
-                np.zeros((2, 2)), np.zeros((2, 2))
-            )
+            transforms.estimate(np.zeros((2, 2)), np.zeros((2, 2)))
 
     def test_channel_roi_residuals_pure_translation_is_constant(self):
         # Detections sit on integer pixels, so a pure translation shifts every
@@ -2981,8 +2993,8 @@ class TestSplineHelpers:
         ids = pd.DataFrame(
             {"x": np.arange(40, 340, 7), "y": np.arange(60, 360, 7)}
         )
-        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-        shifted = np.array([[1.0, 0.0, 12.3], [0.0, 1.0, -4.8]])
+        identity = affine([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        shifted = affine([[1.0, 0.0, 12.3], [0.0, 1.0, -4.8]])
         res = localize.channel_roi_residuals(ids, [identity, shifted])
         assert res.shape == (len(ids), 2, 2)
         # channel 0 is the reference: its box is the detection itself
@@ -3005,14 +3017,14 @@ class TestSplineHelpers:
                 [np.sin(theta), np.cos(theta), 0.0],
             ]
         )
-        res = localize.channel_roi_residuals(ids, [np.eye(2, 3), rotated])
+        res = localize.channel_roi_residuals(
+            ids, [affine(np.eye(2, 3)), affine(rotated)]
+        )
         assert np.all(np.abs(res) <= 0.5 + 1e-6)
         # spans most of the available range rather than sitting at one value
         assert np.ptp(res[:, 1, 0]) > 0.8
         # and it is not noise: it tracks the mapped position deterministically
-        mapped = localize.apply_affine_transform(
-            ids[["x", "y"]].to_numpy(float), rotated
-        )
+        mapped = apply_transform(ids[["x", "y"]].to_numpy(float), rotated)
         np.testing.assert_allclose(
             res[:, 1, :], mapped - np.rint(mapped), atol=1e-6
         )
@@ -3022,8 +3034,8 @@ class TestSplineHelpers:
     ):
         # the extractor's by-product and the standalone helper must agree,
         # otherwise the model is told about a shift the ROIs do not have
-        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-        skewed = np.array([[1.002, 0.004, 1.4], [-0.004, 1.001, -0.6]])
+        identity = affine([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        skewed = affine([[1.002, 0.004, 1.4], [-0.004, 1.001, -0.6]])
         transforms = [identity, skewed]
         ids = localize.multichannel_inbounds_ids(
             real_identifications, BOX, [movie, movie], transforms
@@ -3064,7 +3076,7 @@ class TestSplineHelpers:
         calib = dict(calib)
         calib["n_channels"] = 1
         calib["coefficients"] = calib["coefficients"][..., 1:2]
-        calib["channel_transforms"] = [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]
+        calib["channel_transforms"] = [IDENTITY]
         box = calib["box"]
         rng = np.random.default_rng(1)
         theta = np.zeros((4, 5))  # [amplitude, x, y, z, offset]
@@ -3098,7 +3110,7 @@ class TestSplineHelpers:
         calib = dict(calib)
         calib["n_channels"] = 1
         calib["coefficients"] = calib["coefficients"][..., 1:2]
-        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        identity = IDENTITY
         calib["channel_transforms"] = [identity]
         box = calib["box"]
         rng = np.random.default_rng(2)
@@ -3109,7 +3121,9 @@ class TestSplineHelpers:
 
         s = 1.05
         scaled = dict(calib)
-        scaled["channel_transforms"] = [[[s, 0.0, 0.0], [0.0, s, 0.0]]]
+        scaled["channel_transforms"] = [
+            affine([[s, 0.0, 0.0], [0.0, s, 0.0]]).to_dict()
+        ]
         crlb_scaled = _crlb(theta, scaled, box, gpu=gpu, mle=True)
         # identity affine reaches the same evaluation point at s * p
         moved = theta.copy()
@@ -3157,20 +3171,20 @@ class TestSplineHelpers:
         assert np.isfinite(implied).all()
         np.testing.assert_array_equal(explicit, implied)
 
-    def test_spline_channel_affines_defaults_to_identity(self):
+    def test_spline_channel_jacobians_default_to_identity(self):
         calib = _fake_spline_calibration(
             model="spline-3d-multichannel", n_channels=3
         )
-        aff = precision._spline_channel_affines(calib, 3)
+        jac = precision._spline_channel_jacobians(None, 5, 3, calib)
         np.testing.assert_array_equal(
-            aff, np.tile([1.0, 0.0, 0.0, 1.0], (3, 1))
+            jac, np.tile([1.0, 0.0, 0.0, 1.0], (5, 3, 1))
         )
         # a calibration without usable transforms falls back to the identity,
         # matching what the CUDA models do with no affine block
         stripped = dict(calib)
         stripped.pop("channel_transforms")
         np.testing.assert_array_equal(
-            precision._spline_channel_affines(stripped, 3), aff
+            precision._spline_channel_jacobians(None, 5, 3, stripped), jac
         )
 
     def test_default_n_z_starts_from_calibration_depth(self):
@@ -3304,6 +3318,8 @@ class TestSplineHelpers:
                 out += (np.zeros((n_spots, 2, 2), np.float32),)
             if kwargs.get("return_variance"):
                 out += (None,)
+            if kwargs.get("return_jacobians"):
+                out += (np.tile([1.0, 0.0, 0.0, 1.0], (n_spots, 2, 1)),)
             return out[0] if len(out) == 1 else out
 
         monkeypatch.setattr(localize, "get_spots_multichannel", fake_get_spots)
@@ -3415,7 +3431,7 @@ class TestSplineHelpers:
         single = localize.get_spots(
             movie, real_identifications, BOX, CAMERA_INFO
         )
-        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        identity = affine([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
         stacked = localize.get_spots_multichannel(
             [movie, movie],
             real_identifications,
@@ -3443,9 +3459,9 @@ class TestSplineHelpers:
                 "net_gradient": [1.0, 1.0, 1.0, 1.0],
             }
         )
-        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        identity = affine([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
         # channel 1 shifts +r in x, pushing the last (near-right-edge) spot out
-        shift = np.array([[1.0, 0.0, float(r + 1)], [0.0, 1.0, 0.0]])
+        shift = affine([[1.0, 0.0, float(r + 1)], [0.0, 1.0, 0.0]])
         kept = localize.multichannel_inbounds_ids(
             ids, BOX, [movie, movie], [identity, shift]
         )
@@ -3469,8 +3485,8 @@ class TestCrossChannelLinking:
     the joint multichannel model shares x, y, z across channels, so a spot
     missing from one channel would be fitted there against background only."""
 
-    IDENTITY = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
-    SHIFT_X = [[1.0, 0.0, 100.0], [0.0, 1.0, 0.0]]
+    IDENTITY = affine([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    SHIFT_X = affine([[1.0, 0.0, 100.0], [0.0, 1.0, 0.0]])
 
     @staticmethod
     def _ids(frames, xs, ys):
@@ -3584,7 +3600,7 @@ class TestCrossRegionLinkingSplitFov:
     def _calibration(self, reference=0):
         transforms = localize.compose_region_transforms(
             [localize._normalize_rect(r) for r in self.REGIONS],
-            [np.asarray(a, dtype=float) for a in self.AFFINES],
+            [affine(a) for a in self.AFFINES],
         )
         return {
             "model": "spline-3d-multichannel",
@@ -3592,8 +3608,10 @@ class TestCrossRegionLinkingSplitFov:
             "n_channels": 2,
             "reference": reference,
             "regions": self.REGIONS,
-            "channel_affines": self.AFFINES,
-            "channel_transforms": [t.tolist() for t in transforms],
+            "channel_registration": [
+                affine(a).to_dict() for a in self.AFFINES
+            ],
+            "channel_transforms": [t.to_dict() for t in transforms],
         }, transforms
 
     @staticmethod
@@ -3612,9 +3630,7 @@ class TestCrossRegionLinkingSplitFov:
         """Three reference-region spots, two of which have a counterpart in
         region 1, plus one unpaired detection in region 1."""
         ref = np.array([[5.0, 5.0], [10.0, 20.0], [25.0, 8.0]])
-        partners = (
-            localize.apply_affine_transform(ref[:2], transforms[1]) + 0.3
-        )
+        partners = apply_transform(ref[:2], transforms[1]) + 0.3
         return self._ids(np.vstack([ref, partners, [[50.0, 30.0]]])), ref
 
     def test_keeps_reference_spots_found_in_every_region(self):
@@ -3650,11 +3666,8 @@ class TestCrossRegionLinkingSplitFov:
         calib, transforms = self._calibration(reference=1)
         ids, _ = self._detections(transforms)
         # transforms must map the reference region (1) into every region
-        inverse = np.array([[1.0, 0.0, -32.5], [0.0, 1.0, 0.25]])
-        calib["channel_transforms"] = [
-            inverse.tolist(),
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-        ]
+        inverse = affine([[1.0, 0.0, -32.5], [0.0, 1.0, 0.25]])
+        calib["channel_transforms"] = [inverse.to_dict(), IDENTITY]
         linked, n_kept, n_total = (
             localize.filter_linked_identifications_split_fov(ids, calib, box=7)
         )
@@ -3667,8 +3680,8 @@ class TestCrossRegionLinkingSplitFov:
         ids, _ = self._detections(transforms)
         # the stored transform puts channel 1 40 px off its true position
         calib["channel_transforms"] = [
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            [[1.0, 0.0, 32.5], [0.0, 1.0, 39.75]],
+            IDENTITY,
+            affine([[1.0, 0.0, 32.5], [0.0, 1.0, 39.75]]).to_dict(),
         ]
         with pytest.warns(UserWarning, match="registration"):
             _, n_kept, n_total = (
@@ -4642,7 +4655,7 @@ class TestCRLBModuleBoundary:
             "_LINK_XYZ_MODEL",
             "_crlb_variance_channel_major",
             "_gauss_crlb",
-            "_spline_channel_affines",
+            "_spline_channel_jacobians",
             "_spline_channel_major",
             "_spline_coeff_reshaped",
             "_spline_crlb",
@@ -4902,12 +4915,14 @@ def _with_channel_geometry(calib, n_locs, rng):
     calib = dict(calib)
     calib["channel_transforms"] = [
         (
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+            IDENTITY
             if c == 0
-            else [
-                [1.0 + 0.03 * c, 0.02 * c, 0.0],
-                [-0.015 * c, 1.0 - 0.01 * c, 0.0],
-            ]
+            else affine(
+                [
+                    [1.0 + 0.03 * c, 0.02 * c, 0.0],
+                    [-0.015 * c, 1.0 - 0.01 * c, 0.0],
+                ]
+            ).to_dict()
         )
         for c in range(n_channels)
     ]
@@ -5137,7 +5152,7 @@ class TestSplineCRLBGPU:
 
         def stub(
             coeff,
-            aff,
+            jac,
             res,
             box,
             amp,
@@ -5154,7 +5169,7 @@ class TestSplineCRLBGPU:
             called.append(True)
             out = precision._spline_crlb_cpu(
                 np.asarray(coeff, dtype=np.float64),
-                aff,
+                jac,
                 res,
                 box,
                 amp,
@@ -5848,7 +5863,7 @@ def _stack_multichannel(
 ):
     """Turn a single-channel 3D spline calibration into a multichannel one by
     replicating its (real, fit-grade) coefficient block across channels."""
-    identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    identity = IDENTITY
     calib = dict(calib1)
     calib["model"] = "spline-3d-multichannel"
     calib["coefficients"] = np.repeat(
@@ -6093,30 +6108,36 @@ class TestSplitFovRegionAffines:
         regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
         t0 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
         tc = [[1.0, 0.0, 50.0], [0.0, 1.0, -1.0]]  # 48 offset + (2, -1) fine
-        affines = localize.decompose_region_affines(regions, [t0, tc])
+        affines = localize.decompose_region_transforms(
+            regions, [affine(t0), affine(tc)]
+        )
         # region-local affine carries only the fine (2, -1) registration
         np.testing.assert_allclose(
-            affines[0], [[1, 0, 0], [0, 1, 0]], atol=1e-9
+            affine_matrix(affines[0]), [[1, 0, 0], [0, 1, 0]], atol=1e-9
         )
         np.testing.assert_allclose(
-            affines[1], [[1, 0, 2], [0, 1, -1]], atol=1e-9
+            affine_matrix(affines[1]), [[1, 0, 2], [0, 1, -1]], atol=1e-9
         )
         back = localize.compose_region_transforms(regions, affines)
-        np.testing.assert_allclose(back[0], t0, atol=1e-9)
-        np.testing.assert_allclose(back[1], tc, atol=1e-9)
+        np.testing.assert_allclose(affine_matrix(back[0]), t0, atol=1e-9)
+        np.testing.assert_allclose(affine_matrix(back[1]), tc, atol=1e-9)
 
     def test_replace_at_new_positions(self):
         regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
         tc = [[1.0, 0.0, 50.0], [0.0, 1.0, -1.0]]
-        affines = localize.decompose_region_affines(
-            regions, [[[1, 0, 0], [0, 1, 0]], tc]
+        affines = localize.decompose_region_transforms(
+            regions, [affine([[1, 0, 0], [0, 1, 0]]), affine(tc)]
         )
         # channels re-placed: reference at (10, 10), channel at (10, 200)
         new = [[[10, 10], [58, 58]], [[10, 200], [58, 248]]]
         t = localize.compose_region_transforms(new, affines)
         # reference is identity at its new spot; channel = new offset + fine
-        np.testing.assert_allclose(t[0], [[1, 0, 0], [0, 1, 0]], atol=1e-9)
-        np.testing.assert_allclose(t[1], [[1, 0, 192], [0, 1, -1]], atol=1e-9)
+        np.testing.assert_allclose(
+            affine_matrix(t[0]), [[1, 0, 0], [0, 1, 0]], atol=1e-9
+        )
+        np.testing.assert_allclose(
+            affine_matrix(t[1]), [[1, 0, 192], [0, 1, -1]], atol=1e-9
+        )
 
     def test_rotation_is_position_independent(self):
         # a small rotation in the linear part survives re-placement unchanged
@@ -6124,13 +6145,13 @@ class TestSplitFovRegionAffines:
         L = [[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]]
         regions = [[[0, 0], [40, 40]], [[0, 50], [40, 90]]]
         tc = [[L[0][0], L[0][1], 55.0], [L[1][0], L[1][1], 2.0]]
-        affines = localize.decompose_region_affines(
-            regions, [[[1, 0, 0], [0, 1, 0]], tc]
+        affines = localize.decompose_region_transforms(
+            regions, [affine([[1, 0, 0], [0, 1, 0]]), affine(tc)]
         )
         new = [[[5, 5], [45, 45]], [[5, 300], [45, 340]]]
         t = localize.compose_region_transforms(new, affines)
         # linear (rotation) part is unchanged by moving the regions
-        np.testing.assert_allclose(np.asarray(t[1])[:, :2], L, atol=1e-9)
+        np.testing.assert_allclose(linear_part(t[1]), L, atol=1e-9)
 
 
 class TestFitSplineSplitFovValidation:
@@ -6208,7 +6229,9 @@ class TestFitSplineSplitFov:
         """ROI-agnostic: the same calibration fits data whose split sits at a
         different position, when the fit-time ROIs are supplied."""
         movie, calib, bead_xy, focus = self._movie_and_calib()
-        assert "channel_affines" in calib  # ROI-agnostic registration stored
+        assert (
+            "channel_registration" in calib
+        )  # ROI-agnostic registration stored
         # embed the identical split (same inter-channel geometry) at a global
         # offset in a larger frame
         oy, ox = 20, 60
@@ -6363,7 +6386,7 @@ class TestMultichannelWorkerRouting:
                 pd.DataFrame({"frame": [0], "x": [0.0], "y": [0.0]}),
             )[1],
         )
-        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        identity = IDENTITY
         ref = pd.DataFrame(
             {
                 "frame": [0, 0],
@@ -7719,7 +7742,7 @@ def _affine_bead_image(
     baseline: float = 100.0,
 ) -> np.ndarray:
     """One-frame bead movie with Gaussian beads at ``positions`` (``(n, 2)``
-    in ``[x, y]``), as ``calibrate_affine_transform`` expects its inputs."""
+    in ``[x, y]``), as ``calibrate_lateral_transform`` expects its inputs."""
     yy, xx = np.mgrid[0 : shape[0], 0 : shape[1]]
     img = np.full(shape, baseline, dtype=np.float64)
     for x, y in positions:
@@ -7751,8 +7774,13 @@ def _apply_homogeneous(matrix: np.ndarray, xy: np.ndarray) -> np.ndarray:
     return xy @ np.asarray(matrix)[:2, :2].T + np.asarray(matrix)[:2, 2]
 
 
-class TestAffineTransformMath:
-    """The estimator and the QR decomposition on synthetic point sets."""
+class TestLateralTransformMath:
+    """The lateral estimator and the decomposition on synthetic point sets.
+
+    The decomposition itself is covered per model in
+    ``tests/test_transforms.py``; these pin the ``[row, col]`` convention the
+    bead pipeline feeds it and the outlier trim.
+    """
 
     def test_recovers_known_transform(self):
         rng = np.random.RandomState(1)
@@ -7762,23 +7790,16 @@ class TestAffineTransformMath:
         )
         dst_xy = _apply_homogeneous(truth, src_xy)
         # the estimator takes [row, col] = [y, x] correspondences
-        matrix = localize._affine_estimate_2d(src_xy[:, ::-1], dst_xy[:, ::-1])
-        assert np.allclose(matrix, truth, atol=1e-8)
-
-    def test_translation_only_for_two_pairs(self):
-        src = np.array([[10.0, 20.0], [40.0, 60.0]])  # [row, col]
-        dst = src + np.array([2.0, -3.0])
-        matrix = localize._affine_estimate_2d(src, dst)
-        # 6 DOF are not determined by 2 pairs, so it degrades to the mean shift
-        assert np.allclose(matrix[:2, :2], np.eye(2))
-        assert matrix[0, 2] == pytest.approx(-3.0)  # tx, from the columns
-        assert matrix[1, 2] == pytest.approx(2.0)  # ty, from the rows
-
-    def test_identity_without_pairs(self):
-        matrix = localize._affine_estimate_2d(
-            np.empty((0, 2)), np.empty((0, 2))
+        transform, keep = localize._estimate_lateral_transform(
+            src_xy[:, ::-1], dst_xy[:, ::-1]
         )
-        assert np.allclose(matrix, np.eye(3))
+        assert keep.all()
+        assert np.allclose(affine_matrix_3x3(transform), truth, atol=1e-8)
+
+    def test_too_few_pairs_raise(self):
+        src = np.array([[10.0, 20.0], [40.0, 60.0]])  # [row, col]
+        with pytest.raises(ValueError, match="at least 3"):
+            localize._estimate_lateral_transform(src, src + 1.0)
 
     def test_decomposition_recovers_rotation_and_scale(self):
         angle = np.radians(1.5)
@@ -7792,7 +7813,7 @@ class TestAffineTransformMath:
         matrix = np.eye(3)
         matrix[:2, :2] = rotation @ np.diag([scale_x, scale_y])
         matrix[:2, 2] = [4.0, -6.0]
-        decomposition = localize._affine_decompose(matrix, pixelsize=130)
+        decomposition = affine(matrix).decompose(pixelsize=130)
         assert decomposition["rotation_deg"] == pytest.approx(1.5, abs=1e-6)
         assert decomposition["scale_x"] == pytest.approx(scale_x, abs=1e-9)
         assert decomposition["scale_y"] == pytest.approx(scale_y, abs=1e-9)
@@ -7802,7 +7823,7 @@ class TestAffineTransformMath:
         assert decomposition["ty_nm"] == pytest.approx(-6.0 * 130)
 
     def test_decomposition_omits_nm_without_pixelsize(self):
-        decomposition = localize._affine_decompose(np.eye(3))
+        decomposition = transforms.identity().decompose()
         assert "tx_nm" not in decomposition and "ty_nm" not in decomposition
 
 
@@ -7822,13 +7843,75 @@ class TestFitAffineTransform:
         cyl_xy = _apply_homogeneous(inverse, ref_xy)
         return _affine_bead_image(ref_xy), _affine_bead_image(cyl_xy), ref_xy
 
-    def test_recovers_the_applied_transform(self, bead_movies):
+    @pytest.mark.parametrize("model", transforms.MODELS)
+    def test_every_model_recovers_the_applied_transform(
+        self, bead_movies, model
+    ):
+        """The correction is a pure affine here, which every model can
+        represent - so each must recover it, and record which one it is."""
         movie_ref, movie_cyl, ref_xy = bead_movies
-        calibration, qc = localize.fit_affine_transform(
+        calibration, _ = localize.fit_lateral_transform(
+            movie_ref,
+            movie_cyl,
+            {},
+            box=BOX,
+            minimum_ng=1000,
+            model=model,
+        )
+        (entry,) = lib.lateral_transforms(calibration)
+        assert entry["Transform"]["model"] == model
+        cyl_xy = _apply_homogeneous(np.linalg.inv(self.TRUTH), ref_xy)
+        mapped = transforms.from_dict(entry["Transform"]).apply(cyl_xy)
+        assert np.allclose(mapped, ref_xy, atol=0.3)
+
+    def test_too_few_pairs_for_the_model_raises(self):
+        """Enough beads for an affine, too few for a degree-3 polynomial: the
+        error must name the model's own requirement, not a fixed 3."""
+        ref_xy = _affine_bead_grid(n=2)  # 4 beads
+        cyl_xy = _apply_homogeneous(np.linalg.inv(self.TRUTH), ref_xy)
+        movie_ref = _affine_bead_image(ref_xy)
+        movie_cyl = _affine_bead_image(cyl_xy)
+        # an affine (needs 3) is fine on the same data
+        localize.fit_lateral_transform(
             movie_ref, movie_cyl, {}, box=BOX, minimum_ng=1000
         )
-        (entry,) = lib.affine_transforms(calibration)
-        matrix = np.asarray(entry["Matrix"])
+        with pytest.raises(ValueError, match="polynomial3"):
+            localize.fit_lateral_transform(
+                movie_ref,
+                movie_cyl,
+                {},
+                box=BOX,
+                minimum_ng=1000,
+                model="polynomial3",
+            )
+
+    def test_a_mismatched_pair_is_trimmed(self):
+        """Mutual-nearest-neighbour matching has no outlier rejection, so the
+        fit must reject the bad pair itself - otherwise one mismatched bead
+        visibly warps a projective and wrecks a polynomial."""
+        ref_xy = _affine_bead_grid()
+        cyl_xy = _apply_homogeneous(np.linalg.inv(self.TRUTH), ref_xy)
+        clean, _ = localize._estimate_lateral_transform(
+            cyl_xy[:, ::-1], ref_xy[:, ::-1], "affine"
+        )
+        # drag one target bead far off its true counterpart
+        spoiled = ref_xy.copy()
+        spoiled[0] += (25.0, -18.0)
+        trimmed, keep = localize._estimate_lateral_transform(
+            cyl_xy[:, ::-1], spoiled[:, ::-1], "affine"
+        )
+        assert not keep[0] and keep.sum() == len(ref_xy) - 1
+        assert np.allclose(
+            trimmed.apply(cyl_xy), clean.apply(cyl_xy), atol=1e-6
+        )
+
+    def test_recovers_the_applied_transform(self, bead_movies):
+        movie_ref, movie_cyl, ref_xy = bead_movies
+        calibration, qc = localize.fit_lateral_transform(
+            movie_ref, movie_cyl, {}, box=BOX, minimum_ng=1000
+        )
+        (entry,) = lib.lateral_transforms(calibration)
+        matrix = affine_matrix_3x3(entry["Transform"])
         # compare where it sends points, not the coefficients: a small
         # coefficient error far from the origin is what actually matters
         cyl_xy = _apply_homogeneous(np.linalg.inv(self.TRUTH), ref_xy)
@@ -7840,7 +7923,7 @@ class TestFitAffineTransform:
     def test_calibration_entry_contents(self, bead_movies):
         movie_ref, movie_cyl, _ = bead_movies
         calibration = {"X Coefficients": [1, 2, 3]}
-        calibration, _ = localize.fit_affine_transform(
+        calibration, _ = localize.fit_lateral_transform(
             movie_ref,
             movie_cyl,
             calibration,
@@ -7850,7 +7933,7 @@ class TestFitAffineTransform:
             ref_path="ref.tif",
             target_path="cyl.tif",
         )
-        (entry,) = lib.affine_transforms(calibration)
+        (entry,) = lib.lateral_transforms(calibration)
         # the existing 3D calibration is augmented, not replaced
         assert calibration["X Coefficients"] == [1, 2, 3]
         assert entry["Type"] == "astigmatism"
@@ -7863,21 +7946,25 @@ class TestFitAffineTransform:
         )
         # plain floats, so yaml.dump can write the calibration
         assert all(
-            isinstance(v, float) for row in entry["Matrix"] for v in row
+            isinstance(v, float)
+            for row in entry["Transform"]["matrix"]
+            for v in row
         )
 
     def test_identical_movies_give_identity(self, bead_movies):
         movie_ref, _, ref_xy = bead_movies
-        calibration, _ = localize.fit_affine_transform(
+        calibration, _ = localize.fit_lateral_transform(
             movie_ref, movie_ref, {}, box=BOX, minimum_ng=1000
         )
-        matrix = np.asarray(lib.affine_transforms(calibration)[0]["Matrix"])
+        matrix = affine_matrix_3x3(
+            lib.lateral_transforms(calibration)[0]["Transform"]
+        )
         mapped = _apply_homogeneous(matrix, ref_xy)
         assert np.allclose(mapped, ref_xy, atol=0.05)
 
     def test_survives_a_yaml_round_trip(self, bead_movies, tmp_path):
         movie_ref, movie_cyl, _ = bead_movies
-        calibration, _ = localize.fit_affine_transform(
+        calibration, _ = localize.fit_lateral_transform(
             movie_ref,
             movie_cyl,
             dict(CALIB_3D),  # io.load_calibration validates the 3D entries
@@ -7888,8 +7975,8 @@ class TestFitAffineTransform:
         path = str(tmp_path / "calib.yaml")
         io.save_calibration(path, calibration)
         loaded = io.load_calibration(path)
-        assert np.allclose(
-            lib.affine_matrices(loaded), lib.affine_matrices(calibration)
+        assert lib.lateral_transform_models(loaded)[0].allclose(
+            lib.lateral_transform_models(calibration)[0]
         )
 
     def test_multichannel_calibration_is_rejected(self, bead_movies):
@@ -7898,7 +7985,7 @@ class TestFitAffineTransform:
         movie_ref, movie_target, _ = bead_movies
         for model in ("spline-3d-multichannel", precision._LINK_XYZ_MODEL):
             with pytest.raises(ValueError, match="single-channel"):
-                localize.fit_affine_transform(
+                localize.fit_lateral_transform(
                     movie_ref,
                     movie_target,
                     {"model": model, "n_channels": 2},
@@ -7909,13 +7996,13 @@ class TestFitAffineTransform:
     def test_too_few_beads_raises(self):
         movie = _affine_bead_image(np.array([[40.0, 40.0], [140.0, 140.0]]))
         with pytest.raises(ValueError, match="matched bead pair"):
-            localize.fit_affine_transform(
+            localize.fit_lateral_transform(
                 movie, movie, {}, box=BOX, minimum_ng=1000
             )
 
     def test_qc_carries_the_plot_inputs(self, bead_movies):
         movie_ref, movie_cyl, ref_xy = bead_movies
-        _, qc = localize.fit_affine_transform(
+        _, qc = localize.fit_lateral_transform(
             movie_ref,
             movie_cyl,
             {},
@@ -7966,11 +8053,11 @@ class TestFitAffineTransform:
         movie_ref, movie_cyl, _ = bead_movies
 
         def _fail(*args, **kwargs):
-            raise AssertionError("fit_affine_transform must not plot")
+            raise AssertionError("fit_lateral_transform must not plot")
 
         monkeypatch.setattr(localize.plt, "figure", _fail)
         monkeypatch.setattr(localize.plt, "show", _fail)
-        localize.fit_affine_transform(
+        localize.fit_lateral_transform(
             movie_ref, movie_cyl, {}, box=BOX, minimum_ng=1000
         )
 
@@ -7984,8 +8071,8 @@ class TestFitAffineTransform:
             drawn["qc"] = qc
             drawn["save_path"] = save_path
 
-        monkeypatch.setattr(localize, "plot_affine_calibration", _plot)
-        calibration = localize.calibrate_affine_transform(
+        monkeypatch.setattr(localize, "plot_lateral_calibration", _plot)
+        calibration = localize.calibrate_lateral_transform(
             movie_ref,
             movie_cyl,
             {},
@@ -7994,7 +8081,7 @@ class TestFitAffineTransform:
             pixelsize=PIXELSIZE,
             plot_path="figure.png",
         )
-        assert len(lib.affine_transforms(calibration)) == 1
+        assert len(lib.lateral_transforms(calibration)) == 1
         assert drawn["save_path"] == "figure.png"
         assert drawn["qc"]["n_pairs"] == 25
 
@@ -8165,6 +8252,37 @@ class TestCalibrateAffineDialogGUI:
         assert "channel" in dialog.target_label.text().lower()
         assert "channel" in dialog.reference_label.text().lower()
 
+    def test_defaults_to_affine_and_offers_the_other_models(self):
+        dialog = self._dialog()
+        assert dialog.transform_model == "affine"
+        offered = [
+            dialog.model_combo.itemData(i)
+            for i in range(dialog.model_combo.count())
+        ]
+        assert offered == list(transforms.MODELS)
+
+    def test_the_chosen_model_reaches_the_worker(self, monkeypatch):
+        """The combo is only useful if its value is what gets fitted."""
+        seen = {}
+
+        def fake_fit(*args, **kwargs):
+            seen.update(kwargs)
+            raise RuntimeError("stop after capturing the arguments")
+
+        monkeypatch.setattr(localize, "fit_lateral_transform", fake_fit)
+        worker = localize_gui.AffineCalibrationWorker(
+            ref_path="ref.tif",
+            target_path="target.tif",
+            calibration_path="calib.yaml",
+            box=7,
+            minimum_ng=1000,
+            prompt_for_path=lambda path: (lambda *a, **k: None),
+            pixelsize_prompt=lambda: None,
+            transform_type="chromatic",
+            model="polynomial3",
+        )
+        assert worker.model == "polynomial3"
+
     def test_calibrate_requests_a_fit_without_closing(self):
         """The dialog must stay open: the bead pairing is inspected right
         after the fit by loading either image with 'Show', and re-picking
@@ -8222,7 +8340,7 @@ class TestAffineCalibrationWorkerGUI:
         worker.failed.connect(failures.append)
         worker.run()
         assert not failures
-        (entry,) = lib.affine_transforms(io.load_any_calibration(calib_path))
+        (entry,) = lib.lateral_transforms(io.load_any_calibration(calib_path))
         assert entry["Type"] == "chromatic"
 
     def test_appends_to_a_spline_calibration(self, tmp_path, monkeypatch):
@@ -8243,22 +8361,22 @@ class TestAffineCalibrationWorkerGUI:
         calibration = io.load_any_calibration(calib_path)
         # the PSF itself survives alongside the new correction
         assert calibration["model"] == "spline-2d"
-        assert len(lib.affine_transforms(calibration)) == 1
+        assert len(lib.lateral_transforms(calibration)) == 1
 
 
 class TestAffineDuplicateGuardsGUI:
     """A correction the loaded calibration already carries must not be
-    taken a second time through the 2D affine correction box."""
+    taken a second time through the 2D lateral correction box."""
 
     MATRIX = [[1.0, 0.0, 4.0], [0.0, 1.0, -3.0], [0.0, 0.0, 1.0]]
 
     def _calibration_file(self, tmp_path, name="calib.yaml"):
         calibration = dict(CALIB_3D)
-        lib.append_affine_transform(
+        lib.append_lateral_transform(
             calibration,
             {
                 "Type": "astigmatism",
-                "Matrix": self.MATRIX,
+                "Transform": affine(self.MATRIX).to_dict(),
                 "Bead pairs": 20,
             },
         )
@@ -8279,7 +8397,7 @@ class TestAffineDuplicateGuardsGUI:
             lambda *args, **kwargs: warnings_shown.append(args[2]),
         )
         dialog.update_affine_calib([path])
-        assert dialog.affine_transforms == []
+        assert dialog.lateral_transforms == []
         assert any(
             "would correct the coordinates twice" in w for w in warnings_shown
         )
@@ -8287,11 +8405,13 @@ class TestAffineDuplicateGuardsGUI:
     def test_an_unrelated_correction_still_loads(self, tmp_path, monkeypatch):
         _, calibration = self._calibration_file(tmp_path)
         other = {}
-        lib.append_affine_transform(
+        lib.append_lateral_transform(
             other,
             {
                 "Type": "chromatic",
-                "Matrix": [[1.0, 0.0, 7.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                "Transform": affine(
+                    [[1.0, 0.0, 7.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+                ).to_dict(),
                 "Bead pairs": 8,
             },
         )
@@ -8303,8 +8423,8 @@ class TestAffineDuplicateGuardsGUI:
             QtWidgets.QMessageBox, "warning", lambda *a, **k: None
         )
         dialog.update_affine_calib([other_path])
-        assert len(dialog.affine_transforms) == 1
-        assert dialog.affine_transforms[0]["Type"] == "chromatic"
+        assert len(dialog.lateral_transforms) == 1
+        assert dialog.lateral_transforms[0]["Type"] == "chromatic"
 
 
 class TestChainedAffineTransforms:
@@ -8315,27 +8435,33 @@ class TestChainedAffineTransforms:
 
     @staticmethod
     def _entry(kind, matrix):
-        return {"Type": kind, "Matrix": matrix, "Bead pairs": 12}
+        return {
+            "Type": kind,
+            "Transform": affine(matrix).to_dict(),
+            "Bead pairs": 12,
+        }
 
     def _both(self):
         calibration = {}
-        lib.append_affine_transform(
+        lib.append_lateral_transform(
             calibration, self._entry("astigmatism", self.ASTIG)
         )
-        lib.append_affine_transform(
+        lib.append_lateral_transform(
             calibration, self._entry("chromatic", self.CHROMATIC)
         )
         return calibration
 
     def test_locs_are_mapped_into_the_reference_frame(self):
         calibration = {
-            lib.AFFINE_TRANSFORMS_KEY: [self._entry("astigmatism", self.ASTIG)]
+            lib.LATERAL_TRANSFORMS_KEY: [
+                self._entry("astigmatism", self.ASTIG)
+            ]
         }
         locs = pd.DataFrame({"x": [10.0, 100.0], "y": [20.0, 200.0]})
         expected = _apply_homogeneous(
             np.asarray(self.ASTIG), locs[["x", "y"]].to_numpy()
         )
-        moved = lib.apply_affine_transforms(locs, calibration)
+        moved = lib.apply_lateral_transforms(locs, calibration)
         assert np.allclose(moved[["x", "y"]].to_numpy(), expected, atol=1e-4)
 
     def test_two_transforms_apply_in_order(self):
@@ -8345,7 +8471,7 @@ class TestChainedAffineTransforms:
             np.asarray(self.CHROMATIC),
             _apply_homogeneous(np.asarray(self.ASTIG), xy),
         )
-        moved = lib.apply_affine_transforms(locs, self._both())
+        moved = lib.apply_lateral_transforms(locs, self._both())
         assert np.allclose(moved[["x", "y"]].to_numpy(), expected, atol=1e-4)
         # the input frame is left alone
         assert np.allclose(locs[["x", "y"]].to_numpy(), xy)
@@ -8353,34 +8479,27 @@ class TestChainedAffineTransforms:
     def test_same_type_is_replaced_not_stacked(self):
         calibration = self._both()
         updated = self._entry("astigmatism", np.eye(3).tolist())
-        lib.append_affine_transform(calibration, updated)
-        transforms = lib.affine_transforms(calibration)
+        lib.append_lateral_transform(calibration, updated)
+        transforms = lib.lateral_transforms(calibration)
         assert [t["Type"] for t in transforms] == [
             "astigmatism",
             "chromatic",
         ]
-        assert np.allclose(transforms[0]["Matrix"], np.eye(3))
-
-    def test_legacy_single_key_is_read_and_migrated(self):
-        legacy = {lib.LEGACY_AFFINE_TRANSFORM_KEY: {"Matrix": self.ASTIG}}
-        assert np.allclose(lib.affine_matrices(legacy)[0], self.ASTIG)
-        lib.append_affine_transform(
-            legacy, self._entry("chromatic", self.CHROMATIC)
+        assert np.allclose(
+            affine_matrix_3x3(transforms[0]["Transform"]), np.eye(3)
         )
-        assert lib.LEGACY_AFFINE_TRANSFORM_KEY not in legacy
-        assert len(lib.affine_transforms(legacy)) == 2
 
     def test_no_transforms_is_a_no_op(self):
         locs = pd.DataFrame({"x": [1.0], "y": [2.0]})
-        assert lib.apply_affine_transforms(locs, {}) is locs
-        assert lib.apply_affine_transforms(locs, None) is locs
+        assert lib.apply_lateral_transforms(locs, {}) is locs
+        assert lib.apply_lateral_transforms(locs, None) is locs
 
     def test_duplicates_of_the_calibration_are_dropped(self):
         """A correction the fit's own calibration carries must not be
         applied a second time as an extra."""
         calibration = self._both()
         # the very same file loaded again as an "extra"
-        new, duplicates = lib.drop_duplicate_affine_transforms(
+        new, duplicates = lib.drop_duplicate_lateral_transforms(
             calibration, calibration
         )
         assert new == []
@@ -8392,15 +8511,17 @@ class TestChainedAffineTransforms:
         calibration = self._both()
         copy = {
             "Type": "chromatic",
-            "Matrix": [list(row) for row in self.CHROMATIC],
+            "Transform": affine(self.CHROMATIC).to_dict(),
             "Reference image": "somewhere_else.tif",
             "Bead pairs": 99,
         }
         fresh = {
             "Type": "chromatic",
-            "Matrix": [[1.0, 0.0, 4.0], [0.0, 1.0, -2.0], [0.0, 0.0, 1.0]],
+            "Transform": affine(
+                [[1.0, 0.0, 4.0], [0.0, 1.0, -2.0], [0.0, 0.0, 1.0]]
+            ).to_dict(),
         }
-        new, duplicates = lib.drop_duplicate_affine_transforms(
+        new, duplicates = lib.drop_duplicate_lateral_transforms(
             [copy, fresh], calibration
         )
         assert new == [fresh]
@@ -8408,12 +8529,12 @@ class TestChainedAffineTransforms:
 
     def test_nothing_to_compare_against_keeps_everything(self):
         calibration = self._both()
-        new, duplicates = lib.drop_duplicate_affine_transforms(
+        new, duplicates = lib.drop_duplicate_lateral_transforms(
             calibration, None
         )
         assert len(new) == 2 and duplicates == []
         # a calibration still given as a path carries nothing to compare
-        new, duplicates = lib.drop_duplicate_affine_transforms(
+        new, duplicates = lib.drop_duplicate_lateral_transforms(
             calibration, "calib.yaml"
         )
         assert len(new) == 2 and duplicates == []
@@ -8439,26 +8560,28 @@ class TestChainedAffineTransforms:
         extra = [self._entry("chromatic", self.CHROMATIC)]
         # the fit's own calibration carries a different correction
         applied = {
-            lib.AFFINE_TRANSFORMS_KEY: [self._entry("astigmatism", self.ASTIG)]
+            lib.LATERAL_TRANSFORMS_KEY: [
+                self._entry("astigmatism", self.ASTIG)
+            ]
         }
         out, info = localize._apply_extra_affine(
             locs, [], extra, applied=applied
         )
         np.testing.assert_allclose(out["x"], locs["x"] + 5.0)
-        assert info[-1]["Affine corrections applied"] == [
-            "chromatic (12 bead pairs)"
+        assert info[-1]["Lateral corrections applied"] == [
+            "chromatic, affine (12 bead pairs)"
         ]
 
     def test_chromatic_only_calibration_round_trips_as_yaml(self, tmp_path):
         calibration = {}
-        lib.append_affine_transform(
+        lib.append_lateral_transform(
             calibration, self._entry("chromatic", self.CHROMATIC)
         )
         path = str(tmp_path / "chromatic.yaml")
         io.save_any_calibration(path, calibration)
         loaded = io.load_any_calibration(path)
-        assert np.allclose(
-            lib.affine_matrices(loaded), lib.affine_matrices(calibration)
+        assert lib.lateral_transform_models(loaded)[0].allclose(
+            lib.lateral_transform_models(calibration)[0]
         )
 
     def test_spline_calibration_carries_transforms(self, tmp_path):
@@ -8467,18 +8590,19 @@ class TestChainedAffineTransforms:
             "model": "spline-2d",
             "n_data": [3, 3],
         }
-        lib.append_affine_transform(
+        lib.append_lateral_transform(
             calibration, self._entry("chromatic", self.CHROMATIC)
         )
         path = str(tmp_path / "spline_calib.hdf5")
         io.save_any_calibration(path, calibration)
         loaded = io.load_any_calibration(path)
         assert np.allclose(
-            lib.affine_matrices(loaded), [np.asarray(self.CHROMATIC)]
+            affine_matrix_3x3(lib.lateral_transform_models(loaded)[0]),
+            np.asarray(self.CHROMATIC),
         )
         # cropping to a smaller fit box must not drop the corrections
         cropped = localize.crop_spline_calibration(loaded, 2)
-        assert len(lib.affine_transforms(cropped)) == 1
+        assert len(lib.lateral_transforms(cropped)) == 1
 
 
 class TestRangeSlider:
@@ -9300,8 +9424,8 @@ class TestScmosMultichannel:
             {"Baseline": 100.0, "Sensitivity": 1.0, "Gain": 1}
         ] * n_channels
         transforms = [
-            np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
-            np.array([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]]),
+            affine([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            affine([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]]),
         ][:n_channels]
         identifications = pd.DataFrame(
             {
@@ -9480,8 +9604,8 @@ class TestScmosMultichannel:
         )
         dx, dy = 6, 4
         calibration["channel_transforms"] = [
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            [[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]],
+            IDENTITY,
+            affine([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]]).to_dict(),
         ]
         rng = np.random.default_rng(4)
         n_frames = 20
@@ -9599,8 +9723,8 @@ class TestScmosMultichannel:
         calibration["split_fov"] = True
         calibration["regions"] = [((0, 0), (40, 20)), ((0, 20), (40, 40))]
         calibration["channel_transforms"] = [
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            [[1.0, 0.0, 20.0], [0.0, 1.0, 0.0]],
+            IDENTITY,
+            affine([[1.0, 0.0, 20.0], [0.0, 1.0, 0.0]]).to_dict(),
         ]
         rng = np.random.default_rng(6)
         n_frames = 12
@@ -10063,7 +10187,7 @@ class TestCameraCalibrationDialogs:
 # Channel-sum identification
 # ---------------------------------------------------------------------------
 
-IDENTITY_AFFINE = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+IDENTITY_AFFINE = affine(np.eye(3))
 UNIT_CAMERA = {"Baseline": 0.0, "Sensitivity": 1.0, "Gain": 1.0, "Qe": 1.0}
 
 
@@ -10097,9 +10221,7 @@ def _channel_pair(
                 background=background,
             )
         )
-        mapped = localize.apply_affine_transform(
-            np.asarray(positions, dtype=float), transform
-        )
+        mapped = apply_transform(np.asarray(positions, dtype=float), transform)
         channel.append(
             _spots_frame(
                 shape,
@@ -10110,32 +10232,12 @@ def _channel_pair(
     return np.stack(reference), np.stack(channel)
 
 
-class TestChannelWarp:
-    """The ``(2, 3)`` reference->channel affine as scipy expects it."""
-
-    def test_axes_are_swapped_not_inverted(self):
-        transform = np.array([[2.0, 0.5, 3.0], [0.25, 1.5, -2.0]])
-        matrix, offset = localize._channel_warp(transform)
-        # matrix @ (row, col) + offset must equal the transform applied to
-        # (x, y) = (col, row), read back as (row, col)
-        for row, col in [(0.0, 0.0), (3.0, 7.0), (11.0, 2.0)]:
-            expected = localize.apply_affine_transform(
-                np.array([[col, row]]), transform
-            )[0]
-            got = matrix @ np.array([row, col]) + offset
-            assert got == pytest.approx(expected[::-1])
-
-    def test_rejects_a_wrongly_shaped_affine(self):
-        with pytest.raises(ValueError, match=r"\(2, 3\) affine"):
-            localize._channel_warp(np.eye(3))
-
-
 class TestSummedChannelsMovie:
     """The identification-only view of the registered channels added up."""
 
     def test_shifted_channel_lands_on_the_reference_spots(self):
         positions = [(12.0, 15.0), (30.0, 22.0)]
-        transform = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+        transform = affine([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
         reference, channel = _channel_pair(positions, transform)
         summed = localize.SummedChannelsMovie(
             [reference, channel],
@@ -10153,7 +10255,7 @@ class TestSummedChannelsMovie:
     def test_mirrored_channel_is_mapped_back(self):
         positions = [(12.0, 15.0), (30.0, 22.0)]
         # flip in x about a 48 px wide frame
-        transform = np.array([[-1.0, 0.0, 47.0], [0.0, 1.0, 0.0]])
+        transform = affine([[-1.0, 0.0, 47.0], [0.0, 1.0, 0.0]])
         reference, channel = _channel_pair(positions, transform)
         summed = localize.SummedChannelsMovie(
             [reference, channel],
@@ -10166,7 +10268,7 @@ class TestSummedChannelsMovie:
 
     def test_reference_channel_is_not_resampled(self):
         positions = [(12.5, 15.5)]
-        transform = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+        transform = affine([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
         reference, channel = _channel_pair(positions, transform)
         summed = localize.SummedChannelsMovie(
             [reference, np.zeros_like(channel)],
@@ -10206,7 +10308,7 @@ class TestSummedChannelsMovie:
     def test_split_fov_fills_only_the_reference_region(self):
         regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
         # the same molecule in both halves of one frame
-        transform = np.array([[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]])
+        transform = affine([[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]])
         positions = [(12.0, 15.0), (30.0, 22.0)]
         frames = []
         for _ in range(3):
@@ -10263,7 +10365,7 @@ class TestIdentifyMultichannelSum:
         """The regression this mode exists for: a molecule below threshold in
         every channel on its own, but above it in the sum."""
         positions = [(16.0, 20.0), (32.0, 28.0)]
-        transform = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
+        transform = affine([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
         reference, channel = _channel_pair(
             positions, transform, amplitudes=(300.0, 300.0), n_frames=4
         )
@@ -10288,11 +10390,14 @@ class TestIdentifyMultichannelSum:
         assert info["Identification Mode"] == "sum"
         assert info["Sum Regions"] is None
         assert info["Sum Reference Channel"] == 0
-        assert np.allclose(info["Sum Channel Transforms"][1], transform)
+        assert np.allclose(
+            affine_matrix(info["Sum Channel Transforms"][1]),
+            affine_matrix(transform),
+        )
 
     def test_split_fov_detections_are_in_reference_coordinates(self):
         regions = [[[0, 0], [48, 48]], [[0, 48], [48, 96]]]
-        transform = np.array([[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]])
+        transform = affine([[1.0, 0.0, 48.0], [0.0, 1.0, 0.0]])
         positions = [(12.0, 15.0), (30.0, 22.0)]
         frames = []
         for _ in range(3):
@@ -10491,8 +10596,8 @@ class TestChannelSumRegistration:
                 model="spline-3d-multichannel"
             )
             calibration["channel_transforms"] = [
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                [[1.0, 0.0, 7.0], [0.0, 1.0, -3.0]],
+                IDENTITY,
+                affine([[1.0, 0.0, 7.0], [0.0, 1.0, -3.0]]).to_dict(),
             ]
             window.parameters_dialog.spline_calibration = calibration
             transforms, regions, source = window._sum_channel_transforms(
@@ -10501,7 +10606,8 @@ class TestChannelSumRegistration:
             assert regions is None
             assert source == "the loaded spline calibration"
             np.testing.assert_allclose(
-                transforms[1], [[1.0, 0.0, 7.0], [0.0, 1.0, -3.0]]
+                affine_matrix(transforms[1]),
+                [[1.0, 0.0, 7.0], [0.0, 1.0, -3.0]],
             )
         finally:
             window.close()
@@ -10509,12 +10615,12 @@ class TestChannelSumRegistration:
     def test_estimated_from_the_per_channel_identifications(self):
         """Without a calibration the channels register from their own
         detections - which is why the sum mode identifies them first."""
-        transform = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
+        transform = affine([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
         rng = np.random.default_rng(3)
         positions = rng.uniform(8, 40, size=(40, 2))
         frames = np.repeat(np.arange(8), 5)
         ref_xy = positions[: len(frames)]
-        chan_xy = localize.apply_affine_transform(ref_xy, transform)
+        chan_xy = apply_transform(ref_xy, transform)
         ids_ref = pd.DataFrame(
             {
                 "frame": frames,
@@ -10542,7 +10648,11 @@ class TestChannelSumRegistration:
             )
             assert regions is None
             assert "per-channel identifications" in source
-            np.testing.assert_allclose(transforms[1], transform, atol=1e-6)
+            np.testing.assert_allclose(
+                affine_matrix(transforms[1]),
+                affine_matrix(transform),
+                atol=1e-6,
+            )
         finally:
             window.close()
 
@@ -10577,7 +10687,7 @@ class TestChannelSumState:
 
     def _windowed_sum(self):
         positions = [(12.0, 15.0), (30.0, 22.0)]
-        transform = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+        transform = affine([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
         reference, channel = _channel_pair(positions, transform)
         window = _sum_mode_window(reference, channel)
         window._run_sum_identification(
@@ -10623,7 +10733,7 @@ class TestChannelSumState:
             window.parameters_dialog.identify_mode_combo.setCurrentText(
                 localize_gui.IDENTIFY_MODE_SUM
             )
-            transform = np.array([[1.0, 0.0, 32.0], [0.0, 1.0, 0.0]])
+            transform = affine([[1.0, 0.0, 32.0], [0.0, 1.0, 0.0]])
             window._run_sum_identification(
                 [IDENTITY_AFFINE, transform],
                 [[[0, 0], [32, 32]], [[0, 32], [32, 64]]],
@@ -10658,7 +10768,7 @@ class TestChannelSumPreview:
         """The complaint this guards against: the summed movie only appeared
         once identification had run, which made the preview useless."""
         positions = [(12.0, 15.0), (30.0, 22.0)]
-        transform = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+        transform = affine([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
         reference, channel = _channel_pair(positions, transform)
         window = _sum_mode_window(reference, channel)
         try:
@@ -10666,8 +10776,8 @@ class TestChannelSumPreview:
                 model="spline-3d-multichannel"
             )
             calibration["channel_transforms"] = [
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                transform.tolist(),
+                IDENTITY,
+                transform.to_dict(),
             ]
             window.parameters_dialog.spline_calibration = calibration
             self._reselect_sum_mode(window)
@@ -10685,11 +10795,11 @@ class TestChannelSumPreview:
     def test_the_per_channel_identifications_register_the_preview(self):
         """Without a calibration the detections already made are enough: only
         a layout that cannot be registered at all has to wait for Identify."""
-        transform = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
+        transform = affine([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
         rng = np.random.default_rng(3)
         frames = np.repeat(np.arange(8), 5)
         ref_xy = rng.uniform(8, 40, size=(len(frames), 2))
-        chan_xy = localize.apply_affine_transform(ref_xy, transform)
+        chan_xy = apply_transform(ref_xy, transform)
         ids = [
             pd.DataFrame(
                 {
@@ -10711,7 +10821,9 @@ class TestChannelSumPreview:
             assert window._sum_movie is not None
             assert "per-channel identifications" in window.sum_transform_source
             np.testing.assert_allclose(
-                window.sum_transforms[1], transform, atol=1e-6
+                affine_matrix(window.sum_transforms[1]),
+                affine_matrix(transform),
+                atol=1e-6,
             )
         finally:
             window.close()
@@ -10751,7 +10863,7 @@ class TestChannelSumPreview:
         """The identification takes the summed view already on screen rather
         than registering the channels a second time."""
         positions = [(12.0, 15.0), (30.0, 22.0)]
-        transform = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+        transform = affine([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
         reference, channel = _channel_pair(positions, transform)
         window = _sum_mode_window(reference, channel)
         try:
@@ -10822,7 +10934,7 @@ class TestEstimateTransformsDiagnostics:
         rng = np.random.default_rng(seed)
         frames = np.repeat(np.arange(n_frames), per_frame)
         ref_xy = rng.uniform(8, 40, size=(len(frames), 2))
-        chan_xy = localize.apply_affine_transform(ref_xy, transform)
+        chan_xy = apply_transform(ref_xy, transform)
         make = lambda xy: pd.DataFrame(  # noqa: E731
             {
                 "frame": frames,
@@ -10834,12 +10946,14 @@ class TestEstimateTransformsDiagnostics:
         return [make(ref_xy), make(chan_xy)]
 
     def test_pair_counts_are_returned_alongside_the_transforms(self):
-        transform = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
+        transform = affine([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
         ids = self._identifications(transform)
         transforms, n_pairs = spline.estimate_transforms_from_identifications(
             ids, BOX, frame_shape=(48, 48), return_diagnostics=True
         )
-        np.testing.assert_allclose(transforms[1], transform, atol=1e-6)
+        np.testing.assert_allclose(
+            affine_matrix(transforms[1]), affine_matrix(transform), atol=1e-6
+        )
         assert n_pairs[0] == 0  # the reference registers against itself
         assert n_pairs[1] >= 10
 
@@ -10853,13 +10967,15 @@ class TestEstimateTransformsDiagnostics:
         assert n_pairs == [0, 0]
 
     def test_the_default_return_value_is_unchanged(self):
-        transform = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
+        transform = affine([[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]])
         ids = self._identifications(transform)
         transforms = spline.estimate_transforms_from_identifications(
             ids, BOX, frame_shape=(48, 48)
         )
         assert isinstance(transforms, list)
-        np.testing.assert_allclose(transforms[1], transform, atol=1e-6)
+        np.testing.assert_allclose(
+            affine_matrix(transforms[1]), affine_matrix(transform), atol=1e-6
+        )
 
 
 class TestChannelSumAfterRealignment:
@@ -10871,8 +10987,8 @@ class TestChannelSumAfterRealignment:
         window = _sum_mode_window(movie, movie)
         calibration = _fake_spline_calibration(model="spline-3d-multichannel")
         calibration["channel_transforms"] = [
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            [[1.0, 0.0, 7.0], [0.0, 1.0, -3.0]],
+            IDENTITY,
+            affine([[1.0, 0.0, 7.0], [0.0, 1.0, -3.0]]).to_dict(),
         ]
         window.parameters_dialog.spline_calibration = calibration
         return window, calibration
@@ -10881,16 +10997,16 @@ class TestChannelSumAfterRealignment:
         window, calibration = self._window_with_calibration()
         try:
             # what a re-alignment does: mutate the loaded calibration
-            calibration["channel_transforms"][1] = [
-                [1.0, 0.0, 7.4],
-                [0.0, 1.0, -2.6],
-            ]
+            calibration["channel_transforms"][1] = affine(
+                [[1.0, 0.0, 7.4], [0.0, 1.0, -2.6]]
+            ).to_dict()
             transforms, _, source = window._sum_channel_transforms(
                 estimate=False
             )
             assert source == "the loaded spline calibration"
             np.testing.assert_allclose(
-                transforms[1], [[1.0, 0.0, 7.4], [0.0, 1.0, -2.6]]
+                affine_matrix(transforms[1]),
+                [[1.0, 0.0, 7.4], [0.0, 1.0, -2.6]],
             )
         finally:
             window.close()
@@ -10900,7 +11016,7 @@ class TestChannelSumAfterRealignment:
         stale sum has to be dropped explicitly - otherwise the display, the
         preview and the fit would keep using the old registration."""
         positions = [(12.0, 15.0)]
-        transform = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+        transform = affine([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
         reference, channel = _channel_pair(positions, transform)
         window = _sum_mode_window(reference, channel)
         try:
@@ -10988,7 +11104,7 @@ class TestPreviewLinkColors:
     the registration can be judged while the settings are still being tuned."""
 
     POSITIONS = [(12.0, 15.0), (30.0, 22.0), (20.0, 36.0)]
-    TRANSFORM = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
+    TRANSFORM = affine([[1.0, 0.0, 4.0], [0.0, 1.0, -3.0]])
 
     def _window(self, positions=None, transform=None, **kwargs):
         reference, channel = _channel_pair(
@@ -11006,8 +11122,8 @@ class TestPreviewLinkColors:
     def _with_calibration(self, window, transform=None):
         calibration = _fake_spline_calibration(model="spline-3d-multichannel")
         calibration["channel_transforms"] = [
-            IDENTITY_AFFINE.tolist(),
-            (self.TRANSFORM if transform is None else transform).tolist(),
+            IDENTITY_AFFINE.to_dict(),
+            (self.TRANSFORM if transform is None else transform).to_dict(),
         ]
         window.parameters_dialog.spline_calibration = calibration
         return window
@@ -11045,7 +11161,7 @@ class TestPreviewLinkColors:
                 for item in window.scene.items()[::-1]
                 if isinstance(item, QtWidgets.QGraphicsRectItem)
             ]
-            mapped = localize.apply_affine_transform(
+            mapped = apply_transform(
                 np.asarray(self.POSITIONS, dtype=float), self.TRANSFORM
             )
             half = int(window.parameters["Box Size"] / 2)
@@ -11080,7 +11196,7 @@ class TestPreviewLinkColors:
         window = self._with_calibration(self._window())
         try:
             ids = window.channel_frame_identifications(1)
-            mapped = localize.apply_affine_transform(
+            mapped = apply_transform(
                 np.asarray(self.POSITIONS, dtype=float), self.TRANSFORM
             )
             found = sorted(zip(ids["x"].tolist(), ids["y"].tolist()))
@@ -11212,10 +11328,7 @@ class TestPreviewLinkColorsSplitFov:
         calibration = _fake_spline_calibration(model="spline-3d-multichannel")
         calibration["split_fov"] = True
         calibration["regions"] = self.REGIONS
-        calibration["channel_affines"] = [
-            IDENTITY_AFFINE.tolist(),
-            IDENTITY_AFFINE.tolist(),
-        ]
+        calibration["channel_registration"] = [IDENTITY, IDENTITY]
         dialog.spline_calibration = calibration
         dialog.preview_checkbox.setChecked(True)
         dialog.link_colors_checkbox.setChecked(True)

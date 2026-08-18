@@ -2416,12 +2416,13 @@ def sync_groups(locs: list[pd.DataFrame]) -> list[pd.DataFrame]:
 
 
 # ---------------------------------------------------------------------------
-# Affine (x, y) corrections chained onto any calibration
+# Lateral (x, y) corrections chained onto any calibration
 # ---------------------------------------------------------------------------
 # A calibration - Gaussian astigmatism (YAML), cubic-spline PSF (HDF5) or a
-# standalone affine calibration - may carry an ORDERED list of lateral affine
-# corrections under AFFINE_TRANSFORMS_KEY. Each entry maps the coordinates of
-# the movie being localized into a reference frame:
+# standalone lateral calibration - may carry an ORDERED list of lateral
+# corrections under LATERAL_TRANSFORMS_KEY. Each entry holds a geometric
+# transform (affine, projective or polynomial; see picasso.transforms) mapping
+# the coordinates of the movie being localized into a reference frame:
 #
 #   astigmatism : cylindrical-lens image -> reference (no-lens) image
 #   chromatic   : this color channel     -> reference color channel
@@ -2431,14 +2432,12 @@ def sync_groups(locs: list[pd.DataFrame]) -> list[pd.DataFrame]:
 #
 # Single-channel only
 
-AFFINE_TRANSFORMS_KEY = "Affine transforms"
-# v0.11 wrote a single astigmatism transform under this key; still read.
-LEGACY_AFFINE_TRANSFORM_KEY = "Affine transform"
-AFFINE_TRANSFORM_TYPES = ("astigmatism", "chromatic")
+LATERAL_TRANSFORMS_KEY = "Lateral transforms"
+LATERAL_TRANSFORM_TYPES = ("astigmatism", "chromatic")
 
 
-def affine_transforms(calibration: dict | list | None) -> list[dict]:
-    """The ordered affine-correction entries carried by a calibration.
+def lateral_transforms(calibration: dict | list | None) -> list[dict]:
+    """The ordered lateral-correction entries carried by a calibration.
 
     Parameters
     ----------
@@ -2451,9 +2450,7 @@ def affine_transforms(calibration: dict | list | None) -> list[dict]:
     -------
     transforms : list of dicts
         The entries in the order they must be applied. Empty if the
-        calibration carries none. A calibration written before the ordered
-        list existed (single ``"Affine transform"`` key) yields that one
-        entry.
+        calibration carries none.
     """
     if calibration is None:
         return []
@@ -2462,39 +2459,28 @@ def affine_transforms(calibration: dict | list | None) -> list[dict]:
     if not isinstance(calibration, dict):
         # e.g. a calibration still given as a path; nothing to read
         return []
-    transforms = calibration.get(AFFINE_TRANSFORMS_KEY)
-    if transforms:
-        return list(transforms)
-    legacy = calibration.get(LEGACY_AFFINE_TRANSFORM_KEY)
-    if legacy:
-        return [legacy]
-    return []
+    return list(calibration.get(LATERAL_TRANSFORMS_KEY) or [])
 
 
-def affine_matrices(calibration: dict | list | None) -> list[np.ndarray]:
-    """The ``(3, 3)`` homogeneous matrices of ``affine_transforms``, in the
-    order they must be applied. Accepts entries or bare matrices."""
-    matrices = []
-    for transform in affine_transforms(calibration):
-        if isinstance(transform, dict):
-            transform = transform["Matrix"]
-        matrix = np.asarray(transform, dtype=np.float64)
-        if matrix.shape != (3, 3):
-            raise ValueError(
-                f"Invalid affine transform of shape {matrix.shape}; "
-                "expected a (3, 3) homogeneous matrix."
-            )
-        matrices.append(matrix)
-    return matrices
+def lateral_transform_models(calibration: dict | list | None) -> list:
+    """The geometric transforms of ``lateral_transforms``, in the order they
+    must be applied. Accepts entries or bare transforms."""
+    from picasso import transforms as _tf
+
+    models = []
+    for entry in lateral_transforms(calibration):
+        if isinstance(entry, dict) and "Transform" in entry:
+            entry = entry["Transform"]
+        models.append(_tf.from_dict(entry))
+    return models
 
 
-def append_affine_transform(calibration: dict, entry: dict) -> dict:
-    """Append an affine correction to ``calibration``'s ordered list.
+def append_lateral_transform(calibration: dict, entry: dict) -> dict:
+    """Append a lateral correction to ``calibration``'s ordered list.
 
     An existing entry of the same ``"Type"`` is replaced in place (keeping
     its position), so re-running a calibration updates it instead of
-    stacking a second copy of the same correction. A legacy single-key
-    transform is migrated into the list first.
+    stacking a second copy of the same correction.
 
     Parameters
     ----------
@@ -2503,16 +2489,15 @@ def append_affine_transform(calibration: dict, entry: dict) -> dict:
         is how a standalone affine calibration file is started.
     entry : dict
         The transform entry, as built by
-        ``picasso.localize.fit_affine_transform``. Must carry ``"Matrix"``
-        and ``"Type"``.
+        ``picasso.localize.fit_lateral_transform``. Must carry
+        ``"Transform"`` and ``"Type"``.
 
     Returns
     -------
     calibration : dict
         The same dictionary, with the entry appended or replaced.
     """
-    transforms = affine_transforms(calibration)
-    calibration.pop(LEGACY_AFFINE_TRANSFORM_KEY, None)
+    transforms = lateral_transforms(calibration)
     kind = entry.get("Type")
     for i, existing in enumerate(transforms):
         if existing.get("Type") == kind:
@@ -2520,14 +2505,14 @@ def append_affine_transform(calibration: dict, entry: dict) -> dict:
             break
     else:
         transforms.append(entry)
-    calibration[AFFINE_TRANSFORMS_KEY] = transforms
+    calibration[LATERAL_TRANSFORMS_KEY] = transforms
     return calibration
 
 
-def apply_affine_transforms(
+def apply_lateral_transforms(
     locs: pd.DataFrame, calibration: dict | list | None
 ) -> pd.DataFrame:
-    """Map ``locs`` x/y through a calibration's affine corrections.
+    """Map ``locs`` x/y through a calibration's lateral corrections.
 
     The transforms are applied in stored order, in camera-pixel
     coordinates. Returns ``locs`` unchanged (and untouched) when there is
@@ -2547,46 +2532,42 @@ def apply_affine_transforms(
         Localizations with corrected ``x`` and ``y``. A copy, if anything
         was applied.
     """
-    matrices = affine_matrices(calibration)
-    if not matrices or not len(locs):
+    models = lateral_transform_models(calibration)
+    if not models or not len(locs):
         return locs
     locs = locs.copy()
-    x = locs["x"].to_numpy(dtype=np.float64)
-    y = locs["y"].to_numpy(dtype=np.float64)
-    for matrix in matrices:
-        x, y = (
-            matrix[0, 0] * x + matrix[0, 1] * y + matrix[0, 2],
-            matrix[1, 0] * x + matrix[1, 1] * y + matrix[1, 2],
-        )
-    locs["x"] = x.astype(np.float32)
-    locs["y"] = y.astype(np.float32)
+    xy = np.column_stack(
+        [
+            locs["x"].to_numpy(dtype=np.float64),
+            locs["y"].to_numpy(dtype=np.float64),
+        ]
+    )
+    for model in models:
+        xy = model.apply(xy)
+    locs["x"] = xy[:, 0].astype(np.float32)
+    locs["y"] = xy[:, 1].astype(np.float32)
     return locs
 
 
-def is_same_affine_transform(
+def is_same_lateral_transform(
     a: dict | list, b: dict | list, tol: float = 1e-9
 ) -> bool:
-    """Whether two affine entries hold the same matrix (within ``tol``).
+    """Whether two lateral entries hold the same transform (within ``tol``).
 
-    Compared by matrix, not by identity or source path: the same correction
-    saved twice under different names must count as one, since applying it
-    twice would correct twice.
+    Compared by the transform, not by identity or source path: the same
+    correction saved twice under different names must count as one, since
+    applying it twice would correct twice.
     """
-    if isinstance(a, dict):
-        a = a["Matrix"]
-    if isinstance(b, dict):
-        b = b["Matrix"]
-    return bool(
-        np.allclose(
-            np.asarray(a, dtype=np.float64),
-            np.asarray(b, dtype=np.float64),
-            atol=tol,
-            rtol=0.0,
-        )
-    )
+    from picasso import transforms as _tf
+
+    if isinstance(a, dict) and "Transform" in a:
+        a = a["Transform"]
+    if isinstance(b, dict) and "Transform" in b:
+        b = b["Transform"]
+    return _tf.from_dict(a).allclose(_tf.from_dict(b), tol)
 
 
-def drop_duplicate_affine_transforms(
+def drop_duplicate_lateral_transforms(
     transforms: dict | list | None, applied: dict | list | None
 ) -> tuple[list[dict], list[dict]]:
     """Split ``transforms`` into the ones still to apply and the ones
@@ -2612,24 +2593,24 @@ def drop_duplicate_affine_transforms(
     duplicates : list of dicts
         Entries dropped because ``applied`` already covers them.
     """
-    already = affine_transforms(applied)
+    already = lateral_transforms(applied)
     new, duplicates = [], []
-    for transform in affine_transforms(transforms):
-        if any(is_same_affine_transform(transform, a) for a in already):
+    for transform in lateral_transforms(transforms):
+        if any(is_same_lateral_transform(transform, a) for a in already):
             duplicates.append(transform)
         else:
             new.append(transform)
     return new, duplicates
 
 
-def describe_affine_transforms(calibration: dict | list | None) -> list[str]:
-    """One human-readable line per affine correction, for metadata and
-    GUI labels, e.g. ``"astigmatism (25 bead pairs)"``."""
+def describe_lateral_transforms(calibration: dict | list | None) -> list[str]:
+    """One human-readable line per lateral correction, for metadata and
+    GUI labels, e.g. ``"astigmatism, projective (25 bead pairs)"``."""
     described = []
-    for transform in affine_transforms(calibration):
-        kind = transform.get("Type", "affine")
+    for transform in lateral_transforms(calibration):
+        purpose = transform.get("Type", "lateral")
+        model = (transform.get("Transform") or {}).get("model")
         pairs = transform.get("Bead pairs")
-        described.append(
-            f"{kind} ({pairs} bead pairs)" if pairs else str(kind)
-        )
+        label = f"{purpose}, {model}" if model else str(purpose)
+        described.append(f"{label} ({pairs} bead pairs)" if pairs else label)
     return described

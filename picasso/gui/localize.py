@@ -38,6 +38,10 @@ from .. import (
     __version__,
     zfit,
 )
+
+# aliased: `transforms` is used as a local name for lists of channel
+# transforms throughout this module
+from .. import transforms as transforms_mod
 from ..fitting import precision, splinefit
 from PyQt6 import QtCore, QtGui, QtWidgets
 from playsound3 import playsound
@@ -111,6 +115,53 @@ _TEMPORAL_MEDIAN_MIN_FRAMES = 2
 # the channel that makes summing worthwhile in the first place is the dim one,
 # and it contributes few detections per frame.
 _SUM_REGISTRATION_MAX_FRAMES = 200
+
+
+# The geometric transform models offered wherever Picasso fits one, as
+# (label, model). A polynomial's degree is part of the model name rather than
+# a separate field, so the combo carries one value - see picasso.transforms.
+_TRANSFORM_MODELS = [
+    ("Affine (6 DOF, >= 3 pairs)", "affine"),
+    ("Projective (8 DOF, >= 4 pairs)", "projective"),
+    ("Polynomial, degree 2 (>= 6 pairs)", "polynomial2"),
+    ("Polynomial, degree 3 (>= 10 pairs)", "polynomial3"),
+]
+
+_TRANSFORM_MODEL_TOOLTIP = (
+    "How the two coordinate frames are related.\n"
+    "  Affine: translation, rotation, scale and shear - the default, and\n"
+    "    what a well-aligned splitter does to first order.\n"
+    "  Projective: adds the perspective/keystone term a tilted dichroic or\n"
+    "    an unequal path length introduces.\n"
+    "  Polynomial: a smooth warp that follows genuine field distortion.\n"
+    "    Not an optical model, and it extrapolates badly outside the field\n"
+    "    the beads span, so use it only with many, well-spread beads.\n"
+    "The minima above are hard requirements; about three times as many is\n"
+    "wanted, otherwise the fit interpolates the noise in them."
+)
+
+
+def _transform_model_combo() -> QtWidgets.QComboBox:
+    """A combo box offering the transform models, defaulting to affine."""
+    combo = QtWidgets.QComboBox()
+    for label, data in _TRANSFORM_MODELS:
+        combo.addItem(label, data)
+    combo.setToolTip(_TRANSFORM_MODEL_TOOLTIP)
+    return combo
+
+
+def _transform_model_of(combo: QtWidgets.QComboBox) -> str:
+    """The model currently selected in a model combo."""
+    return combo.currentData() or "affine"
+
+
+def _select_transform_model(
+    combo: QtWidgets.QComboBox, model: str | None
+) -> None:
+    """Pre-select ``model`` in a model combo, if it is offered."""
+    index = combo.findData(model)
+    if index >= 0:
+        combo.setCurrentIndex(index)
 
 
 def _retain_size_when_hidden(widget: QtWidgets.QWidget) -> None:
@@ -1943,6 +1994,15 @@ class CalibrateSplineDialog(lib.Dialog):
         self.link_photons.setVisible(multichannel)
         grid.addWidget(self.link_photons, 6, 0, 1, 2)
 
+        # How the channels are registered to the reference. Multichannel only:
+        # a single-channel calibration has nothing to register.
+        self.registration_label = QtWidgets.QLabel("Channel registration:")
+        self.registration_model = _transform_model_combo()
+        self.registration_label.setVisible(multichannel)
+        self.registration_model.setVisible(multichannel)
+        grid.addWidget(self.registration_label, 7, 0)
+        grid.addWidget(self.registration_model, 7, 1)
+
         self.frames_per_step.valueChanged.connect(self._update_order_enabled)
         self._update_order_enabled(self.frames_per_step.value())
 
@@ -1968,12 +2028,13 @@ class CalibrateSplineDialog(lib.Dialog):
     def getCalibrationSpecs(
         parent: QtWidgets.QWidget | None = None,
         multichannel: bool = False,
-    ) -> tuple[float, int, str, str, float, bool, bool, bool]:
+    ) -> tuple[float, int, str, str, float, bool, bool, str, int | None, bool]:
         """Show the dialog and return the chosen step size, number of frames
         per step, frame order, spline model, magnification factor, whether to
-        correct the z bias, whether to link photons across channels, and whether
-        it was accepted. ``multichannel`` shows the multichannel-only options
-        (link photons); they are hidden for a single-channel calibration."""
+        correct the z bias, whether to link photons across channels, the
+        channel-registration model, and whether it was accepted. ``multichannel`` shows the multichannel-only options (link
+        photons, registration model); they are hidden for a single-channel
+        calibration."""
         dialog = CalibrateSplineDialog(parent, multichannel=multichannel)
         result = dialog.exec()
         step = dialog.step.value()
@@ -1983,6 +2044,7 @@ class CalibrateSplineDialog(lib.Dialog):
         magnification_factor = dialog.magnification_factor.value()
         correct_z_bias = dialog.correct_z_bias.isChecked()
         link_photons = dialog.link_photons.isChecked()
+        registration = _transform_model_of(dialog.registration_model)
         accepted = result == QtWidgets.QDialog.DialogCode.Accepted
         return (
             step,
@@ -1992,6 +2054,7 @@ class CalibrateSplineDialog(lib.Dialog):
             magnification_factor,
             correct_z_bias,
             link_photons,
+            registration,
             accepted,
         )
 
@@ -2241,6 +2304,7 @@ class RefineRegistrationDialog(lib.Dialog):
         window: QtWidgets.QWidget,
         n_frames: int,
         frame_range: list | None,
+        model: str | None = None,
     ) -> None:
         super().__init__(window)
         self.window = window
@@ -2286,6 +2350,13 @@ class RefineRegistrationDialog(lib.Dialog):
         self.max_frames.setValue(50)
         grid.addWidget(self.max_frames, 2, 1)
 
+        # Re-registration may also change the model; it defaults to the one
+        # the calibration already uses, so a plain re-align keeps it.
+        grid.addWidget(QtWidgets.QLabel("Transform model:"), 3, 0)
+        self.registration_model = _transform_model_combo()
+        _select_transform_model(self.registration_model, model)
+        grid.addWidget(self.registration_model, 3, 1)
+
         # keep the window ordered
         self.first_frame.valueChanged.connect(
             lambda v: self.last_frame.setValue(max(v, self.last_frame.value()))
@@ -2311,18 +2382,22 @@ class RefineRegistrationDialog(lib.Dialog):
         parent: QtWidgets.QWidget,
         n_frames: int,
         frame_range: list | None = None,
-    ) -> tuple[list, int, bool]:
+        model: str | None = None,
+    ) -> tuple[list, int, str, bool]:
         """Show the dialog and return the chosen ``frame_bounds`` (a single
-        0-indexed inclusive segment), the number of frames to sample and
-        whether the dialog was accepted."""
-        dialog = RefineRegistrationDialog(parent, n_frames, frame_range)
+        0-indexed inclusive segment), the number of frames to sample, the
+        transform model, and whether the dialog was accepted. ``model``
+        pre-selects the calibration's current model."""
+        dialog = RefineRegistrationDialog(parent, n_frames, frame_range, model)
         result = dialog.exec()
         bounds = [
             [dialog.first_frame.value() - 1, dialog.last_frame.value() - 1]
         ]
+        chosen = _transform_model_of(dialog.registration_model)
         return (
             bounds,
             dialog.max_frames.value(),
+            chosen,
             result == QtWidgets.QDialog.DialogCode.Accepted,
         )
 
@@ -2560,7 +2635,7 @@ class CalibrateAffineDialog(lib.Dialog):
     def __init__(self, window: QtWidgets.QWidget) -> None:
         super().__init__(window)
         self.window = window
-        self.setWindowTitle("Calibrate affine transform")
+        self.setWindowTitle("Calibrate lateral transform")
         self.setModal(False)
 
         vbox = QtWidgets.QVBoxLayout(self)
@@ -2583,6 +2658,13 @@ class CalibrateAffineDialog(lib.Dialog):
         type_row.addWidget(self.type_combo)
         type_row.addStretch(1)
         vbox.addLayout(type_row)
+
+        model_row = QtWidgets.QHBoxLayout()
+        self.model_combo = _transform_model_combo()
+        model_row.addWidget(QtWidgets.QLabel("Transform model:"))
+        model_row.addWidget(self.model_combo)
+        model_row.addStretch(1)
+        vbox.addLayout(model_row)
 
         grid = QtWidgets.QGridLayout()
 
@@ -2676,6 +2758,11 @@ class CalibrateAffineDialog(lib.Dialog):
     @property
     def transform_type(self) -> str:
         return self.type_combo.currentData()
+
+    @property
+    def transform_model(self) -> str:
+        """The model the transform is to be fitted with."""
+        return _transform_model_of(self.model_combo)
 
     @property
     def reference_path(self) -> str:
@@ -2887,7 +2974,7 @@ class ParametersDialog(lib.Dialog):
         # Standalone (2D) affine corrections applied after the fit; those
         # carried by the 3D / spline calibration are applied by the fit
         # itself (see load_affine_calib).
-        self.affine_transforms = []
+        self.lateral_transforms = []
         self.affine_calibration_paths = []
         self.camera_calibration = {}
         self.camera_calibration_path = None
@@ -3650,11 +3737,11 @@ class ParametersDialog(lib.Dialog):
         # fitting. This is how a chromatic correction is used on its own,
         # with no 3D calibration to append it to; for 3D the correction goes
         # into the 3D / spline calibration above, which applies it itself.
-        affine_groupbox = QtWidgets.QGroupBox("2D affine correction (x, y)")
+        affine_groupbox = QtWidgets.QGroupBox("2D lateral correction (x, y)")
         affine_groupbox.setToolTip(
             "Affine corrections applied to the fitted x/y of 2D data,\n"
             "typically a chromatic-aberration correction. Build one with\n"
-            "3D > Calibrate affine transform and load the standalone\n"
+            "3D > Calibrate lateral transform and load the standalone\n"
             "calibration here.\n\n"
             "For 3D data, append the correction to the 3D or spline\n"
             "calibration instead: those are applied automatically during\n"
@@ -4210,7 +4297,7 @@ class ParametersDialog(lib.Dialog):
             dialog_directory = None
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
-            "Load 2D affine correction",
+            "Load 2D lateral correction",
             directory=dialog_directory,
             filter="Calibration files (*.yaml *.hdf5)",
         )
@@ -4218,9 +4305,9 @@ class ParametersDialog(lib.Dialog):
             self.update_affine_calib(paths)
 
     def update_affine_calib(self, paths: list[str] | None) -> None:
-        """Load (or clear) the 2D affine corrections applied after fitting."""
+        """Load (or clear) the 2D lateral corrections applied after fitting."""
         if not paths:
-            self.affine_transforms = []
+            self.lateral_transforms = []
             self.affine_calibration_paths = []
             self.affine_calib_label.setAlignment(
                 QtCore.Qt.AlignmentFlag.AlignCenter
@@ -4236,11 +4323,11 @@ class ParametersDialog(lib.Dialog):
             except Exception as e:
                 QtWidgets.QMessageBox.warning(
                     self,
-                    "Load 2D affine correction",
+                    "Load 2D lateral correction",
                     f"Could not read {os.path.basename(path)}:\n{e}",
                 )
                 continue
-            found = lib.affine_transforms(calibration)
+            found = lib.lateral_transforms(calibration)
             if not found:
                 empty.append(os.path.basename(path))
                 continue
@@ -4248,10 +4335,10 @@ class ParametersDialog(lib.Dialog):
             # is applied by the fit itself; taking it here as well would
             # correct the coordinates twice. This catches the common case -
             # picking the 3D calibration file itself - at load time, while
-            # the fit-time check (see ``_extra_affine_transforms``) also
+            # the fit-time check (see ``_extra_lateral_transforms``) also
             # catches a copy of the same transform saved elsewhere.
-            found, duplicates = lib.drop_duplicate_affine_transforms(
-                found, self._calibration_affine_transforms()
+            found, duplicates = lib.drop_duplicate_lateral_transforms(
+                found, self._calibration_lateral_transforms()
             )
             already.extend(duplicates)
             if not found:
@@ -4261,17 +4348,17 @@ class ParametersDialog(lib.Dialog):
         if empty:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Load 2D affine correction",
+                "Load 2D lateral correction",
                 "No affine corrections found in: "
                 + ", ".join(empty)
-                + ".\nBuild one with 3D > Calibrate affine transform.",
+                + ".\nBuild one with 3D > Calibrate lateral transform.",
             )
         if already:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Load 2D affine correction",
+                "Load 2D lateral correction",
                 "Not loaded: "
-                + ", ".join(lib.describe_affine_transforms(already))
+                + ", ".join(lib.describe_lateral_transforms(already))
                 + ".\n\nThe loaded 3D / spline calibration already carries "
                 "this correction and applies it during the fit. Loading it "
                 "here as well would correct the coordinates twice.",
@@ -4281,12 +4368,12 @@ class ParametersDialog(lib.Dialog):
             return
         self._set_affine_state(transforms, loaded)
 
-    def _calibration_affine_transforms(self) -> list[dict]:
+    def _calibration_lateral_transforms(self) -> list[dict]:
         """The affine corrections the currently loaded 3D and spline
         calibrations carry, i.e. the ones the fit applies by itself."""
-        return lib.affine_transforms(
+        return lib.lateral_transforms(
             self.z_calibration
-        ) + lib.affine_transforms(self.spline_calibration)
+        ) + lib.lateral_transforms(self.spline_calibration)
 
     def _set_affine_state(self, transforms: list, paths: list[str]) -> None:
         """Store already-loaded affine corrections and label them. Kept
@@ -4295,9 +4382,9 @@ class ParametersDialog(lib.Dialog):
         if not transforms:
             self.update_affine_calib(None)
             return
-        self.affine_transforms = transforms
+        self.lateral_transforms = transforms
         self.affine_calibration_paths = paths
-        described = lib.describe_affine_transforms(transforms)
+        described = lib.describe_lateral_transforms(transforms)
         self.affine_calib_label.setAlignment(
             QtCore.Qt.AlignmentFlag.AlignRight
         )
@@ -5554,7 +5641,7 @@ class Window(QtWidgets.QMainWindow):
         calibrate_z_action.triggered.connect(self.calibrate_z)
 
         calibrate_affine_action = threed_menu.addAction(
-            "Calibrate affine transform (astigmatism / chromatic)"
+            "Calibrate lateral transform (astigmatism / chromatic)"
         )
         calibrate_affine_action.setToolTip(
             "Fit a lateral affine correction from two bead images and\n"
@@ -5666,10 +5753,11 @@ class Window(QtWidgets.QMainWindow):
         target_path = dialog.target_path
         calib_path = dialog.calibration_path
         transform_type = dialog.transform_type
+        model = dialog.transform_model
         if not (ref_path and target_path and calib_path):
             QtWidgets.QMessageBox.warning(
                 self,
-                "Calibrate affine transform",
+                "Calibrate lateral transform",
                 "All three paths must be provided.",
             )
             return
@@ -5678,7 +5766,7 @@ class Window(QtWidgets.QMainWindow):
         if worker is not None and worker.isRunning():
             QtWidgets.QMessageBox.information(
                 self,
-                "Calibrate affine transform",
+                "Calibrate lateral transform",
                 "An affine calibration is already running.",
             )
             return
@@ -5700,6 +5788,7 @@ class Window(QtWidgets.QMainWindow):
             target_path=target_path,
             calibration_path=calib_path,
             transform_type=transform_type,
+            model=model,
             box=self.parameters["Box Size"],
             minimum_ng=self.parameters_dialog.mng_slider.value(),
             prompt_for_path=self._prompt_for_path,
@@ -5749,11 +5838,11 @@ class Window(QtWidgets.QMainWindow):
             self.affine_pairing = None
         plot_path = os.path.splitext(path)[0] + "_affine.png"
         try:
-            localize.plot_affine_calibration(qc, save_path=plot_path)
+            localize.plot_lateral_calibration(qc, save_path=plot_path)
         except Exception as e:  # a failed figure must not lose the fit
             QtWidgets.QMessageBox.warning(
                 self,
-                "Calibrate affine transform",
+                "Calibrate lateral transform",
                 f"The transform was saved to {path}, but the diagnostic "
                 f"figure could not be drawn:\n{e}",
             )
@@ -5763,7 +5852,7 @@ class Window(QtWidgets.QMainWindow):
         self.affine_calibration_worker = None
         self.status_bar.showMessage("Affine calibration failed.")
         QtWidgets.QMessageBox.warning(
-            self, "Calibrate affine transform", message
+            self, "Calibrate lateral transform", message
         )
 
     def on_affine_calibration_cancelled(self) -> None:
@@ -6064,6 +6153,7 @@ class Window(QtWidgets.QMainWindow):
             magnification_factor,
             correct_z_bias,
             link_photons,
+            registration_model,
             accepted,
         ) = specs
         if not accepted:
@@ -6105,6 +6195,7 @@ class Window(QtWidgets.QMainWindow):
             magnification_factor=magnification_factor,
             correct_z_bias=correct_z_bias,
             link_photons=link_photons,
+            registration_model=registration_model,
             roi=self.view.rois,
             regions=regions,
             movies=movies,
@@ -6776,7 +6867,7 @@ class Window(QtWidgets.QMainWindow):
             "z_calibration_path": pd.z_calibration_path,
             "z_calib_label": pd.z_calib_label.text(),
             # per loaded movie: each can need its own correction
-            "affine_transforms": pd.affine_transforms,
+            "lateral_transforms": pd.lateral_transforms,
             "affine_calibration_paths": pd.affine_calibration_paths,
             "use_gpu": pd.gpu_checkbox.isChecked(),
             "temporal_median_on": pd.temporal_median_checkbox.isChecked(),
@@ -6845,7 +6936,7 @@ class Window(QtWidgets.QMainWindow):
         pd.fit_z_checkbox.setChecked(params["fit_z"])
         # .get(): parameter sets captured before affine corrections existed
         pd._set_affine_state(
-            params.get("affine_transforms", []),
+            params.get("lateral_transforms", []),
             params.get("affine_calibration_paths", []),
         )
         # Saved parameter files written before the Numba CUDA port use the
@@ -7390,7 +7481,7 @@ class Window(QtWidgets.QMainWindow):
         """Keep the bead pairing of an affine calibration so it can be drawn
         over the two bead images (see :meth:`draw_affine_pairing`).
 
-        ``qc`` is what ``localize.fit_affine_transform`` returns: every
+        ``qc`` is what ``localize.fit_lateral_transform`` returns: every
         refined detection in each image plus the indices of the matched
         ones, pair ``k`` being ``(idx_ref[k], idx_target[k])``.
         """
@@ -7837,31 +7928,25 @@ class Window(QtWidgets.QMainWindow):
                 "n_channels": n_channels,
                 "split_fov": True,
                 "regions": [list(map(list, r)) for r in self.view.rois],
-                "channel_affines": [
-                    np.asarray(t, dtype=float).tolist()
-                    for t in transforms[:n_channels]
-                ],
+                "channel_registration": list(transforms[:n_channels]),
             }
         if len(self.channels) < 2:
             return cal  # single movie: keep the calibration's own regions
-        affines = cal.get("channel_affines")
+        affines = cal.get("channel_registration")
         if affines is None:
             regions = cal.get("regions")
             transforms = cal.get("channel_transforms")
             if not regions or not transforms:
                 return None
             affines = [
-                a.tolist()
-                for a in localize.decompose_region_affines(
+                a.to_dict()
+                for a in localize.decompose_region_transforms(
                     [_normalize_rect(r) for r in regions], transforms
                 )
             ]
         return {
             "n_channels": n_channels,
-            "channel_transforms": [
-                np.asarray(a, dtype=float).tolist()
-                for a in affines[:n_channels]
-            ],
+            "channel_transforms": list(affines[:n_channels]),
         }
 
     def link_identifications(self, channel: int = 0) -> pd.DataFrame | None:
@@ -7976,7 +8061,7 @@ class Window(QtWidgets.QMainWindow):
         if cached is not None and cached[0] == key:
             return cached[1]
 
-        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        identity = transforms_mod.identity().to_dict()
         if split_fov:
             region_rects = [_normalize_rect(r) for r in regions]
         try:
@@ -7998,10 +8083,10 @@ class Window(QtWidgets.QMainWindow):
                     (
                         identity
                         if t is None
-                        else localize.decompose_region_affines(
+                        else localize.decompose_region_transforms(
                             [region_rects[0], region_rects[c]],
-                            [np.asarray(transforms[0]), np.asarray(t)],
-                        )[1].tolist()
+                            [transforms[0], t],
+                        )[1].to_dict()
                     )
                     for c, t in enumerate(transforms)
                 ]
@@ -8009,7 +8094,7 @@ class Window(QtWidgets.QMainWindow):
                 "n_channels": n_channels,
                 "split_fov": True,
                 "regions": regions,
-                "channel_affines": affines,
+                "channel_registration": affines,
             }
         else:
             cal = {
@@ -8018,7 +8103,7 @@ class Window(QtWidgets.QMainWindow):
                     (
                         identity
                         if transforms is None or transforms[c] is None
-                        else np.asarray(transforms[c]).tolist()
+                        else transforms[c].to_dict()
                     )
                     for c in range(n_channels)
                 ],
@@ -8060,17 +8145,15 @@ class Window(QtWidgets.QMainWindow):
         if not regions or len(regions) != n_channels:
             return None
         region_rects = [_normalize_rect(r) for r in regions]
-        affines = cal.get("channel_affines")
+        affines = cal.get("channel_registration")
         if affines is None:
             affines = [
-                a.tolist()
-                for a in localize.decompose_region_affines(
+                a.to_dict()
+                for a in localize.decompose_region_transforms(
                     cal["regions"], cal["channel_transforms"]
                 )
             ]
-        transforms = localize.compose_region_transforms(
-            region_rects, [np.asarray(a, dtype=float) for a in affines]
-        )
+        transforms = localize.compose_region_transforms(region_rects, affines)
         m = np.asarray(ids["frame"]) == frame_number
         xy = np.column_stack(
             [np.asarray(ids["x"])[m], np.asarray(ids["y"])[m]]
@@ -8103,7 +8186,7 @@ class Window(QtWidgets.QMainWindow):
             if len(chan_local) == 0 or n_ref == 0:
                 per_channel.append((chan_local, {}))
                 continue
-            pred = localize.apply_affine_transform(ref_xy, transforms[c])
+            pred = transforms_mod.from_dict(transforms[c]).apply(ref_xy)
             matches = _nearest_unique_match(pred, xy[chan_local], tol)
             per_channel.append((chan_local, matches))
             for rk in set(matches.values()):
@@ -8165,9 +8248,7 @@ class Window(QtWidgets.QMainWindow):
             chan_xy = frame_xy(self.link_identifications(c2))
             if n_ref == 0 or len(chan_xy) == 0:
                 continue
-            pred = localize.apply_affine_transform(
-                ref_xy, np.asarray(transforms[c2], dtype=float)
-            )
+            pred = transforms_mod.from_dict(transforms[c2]).apply(ref_xy)
             for rk in set(_nearest_unique_match(pred, chan_xy, tol).values()):
                 match_count[rk] += 1
         complete = (
@@ -8199,9 +8280,7 @@ class Window(QtWidgets.QMainWindow):
             return []
         matches = {}
         if n_ref:
-            pred = localize.apply_affine_transform(
-                ref_xy, np.asarray(transforms[c], dtype=float)
-            )
+            pred = transforms_mod.from_dict(transforms[c]).apply(ref_xy)
             matches = _nearest_unique_match(pred, cur_xy, tol)
         return [
             (
@@ -9030,7 +9109,7 @@ class Window(QtWidgets.QMainWindow):
             return None
         if not transforms or len(transforms) < n_channels:
             return None
-        return [np.asarray(t, dtype=float) for t in transforms[:n_channels]]
+        return [transforms_mod.from_dict(t) for t in transforms[:n_channels]]
 
     def _sum_channel_transforms(
         self, estimate: bool = True
@@ -9083,7 +9162,7 @@ class Window(QtWidgets.QMainWindow):
         if transforms is None or any(t is None for t in transforms):
             return None, regions, ""
         return (
-            [np.asarray(t, dtype=float) for t in transforms],
+            list(transforms),
             regions,
             "the per-channel identifications "
             f"({min(n_pairs[1:]):,} pairs or more per channel)",
@@ -9501,7 +9580,7 @@ class Window(QtWidgets.QMainWindow):
             calibrate_z,
             use_gpu,
             spline_calibration=spline_calibration,
-            affine_transforms=self._extra_affine_transforms(
+            lateral_transforms=self._extra_lateral_transforms(
                 spline_calibration
             ),
             camera_calibration=(
@@ -9530,7 +9609,7 @@ class Window(QtWidgets.QMainWindow):
         # Affine corrections are single-channel only: this fit registers its
         # channels itself, so applying one on top would correct twice. Say
         # so rather than silently ignoring what the user loaded.
-        if self.parameters_dialog.affine_transforms:
+        if self.parameters_dialog.lateral_transforms:
             QtWidgets.QMessageBox.information(
                 self,
                 "Multichannel spline fit",
@@ -9774,7 +9853,7 @@ class Window(QtWidgets.QMainWindow):
             ):
                 minimum_ng = self.parameters_dialog.mng_slider.value()
 
-            def _refine(frame_bounds, max_frames):
+            def _refine(frame_bounds, max_frames, model):
                 return spline.refine_split_fov_transforms_from_signal(
                     self.movie,
                     calibration,
@@ -9783,6 +9862,7 @@ class Window(QtWidgets.QMainWindow):
                     box=parameters["Box Size"],
                     frame_bounds=frame_bounds,
                     max_frames=max_frames,
+                    model=model,
                 )
 
         else:
@@ -9804,7 +9884,7 @@ class Window(QtWidgets.QMainWindow):
             # every movie can be paired
             n_movie_frames = min(len(m) for m in movies)
 
-            def _refine(frame_bounds, max_frames):
+            def _refine(frame_bounds, max_frames, model):
                 return spline.refine_multichannel_transforms_from_signal(
                     movies,
                     calibration,
@@ -9812,12 +9892,21 @@ class Window(QtWidgets.QMainWindow):
                     box=parameters["Box Size"],
                     frame_bounds=frame_bounds,
                     max_frames=max_frames,
+                    model=model,
                 )
 
         # let the user pick the frames considered: the first frames of a movie
         # are often too dense (or still bleaching) for unambiguous pairing
-        frame_bounds, max_frames, ok = RefineRegistrationDialog.getFrameSpecs(
-            self, n_movie_frames, self.frame_range
+        (
+            frame_bounds,
+            max_frames,
+            model,
+            ok,
+        ) = RefineRegistrationDialog.getFrameSpecs(
+            self,
+            n_movie_frames,
+            self.frame_range,
+            spline.registration_model_name(calibration),
         )
         if not ok:
             return
@@ -9827,7 +9916,7 @@ class Window(QtWidgets.QMainWindow):
             QtCore.Qt.CursorShape.WaitCursor
         )
         try:
-            _, reg_info = _refine(frame_bounds, max_frames)
+            _, reg_info = _refine(frame_bounds, max_frames, model)
         except Exception as e:
             QtWidgets.QApplication.restoreOverrideCursor()
             self.status_bar.showMessage("")
@@ -9852,11 +9941,18 @@ class Window(QtWidgets.QMainWindow):
             self.parameters_dialog.update_roi_display()
             self.draw_frame()
 
-        rows = [
-            f"ch{r['channel']}: {r['n_matches']} paired signals, "
-            f"RMS {r['rms']:.2f} px"
-            for r in reg_info
-        ]
+        rows = []
+        for r in reg_info:
+            row = (
+                f"ch{r['channel']}: {r['n_matches']} paired signals, "
+                f"RMS {r['rms']:.2f} px, {r.get('model', 'affine')}"
+            )
+            # say so when too few pairs survived for the chosen model, rather
+            # than silently registering with something simpler
+            requested = r.get("model_requested")
+            if requested and requested != r.get("model"):
+                row += f" (fell back from {requested})"
+            rows.append(row)
         QtWidgets.QMessageBox.information(
             self,
             title,
@@ -9884,7 +9980,7 @@ class Window(QtWidgets.QMainWindow):
             self.parameters_dialog.pixelsize.value(),
             fitting_method,
             self.parameters_dialog.gpu_checkbox.isChecked(),
-            affine_transforms=self._extra_affine_transforms(
+            lateral_transforms=self._extra_lateral_transforms(
                 self.parameters_dialog.z_calibration
             ),
         )
@@ -9895,7 +9991,7 @@ class Window(QtWidgets.QMainWindow):
         self.abort_action.setEnabled(True)
         self.fit_z_worker.start()
 
-    def _extra_affine_transforms(self, calibration: dict | None) -> list:
+    def _extra_lateral_transforms(self, calibration: dict | None) -> list:
         """The loaded affine corrections minus those ``calibration`` carries
         and therefore applies itself.
 
@@ -9903,13 +9999,13 @@ class Window(QtWidgets.QMainWindow):
         file itself; this also catches a copy of the same transform saved
         under another name, which only a comparison of the matrices finds.
         """
-        extra, duplicates = lib.drop_duplicate_affine_transforms(
-            self.parameters_dialog.affine_transforms, calibration
+        extra, duplicates = lib.drop_duplicate_lateral_transforms(
+            self.parameters_dialog.lateral_transforms, calibration
         )
         if duplicates:
             self.status_bar.showMessage(
                 "Skipping "
-                + ", ".join(lib.describe_affine_transforms(duplicates))
+                + ", ".join(lib.describe_lateral_transforms(duplicates))
                 + ": already applied by the calibration used for fitting."
             )
         return extra
@@ -10028,15 +10124,15 @@ class Window(QtWidgets.QMainWindow):
         self, locs: pd.DataFrame, transform: np.ndarray
     ) -> pd.DataFrame:
         """Map reference-channel localizations into another channel's pixel
-        coordinates via the calibration's affine, for cross-channel display."""
-        xy = localize.apply_affine_transform(
+        coordinates via the calibration's transform, for cross-channel
+        display."""
+        xy = transforms_mod.from_dict(transform).apply(
             np.column_stack(
                 [
                     np.asarray(locs["x"], dtype=np.float64),
                     np.asarray(locs["y"], dtype=np.float64),
                 ]
-            ),
-            np.asarray(transform, dtype=np.float64),
+            )
         )
         mapped = locs.copy()
         mapped["x"] = xy[:, 0].astype(np.float32)
@@ -10595,7 +10691,7 @@ class FitWorker(QtCore.QThread):
         calibrate_z: bool,
         use_gpu: bool,
         spline_calibration: dict | None = None,
-        affine_transforms: list | None = None,
+        lateral_transforms: list | None = None,
         camera_calibration: dict | None = None,
     ) -> None:
         super().__init__()
@@ -10609,7 +10705,7 @@ class FitWorker(QtCore.QThread):
         self.fit_z = fit_z
         self.calibrate_z = calibrate_z
         self.spline_calibration = spline_calibration
-        self.affine_transforms = affine_transforms or []
+        self.lateral_transforms = lateral_transforms or []
         self.camera_calibration = camera_calibration
         self.N = len(identifications)
         self._last_cut_emit = 0
@@ -10650,7 +10746,7 @@ class FitWorker(QtCore.QThread):
             self.aborted.emit()
             return
         if not self.fit_z:
-            locs = lib.apply_affine_transforms(locs, self.affine_transforms)
+            locs = lib.apply_lateral_transforms(locs, self.lateral_transforms)
         self.progressMade.emit(self.N + 1, self.N)
         dt = time.time() - t0
         self.finished.emit(locs, dt, self.fit_z, self.calibrate_z)
@@ -10776,7 +10872,7 @@ class MultichannelSplineFitWorker(QtCore.QThread):
                 self.calibration, self.regions
             )
         except (ValueError, KeyError):
-            # geometry unavailable (e.g. no channel_affines to re-place at the
+            # geometry unavailable (e.g. no channel_registration to re-place at
             # drawn ROIs): fit as before, on the whole identification table
             return True
         # only the reference region is fitted (the other regions are cut from
@@ -10910,7 +11006,7 @@ class FitZWorker(QtCore.QThread):
         pixelsize: float,
         fitting_method: Literal["gausslq", "gaussmle"],
         gpu: bool = False,
-        affine_transforms: list | None = None,
+        lateral_transforms: list | None = None,
     ) -> None:
         super().__init__()
         self.locs = locs
@@ -10920,7 +11016,7 @@ class FitZWorker(QtCore.QThread):
         self.pixelsize = pixelsize
         self.fitting_method = fitting_method
         self.gpu = gpu
-        self.affine_transforms = affine_transforms or []
+        self.lateral_transforms = lateral_transforms or []
 
     def on_progress(self, n_done: int) -> None:
         self.progressMade.emit(n_done, len(self.locs))
@@ -10942,7 +11038,7 @@ class FitZWorker(QtCore.QThread):
             abort_callback=self.isInterruptionRequested,
         )
         if locs is not None:
-            locs = lib.apply_affine_transforms(locs, self.affine_transforms)
+            locs = lib.apply_lateral_transforms(locs, self.lateral_transforms)
         dt = time.time() - t0
         self.finished.emit(locs, dt)
 
@@ -10972,6 +11068,7 @@ class SplineCalibrationWorker(QtCore.QThread):
         magnification_factor: float = 0.79,
         correct_z_bias: bool = False,
         link_photons: bool = True,
+        registration_model: str = "affine",
         roi=None,
         regions=None,
         movies=None,
@@ -10993,6 +11090,7 @@ class SplineCalibrationWorker(QtCore.QThread):
         self.magnification_factor = magnification_factor
         self.correct_z_bias = correct_z_bias
         self.link_photons = link_photons
+        self.registration_model = registration_model
         self.roi = roi
         # When set (>= 2 rectangles), the ROIs are treated as channels of one
         # movie (split-FOV) and a multichannel calibration is built instead.
@@ -11022,6 +11120,7 @@ class SplineCalibrationWorker(QtCore.QThread):
                         magnification_factor=self.magnification_factor,
                         correct_z_bias=self.correct_z_bias,
                         link_photons=self.link_photons,
+                        model=self.registration_model,
                         reference=0,
                         path=self.path,
                         return_diagnostics=True,
@@ -11042,6 +11141,7 @@ class SplineCalibrationWorker(QtCore.QThread):
                     magnification_factor=self.magnification_factor,
                     correct_z_bias=self.correct_z_bias,
                     link_photons=self.link_photons,
+                    model=self.registration_model,
                     path=self.path,
                     return_diagnostics=True,
                 )
@@ -11089,7 +11189,7 @@ class AffineCalibrationWorker(QtCore.QThread):
     thread via ``promptRequested`` (the worker blocks on a
     ``threading.Event`` until the main thread fills in ``holder``, exactly
     as ``MovieLoadWorker`` does), and the figure is not drawn here at all -
-    ``localize.fit_affine_transform`` hands back a ``qc`` dict that the
+    ``localize.fit_lateral_transform`` hands back a ``qc`` dict that the
     window plots once ``finished`` arrives.
     """
 
@@ -11111,12 +11211,14 @@ class AffineCalibrationWorker(QtCore.QThread):
         prompt_for_path,
         pixelsize_prompt,
         transform_type: str = "astigmatism",
+        model: str = "affine",
     ) -> None:
         super().__init__()
         self.ref_path = ref_path
         self.target_path = target_path
         self.calibration_path = calibration_path
         self.transform_type = transform_type
+        self.model = model
         self.box = box
         self.minimum_ng = minimum_ng
         # Window._prompt_for_path: path -> metadata prompt callback
@@ -11182,7 +11284,7 @@ class AffineCalibrationWorker(QtCore.QThread):
 
         self.statusChanged.emit("Fitting affine transform ...")
         try:
-            calibration, qc = localize.fit_affine_transform(
+            calibration, qc = localize.fit_lateral_transform(
                 movie_ref,
                 movie_target,
                 calibration,
@@ -11192,6 +11294,7 @@ class AffineCalibrationWorker(QtCore.QThread):
                 transform_type=self.transform_type,
                 ref_path=self.ref_path,
                 target_path=self.target_path,
+                model=self.model,
             )
             io.save_any_calibration(self.calibration_path, calibration)
         except Exception as e:  # noqa: BLE001 - reported to the GUI
