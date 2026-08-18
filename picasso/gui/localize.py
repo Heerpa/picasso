@@ -2595,7 +2595,7 @@ class ROIDialog(lib.Dialog):
 
 
 class CalibrateAffineDialog(lib.Dialog):
-    """Select the inputs/output for an affine-transform calibration.
+    """Select the inputs/output for a lateral-transform calibration.
 
     The same calibration corrects two things, chosen at the top of the
     dialog: the lateral distortion of a cylindrical lens (astigmatism) or
@@ -2603,10 +2603,12 @@ class CalibrateAffineDialog(lib.Dialog):
     reference bead image, the bead image to be mapped onto it, and the
     calibration file the transform is appended to - an existing Gaussian
     astigmatism (YAML) or spline PSF (HDF5) calibration, or a new
-    standalone YAML holding only affine corrections (for 2D data). Several
+    standalone YAML holding only lateral corrections (for 2D data). Several
     transforms accumulate in one file as an ordered list and are applied
     one after another.
     """
+
+    LATERAL_URL = "https://picassosr.readthedocs.io/en/latest/localize.html#lateral-corrections-of-x-and-y"  # noqa: E501
 
     # Emitted when "Calibrate" is pressed. Not ``accepted``: the dialog
     # stays open so the pairing can be inspected on both bead images.
@@ -2657,6 +2659,7 @@ class CalibrateAffineDialog(lib.Dialog):
         type_row.addWidget(type_label)
         type_row.addWidget(self.type_combo)
         type_row.addStretch(1)
+        type_row.addWidget(lib.HelpButton(self.LATERAL_URL))
         vbox.addLayout(type_row)
 
         model_row = QtWidgets.QHBoxLayout()
@@ -2687,7 +2690,7 @@ class CalibrateAffineDialog(lib.Dialog):
         calibration_tooltip = (
             "Where the transform is stored. Select an existing calibration\n"
             "(a Gaussian 3D .yaml or a spline PSF .hdf5) to append it to,\n"
-            "or 'New' to start a standalone affine calibration .yaml - the\n"
+            "or 'New' to start a standalone lateral calibration .yaml - the\n"
             "option for purely 2D data."
         )
         calibration_label.setToolTip(calibration_tooltip)
@@ -2716,8 +2719,8 @@ class CalibrateAffineDialog(lib.Dialog):
             else:
                 new_button = QtWidgets.QPushButton("New")
                 new_button.setToolTip(
-                    "Create a new standalone affine calibration file\n"
-                    "(.yaml), holding only affine corrections. Use it when\n"
+                    "Create a new standalone lateral calibration file\n"
+                    "(.yaml), holding only lateral corrections. Use it when\n"
                     "there is no 3D calibration to append to, e.g. a\n"
                     "chromatic correction for 2D data."
                 )
@@ -2827,7 +2830,7 @@ class CalibrateAffineDialog(lib.Dialog):
         )
 
     def _new_calibration(self) -> None:
-        """Pick a path for a new standalone affine calibration (.yaml).
+        """Pick a path for a new standalone lateral calibration (.yaml).
         Existing files are appended to, not overwritten, by the worker."""
         current = self.calibration_edit.text()
         directory = (
@@ -2835,12 +2838,12 @@ class CalibrateAffineDialog(lib.Dialog):
             if current
             else os.path.join(
                 os.path.split(self.reference_path)[0],
-                "affine_calibration.yaml",
+                "lateral_calibration.yaml",
             )
         )
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
-            "New affine calibration",
+            "New lateral calibration",
             directory=directory,
             filter="*.yaml",
         )
@@ -3754,7 +3757,7 @@ class ParametersDialog(lib.Dialog):
         affine_grid = QtWidgets.QGridLayout(affine_groupbox)
         load_affine_calib = QtWidgets.QPushButton("Load 2D correction")
         load_affine_calib.setToolTip(
-            "Load a standalone affine calibration (.yaml) to apply to this\n"
+            "Load a standalone lateral calibration (.yaml) to apply to this\n"
             "2D measurement."
         )
         load_affine_calib.setAutoDefault(False)
@@ -4280,7 +4283,7 @@ class ParametersDialog(lib.Dialog):
             self.update_spline_calib(path)
 
     def load_affine_calib(self) -> None:
-        """Load one or more standalone affine calibrations to apply to this
+        """Load one or more standalone lateral calibrations to apply to this
         2D measurement after fitting.
 
         Any calibration file works as a carrier - only its affine
@@ -5644,9 +5647,9 @@ class Window(QtWidgets.QMainWindow):
             "Calibrate lateral transform (astigmatism / chromatic)"
         )
         calibrate_affine_action.setToolTip(
-            "Fit a lateral affine correction from two bead images and\n"
-            "append it to any calibration (Gaussian, spline, or a new\n"
-            "standalone affine calibration). Several corrections stack\n"
+            "Fit a lateral correction from two bead images and append\n"
+            "it to any calibration (Gaussian, spline, or a new\n"
+            "standalone lateral calibration). Several corrections stack\n"
             "and are applied one after another."
         )
         calibrate_affine_action.triggered.connect(self.calibrate_affine)
@@ -5767,7 +5770,7 @@ class Window(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "Calibrate lateral transform",
-                "An affine calibration is already running.",
+                "A lateral calibration is already running.",
             )
             return
 
@@ -5800,7 +5803,7 @@ class Window(QtWidgets.QMainWindow):
         worker.failed.connect(self.on_affine_calibration_failed)
         worker.cancelled.connect(self.on_affine_calibration_cancelled)
         self.affine_calibration_worker = worker
-        self.status_bar.showMessage("Calibrating affine transform ...")
+        self.status_bar.showMessage("Calibrating lateral transform ...")
         worker.start()
 
     def _on_affine_prompt_requested(
@@ -5824,7 +5827,7 @@ class Window(QtWidgets.QMainWindow):
         matplotlib must be driven from the GUI thread."""
         self.affine_calibration_worker = None
         self.status_bar.showMessage(
-            f"Affine calibration appended to {os.path.basename(path)} "
+            f"Lateral calibration appended to {os.path.basename(path)} "
             f"({n_pairs} bead pairs). Load either bead image to see which "
             "beads were paired."
         )
@@ -5836,7 +5839,10 @@ class Window(QtWidgets.QMainWindow):
             self.draw_frame()
         except Exception:  # bookkeeping must never lose a finished fit
             self.affine_pairing = None
-        plot_path = os.path.splitext(path)[0] + "_affine.png"
+        transform_type = qc.get("transform_type", "lateral")
+        plot_path = (
+            os.path.splitext(path)[0] + f"_lateral_{transform_type}.png"
+        )
         try:
             localize.plot_lateral_calibration(qc, save_path=plot_path)
         except Exception as e:  # a failed figure must not lose the fit
@@ -5848,9 +5854,9 @@ class Window(QtWidgets.QMainWindow):
             )
 
     def on_affine_calibration_failed(self, message: str) -> None:
-        """Report a failed affine calibration."""
+        """Report a failed lateral calibration."""
         self.affine_calibration_worker = None
-        self.status_bar.showMessage("Affine calibration failed.")
+        self.status_bar.showMessage("Lateral calibration failed.")
         QtWidgets.QMessageBox.warning(
             self, "Calibrate lateral transform", message
         )
@@ -5858,7 +5864,7 @@ class Window(QtWidgets.QMainWindow):
     def on_affine_calibration_cancelled(self) -> None:
         """The user cancelled one of the worker's prompts."""
         self.affine_calibration_worker = None
-        self.status_bar.showMessage("Affine calibration cancelled.")
+        self.status_bar.showMessage("Lateral calibration cancelled.")
 
     def calibrate_camera(self) -> None:
         """Characterize the sCMOS camera from a dark movie.
