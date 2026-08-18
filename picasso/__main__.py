@@ -1153,7 +1153,9 @@ def _localize_process_file(
     lateral_transforms : list or None
         Extra lateral affine corrections (see ``--affine-calibration``),
         applied to x/y after fitting and, for 3D astigmatism, after ``zfit``
-        applied the ones stored in the 3D calibration.
+        applied the ones stored in the 3D calibration. Corrections the
+        spline or astigmatism calibration carries - and therefore applies
+        itself - are skipped rather than applied a second time.
     """
     from os.path import splitext
     from .io import load_movie, load_tif_concatenated, save_locs
@@ -1233,10 +1235,33 @@ def _localize_process_file(
     if lateral_transforms:
         from . import lib
 
-        locs = lib.apply_lateral_transforms(locs, lateral_transforms)
-        info[-1]["Lateral corrections applied"] = (
-            lib.describe_lateral_transforms(lateral_transforms)
+        # Corrections the fit already applied on its own - those carried by
+        # the spline calibration (applied by ``localize``) and by the
+        # astigmatism calibration (applied by ``zfit``) - are dropped here.
+        # Passing the very same file to --affine-calibration would otherwise
+        # correct the coordinates twice.
+        applied = lib.lateral_transforms(spline_calibration)
+        if z_params is not None:
+            applied += lib.lateral_transforms(z_params[2])
+        extra, duplicates = lib.drop_duplicate_lateral_transforms(
+            lateral_transforms, applied
         )
+        if duplicates:
+            print(
+                "Skipping "
+                + ", ".join(lib.describe_lateral_transforms(duplicates))
+                + ": the calibration used for fitting already applies this"
+                " correction itself; applying it again would correct twice."
+            )
+        if extra:
+            locs = lib.apply_lateral_transforms(locs, extra)
+            described = lib.describe_lateral_transforms(extra)
+            # zfit records what it applied in this same entry, so extend the
+            # list rather than replacing it.
+            info[-1]["Lateral corrections applied"] = (
+                info[-1].get("Lateral corrections applied", []) + described
+            )
+            print("Applied lateral correction(s): " + ", ".join(described))
 
     base, ext = splitext(path)
 
@@ -1427,11 +1452,26 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
                 "with the 'Calibrate lateral transform' dialog in "
                 "'picasso localize'."
             )
-        lateral_transforms.extend(found)
-        print(
-            f"Loaded {len(found)} lateral correction(s) from {affine_path}: "
-            + ", ".join(lib.describe_lateral_transforms(found))
+        # The same correction given twice - the flag repeated, or a
+        # standalone copy of a transform another file already carries -
+        # counts once: applying it twice would correct twice.
+        found, duplicates = lib.drop_duplicate_lateral_transforms(
+            found, lateral_transforms
         )
+        if duplicates:
+            print(
+                f"Skipping {len(duplicates)} correction(s) from "
+                f"{affine_path} already loaded from an earlier "
+                "--affine-calibration: "
+                + ", ".join(lib.describe_lateral_transforms(duplicates))
+            )
+        if found:
+            lateral_transforms.extend(found)
+            print(
+                f"Loaded {len(found)} lateral correction(s) from "
+                f"{affine_path}: "
+                + ", ".join(lib.describe_lateral_transforms(found))
+            )
 
     camera_calibration = None
     if args.camera_calibration:
@@ -3025,7 +3065,9 @@ def main():  # noqa: C901
             " the file (affine, projective or polynomial) is used as saved."
             " Repeat the flag to chain"
             " several; they are applied in the order given, after any"
-            " corrections stored in the 3D or spline calibration itself"
+            " corrections stored in the 3D or spline calibration itself."
+            " A correction the 3D or spline calibration already carries is"
+            " skipped, so the same file can be passed to both flags"
         ),
     )
     localize_parser.add_argument(
