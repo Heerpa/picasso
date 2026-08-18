@@ -75,6 +75,9 @@ INITIAL_REL_MAXIMUM = 0.5
 ZOOM = 9 / 7
 N_GROUP_COLORS = render.N_GROUP_COLORS  # 8
 POLYGON_POINTER_SIZE = 16  # must be even
+# steps of the loading progress bar per file, such that it also
+# advances within a file, see ``LocsLoadWorker``
+LOAD_PROGRESS_RESOLUTION = 1000
 
 
 # G5M default params
@@ -7292,6 +7295,136 @@ class SlicerDialog(lib.Dialog):
         self.close()
 
 
+class _LoadCancelledError(Exception):
+    """Raised inside the loading worker to abort the current file."""
+
+
+def _read_locs_file(
+    path: str, pixelsize: float | None = None, progress=None
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Read localizations and metadata from a given path, either Picasso
+    (.hdf5), ThunderSTORM (.csv) or SMAP (_sml.mat) format.
+
+    Contains no GUI code, so it can run on a background thread, see
+    ``LocsLoadWorker``.
+
+    Parameters
+    ----------
+    path : str
+        Path to the localization file.
+    pixelsize : float or None, optional
+        Camera pixel size (nm), required for the .csv and _sml.mat
+        formats, which do not store it.
+    progress : callable or None, optional
+        Called as ``progress(done, total)`` while the localizations are
+        read (.hdf5 only, which is read in blocks); raising inside it
+        aborts the read.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        Loaded localizations.
+    info : list of dict
+        Loaded metadata.
+    """
+    if path.endswith(".hdf5"):  # standard Picasso localization file
+        return io.load_locs(path, progress=progress)
+    elif path.endswith(".csv"):  # ThunderSTORM localization file
+        return io.import_ts(path, pixelsize)
+    elif path.endswith(".mat"):  # SMAP localization file
+        return io.import_smap(path, pixelsize)
+    raise ValueError(
+        "Unsupported file format. Please load a .hdf5 (Picasso), "
+        ".csv (ThunderSTORM) or _sml.mat (SMAP) file."
+    )
+
+
+class LocsLoadWorker(QtCore.QObject):
+    """Read localization files off the GUI thread, one file per channel.
+
+    Reading a localization file and building its spatial index take many
+    seconds for large datasets. Doing so on the main thread blocks Qt's
+    event loop, i.e. Picasso Render (including its file dialogs) freezes
+    until the last file is in. This worker does both on a background
+    thread instead and hands each finished file to the GUI thread via
+    ``loaded``.
+
+    The worker shows no dialogs: the camera pixel size is asked for on
+    the GUI thread *before* the worker starts (see
+    ``View._prompt_pixelsize``) and errors are reported via ``failed``,
+    such that the GUI thread displays the message box.
+
+    Parameters
+    ----------
+    jobs : list of tuple
+        One ``(path, pixelsize)`` tuple per file to load; ``pixelsize``
+        is None for formats that store it themselves (.hdf5).
+    """
+
+    progress = QtCore.pyqtSignal(int, str)  # index, filename
+    # progress within the current file: (done, total) localizations
+    subprogress = QtCore.pyqtSignal(int, int)
+    # path, locs, info, render index
+    loaded = QtCore.pyqtSignal(str, object, object, object)
+    failed = QtCore.pyqtSignal(str, str)  # path, error message
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, jobs: list[tuple[str, float | None]]) -> None:
+        super().__init__()
+        self.jobs = jobs
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Request cancellation; takes effect at the next block of
+        localizations read, i.e. also within a file."""
+        self._cancelled = True
+
+    def _report(self, done: int, total: int) -> None:
+        """Report the read progress within the current file. Called
+        between the blocks of localizations read, so it doubles as the
+        mid-file cancellation point."""
+        if self._cancelled:
+            raise _LoadCancelledError
+        self.subprogress.emit(done, total)
+
+    def run(self) -> None:
+        """Load each file in turn, emitting ``loaded`` for each one."""
+        for i, (path, pixelsize) in enumerate(self.jobs):
+            if self._cancelled:
+                break
+            self.progress.emit(i, os.path.basename(path))
+            try:
+                locs, info = _read_locs_file(
+                    path, pixelsize, progress=self._report
+                )
+            except _LoadCancelledError:
+                break
+            except io.NoMetadataFileError:
+                self.failed.emit(
+                    path,
+                    "Could not find metadata. Neither the .yaml metadata "
+                    "file nor metadata embedded in the file itself could "
+                    "be read.",
+                )
+                continue
+            except KeyError:
+                self.failed.emit(path, "File does not contain localizations.")
+                continue
+            except Exception as e:  # noqa: BLE001 - reported to the GUI
+                self.failed.emit(path, str(e))
+                continue
+            if self._cancelled:
+                break
+            try:
+                render_index = spatial_index.build_render_index(locs, info)
+            except Exception:
+                render_index = None
+            if self._cancelled:
+                break
+            self.loaded.emit(path, locs, info, render_index)
+        self.finished.emit()
+
+
 class View(QtWidgets.QLabel):
     """Display localization datasets. Render localizations and draw
     objects on top, such as scale bar, legend, etc.
@@ -7437,48 +7570,14 @@ class View(QtWidgets.QLabel):
         self._driftfiles = []
         self.currentdrift = []
         self.x_render_state = False
-
-    def _load_locs(self, path: str) -> tuple[pd.DataFrame, list[dict]]:
-        """Load localizations and metadata from a given path, either
-        Picasso (.hdf5), ThunderSTORM (.csv) or SMAP (_sml.mat) format."""
-        if path.endswith(".hdf5"):  # standard Picasso localization file
-            # read .hdf5 and .yaml files
-            try:
-                locs, info = io.load_locs(path, qt_parent=self)
-            except (io.NoMetadataFileError, KeyError):
-                return None, None
-        elif path.endswith(".csv"):  # ThunderSTORM localization file
-            pixelsize, ok = QtWidgets.QInputDialog.getDouble(
-                self,
-                "Camera pixel size",
-                "Enter camera pixel size in nm:",
-                value=100,
-                min=0.01,
-                max=10000,
-                decimals=2,
-            )
-            if not ok:
-                return None, None
-            locs, info = io.import_ts(path, pixelsize)
-        elif path.endswith(".mat"):  # SMAP localization file
-            pixelsize, ok = QtWidgets.QInputDialog.getDouble(
-                self,
-                "Camera pixel size",
-                "Enter camera pixel size in nm:",
-                value=100,
-                min=0.01,
-                max=10000,
-                decimals=2,
-            )
-            if not ok:
-                return None, None
-            locs, info = io.import_smap(path, pixelsize)
-        else:
-            raise ValueError(
-                "Unsupported file format. Please load a .hdf5 (Picasso), "
-                ".csv (ThunderSTORM) or _sml.mat (SMAP) file."
-            )
-        return locs, info
+        # background loading (see ``LocsLoadWorker``)
+        self._load_thread = None
+        self._load_worker = None
+        self._load_progress = None
+        self._load_queue = []  # (jobs, on_finished) requested while busy
+        self._load_callback = None
+        self._load_fit_in_view = True
+        self._load_index = 0  # file currently being read
 
     def _load_drift(self, info: list[dict]) -> pd.DataFrame | None:
         drift = None
@@ -7491,23 +7590,54 @@ class View(QtWidgets.QLabel):
                 pass
         return drift
 
-    def add(self, path: str, render_: bool = True) -> None:
-        """Load localizations from an .hdf5 file and the associated
-        .yaml metadata file.
+    def _prompt_pixelsize(self, path: str) -> float | None:
+        """Ask for the camera pixel size of a file that does not store
+        it (ThunderSTORM .csv, SMAP _sml.mat). None if cancelled."""
+        pixelsize, ok = QtWidgets.QInputDialog.getDouble(
+            self,
+            "Camera pixel size",
+            f"Enter camera pixel size in nm for {os.path.basename(path)}:",
+            value=100,
+            min=0.01,
+            max=10000,
+            decimals=2,
+        )
+        return pixelsize if ok else None
+
+    def add(
+        self,
+        path: str,
+        locs: pd.DataFrame,
+        info: list[dict],
+        render_index=None,
+        render_: bool = True,
+    ) -> None:
+        """Add localizations that have been read from disk (by
+        ``LocsLoadWorker``) as a new channel.
+
+        Runs on the GUI thread, i.e. it only touches data and widgets,
+        it does not read any file.
 
         New in v0.10.0: Can read a ThunderSTORM .csv file.
         New in v0.11.0: Can read a SMAP _sml.mat file.
+        New in v0.11.0: Files are read on a background thread, see
+        ``LocsLoadWorker``.
 
         Parameters
         ----------
         path : str
-            String specifying the path to the .hdf5 file.
+            String specifying the path to the localization file.
+        locs : pd.DataFrame
+            Loaded localizations.
+        info : list of dict
+            Loaded metadata.
+        render_index : optional
+            Spatial index used for rendering, None if it could not be
+            built.
         render_ : bool, optional
             Specifies if the loaded files should be rendered
             (default True).
         """
-        locs, info = self._load_locs(path)
-
         # update pixelsize (credits to Boyd Peters #602)
         pixelsize = lib.get_from_metadata(
             info,
@@ -7522,12 +7652,7 @@ class View(QtWidgets.QLabel):
         self.infos.append(info)
         self.locs_paths.append(path)
         self.index_blocks.append(None)
-        try:
-            self.render_index.append(
-                spatial_index.build_render_index(locs, info)
-            )
-        except Exception:
-            self.render_index.append(None)
+        self.render_index.append(render_index)
 
         # try to load a drift .txt file:
         drift = self._load_drift(info[-1])
@@ -7590,38 +7715,194 @@ class View(QtWidgets.QLabel):
             os.path.basename(path)
         )
 
-    def add_multiple(self, paths: list[str]) -> None:
-        """Load several .hdf5 and .yaml files, see ``self.add``.
+    def add_multiple(
+        self,
+        paths: list[str],
+        on_finished: Callable | None = None,
+    ) -> None:
+        """Load several localization files, see ``self.add``.
+
+        The files are read on a background thread, such that Picasso
+        Render (and the file dialogs) stay responsive while loading.
+        The function therefore returns immediately, i.e. before the
+        files are loaded; use ``on_finished`` to run code that requires
+        the loaded data.
 
         Parameters
         ----------
         paths: list of strs
             Contains the paths to the files to be loaded.
+        on_finished : callable or None, optional
+            Called (with no arguments) on the GUI thread once all files
+            have been loaded.
         """
-        if len(paths):
-            fit_in_view = len(self.locs) == 0
-            paths = sorted(paths)
-            pd = lib.ProgressDialog("Loading channels", 0, len(paths), self)
-            pd.set_value(0)
-            pd.setModal(False)
-            for i, path in enumerate(paths):
-                try:
-                    self.add(path, render_=False)
-                except Exception as e:
-                    QtWidgets.QMessageBox.warning(
-                        self,
-                        "Error",
-                        (
-                            "An error occurred while loading "
-                            f"{os.path.basename(path)}:\n{str(e)}"
-                        ),
-                    )
-                pd.set_value(i + 1)
-            if len(self.locs):  # if loading was successful
-                if fit_in_view:
-                    self.fit_in_view(autoscale=True)
-                else:
-                    self.update_scene()
+        if not len(paths):
+            return
+        # ask for the camera pixel size of formats that do not store it
+        # before loading starts, i.e. while still on the GUI thread
+        jobs = []
+        for path in sorted(paths):
+            if path.endswith((".csv", ".mat")):
+                pixelsize = self._prompt_pixelsize(path)
+                if pixelsize is None:  # cancelled by the user
+                    continue
+            else:
+                pixelsize = None
+            jobs.append((path, pixelsize))
+        if not jobs:
+            return
+        if self._load_thread is not None:
+            # a load is running; start this one when that one is done
+            self._load_queue.append((jobs, on_finished))
+            return
+        self._start_load(jobs, on_finished)
+
+    def _start_load(
+        self,
+        jobs: list[tuple[str, float | None]],
+        on_finished: Callable | None,
+    ) -> None:
+        """Read the given ``(path, pixelsize)`` jobs on a background
+        thread, see ``LocsLoadWorker``."""
+        self._load_fit_in_view = len(self.locs) == 0
+        self._load_callback = on_finished
+        self._load_index = 0
+
+        # each file spans LOAD_PROGRESS_RESOLUTION steps, such that the
+        # bar also advances *within* a file, from the worker's reports
+        progress = QtWidgets.QProgressDialog(
+            "Loading localizations...",
+            "Cancel",
+            0,
+            len(jobs) * LOAD_PROGRESS_RESOLUTION,
+            self,
+        )
+        progress.setWindowTitle("Loading channels")
+        # non-modal, so that the rest of Picasso Render (in particular
+        # the file dialogs) can be used while the files are read
+        progress.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        self._load_progress = progress
+
+        thread = QtCore.QThread(self)
+        worker = LocsLoadWorker(jobs)
+        worker.moveToThread(thread)
+        self._load_thread = thread
+        self._load_worker = worker
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_load_progress)
+        worker.subprogress.connect(self._on_load_subprogress)
+        worker.loaded.connect(self._on_locs_loaded)
+        worker.failed.connect(self._on_load_failed)
+        worker.finished.connect(self._on_load_finished)
+        # direct connection so that the flag is set immediately; the
+        # worker thread is busy in run() and would not service a queued
+        # slot until the current file has been read
+        progress.canceled.connect(
+            worker.cancel, QtCore.Qt.ConnectionType.DirectConnection
+        )
+        progress.canceled.connect(self._on_load_canceled)
+        thread.start()
+
+    def _on_load_canceled(self) -> None:
+        """Discard the progress dialog as soon as the user cancels: the
+        worker may still emit progress that was queued before it saw the
+        cancellation, and ``setValue`` re-shows a cancelled dialog."""
+        if self._load_progress is not None:
+            self._load_progress.close()
+            self._load_progress = None
+
+    def _on_load_progress(self, index: int, filename: str) -> None:
+        """Update the progress dialog as each file starts loading."""
+        self._load_index = index
+        if self._load_progress is not None:
+            self._load_progress.setLabelText(f"Loading {filename}...")
+            self._load_progress.setValue(index * LOAD_PROGRESS_RESOLUTION)
+
+    def _on_load_subprogress(self, done: int, total: int) -> None:
+        """Advance the bar within the current file, from the worker's
+        reports (see ``LocsLoadWorker.subprogress``)."""
+        if self._load_progress is not None and total > 0:
+            fraction = min(done / total, 1.0)
+            self._load_progress.setValue(
+                int((self._load_index + fraction) * LOAD_PROGRESS_RESOLUTION)
+            )
+
+    def _on_locs_loaded(
+        self,
+        path: str,
+        locs: pd.DataFrame,
+        info: list[dict],
+        render_index,
+    ) -> None:
+        """Add a file that the worker has finished reading."""
+        try:
+            self.add(
+                path, locs, info, render_index=render_index, render_=False
+            )
+        except Exception as e:
+            self._on_load_failed(path, str(e))
+
+    def _on_load_failed(self, path: str, message: str) -> None:
+        """Report a file that could not be read; the remaining files
+        keep loading."""
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Error",
+            (
+                "An error occurred while loading "
+                f"{os.path.basename(path)}:\n{message}"
+            ),
+        )
+
+    def _on_load_finished(self) -> None:
+        """Render the loaded files and tear the worker thread down."""
+        n_loaded = len(self.locs)
+        self._finish_load()
+        if n_loaded:  # if loading was successful
+            if self._load_fit_in_view:
+                self.fit_in_view(autoscale=True)
+            else:
+                self.update_scene()
+        callback = self._load_callback
+        self._load_callback = None
+        if callback is not None and n_loaded:
+            callback()
+        if self._load_queue:  # files requested while this load ran
+            jobs, on_finished = self._load_queue.pop(0)
+            self._start_load(jobs, on_finished)
+
+    def _finish_load(self) -> None:
+        """Tear down the worker thread and the progress dialog."""
+        if self._load_progress is not None:
+            # disconnect first: closing a QProgressDialog cancels it
+            try:
+                self._load_progress.canceled.disconnect()
+            except TypeError:  # nothing connected
+                pass
+            self._load_progress.close()
+            self._load_progress = None
+        if self._load_thread is not None:
+            self._load_thread.quit()
+            self._load_thread.wait()
+            self._load_thread.deleteLater()
+            self._load_thread = None
+        if self._load_worker is not None:
+            self._load_worker.deleteLater()
+            self._load_worker = None
+
+    def stop_load(self) -> None:
+        """Cancel any load in progress and block until the worker thread
+        has stopped. Called before the window is destroyed, because
+        destroying a running QThread aborts the process."""
+        self._load_queue = []
+        if self._load_worker is not None:
+            self._load_worker.cancel()
+        if self._load_thread is not None:
+            self._load_thread.quit()
+            self._load_thread.wait()
 
     def add_pick(
         self,
@@ -12807,6 +13088,8 @@ class Window(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         """Update user settings and close all dialogs."""
+        # destroying a running QThread aborts the process
+        self.view.stop_load()
         settings = io.load_user_settings()
         current_colormap = self.display_settings_dlg.colormap.currentText()
         if current_colormap == "Custom":
@@ -13512,27 +13795,34 @@ class Window(QtWidgets.QMainWindow):
             )
         if path:
             self.pwd = path[0]
-            self.view.add_multiple(path)
-            if "Pick" in self.view.infos[0][-1]:
-                self.view._picks = []
-                self.view._picks.append(self.view.infos[0][-1]["Pick"])
-                self.view._pick_shape = self.view.infos[0][-1]["Pick shape"]
-                if self.view._pick_shape == "Circle":
-                    self.tools_settings_dialog.pick_diameter.setValue(
-                        self.view.infos[0][-1]["Pick size (nm)"]
-                    )
-                elif self.view._pick_shape == "Rectangle":
-                    self.tools_settings_dialog.pick_width.setValue(
-                        self.view.infos[0][-1]["Pick size (nm)"]
-                    )
-                elif self.view._pick_shape == "Square":
-                    self.tools_settings_dialog.pick_side_length.setValue(
-                        self.view.infos[0][-1]["Pick size (nm)"]
-                    )
-                self.window_rot.view_rot.load_saved_rotation(
-                    self.view.infos[0][-1]
-                )
-                self.rot_win()
+            # loading runs on a background thread, so the rotation info
+            # can only be applied once the files are in
+            self.view.add_multiple(
+                path, on_finished=self._apply_saved_rotation
+            )
+
+    def _apply_saved_rotation(self) -> None:
+        """Apply the pick and rotation saved in the metadata of the
+        first channel, see ``self.open_rotated_locs``."""
+        info = self.view.infos[0][-1]
+        if "Pick" not in info:
+            return
+        self.view._picks = [info["Pick"]]
+        self.view._pick_shape = info["Pick shape"]
+        if self.view._pick_shape == "Circle":
+            self.tools_settings_dialog.pick_diameter.setValue(
+                info["Pick size (nm)"]
+            )
+        elif self.view._pick_shape == "Rectangle":
+            self.tools_settings_dialog.pick_width.setValue(
+                info["Pick size (nm)"]
+            )
+        elif self.view._pick_shape == "Square":
+            self.tools_settings_dialog.pick_side_length.setValue(
+                info["Pick size (nm)"]
+            )
+        self.window_rot.view_rot.load_saved_rotation(info)
+        self.rot_win()
 
     def resize_view_to_fov(self, w: float, h: float) -> None:
         """Resize the main window so that ``view`` has aspect ratio w/h.

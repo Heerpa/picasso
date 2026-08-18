@@ -40,7 +40,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Accept multiple rectangular ROIs
 - Remove a ROI by double-clicking it in the preview
 - 3D calibration allows for multiple FOVs per z position (thanks to Aditya Ajay Chhatre for the suggestion)
-- Movies now load on a background thread, so the Localize window stays responsive (and other windows are no longer blocked) while files are read; a progress dialog with a `Cancel` button is shown
+- Movies now load on a background thread, so the Localize window stays responsive (and other windows are no longer blocked) while files are read; a progress dialog with a `Cancel` button is shown.
 - Slider at the bottom of the app was added to allow easy navigation across frames
 - Contrast slider below it, with a black-point and a white-point handle
 - New keyboard shortcuts for navigating movies (move by 10/100/1,000 frames)
@@ -66,6 +66,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - Rendering rotated Gaussians
 - More user-friendly measure tool
 - Faster AIM through smarter implementation
+- Localization files now load on a background thread, so the Render window (including the file dialogs) stays responsive while files are read; a progress dialog with a `Cancel` button is shown
 - Faster and more memory efficient (especially for large datasets) SMLM clusterer + progress bar
 - Progress bar for finding cluster centers
 - SMAP localization file reading, see "Other improvements" below
@@ -100,6 +101,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 
 #### SPINNA
 - Adjustable font sizes and names for the NND plot's title, labels and ticks
+- Default NND plot title changed from "Nearest Neighbor Distances" to "NNDs"
 - Fixed incorrect density of plotted molecules when using LE fitting
 - Fixed verbose for batch analysis
 - Batch analysis allows for specifying fitting mode (brute force/coarse to fine/bayesian)

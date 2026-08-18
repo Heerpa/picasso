@@ -2628,7 +2628,7 @@ class NNDPlotSettingsDialog(lib.Dialog):
 
         # title
         self.title = QtWidgets.QLineEdit()
-        self.title.setText("Nearest Neighbors Distances:")
+        self.title.setText("NNDs:")
         title_label = QtWidgets.QLabel("Title:")
         title_label.setToolTip("Title of the plot.")
         const_layout.addRow(title_label, self.title)

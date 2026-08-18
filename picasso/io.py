@@ -83,6 +83,10 @@ MOVIE_EXTENSIONS = (
     + CZI_EXTENSIONS
     + LIF_EXTENSIONS
 )
+# Localizations per block when reading an .hdf5 file, see
+# ``_read_locs_dataset``. Blocks make long reads reportable and
+# abortable; smaller blocks report more often but read more slowly.
+LOCS_BLOCK_SIZE = 1_000_000
 
 
 class NoMetadataFileError(FileNotFoundError):
@@ -2611,6 +2615,35 @@ class _PerThreadFileHandles:
         self._local = threading.local()
 
 
+def _index_pages(pages, progress=None) -> int:
+    """Return the number of IFDs in ``pages``, walking the IFD chain in
+    chunks so that a long scan stays reportable and abortable.
+
+    ``len(pages)`` walks the whole chain of a TIFF in one uninterrupt-
+    ible call - minutes for a movie with many frames on network storage,
+    where every IFD costs a round trip. Reading a page only extends the
+    chain up to that index (see ``tifffile.TiffPages._seek``), so the
+    walk is done here one chunk of pages at a time, calling
+    ``progress(done, 0)`` in between. The total is 0 because the frame
+    count is precisely what is not known yet; raising inside ``progress``
+    aborts the scan.
+    """
+    CHUNK = 2000  # IFDs walked per progress report
+    if progress is None or not isinstance(pages, tifffile.TiffPages):
+        return len(pages)
+    if getattr(pages, "_indexed", False):  # chain already walked
+        return len(pages)
+    done = 0
+    while True:
+        try:
+            pages[done + CHUNK - 1]  # extends the chain up to this page
+        except IndexError:  # the chain ended within the last chunk
+            break
+        done += CHUNK
+        progress(done, 0)
+    return len(pages)
+
+
 class TiffMap(_PerThreadFileHandles):
     """Read a single TIFF file and provide array-like access to its frames.
 
@@ -2792,7 +2825,10 @@ class TiffMap(_PerThreadFileHandles):
         keyframe" RuntimeError surfaces; __init__ catches it and retries
         with full-page parsing, where the stray IFD has its real shape
         and is dropped below."""
-        n_pages = len(self._pages)
+        # Counting the pages walks the IFD chain, which is the whole cost
+        # of opening a compressed movie (the branch below returns without
+        # touching the pages again), so it is reported in chunks too.
+        n_pages = _index_pages(self._pages, progress)
 
         # Throttle progress reports to at most ~200 per file so a
         # multi-thousand-frame movie does not flood the GUI event queue
@@ -3993,8 +4029,63 @@ def save_locs(path: str, locs: pd.DataFrame, info: list[dict]) -> None:
         save_info(info_path, info)
 
 
+def _read_locs_dataset(path: str, progress=None) -> pd.DataFrame:
+    """Read the ``locs`` dataset of an .hdf5 file in row blocks.
+
+    Picasso writes the localizations as a single h5py compound dataset
+    (see ``save_locs``), which is read here one block of rows at a time
+    so that ``progress(done, total)`` can report - and, by raising,
+    abort - a long read. Files whose ``locs`` node is not such a dataset
+    (e.g. written by ``pandas.DataFrame.to_hdf``) fall back to
+    ``pandas.read_hdf``, which reads them in one go.
+
+    Parameters
+    ----------
+    path : str
+        The path to the HDF5 file containing localization data.
+    progress : callable or None, optional
+        Called as ``progress(done, total)`` after each block of rows
+        with the number of localizations read so far. Raising inside it
+        aborts the read.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        The localization data read from the file.
+    """
+    BLOCK_SIZE = LOCS_BLOCK_SIZE
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"File {path} does not exist.")
+    with h5py.File(path, "r") as locs_file:
+        if "locs" not in locs_file:
+            raise KeyError(f"File: {path} does not contain a 'locs' dataset.")
+        dataset = locs_file["locs"]
+        names = getattr(dataset.dtype, "names", None)
+        if not isinstance(dataset, h5py.Dataset) or names is None:
+            dataset = None  # not a Picasso-written compound dataset
+        if dataset is not None:
+            n_locs = len(dataset)
+            # fill one contiguous array per column, such that no copy of
+            # the whole dataset is needed to build the DataFrame
+            columns = {
+                name: np.empty(n_locs, dtype=dataset.dtype[name])
+                for name in names
+            }
+            for start in range(0, max(n_locs, 1), BLOCK_SIZE):
+                stop = min(start + BLOCK_SIZE, n_locs)
+                block = dataset[start:stop]
+                for name in names:
+                    columns[name][start:stop] = block[name]
+                if progress is not None:
+                    progress(stop, n_locs)
+            return pd.DataFrame(columns, copy=False)
+    return pd.read_hdf(path, key="locs")
+
+
 def load_locs(
-    path: str, qt_parent: QtWidgets.QWidget | None = None
+    path: str,
+    qt_parent: QtWidgets.QWidget | None = None,
+    progress=None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """Load localization data from an HDF5 file.
 
@@ -4004,6 +4095,10 @@ def load_locs(
         The path to the HDF5 file containing localization data.
     qt_parent : QWidget or None, optional
         Parent widget for any Qt-related operations, default is None.
+    progress : callable or None, optional
+        Called as ``progress(done, total)`` while the localizations are
+        read, see ``_read_locs_dataset``. Raising inside it aborts the
+        read.
 
     Returns
     -------
@@ -4029,7 +4124,7 @@ def load_locs(
             "picasso.io.import_ts instead."
         )
     try:
-        locs = pd.read_hdf(path, key="locs")
+        locs = _read_locs_dataset(path, progress=progress)
     except KeyError as e:  # if "locs" key not found
         print(
             f"\nAn error occured. File: {path} does not contain a "
