@@ -880,6 +880,7 @@ def adjust_widget_size(
     size_hint: QtCore.QSize,
     width_offset: int = 0,
     height_offset: int = 0,
+    max_height: int | None = None,
 ) -> None:
     """Adjust the size of a QWidget based on its size hint. The user
     can specify the offsets to be added to the width and height of the
@@ -899,6 +900,11 @@ def adjust_widget_size(
     height_offset : int, optional
         The offset to be added to the height of the size hint. Default
         is 0.
+    max_height : int or None, optional
+        Absolute cap (in pixels) on the resulting height, applied on top
+        of the screen-size-based cap below. Use this so a widget with a
+        scrollable area does not grow to fill very tall/large screens.
+        Default is None, i.e., no additional cap.
     """
     intended_width = size_hint.width() + width_offset
     intended_height = size_hint.height() + height_offset
@@ -908,6 +914,8 @@ def adjust_widget_size(
     screen_width = 1000 if screen is None else screen.size().width()
     intended_width = min(intended_width, screen_width - 200)
     intended_height = min(intended_height, screen_height - 200)
+    if max_height is not None:
+        intended_height = min(intended_height, max_height)
     widget.resize(intended_width, intended_height)
 
 

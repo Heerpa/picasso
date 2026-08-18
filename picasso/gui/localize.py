@@ -3869,9 +3869,11 @@ class ParametersDialog(lib.Dialog):
         self.reset_quality_check()
         vbox.addStretch(1)
 
-        # adjust the size of the dialog to fit its contents
+        # adjust the size of the dialog to fit its contents, but cap the
+        # height so the dialog stays a reasonable size even on very tall
+        # screens - the scroll area (set up above) takes care of the rest
         hint = container.sizeHint()
-        lib.adjust_widget_size(self, hint)
+        lib.adjust_widget_size(self, hint, max_height=850)
 
     def reset_quality_check(self) -> None:
         """Reset the quality check UI elements."""
