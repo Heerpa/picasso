@@ -47,7 +47,7 @@ from numba import cuda
 from tqdm import tqdm
 
 from picasso.fitting import lmfit_cuda
-from picasso.fitting.splinefit import _allocate_outputs, resolve_variance
+from picasso.fitting.splinefit import allocate_outputs, resolve_variance
 
 # Everything that defines *what model this is* and *where a fit stops* comes
 # from the CPU twin, so the two devices cannot drift apart - the same
@@ -587,7 +587,7 @@ def fit_spots(
         max_iterations = MAX_ITERATIONS
 
     n_spots, box = spots.shape[0], spots.shape[1]
-    thetas, chi_squares, states, iterations = _allocate_outputs(
+    thetas, chi_squares, states, iterations = allocate_outputs(
         n_spots, n_params
     )
     if n_spots == 0:
@@ -1102,7 +1102,7 @@ def fit_spots_multichannel(
         max_iterations = MAX_ITERATIONS
 
     n_spots, n_channels, box = spots.shape[0], spots.shape[1], spots.shape[2]
-    thetas, chi_squares, states, iterations = _allocate_outputs(
+    thetas, chi_squares, states, iterations = allocate_outputs(
         n_spots, n_params
     )
     if n_spots == 0:

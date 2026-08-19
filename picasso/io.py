@@ -315,9 +315,9 @@ def save_config(CONFIG: dict) -> None:
     CONFIG : dict
         The camera configuration dictionary to save.
     """
-    from . import config_filename, _user_config_dir
+    from . import config_filename, user_config_dir
 
-    os.makedirs(_user_config_dir(), exist_ok=True)
+    os.makedirs(user_config_dir(), exist_ok=True)
     with open(config_filename(), "w") as config_file:
         yaml.dump(CONFIG, config_file, width=1000)
 

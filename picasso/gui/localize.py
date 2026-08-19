@@ -6039,9 +6039,9 @@ class Window(QtWidgets.QMainWindow):
     def open_config_location(self) -> None:
         """Open the folder holding the camera config file in the system
         file browser."""
-        from .. import config_filename, _resolve_config_path
+        from .. import config_filename, resolve_config_path
 
-        path = _resolve_config_path()
+        path = resolve_config_path()
         if path is None:
             # No config yet: point the user at the intended location.
             path = config_filename()

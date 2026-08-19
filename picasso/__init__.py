@@ -23,7 +23,7 @@ _this_file = os.path.abspath(__file__)
 _this_dir = os.path.dirname(_this_file)
 
 
-def _user_config_dir() -> str:
+def user_config_dir() -> str:
     """Return the user Picasso directory (``~/.picasso``).
 
     Shared with ``~/.picasso/settings.yaml`` and the other per-user files
@@ -48,7 +48,7 @@ def config_filename() -> str:
     path : str
         ``~/.picasso/config.yaml``.
     """
-    return os.path.join(_user_config_dir(), "config.yaml")
+    return os.path.join(user_config_dir(), "config.yaml")
 
 
 def _legacy_config_filename() -> str:
@@ -56,7 +56,7 @@ def _legacy_config_filename() -> str:
     return os.path.join(_this_dir, "config.yaml")
 
 
-def _resolve_config_path() -> str | None:
+def resolve_config_path() -> str | None:
     """Return the path of the config file to read, or None if none exists.
 
     Resolution:
@@ -78,7 +78,7 @@ def load_config() -> dict:
     """Load the camera configuration used by Picasso Localize.
 
     Reads ``~/.picasso/config.yaml`` if present, otherwise the legacy
-    in-package ``config.yaml`` (see ``_resolve_config_path``).
+    in-package ``config.yaml`` (see ``resolve_config_path``).
 
     Returns
     -------
@@ -86,7 +86,7 @@ def load_config() -> dict:
         The parsed configuration; an empty dict if neither file exists, it
         cannot be read, or it parses to nothing.
     """
-    path = _resolve_config_path()
+    path = resolve_config_path()
     if path is None:
         return {}
     try:

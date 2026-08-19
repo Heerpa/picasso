@@ -56,7 +56,7 @@ def status():  # noqa: C901
             "superresolution runs. By selecting `Estimate and add to database`"
             " in localize, summary statistics of a run will be stored in a "
             "local database in the picasso user folder ("
-            f"{escape_markdown(localize._db_filename())})."
+            f"{escape_markdown(localize.db_filename())})."
         )
         st.write(
             "- Status: Displays the current database status and documentation."
@@ -128,7 +128,7 @@ def status():  # noqa: C901
                     st.write(summary)
                     if st.button("Add to database"):
                         engine = create_engine(
-                            "sqlite:///" + localize._db_filename(), echo=False
+                            "sqlite:///" + localize.db_filename(), echo=False
                         )
                         pd.DataFrame(
                             summary.values(), summary.keys()
@@ -182,7 +182,7 @@ def status():  # noqa: C901
                     st.write(stack)
 
                     engine = create_engine(
-                        "sqlite:///" + localize._db_filename(), echo=False
+                        "sqlite:///" + localize.db_filename(), echo=False
                     )
                     stack.to_sql(
                         "files",

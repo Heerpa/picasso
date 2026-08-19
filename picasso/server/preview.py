@@ -1,5 +1,5 @@
 import streamlit as st
-from helper import _db_filename
+from helper import db_filename
 from sqlalchemy import create_engine
 import pandas as pd
 import os
@@ -73,7 +73,7 @@ def preview():
         "Select a movie from the database. All hdf files with the same base "
         "path as the movie will be selectable."
     )
-    engine = create_engine("sqlite:///" + _db_filename(), echo=False)
+    engine = create_engine("sqlite:///" + db_filename(), echo=False)
 
     try:
         df = pd.read_sql_table("files", con=engine)

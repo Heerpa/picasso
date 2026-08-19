@@ -2,7 +2,7 @@ from sqlalchemy import create_engine
 import pandas as pd
 import streamlit as st
 import time
-from picasso.localize import _db_filename
+from picasso.localize import db_filename
 
 
 def fetch_db():
@@ -15,7 +15,7 @@ def fetch_db():
         does not exist yet.
     """
     try:
-        DB_PATH = "sqlite:///" + _db_filename()
+        DB_PATH = "sqlite:///" + db_filename()
         engine = create_engine(DB_PATH, echo=False)
         df = pd.read_sql_table("files", con=engine)
 
@@ -35,7 +35,7 @@ def fetch_watcher():
         The ``watcher`` table; empty if it does not exist yet.
     """
     try:
-        engine = create_engine("sqlite:///" + _db_filename(), echo=False)
+        engine = create_engine("sqlite:///" + db_filename(), echo=False)
         df = pd.read_sql_table("watcher", con=engine)
     except ValueError as e:
         print(e)

@@ -61,7 +61,7 @@ from picasso.fitting.splinefit import (  # noqa: F401  (re-exported)
     _LAMBDA_DOWN,
     _LAMBDA_INITIAL,
     _LAMBDA_UP,
-    _allocate_outputs,
+    allocate_outputs,
     _lm_solve_step,
     n_workers,
     resolve_variance,
@@ -772,7 +772,7 @@ def _prepare(
         initial_parameters, dtype=np.float64
     )
     variance, use_variance = resolve_variance(variance, spots.shape, ndim=3)
-    outputs = _allocate_outputs(len(spots), n_params)
+    outputs = allocate_outputs(len(spots), n_params)
     return (
         spots,
         variance,
@@ -1554,7 +1554,7 @@ def _prepare_multichannel(
         initial_parameters, dtype=np.float64
     )
     variance, use_variance = resolve_variance(variance, spots.shape, ndim=4)
-    outputs = _allocate_outputs(len(spots), n_params)
+    outputs = allocate_outputs(len(spots), n_params)
     return (
         spots,
         variance,

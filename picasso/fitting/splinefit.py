@@ -1298,7 +1298,7 @@ def _kernel_args(
     )
 
 
-def _allocate_outputs(n_spots: int, n_params: int) -> tuple:
+def allocate_outputs(n_spots: int, n_params: int) -> tuple:
     """Preallocated fit outputs, one row per spot."""
     thetas = np.full((n_spots, n_params), np.nan)
     chi_squares = np.full(n_spots, np.inf)
@@ -1539,7 +1539,7 @@ def fit_spots(
         apply_seeds, tolerance, max_iterations
     )
     n_spots = len(spots)
-    thetas, chi_squares, states, iterations = _allocate_outputs(
+    thetas, chi_squares, states, iterations = allocate_outputs(
         n_spots, initial_parameters.shape[1]
     )
     args = _kernel_args(
@@ -1617,7 +1617,7 @@ def fit_spots_async(
         apply_seeds, tolerance, max_iterations
     )
     n_spots = len(spots)
-    thetas, chi_squares, states, iterations = _allocate_outputs(
+    thetas, chi_squares, states, iterations = allocate_outputs(
         n_spots, initial_parameters.shape[1]
     )
     args = _kernel_args(

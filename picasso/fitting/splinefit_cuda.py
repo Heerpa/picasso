@@ -93,7 +93,7 @@ from picasso.fitting.splinefit import (
     KIND_2D,
     KIND_3D,
     KIND_LINK_XYZ,
-    _allocate_outputs,
+    allocate_outputs,
     _check_inputs,
     resolve_variance,
     resolve_schedule,
@@ -819,7 +819,7 @@ def fit_spots(
     )
     n_spots, n_channels, box, _ = spots.shape
     n_params = initial_parameters.shape[1]
-    thetas, chi_squares, states, iterations = _allocate_outputs(
+    thetas, chi_squares, states, iterations = allocate_outputs(
         n_spots, n_params
     )
     if n_spots == 0:

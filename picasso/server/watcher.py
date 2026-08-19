@@ -329,7 +329,7 @@ def watcher():  # noqa: C901
             if st.button("Remove non-running watchers."):
                 df = df[df["running"]]
                 engine = create_engine(
-                    "sqlite:///" + localize._db_filename(), echo=False
+                    "sqlite:///" + localize.db_filename(), echo=False
                 )
                 df.to_sql(
                     "watcher",
@@ -467,7 +467,7 @@ def watcher():  # noqa: C901
                 "Update time (scan every x-th minute):", DEFAULT_UPDATE_TIME
             )
 
-            logfile_dir = os.path.dirname(localize._db_filename())
+            logfile_dir = os.path.dirname(localize.db_filename())
             now_str = datetime.now().strftime("%Y-%m-%d %H_%M_%S")
             logfile = os.path.join(logfile_dir, f"{now_str}_watcher.log")
             logfile = st.text_input("Logfile", logfile)
@@ -541,7 +541,7 @@ def watcher():  # noqa: C901
                 )
 
                 engine = create_engine(
-                    "sqlite:///" + localize._db_filename(), echo=False
+                    "sqlite:///" + localize.db_filename(), echo=False
                 )
                 df.to_sql(
                     "watcher",

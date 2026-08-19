@@ -7908,7 +7908,12 @@ def get_file_summary(
     return summary
 
 
-def _db_filename() -> str:
+def _db_filename() -> str:  # TODO: remove in 1.0
+    """Old alias for `db_filename."""
+    return db_filename()
+
+
+def db_filename() -> str:
     """Return the path to the SQLite database file used for storing
     localization summaries. The database is stored in the user's home
     directory under the ``.picasso`` folder."""
@@ -7920,7 +7925,7 @@ def _db_filename() -> str:
 
 def _save_file_summary(summary: dict) -> None:
     """Save the summary of a localization file to a SQLite database."""
-    engine = create_engine("sqlite:///" + _db_filename(), echo=False)
+    engine = create_engine("sqlite:///" + db_filename(), echo=False)
     s = pd.Series(summary, index=summary.keys()).to_frame().T
     s.to_sql("files", con=engine, if_exists="append", index=False)
 
@@ -7938,7 +7943,7 @@ def add_file_to_db(
     ----------
     file, file_hdf, drift, len_mean, nena
         As in :func:`get_file_summary`, which builds the summary that is
-        appended to the ``files`` table of the database (see ``_db_filename``).
+        appended to the ``files`` table of the database (see ``db_filename``).
     """
     summary = get_file_summary(file, file_hdf, drift, len_mean, nena)
     _save_file_summary(summary)
