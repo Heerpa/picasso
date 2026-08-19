@@ -33,6 +33,7 @@ from .. import (
     localize,
     lib,
     postprocess,
+    registration,
     scmos,
     spline,
     __version__,
@@ -235,6 +236,16 @@ LINK_PHOTONS_TIP = (
     " to the localizations."
 )
 
+GAUSS_LINK_PHOTONS_TIP = (
+    "How the multichannel 2D Gaussian fit treats brightness.\n\n"
+    "UNCHECKED (default): each channel fits its own photon count and"
+    " background,\n"
+    "with only x, y and the width shared. Makes no assumption about how the"
+    "\nlight is split. Adds photons_ch<c>, bg_ch<c> and rel_photons_ch<c>\n"
+    "(the channel's share of the total photons).\n\n"
+    "CHECKED: one photon count and background shared by every channel."
+)
+
 # Fitting models offered in the GUI, decoupled from the optimizer. Each
 # model maps its optimizer labels to the internal ``fit`` codes;
 # models without an optimizer (e.g. averaging) declare a fixed ``code``
@@ -255,6 +266,7 @@ FIT_MODELS = {
             "Least squares": "gausslq-spherical",
             "MLE": "gaussmle-spherical",
         },
+        "needs_channel_registration": True,
     },
     "Experimental PSF (cubic spline)": {
         "optimizers": {
@@ -2287,6 +2299,87 @@ class BeadInspectionDialog(lib.Dialog):
         return super().eventFilter(obj, event)
 
 
+class RegisterChannelsDialog(lib.Dialog):
+    """Dialog for the bead-based channel registration.
+
+    Only the transform model is asked for: the box size and minimum net
+    gradient come from the parameters dialog."""
+
+    def __init__(self, window: QtWidgets.QWidget) -> None:
+        """Build the dialog.
+
+        Parameters
+        ----------
+        window : QtWidgets.QWidget
+            The parent window, whose parameters dialog supplies the box size
+            and minimum net gradient.
+        """
+        super().__init__(window)
+        self.window = window
+        self.setWindowTitle("Register channels (beads)")
+        vbox = QtWidgets.QVBoxLayout(self)
+        vbox.addWidget(
+            QtWidgets.QLabel(
+                "Beads are detected and fitted with the box size and\n"
+                "minimum net gradient set in the Parameters dialog."
+            )
+        )
+        grid = QtWidgets.QGridLayout()
+        vbox.addLayout(grid)
+        grid.addWidget(QtWidgets.QLabel("Transform model:"), 0, 0)
+        self.registration_model = _transform_model_combo()
+        grid.addWidget(self.registration_model, 0, 1)
+        self.multi_fov = QtWidgets.QCheckBox(
+            "Each frame is a different field of view"
+        )
+        self.multi_fov.setToolTip(
+            "CHECK when the bead movie images a different field of view in\n"
+            "every frame, e.g. a stage scan over several positions. Beads are\n"
+            "then detected frame by frame and only ever paired within the\n"
+            "same frame.\n\n"
+            "UNCHECK for a plain bead acquisition, where the frames are\n"
+            "repeats of one field and are averaged to beat down the noise."
+        )
+        self.multi_fov.setTristate(False)
+        grid.addWidget(self.multi_fov, 1, 0, 1, 2)
+        self.buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            QtCore.Qt.Orientation.Horizontal,
+            self,
+        )
+        vbox.addWidget(self.buttons)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+    @staticmethod
+    def getSpecs(parent: QtWidgets.QWidget) -> tuple[str, bool, bool]:
+        """Show the dialog and read the chosen settings back.
+
+        Parameters
+        ----------
+        parent : QtWidgets.QWidget
+            The window the dialog belongs to.
+
+        Returns
+        -------
+        model : str
+            The chosen transform model.
+        multi_fov : bool
+            Whether each frame of the bead movie is its own field of view.
+        accepted : bool
+            False if the dialog was cancelled, in which case the other two
+            should be ignored.
+        """
+        dialog = RegisterChannelsDialog(parent)
+        result = dialog.exec()
+        return (
+            _transform_model_of(dialog.registration_model),
+            dialog.multi_fov.isChecked(),
+            result == QtWidgets.QDialog.DialogCode.Accepted,
+        )
+
+
 class RefineRegistrationDialog(lib.Dialog):
     """Dialog for choosing which frames the signal-based channel re-alignment
     considers.
@@ -2972,6 +3065,12 @@ class ParametersDialog(lib.Dialog):
         self.z_calibration_path = None
         self.spline_calibration = {}
         self.spline_calibration_path = None
+        # Standalone channel registration for the multichannel (joint) 2D
+        # spherical Gaussian fit. Named apart from the split-FOV
+        # "channel_registration" key a spline calibration carries, which is a
+        # different thing (region-local transforms).
+        self.channel_registration_calibration = {}
+        self.channel_registration_path = None
         # Standalone (2D) affine corrections applied after the fit; those
         # carried by the 3D / spline calibration are applied by the fit
         # itself (see load_affine_calib).
@@ -2986,6 +3085,7 @@ class ParametersDialog(lib.Dialog):
         # further below
         self.z_groupbox = None
         self.spline_groupbox = None
+        self.channel_registration_groupbox = None
         # last resolved fit code, so the convergence defaults are only
         # reapplied when the method actually changes
         self._last_fit_code = None
@@ -3734,6 +3834,65 @@ class ParametersDialog(lib.Dialog):
         self.link_photons_checkbox.hide()  # shown for 2-6 channel calibs
         spline_grid.addWidget(self.link_photons_checkbox, 1, 0, 1, 3)
 
+        # Channel registration for the multichannel (joint) 2D spherical
+        # Gaussian fit. Shown only for that model; unlike the spline path this
+        # needs no measured PSF, only where each channel sits.
+        self.channel_registration_groupbox = reg_groupbox = (
+            QtWidgets.QGroupBox("Multichannel: channel registration")
+        )
+        reg_groupbox.setToolTip(
+            "Fit all loaded channels at once with one shared position and\n"
+            "width (a global fit, as in globLoc), instead of fitting the\n"
+            "active channel alone.\n\n"
+            "Needs a channel registration built with\n"
+            "Calibration > Register channels, from beads or from the\n"
+            "blinking signal itself. Without one the fit stays\n"
+            "single-channel.\n\n"
+            "Li, Y., Shi, W., Liu, S. et al. Global fitting for "
+            "high-accuracy multi-channel single-molecule localization. "
+            "Nat Commun 13, 3133 (2022). "
+            "https://doi.org/10.1038/s41467-022-30719-4"
+        )
+        vbox.addWidget(reg_groupbox)
+        reg_grid = QtWidgets.QGridLayout(reg_groupbox)
+        load_registration = QtWidgets.QPushButton("Load registration")
+        load_registration.setToolTip(
+            "Load a channel registration (.yaml) built via\n"
+            "Calibration > Register channels."
+        )
+        load_registration.setAutoDefault(False)
+        load_registration.clicked.connect(self.load_channel_registration)
+        reg_grid.addWidget(load_registration, 0, 1)
+        clear_registration = QtWidgets.QPushButton("Clear")
+        clear_registration.setAutoDefault(False)
+        clear_registration.clicked.connect(
+            lambda: self.update_channel_registration(None)
+        )
+        reg_grid.addWidget(clear_registration, 0, 2)
+        self.channel_registration_label = QtWidgets.QLabel(
+            "-- no registration loaded --"
+        )
+        self.channel_registration_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignCenter
+        )
+        self.channel_registration_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        reg_grid.addWidget(self.channel_registration_label, 0, 0)
+
+        self.gauss_link_photons_checkbox = QtWidgets.QCheckBox(
+            "Link photon counts across channels"
+        )
+        self.gauss_link_photons_checkbox.setToolTip(GAUSS_LINK_PHOTONS_TIP)
+        self.gauss_link_photons_checkbox.setTristate(False)
+        # Unchecked by default, unlike the spline fit: a Gaussian carries no
+        # per-channel brightness scale, so linking assumes every channel
+        # collects the same photons (see GAUSS_LINK_PHOTONS_TIP).
+        self.gauss_link_photons_checkbox.setChecked(False)
+        self.gauss_link_photons_checkbox.hide()  # shown for 2-6 channels
+        reg_grid.addWidget(self.gauss_link_photons_checkbox, 1, 0, 1, 3)
+
         # Lateral (x, y) affine corrections for 2D data, applied after
         # fitting. This is how a chromatic correction is used on its own,
         # with no 3D calibration to append it to; for 3D the correction goes
@@ -4000,17 +4159,20 @@ class ParametersDialog(lib.Dialog):
 
     def _update_calib_group_visibility(self) -> None:
         """Show only the calibration box relevant to the selected fit model:
-        the astigmatism z-calibration for Gaussian models, or the spline PSF
-        calibration for the experimental-PSF (spline) model. Guarded so the
+        the astigmatism z-calibration for Gaussian models, the spline PSF
+        calibration for the experimental-PSF (spline) model, and the channel
+        registration for the model that has a multichannel fit. Guarded so the
         initial ``on_fit_model_changed`` call (before the boxes exist) is a
         no-op."""
-        needs_spline = FIT_MODELS[self.fit_model.currentText()].get(
-            "needs_spline_calibration", False
-        )
+        entry = FIT_MODELS[self.fit_model.currentText()]
+        needs_spline = entry.get("needs_spline_calibration", False)
+        needs_registration = entry.get("needs_channel_registration", False)
         if self.z_groupbox is not None:
             self.z_groupbox.setVisible(not needs_spline)
         if self.spline_groupbox is not None:
             self.spline_groupbox.setVisible(needs_spline)
+        if self.channel_registration_groupbox is not None:
+            self.channel_registration_groupbox.setVisible(needs_registration)
 
     def current_fit_code(self) -> str:
         """The ``fit`` code the current selection would run."""
@@ -4515,6 +4677,142 @@ class ParametersDialog(lib.Dialog):
         (no GPU / non-multichannel) so behaviour is unchanged by default."""
         cb = getattr(self, "link_photons_checkbox", None)
         return cb.isChecked() if cb is not None else True
+
+    def load_channel_registration(self) -> None:
+        """Load a standalone channel registration from a user-selected file."""
+        dialog_directory = (
+            os.path.dirname(self.channel_registration_path)
+            if self.channel_registration_path
+            else (
+                os.path.dirname(self.window.movie_path)
+                if self.window.movie_path
+                else ""
+            )
+        )
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load channel registration",
+            directory=dialog_directory,
+            filter="*.yaml",
+        )
+        if path:
+            self.update_channel_registration(path)
+
+    def update_channel_registration(self, path: str | None) -> None:
+        """Load (or clear) the standalone channel registration.
+
+        A file that cannot be read, or that carries no ``channel_transforms``,
+        is reported in the label and leaves no registration loaded, rather than
+        being accepted and failing later at fit time.
+
+        Parameters
+        ----------
+        path : str or None
+            The registration file to load. None clears the loaded one.
+        """
+        if path:
+            if not os.path.exists(path):
+                self.update_channel_registration(None)
+                self.channel_registration_label.setText(
+                    "-- registration path not found --"
+                )
+                return
+            try:
+                calibration = io.load_any_calibration(path)
+            except Exception as e:
+                self.update_channel_registration(None)
+                self.channel_registration_label.setText(
+                    "-- invalid registration --"
+                )
+                self.channel_registration_label.setToolTip(str(e))
+                return
+            if not calibration.get("channel_transforms"):
+                self.update_channel_registration(None)
+                self.channel_registration_label.setText(
+                    "-- not a channel registration --"
+                )
+                self.channel_registration_label.setToolTip(
+                    "This file carries no 'channel_transforms'. Build one "
+                    "with Calibration > Register channels."
+                )
+                return
+            self.channel_registration_calibration = calibration
+            self.channel_registration_path = path
+            self.channel_registration_label.setText(os.path.basename(path))
+            self.channel_registration_label.setToolTip(path)
+            # split-FOV: drop the registration's regions into the view and
+            # enter split-FOV mode, as loading a split-FOV spline calibration
+            # does. They are only the defaults - the ROIs can be re-drawn and
+            # the channels are re-placed at them.
+            if calibration.get("split_fov"):
+                regions = calibration.get("regions") or []
+                self.window.view.rois = [
+                    [
+                        [int(r[0][0]), int(r[0][1])],
+                        [int(r[1][0]), int(r[1][1])],
+                    ]
+                    for r in regions
+                ]
+                self.window.view.selected_roi = None
+                self.split_fov_checkbox.blockSignals(True)
+                self.split_fov_checkbox.setChecked(True)
+                self.split_fov_checkbox.blockSignals(False)
+                self.window.set_split_fov_mode(True)
+                self.update_roi_display()
+                self.window.draw_frame()
+        else:
+            self.channel_registration_calibration = {}
+            self.channel_registration_path = None
+            self.channel_registration_label.setText(
+                "-- no registration loaded --"
+            )
+            self.channel_registration_label.setToolTip("")
+        self._update_gauss_link_photons_visibility()
+        try:
+            if self.window.movie is not None:
+                self.window.draw_frame()
+        except (AttributeError, RuntimeError):
+            pass  # called during startup, before the window is fully built
+
+    def link_calibration(self) -> dict:
+        """The loaded calibration whose registration the link colors pair by.
+
+        Either box can hold one - a spline PSF calibration or a standalone
+        channel registration - and only the one belonging to the selected fit
+        model is even shown (see ``_update_calib_group_visibility``), so that
+        model decides which comes first. The other is still used when it is
+        the only one loaded: it registers the same channels either way, and
+        showing its pairing beats falling back to the estimate.
+        """
+        spline = self.spline_calibration or {}
+        registration = self.channel_registration_calibration or {}
+        entry = FIT_MODELS[self.fit_model.currentText()]
+        if entry.get("needs_channel_registration"):
+            return registration or spline
+        return spline or registration
+
+    def _update_gauss_link_photons_visibility(self) -> None:
+        """Show the Gaussian 'Link photons' checkbox only for a registration
+        with 2 to ``precision._LINK_XYZ_MAX_CHANNELS`` channels - the range the
+        photon-decoupled model supports."""
+        if not hasattr(self, "gauss_link_photons_checkbox"):
+            return
+        calibration = self.channel_registration_calibration or {}
+        n_channels = int(
+            calibration.get(
+                "n_channels",
+                len(calibration.get("channel_transforms", []) or []),
+            )
+        )
+        show = 2 <= n_channels <= precision._LINK_XYZ_MAX_CHANNELS
+        self.gauss_link_photons_checkbox.setVisible(show)
+
+    def _gauss_link_photons_enabled(self) -> bool:
+        """Whether the multichannel Gaussian fit should share one photon count
+        across channels. False when the checkbox is absent, matching the
+        decoupled default (see GAUSS_LINK_PHOTONS_TIP)."""
+        cb = getattr(self, "gauss_link_photons_checkbox", None)
+        return cb.isChecked() if cb is not None else False
 
     def update_z_calib_with_config_path(self):
         """Retrieve the z calibration path that corresponds to the
@@ -5668,6 +5966,33 @@ class Window(QtWidgets.QMainWindow):
         calibrate_spline_action = threed_menu.addAction("Calibrate spline PSF")
         calibrate_spline_action.triggered.connect(self.calibrate_spline)
 
+        register_menu = threed_menu.addMenu("Register channels (2D)")
+        register_menu.setToolTip(
+            "Measure where each loaded channel sits relative to the first,\n"
+            "and save it as a standalone registration for the multichannel\n"
+            "2D spherical Gaussian fit."
+        )
+        register_beads_action = register_menu.addAction("From bead images...")
+        register_beads_action.setToolTip(
+            "Register from images of fiducial beads, which appear in every\n"
+            "channel at once. Most accurate, but needs a bead acquisition."
+        )
+        register_beads_action.triggered.connect(
+            self.register_channels_from_beads
+        )
+        register_signal_action = register_menu.addAction(
+            "From current signal..."
+        )
+        register_signal_action.setToolTip(
+            "Register from the loaded movies themselves: the same molecule\n"
+            "blinks in every channel in the same frame, so the detections\n"
+            "can be paired frame by frame. Uses the current identification\n"
+            "settings. Refines the loaded registration when there is one."
+        )
+        register_signal_action.triggered.connect(
+            self.register_channels_from_signal
+        )
+
         threed_menu.addSeparator()
         camera_calib_action = threed_menu.addAction(
             "Characterize sCMOS camera (dark movie)"
@@ -6042,6 +6367,198 @@ class Window(QtWidgets.QMainWindow):
             f"Mean p-value: {report['mean p-value']:.3f} "
             "(0.5 +- 0.1 is a match)\n\n" + verdict,
         )
+
+    def _registration_save_path(self) -> str:
+        """Ask where to save a channel registration."""
+        base = self.movie_path or ""
+        if base:
+            base = os.path.splitext(base)[0] + "_channel_reg.yaml"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save channel registration",
+            base,
+            filter="*.yaml",
+        )
+        return path
+
+    def _start_channel_registration(self, source: str, **kwargs) -> None:
+        """Run one of the channel-registration builders in a worker thread."""
+        path = self._registration_save_path()
+        if not path:
+            return
+        self._snapshot_current_channel()
+        regions = self._registration_regions()
+        if regions is not None:
+            # split field of view: one movie, its regions are the channels
+            movies = [self.movie]
+            channel_paths = [self.movie_path]
+        else:
+            movies = [channel.movie for channel in self.channels]
+            channel_paths = [channel.path for channel in self.channels]
+        self.registration_worker = ChannelRegistrationWorker(
+            source=source,
+            movies=movies,
+            box=self.parameters["Box Size"],
+            minimum_ng=self.parameters["Min. Net Gradient"],
+            channel_paths=channel_paths,
+            regions=regions,
+            path=path,
+            **kwargs,
+        )
+        self.registration_worker.statusChanged.connect(
+            self.status_bar.showMessage
+        )
+        self.registration_worker.finished.connect(
+            self.on_channel_registration_finished
+        )
+        self.registration_worker.failed.connect(
+            self.on_channel_registration_failed
+        )
+        self.status_bar.showMessage("Registering channels...")
+        self.registration_worker.start()
+
+    def _registration_regions(self) -> list | None:
+        """The drawn ROIs as channel regions, or None for separate movies."""
+        if not self.view.split_fov_mode or len(self.view.rois) < 2:
+            return None
+        return [list(map(list, r)) for r in self.view.rois]
+
+    def _check_registration_channels(self) -> bool:
+        """Whether enough channels are loaded to register anything."""
+        if self._registration_regions() is not None:
+            return True
+        if len(self.channels) < 2:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Register channels",
+                "Load at least two channels first, with "
+                "'File > Open channels from several movies' or "
+                "'File > Open one multichannel movie' - or tick "
+                "'Regions = channels' and draw one ROI per channel "
+                "(reference first) to register a split field of view.",
+            )
+            return False
+        return True
+
+    def register_channels_from_beads(self) -> None:
+        """Register the channels from separate bead images."""
+        if not self._check_registration_channels():
+            return
+        regions = self._registration_regions()
+        n_wanted = 1 if regions is not None else len(self.channels)
+        prompt = (
+            "Open the bead movie holding every region"
+            if regions is not None
+            else f"Open {n_wanted} bead movies, reference first"
+        )
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, prompt, filter=IMAGE_FILTER
+        )
+        if not paths:
+            return
+        if len(paths) != n_wanted:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Register channels",
+                (
+                    "Select the single bead movie whose regions are the "
+                    f"channels; {len(paths)} were selected."
+                    if regions is not None
+                    else f"Select one bead movie per channel ({n_wanted}), "
+                    f"reference first; {len(paths)} were selected."
+                ),
+            )
+            return
+        model, multi_fov, ok = RegisterChannelsDialog.getSpecs(self)
+        if not ok:
+            return
+        self._start_channel_registration(
+            "beads",
+            model=model,
+            multi_fov=multi_fov,
+            bead_paths=list(paths),
+        )
+
+    def register_channels_from_signal(self) -> None:
+        """Register the channels from the loaded movies' own blinking signal.
+
+        Seeds from the loaded registration when there is one, so this doubles
+        as a re-alignment of a registration that has drifted."""
+        if not self._check_registration_channels():
+            return
+        loaded = self.parameters_dialog.channel_registration_calibration or {}
+        n_frames = min(int(c.movie.shape[0]) for c in self.channels)
+        bounds, max_frames, model, ok = RefineRegistrationDialog.getFrameSpecs(
+            self,
+            n_frames,
+            self.frame_range,
+            model=loaded.get("registration_model"),
+        )
+        if not ok:
+            return
+        regions = self._registration_regions()
+        n_channels = (
+            len(regions) if regions is not None else len(self.channels)
+        )
+        seed_transforms = loaded.get("channel_transforms")
+        if regions is not None and loaded.get("split_fov"):
+            # place the stored inter-channel registration at the ROIs in use,
+            # so a re-alignment starts from the fine offset rather than only
+            # from where the regions sit
+            try:
+                _, _, seed_transforms = localize.split_fov_fit_geometry(
+                    loaded, regions
+                )
+            except (ValueError, KeyError):
+                seed_transforms = None
+        if seed_transforms is not None and len(seed_transforms) != n_channels:
+            seed_transforms = None
+        self._start_channel_registration(
+            "signal",
+            model=model,
+            frame_bounds=bounds,
+            max_frames=max_frames,
+            seed_transforms=seed_transforms,
+        )
+
+    def on_channel_registration_finished(self, path: str) -> None:
+        """Load the freshly built registration into the parameters dialog.
+
+        Also reports the per-channel pair count and residual RMS, which is what
+        tells the user whether the registration is good enough to fit with.
+
+        Parameters
+        ----------
+        path : str
+            The registration file the worker saved.
+        """
+        self.status_bar.showMessage("")
+        self.parameters_dialog.update_channel_registration(path)
+        calibration = self.parameters_dialog.channel_registration_calibration
+        rms = calibration.get("rms") or []
+        pairs = calibration.get("n_pairs") or []
+        detail = "\n".join(
+            f"Channel {c + 1}: {n} correspondences, {r:.2f} px RMS"
+            for c, (n, r) in enumerate(zip(pairs, rms))
+        )
+        QtWidgets.QMessageBox.information(
+            self,
+            "Register channels",
+            f"Saved {os.path.basename(path)} and loaded it for fitting.\n\n"
+            f"{detail}",
+        )
+
+    def on_channel_registration_failed(self, message: str) -> None:
+        """Report a registration that could not be measured.
+
+        Parameters
+        ----------
+        message : str
+            Why it failed, from the worker. It names the channel, so a partly
+            registerable set says which channel to look at.
+        """
+        self.status_bar.showMessage("")
+        QtWidgets.QMessageBox.warning(self, "Register channels", message)
 
     def calibrate_spline(self) -> None:
         """Build a cubic-spline PSF calibration from the loaded bead z-stack
@@ -7941,7 +8458,7 @@ class Window(QtWidgets.QMainWindow):
             # the detections come from the channel sum, so every one of them
             # is a cross-channel spot already - there is nothing to pair
             return False
-        cal = pdialog.spline_calibration or {}
+        cal = pdialog.link_calibration()
         n_channels = int(cal.get("n_channels", 0))
         if n_channels >= 2:
             # a loaded calibration always provides the registration - the
@@ -8691,10 +9208,10 @@ class Window(QtWidgets.QMainWindow):
         as soon as the mode is selected.
 
         The registration is the one ``identify_channel_sum`` would use, minus
-        the bootstrap: the loaded spline calibration, or the per-channel
-        identifications when they have already been made. Neither of those
-        needs a movie pass, so this is cheap enough to attempt from the draw
-        path - the sum itself is a lazy view (see
+        the bootstrap: a loaded spline calibration or channel registration, or
+        the per-channel identifications when they have already been made.
+        Neither of those needs a movie pass, so this is cheap enough to attempt
+        from the draw path - the sum itself is a lazy view (see
         ``localize.SummedChannelsMovie``). When the channels cannot be
         registered yet the attempt is remembered and not repeated until the
         sum is dropped again, and the summed view only appears once
@@ -8896,18 +9413,20 @@ class Window(QtWidgets.QMainWindow):
         self.status_bar.showMessage(message)
 
     def _linked_count_phrase(self, n_detections: int) -> str | None:
-        """How many identified spots a joint spline fit would actually fit.
+        """How many identified spots a joint fit would actually fit.
 
-        A multichannel (or split-FOV) spline fit fits one spot per molecule:
-        the reference detections that are found in every channel / region are
-        fitted jointly, everything else is dropped (see
-        ``localize.filter_linked_identifications``).
+        A multichannel (or split-FOV) fit - spline or Gaussian - fits one spot
+        per molecule: the reference detections that are found in every channel
+        / region are fitted jointly, everything else is dropped (see
+        ``localize.filter_linked_identifications``). The pairing uses whichever
+        registration the fit would (see
+        ``ParametersDialog.link_calibration``).
         """
         if self.sum_identifications is not None:
             # identified on the channel sum: every detection is fitted, there
             # is no linking step (see Window.identify_channel_sum)
             return None
-        cal = self.parameters_dialog.spline_calibration or {}
+        cal = self.parameters_dialog.link_calibration()
         box = self.parameters["Box Size"]
         split_fov = bool(cal.get("split_fov"))
         self.status_bar.showMessage(
@@ -9179,29 +9698,58 @@ class Window(QtWidgets.QMainWindow):
 
     def _sum_transforms_from_calibration(
         self, n_channels: int, regions: list | None
-    ) -> list | None:
-        """The loaded spline calibration's reference->channel transforms,
-        placed at the regions in use. None if no calibration describes this
-        data's layout."""
-        cal = self.parameters_dialog.spline_calibration or {}
-        if int(cal.get("n_channels", 0)) != n_channels:
-            return None
-        link_cal = self._link_calibration_for_mode(cal, n_channels)
-        if link_cal is None:
-            return None
-        try:
-            if regions is not None:
-                # re-place the stored inter-channel affine at the drawn ROIs
-                _, _, transforms = localize.split_fov_fit_geometry(
-                    link_cal, regions
+    ) -> tuple[list | None, str]:
+        """A loaded calibration's reference->channel transforms, placed at the
+        regions in use, and a phrase naming where they came from.
+
+        Either kind of loaded registration serves: the multichannel spline PSF
+        calibration, or the standalone channel registration the multichannel 2D
+        Gaussian fit uses. Whichever describes this data is the one the fit will
+        use, so the sum is built with exactly those transforms. ``(None, "")``
+        if neither describes the data's layout."""
+        pdialog = self.parameters_dialog
+        cal = pdialog.link_calibration()
+        source = (
+            "the loaded channel registration"
+            if cal is pdialog.channel_registration_calibration
+            else "the loaded spline calibration"
+        )
+        if int(cal.get("n_channels", 0)) == n_channels:
+            link_cal = self._link_calibration_for_mode(cal, n_channels)
+            if link_cal is not None:
+                try:
+                    if regions is not None:
+                        # re-place the stored affine at the drawn ROIs
+                        _, _, transforms = localize.split_fov_fit_geometry(
+                            link_cal, regions
+                        )
+                    else:
+                        transforms = link_cal.get("channel_transforms")
+                except (ValueError, KeyError, IndexError):
+                    transforms = None
+                if transforms and len(transforms) >= n_channels:
+                    return (
+                        [
+                            transforms_mod.from_dict(t)
+                            for t in transforms[:n_channels]
+                        ],
+                        source,
+                    )
+        # Whichever of the two was not tried above, for separate movies: their
+        # transforms need no region placement, so a registration that does not
+        # name this data's channel count still maps them.
+        if regions is None:
+            registration = pdialog.channel_registration_calibration or {}
+            transforms = registration.get("channel_transforms")
+            if transforms and len(transforms) >= n_channels:
+                return (
+                    [
+                        transforms_mod.from_dict(t)
+                        for t in transforms[:n_channels]
+                    ],
+                    "the loaded channel registration",
                 )
-            else:
-                transforms = link_cal.get("channel_transforms")
-        except (ValueError, KeyError, IndexError):
-            return None
-        if not transforms or len(transforms) < n_channels:
-            return None
-        return [transforms_mod.from_dict(t) for t in transforms[:n_channels]]
+        return None, ""
 
     def _sum_channel_transforms(
         self, estimate: bool = True
@@ -9230,9 +9778,11 @@ class Window(QtWidgets.QMainWindow):
             if self.view.split_fov_mode
             else None
         )
-        transforms = self._sum_transforms_from_calibration(n_channels, regions)
+        transforms, source = self._sum_transforms_from_calibration(
+            n_channels, regions
+        )
         if transforms is not None:
-            return transforms, regions, "the loaded spline calibration"
+            return transforms, regions, source
         if not estimate:
             return None, regions, ""
         ids_per_channel, _ = self._channel_identification_inputs()
@@ -9633,6 +10183,23 @@ class Window(QtWidgets.QMainWindow):
         max_it = self.parameters_dialog.max_it.value() if iterates else None
         fit_z = self.parameters_dialog.fit_z_checkbox.isChecked()
         use_gpu = self.parameters_dialog.gpu_checkbox.isChecked()
+        # A loaded channel registration turns the spherical Gaussian into a
+        # joint fit across every channel; with none loaded the fit stays
+        # single-channel, exactly as before.
+        if FIT_MODELS[model].get("needs_channel_registration"):
+            registration = (
+                self.parameters_dialog.channel_registration_calibration
+            )
+            # separate movies loaded as channels, or one movie whose drawn
+            # regions are the channels
+            split_fov = bool(registration.get("split_fov")) and (
+                self.view.split_fov_mode
+            )
+            if registration and (len(self.channels) > 1 or split_fov):
+                self._start_multichannel_gauss_fit(
+                    registration, method, use_gpu, eps, max_it
+                )
+                return
         spline_calibration = None
         if method.startswith("spline"):
             spline_calibration = self.parameters_dialog.spline_calibration
@@ -9681,6 +10248,224 @@ class Window(QtWidgets.QMainWindow):
         )
         self.fit_worker.progressMade.connect(self.on_fit_progress)
         self.fit_worker.cutProgressMade.connect(self.on_cut_progress)
+        self.fit_worker.finished.connect(self.on_fit_finished)
+        self.fit_worker.aborted.connect(self.on_worker_aborted)
+        self._active_worker = self.fit_worker
+        self.abort_action.setEnabled(True)
+        self.fit_worker.start()
+
+    def _start_multichannel_gauss_fit(
+        self,
+        registration: dict,
+        method: str,
+        use_gpu: bool = False,
+        eps: float | None = None,
+        max_it: int | None = None,
+    ) -> None:
+        """Fit a spherical Gaussian jointly across all loaded channels.
+
+        The first loaded channel is the reference; its identifications are
+        mapped into every channel via the registration's stored transforms.
+        The Gaussian counterpart of :meth:`_start_multichannel_spline_fit`."""
+        # Lateral corrections are single-channel only - this fit registers its
+        # channels itself - so say so rather than silently ignoring them.
+        if self.parameters_dialog.lateral_transforms:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Multichannel Gaussian fit",
+                "2D lateral corrections apply to single-channel data only and "
+                "are not used here: the multichannel fit registers its "
+                "channels itself, from the loaded channel registration.",
+            )
+        n_channels = int(
+            registration.get(
+                "n_channels", len(registration.get("channel_transforms", []))
+            )
+        )
+        if registration.get("split_fov"):
+            self._start_split_fov_gauss_fit(
+                registration, method, use_gpu, eps, max_it
+            )
+            return
+        # persist the displayed channel's identifications, so the per-channel
+        # tables read below are complete even if no channel switch happened
+        # since the last Identify run
+        self._snapshot_current_channel()
+        if len(self.channels) < n_channels:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Multichannel Gaussian fit",
+                f"This registration expects {n_channels} channels, but "
+                f"{len(self.channels)} are loaded. Load them with "
+                "'File > Open channels from several movies' in the same "
+                "order as the registration.",
+            )
+            self.status_bar.showMessage("")
+            return
+        reference = self.channels[0]
+        if reference.identifications is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Multichannel Gaussian fit",
+                "Identify spots in the reference channel (the first loaded "
+                "channel) before running a multichannel fit.",
+            )
+            self.status_bar.showMessage("")
+            return
+        link_photons = self.parameters_dialog._gauss_link_photons_enabled()
+        if not link_photons and not (
+            2 <= n_channels <= precision._LINK_XYZ_MAX_CHANNELS
+        ):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Multichannel Gaussian fit",
+                "The photon-decoupled model supports 2 to "
+                f"{precision._LINK_XYZ_MAX_CHANNELS} channels, but this "
+                f"registration has {n_channels}. Tick 'Link photon counts "
+                "across channels' to fit them with a shared photon count.",
+            )
+            self.status_bar.showMessage("")
+            return
+        movies = [self.channels[c].movie for c in range(n_channels)]
+        camera_infos = [
+            getattr(self.channels[c], "camera_info", None) or self.camera_info
+            for c in range(n_channels)
+        ]
+        ids_per_channel = [
+            getattr(self.channels[c], "identifications", None)
+            for c in range(n_channels)
+        ]
+        # Identifications made on the channel sum are the linked set already
+        # (see Window.identify_channel_sum).
+        link_identifications = self.sum_identifications is None
+        n_missing = sum(
+            1 for ids in ids_per_channel[1:] if ids is None or len(ids) == 0
+        )
+        if n_missing and link_identifications:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Multichannel Gaussian fit",
+                f"{n_missing} of the {n_channels - 1} non-reference channels "
+                "have no identifications, so localizations cannot be linked "
+                "across all channels. Run 'Analyze > Identify' (Ctrl+I) first "
+                "for a fully linked fit; continuing with the channels that "
+                "are identified.",
+            )
+        self.fit_worker = MultichannelGaussianFitWorker(
+            movies,
+            camera_infos,
+            reference.identifications,
+            self.parameters["Box Size"],
+            registration,
+            mle=method.startswith("gaussmle"),
+            use_gpu=use_gpu,
+            link_photons=link_photons,
+            identifications_per_channel=ids_per_channel,
+            link_identifications=link_identifications,
+            eps=eps,
+            max_it=max_it,
+            camera_calibration=(
+                self.parameters_dialog.camera_calibration or None
+            ),
+        )
+        self.fit_worker.linkMade.connect(self.on_link_progress)
+        self.fit_worker.linkFinished.connect(self.on_link_finished)
+        self.fit_worker.progressMade.connect(self.on_fit_progress)
+        self.fit_worker.finished.connect(self.on_fit_finished)
+        self.fit_worker.aborted.connect(self.on_worker_aborted)
+        self._active_worker = self.fit_worker
+        self.abort_action.setEnabled(True)
+        self.fit_worker.start()
+
+    def _start_split_fov_gauss_fit(
+        self,
+        registration: dict,
+        method: str,
+        use_gpu: bool = False,
+        eps: float | None = None,
+        max_it: int | None = None,
+    ) -> None:
+        """Fit a spherical Gaussian across the regions of the single movie.
+
+        The channels are placed at the drawn ROIs when they match the
+        registration's channel count - so a moved split is handled by
+        re-drawing them - otherwise at the registration's stored regions. The
+        Gaussian counterpart of :meth:`_start_split_fov_spline_fit`."""
+        if self.identifications is None or len(self.identifications) == 0:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Split-FOV Gaussian fit",
+                "Identify spots first (they are confined to the reference "
+                "region automatically).",
+            )
+            self.status_bar.showMessage("")
+            return
+        n_channels = int(registration.get("n_channels", 0))
+        regions = None
+        if self.view.split_fov_mode and len(self.view.rois) == n_channels:
+            regions = [list(map(list, r)) for r in self.view.rois]
+        link_photons = self.parameters_dialog._gauss_link_photons_enabled()
+        if not link_photons and not (
+            2 <= n_channels <= precision._LINK_XYZ_MAX_CHANNELS
+        ):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Split-FOV Gaussian fit",
+                "The photon-decoupled model supports 2 to "
+                f"{precision._LINK_XYZ_MAX_CHANNELS} channels, but this "
+                f"registration has {n_channels}. Tick 'Link photon counts "
+                "across channels' to fit them with a shared photon count.",
+            )
+            self.status_bar.showMessage("")
+            return
+        # A reference region in the wrong place would otherwise fit nothing,
+        # so say so rather than returning an empty result.
+        ref_rect = (regions or registration.get("regions"))[
+            0 if regions else int(registration.get("reference", 0))
+        ]
+        (ry0, rx0), (ry1, rx1) = ref_rect
+        rx = np.asarray(self.identifications["x"], dtype=float)
+        ry = np.asarray(self.identifications["y"], dtype=float)
+        n_in = int(
+            np.count_nonzero(
+                (rx >= min(rx0, rx1))
+                & (rx < max(rx0, rx1))
+                & (ry >= min(ry0, ry1))
+                & (ry < max(ry0, ry1))
+            )
+        )
+        if n_in == 0:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Split-FOV Gaussian fit",
+                f"{len(self.identifications)} spots were identified but none "
+                "fall inside the reference region, so there is nothing to "
+                "fit. The reference region is probably in the wrong place for "
+                "this data: enable 'Regions = channels' and drag the ROIs onto "
+                "the channels (reference first), or re-register the channels.",
+            )
+            self.status_bar.showMessage("")
+            return
+        self.fit_worker = MultichannelGaussianFitWorker(
+            [self.movie],
+            [self.camera_info],
+            self.identifications,
+            self.parameters["Box Size"],
+            registration,
+            mle=method.startswith("gaussmle"),
+            use_gpu=use_gpu,
+            link_photons=link_photons,
+            split_fov=True,
+            regions=regions,
+            eps=eps,
+            max_it=max_it,
+            camera_calibration=(
+                self.parameters_dialog.camera_calibration or None
+            ),
+        )
+        self.fit_worker.linkMade.connect(self.on_link_progress)
+        self.fit_worker.linkFinished.connect(self.on_link_finished)
+        self.fit_worker.progressMade.connect(self.on_fit_progress)
         self.fit_worker.finished.connect(self.on_fit_finished)
         self.fit_worker.aborted.connect(self.on_worker_aborted)
         self._active_worker = self.fit_worker
@@ -10131,9 +10916,14 @@ class Window(QtWidgets.QMainWindow):
     def on_fit_progress(self, curr: int, total: int) -> None:
         """Update the status bar with the fitting progress."""
         worker = getattr(self, "fit_worker", None)
-        if isinstance(worker, MultichannelSplineFitWorker):
+        if isinstance(worker, _MULTICHANNEL_FIT_WORKERS):
             # extraction, GPU fit and per-spot CRLB share this callback
-            message = f"Fitting multichannel spline: {curr:,} / {total:,} ..."
+            model = (
+                "spline"
+                if isinstance(worker, MultichannelSplineFitWorker)
+                else "Gaussian"
+            )
+            message = f"Fitting multichannel {model}: {curr:,} / {total:,} ..."
             self.status_bar.showMessage(message)
         elif getattr(worker, "method", "").endswith("-gpu") and getattr(
             worker, "method", ""
@@ -10245,7 +11035,14 @@ class Window(QtWidgets.QMainWindow):
         """
         if len(self.channels) <= 1:
             return False
-        calibration = self.parameters_dialog.spline_calibration
+        # Read the transforms off the worker that actually produced these
+        # localizations, rather than whichever calibration happens to be
+        # loaded - both a spline calibration and a channel registration can be
+        # loaded at once, and only one of them ran.
+        worker = getattr(self, "fit_worker", None)
+        calibration = getattr(worker, "calibration", None) or getattr(
+            worker, "channel_registration", None
+        )
         transforms = (calibration or {}).get("channel_transforms")
         for c, channel in enumerate(self.channels):
             if c == 0 or not transforms or c >= len(transforms):
@@ -11081,6 +11878,289 @@ class MultichannelSplineFitWorker(QtCore.QThread):
         self.finished.emit(locs, dt, False, False)
 
 
+class MultichannelGaussianFitWorker(QtCore.QThread):
+    """Fit a spherical Gaussian jointly across several registered channels.
+
+    The Gaussian counterpart of :class:`MultichannelSplineFitWorker`, and
+    deliberately the same shape - same signals, same cross-channel linking - so
+    it plugs into the window's existing fit slots. It needs no PSF calibration,
+    only a channel registration (see :mod:`picasso.registration`)."""
+
+    progressMade = QtCore.pyqtSignal(int, int)
+    linkMade = QtCore.pyqtSignal(int, int)
+    linkFinished = QtCore.pyqtSignal(int, int)
+    finished = QtCore.pyqtSignal(pd.DataFrame, float, bool, bool)
+    aborted = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        movies: list,
+        camera_infos: list,
+        identifications: pd.DataFrame,
+        box: int,
+        channel_registration: dict,
+        mle: bool = False,
+        link_photons: bool = False,
+        identifications_per_channel: list | None = None,
+        link_identifications: bool = True,
+        use_gpu: bool = False,
+        eps: float | None = None,
+        max_it: int | None = None,
+        camera_calibration: dict | None = None,
+        split_fov: bool = False,
+        regions: list | None = None,
+    ) -> None:
+        """Set up a joint fit of every channel.
+
+        Parameters
+        ----------
+        movies : list
+            One movie per channel, reference first, in the registration's own
+            channel order. For split field of view, the single loaded movie.
+        camera_infos : list
+            One camera-info dict per channel, for the photon conversion.
+        identifications : pd.DataFrame
+            Detections in the reference channel; the set that will be fitted.
+        box : int
+            Box side length (camera pixels).
+        channel_registration : dict
+            A calibration carrying ``channel_transforms``, from
+            :mod:`picasso.registration`.
+        mle : bool, optional
+            Use the Poisson maximum-likelihood estimator. Default False.
+        link_photons : bool, optional
+            Share one photon count and background across the channels. Default
+            False - see :func:`picasso.localize.fit_gauss_multichannel` for why
+            the decoupled model is the safe default here.
+        identifications_per_channel : list, optional
+            Each channel's own detections, used to keep only the molecules
+            found in every channel. Entries may be None for a channel that was
+            not identified.
+        link_identifications : bool, optional
+            Whether to do that cross-channel filtering at all. False when the
+            detections came from the channel sum, which is the linked set
+            already. Default True.
+        use_gpu : bool, optional
+            Fit on a CUDA GPU. Default False.
+        eps, max_it : optional
+            Convergence criterion and iteration cap; None uses the method's own
+            schedule.
+        camera_calibration : dict, optional
+            One per-pixel sCMOS calibration, applied to every channel.
+        split_fov : bool, optional
+            The channels are regions of one movie rather than separate movies.
+            Default False.
+        regions : list, optional
+            Split-FOV only: the channel ROIs in use, reference first. None uses
+            the registration's own.
+        """
+        super().__init__()
+        self.movies = movies
+        self.camera_infos = camera_infos
+        # One loaded calibration applied to every channel, as for the spline
+        # worker; the API takes a per-channel list.
+        self.camera_calibration = camera_calibration
+        self.camera_calibrations = (
+            None
+            if camera_calibration is None
+            else [camera_calibration] * len(movies)
+        )
+        self.identifications = identifications
+        self.identifications_per_channel = identifications_per_channel
+        self.link_identifications = link_identifications
+        self.box = box
+        self.channel_registration = channel_registration
+        self.mle = mle
+        self.use_gpu = use_gpu
+        self.eps = eps
+        self.max_it = max_it
+        self.link_photons = link_photons
+        # Split-FOV: ``movies`` holds a single entry (one loaded movie); the
+        # channels are regions of it, handled by ``fit_gauss_split_fov``.
+        # ``regions`` (optional) places the channels at the current ROIs.
+        self.split_fov = split_fov
+        self.regions = regions
+        self.N = len(identifications)
+
+    def on_progress(self, n_done: int) -> None:
+        """Report fit progress to the window.
+
+        Parameters
+        ----------
+        n_done : int
+            Spots fitted so far, out of ``self.N``.
+        """
+        self.progressMade.emit(n_done, self.N)
+
+    def on_link_progress(self, n_done: int) -> None:
+        """Report cross-channel linking progress to the window.
+
+        Parameters
+        ----------
+        n_done : int
+            Reference detections checked so far, out of ``self.N``.
+        """
+        self.linkMade.emit(n_done, self.N)
+
+    def _link_across_channels(self, n_channels: int) -> bool:
+        """Restrict the reference detections to those found in every channel.
+
+        As for the spline worker: one fit per molecule across all channels, so
+        ``self.N`` becomes the number of linked molecules.
+
+        Parameters
+        ----------
+        n_channels : int
+            Number of channels the registration describes.
+
+        Returns
+        -------
+        ok : bool
+            False if nothing survives the linking, so the caller aborts rather
+            than fitting an empty set.
+        """
+        if not self.link_identifications:
+            return True
+        if self.split_fov:
+            return self._link_across_regions()
+        ids_per_channel = self.identifications_per_channel
+        if not ids_per_channel or len(ids_per_channel) < 2:
+            return True
+        ids_per_channel = list(ids_per_channel[:n_channels])
+        transforms = self.channel_registration.get("channel_transforms")
+        if not transforms or len(transforms) < len(ids_per_channel):
+            return True
+        linked, n_kept, n_total = localize.filter_linked_identifications(
+            ids_per_channel,
+            transforms,
+            self.box,
+            progress_callback=self.on_link_progress,
+        )
+        self.linkFinished.emit(n_kept, n_total)
+        if n_kept == 0:
+            return False
+        self.identifications = linked
+        self.N = len(linked)
+        return True
+
+    def _link_across_regions(self) -> bool:
+        """Split-FOV counterpart of :meth:`_link_across_channels`.
+
+        One identification table holds every region's detections, so it is
+        split by region and linked across them, keeping the reference-region
+        detections found in all the others - one fitted spot per molecule.
+
+        Returns
+        -------
+        ok : bool
+            False if nothing links across the regions.
+        """
+        all_regions = self.identifications
+        try:
+            fit_regions, reference, _ = localize.split_fov_fit_geometry(
+                self.channel_registration, self.regions
+            )
+        except (ValueError, KeyError):
+            # geometry unavailable: fit the whole identification table, as
+            # before
+            return True
+        # only the reference region is fitted (the others are cut from it via
+        # the transforms), so it - not the movie-wide count - is the
+        # denominator of the linking and fit progress
+        self.identifications = localize.confine_to_region(
+            all_regions, fit_regions[reference]
+        )
+        self.N = len(self.identifications)
+        linked, n_kept, n_total = (
+            localize.filter_linked_identifications_split_fov(
+                all_regions,
+                self.channel_registration,
+                self.box,
+                regions=self.regions,
+                progress_callback=self.on_link_progress,
+            )
+        )
+        self.linkFinished.emit(n_kept, n_total)
+        if n_kept == 0:
+            return False
+        self.identifications = linked
+        self.N = len(linked)
+        return True
+
+    def run(self) -> None:
+        """Link the channels, then fit them jointly.
+
+        The ``QThread`` entry point; emits ``finished`` with the localizations
+        or ``aborted`` if nothing could be linked, the fit was stopped, or it
+        raised.
+        """
+        t0 = time.time()
+        try:
+            n_channels = int(
+                self.channel_registration.get("n_channels", len(self.movies))
+            )
+            if not self._link_across_channels(n_channels):
+                where = "regions" if self.split_fov else "channels"
+                print(
+                    "Multichannel Gaussian fit: no detection is linked across "
+                    f"all {where} - check the channel registration."
+                )
+                self.aborted.emit()
+                return
+            if self.split_fov:
+                locs = localize.fit_gauss_split_fov(
+                    self.movies[0],
+                    self.camera_infos[0],
+                    self.identifications,
+                    self.box,
+                    self.channel_registration,
+                    regions=self.regions,
+                    mle=self.mle,
+                    link_photons=self.link_photons,
+                    use_gpu=self.use_gpu,
+                    tolerance=self.eps,
+                    max_iterations=self.max_it,
+                    progress_callback=self.on_progress,
+                    abort_callback=self.isInterruptionRequested,
+                    camera_calibration=self.camera_calibration,
+                )
+            else:
+                locs = localize.fit_gauss_multichannel(
+                    self.movies,
+                    self.camera_infos,
+                    self.identifications,
+                    self.box,
+                    self.channel_registration,
+                    mle=self.mle,
+                    link_photons=self.link_photons,
+                    use_gpu=self.use_gpu,
+                    tolerance=self.eps,
+                    max_iterations=self.max_it,
+                    progress_callback=self.on_progress,
+                    abort_callback=self.isInterruptionRequested,
+                    camera_calibrations=self.camera_calibrations,
+                )
+        except Exception as e:
+            print(f"Multichannel Gaussian fit failed: {e}")
+            self.aborted.emit()
+            return
+        if locs is None:
+            self.aborted.emit()
+            return
+        self.progressMade.emit(self.N + 1, self.N)
+        dt = time.time() - t0
+        # this fit has no astigmatism step: it is 2D and its width is fitted
+        self.finished.emit(locs, dt, False, False)
+
+
+#: Workers that fit every channel at once. They share the window's fit slots,
+#: which branch on this rather than on either worker individually.
+_MULTICHANNEL_FIT_WORKERS = (
+    MultichannelSplineFitWorker,
+    MultichannelGaussianFitWorker,
+)
+
+
 class FitZWorker(QtCore.QThread):
     """Fit the z coordinates to fitted localizations based on the
     calibration file using multiprocessing."""
@@ -11133,6 +12213,133 @@ class FitZWorker(QtCore.QThread):
             locs = lib.apply_lateral_transforms(locs, self.lateral_transforms)
         dt = time.time() - t0
         self.finished.emit(locs, dt)
+
+
+class ChannelRegistrationWorker(QtCore.QThread):
+    """Measure where each channel sits relative to the reference, in a
+    background thread. ``source`` selects the builder: fiducial beads, or the
+    loaded movies' own blinking signal."""
+
+    finished = QtCore.pyqtSignal(str)  # path
+    failed = QtCore.pyqtSignal(str)
+    statusChanged = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        source: str,
+        movies: list,
+        box: int,
+        minimum_ng: float,
+        path: str,
+        model: str = "affine",
+        channel_paths: list | None = None,
+        bead_paths: list | None = None,
+        frame_bounds: list | None = None,
+        max_frames: int = 50,
+        seed_transforms: list | None = None,
+        regions: list | None = None,
+        multi_fov: bool = False,
+    ) -> None:
+        """Set up a channel-registration measurement.
+
+        Parameters
+        ----------
+        source : {"beads", "signal"}
+            Which builder to run: fiducial bead images, or the loaded movies'
+            own blinking signal.
+        movies : list
+            The loaded channel movies, reference first. Used by the signal
+            builder; the bead builder reads ``bead_paths`` instead.
+        box : int
+            Box side length (camera pixels) used to detect and fit.
+        minimum_ng : float
+            Minimum net gradient for a detection.
+        path : str
+            Where to save the resulting registration (YAML).
+        model : str, optional
+            Transform model, as in :mod:`picasso.transforms`. Default
+            ``"affine"``.
+        channel_paths : list, optional
+            The loaded channels' file paths, recorded for traceability.
+        bead_paths : list, optional
+            One bead movie path per channel, reference first. Required for
+            ``source="beads"``.
+        frame_bounds : list, optional
+            Frames the signal builder samples from. None uses all of them.
+        max_frames : int, optional
+            How many frames are evenly sampled from that range. Default 50.
+        seed_transforms : list, optional
+            One transform per channel to start the pairing from, when
+            re-aligning a registration that has drifted. None builds one from
+            scratch.
+        regions : list, optional
+            Split field of view: one ROI per channel, reference first. The
+            single movie is then split by region instead of one movie per
+            channel.
+        multi_fov : bool, optional
+            Beads only: each frame of the bead movie is a different field of
+            view, so beads are paired within a frame rather than the frames
+            being averaged. Default False.
+        """
+        super().__init__()
+        self.source = source
+        self.movies = movies
+        self.box = box
+        self.minimum_ng = minimum_ng
+        self.path = path
+        self.model = model
+        self.channel_paths = channel_paths
+        self.bead_paths = bead_paths
+        self.frame_bounds = frame_bounds
+        self.max_frames = max_frames
+        self.seed_transforms = seed_transforms
+        self.regions = regions
+        self.multi_fov = multi_fov
+
+    def run(self) -> None:
+        """Measure and save the registration.
+
+        The ``QThread`` entry point; emits ``finished`` with the saved path, or
+        ``failed`` with the message when a channel could not be registered.
+        """
+        try:
+            if self.source == "beads":
+                self.statusChanged.emit("Loading bead movies...")
+                movies = [io.load_movie(p)[0] for p in self.bead_paths]
+                self.statusChanged.emit("Registering channels on beads...")
+                registration.calibrate_channel_registration_from_beads(
+                    movies,
+                    box=self.box,
+                    minimum_ng=self.minimum_ng,
+                    model=self.model,
+                    regions=self.regions,
+                    multi_fov=self.multi_fov,
+                    channel_paths=self.bead_paths,
+                    path=self.path,
+                )
+            else:
+                self.statusChanged.emit(
+                    "Detecting spots for channel registration..."
+                )
+                registration.calibrate_channel_registration_from_signal(
+                    self.movies,
+                    box=self.box,
+                    minimum_ng=self.minimum_ng,
+                    model=self.model,
+                    frame_bounds=self.frame_bounds,
+                    max_frames=self.max_frames,
+                    seed_transforms=self.seed_transforms,
+                    regions=self.regions,
+                    channel_paths=self.channel_paths,
+                    path=self.path,
+                    progress_callback=lambda n: self.statusChanged.emit(
+                        f"Registered {n} channel(s)..."
+                    ),
+                )
+        except Exception as e:
+            self.failed.emit(str(e))
+            return
+        self.finished.emit(self.path)
 
 
 class SplineCalibrationWorker(QtCore.QThread):

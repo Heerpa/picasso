@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from picasso import localize, spline, transforms
+from picasso import localize, registration, spline, transforms
 from picasso.fitting import precision
 
 from tests.conftest import (
@@ -886,18 +886,18 @@ class TestCalibrateSpline:
 
 
 class TestMultichannelCalibration:
-    def test_match_beads(self):
+    def test_match_points(self):
         ref = np.array([[0, 0], [10, 10], [20, 20]], dtype=float)
         other = np.array([[20.3, 20.1], [0.2, -0.1], [100, 100]], dtype=float)
-        ref_idx, other_idx = spline._match_beads(ref, other, 1.0)
+        ref_idx, other_idx = spline.match_points(ref, other, 1.0)
         # ref[0]->other[1], ref[2]->other[0]; ref[1] has no match within 1 px
         assert ref_idx.tolist() == [0, 2]
         assert other_idx.tolist() == [1, 0]
 
-    def test_match_beads_unique_targets(self):
+    def test_match_points_unique_targets(self):
         ref = np.array([[0, 0], [0.5, 0]], dtype=float)
         other = np.array([[0.1, 0.0]], dtype=float)
-        ref_idx, other_idx = spline._match_beads(ref, other, 5.0)
+        ref_idx, other_idx = spline.match_points(ref, other, 5.0)
         # both refs are near the single target; it must be used only once
         assert len(other_idx) == 1
         assert ref_idx.tolist() == [0]  # closest reference wins
@@ -935,7 +935,7 @@ class TestRansacMatch:
         # nearest-neighbour match at this offset would mis-pair some beads
         inv = np.linalg.inv(linear)
         aligned = (c - offset) @ inv.T + np.asarray(overlay_offset)
-        ref_idx, c_idx = spline._ransac_match(
+        ref_idx, c_idx = spline.ransac_match(
             ref, c, aligned, inlier_tol=3.0, radius=40.0
         )
         assert len(ref_idx) == len(ref)  # all beads matched
@@ -958,7 +958,7 @@ class TestRansacMatch:
             aligned = np.vstack(
                 [ref + np.asarray(off), [[999.0, 999.0], [-999.0, -999.0]]]
             )
-            ri, ci = spline._ransac_match(
+            ri, ci = spline.ransac_match(
                 ref, c_dec, aligned, inlier_tol=3.0, radius=45.0
             )
             results.append((ri.tolist(), ci.tolist()))
@@ -1415,7 +1415,7 @@ class TestChannelTransformMultiFov:
         lone_c = 6  # channel (101, 101), FOV 1
 
         # pooled (no labels): the cross-field pair is made
-        ri, ci = spline._ransac_match(
+        ri, ci = spline.ransac_match(
             ref_xy, c_xy, c_xy, inlier_tol=3.0, radius=15.0
         )
         pooled = dict(zip(ri.tolist(), ci.tolist()))
@@ -1423,7 +1423,7 @@ class TestChannelTransformMultiFov:
         assert np.any(ref_fov[ri] != c_fov[ci])
 
         # per field: it is refused, and every other pair is unaffected
-        ri, ci = spline._ransac_match(
+        ri, ci = spline.ransac_match(
             ref_xy,
             c_xy,
             c_xy,
@@ -1441,16 +1441,17 @@ class TestChannelTransformMultiFov:
     def test_fov_groups_drops_fields_missing_on_one_side(self):
         # a field with no counterpart cannot yield a correspondence; letting
         # its beads search other fields is the mis-pairing we are preventing
-        groups = spline._fov_groups(
+        groups = registration._fov_groups(
             np.array([0, 0, 2]), np.array([0, 0, 1]), 3, 3
         )
         assert len(groups) == 1
         np.testing.assert_array_equal(groups[0][0], [0, 1])
         np.testing.assert_array_equal(groups[0][1], [0, 1])
         # missing / mismatched labels fall back to one pooled cloud
-        assert spline._fov_groups(None, np.array([0]), 1, 1) is None
+        assert registration._fov_groups(None, np.array([0]), 1, 1) is None
         assert (
-            spline._fov_groups(np.array([0, 1]), np.array([0]), 5, 1) is None
+            registration._fov_groups(np.array([0, 1]), np.array([0]), 5, 1)
+            is None
         )
 
     def test_degenerate_registration_is_rejected(self):
@@ -1488,10 +1489,10 @@ class TestChannelTransformMultiFov:
         )
         orig_detect, orig_match = (
             spline._detect_bead_positions,
-            spline._ransac_match,
+            spline.ransac_match,
         )
         spline._detect_bead_positions = lambda *a, **k: clustered
-        spline._ransac_match = lambda *a, **k: (
+        spline.ransac_match = lambda *a, **k: (
             np.array([0, 1, 2]),
             np.array([0, 1, 2]),
         )
@@ -1512,7 +1513,7 @@ class TestChannelTransformMultiFov:
                 )
         finally:
             spline._detect_bead_positions = orig_detect
-            spline._ransac_match = orig_match
+            spline.ransac_match = orig_match
 
     def test_global_dedupe_would_have_merged_across_fields(self):
         """Guards the premise of the test above: without the FOV labels the

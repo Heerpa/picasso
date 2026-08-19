@@ -26,6 +26,7 @@ from scipy.interpolate import CubicSpline
 from PyQt6 import QtWidgets
 
 from picasso import gaussmle, gausslq, io, lib, localize, spline, transforms
+from picasso import transforms as transforms_mod
 from picasso.fitting import gaussfit_cuda, precision, splinefit
 from picasso.gui import localize as localize_gui
 
@@ -10612,6 +10613,66 @@ class TestChannelSumRegistration:
         finally:
             window.close()
 
+    def test_a_loaded_channel_registration_is_used(self):
+        """The standalone registration the multichannel 2D Gaussian fit uses
+        registers the sum too, so the sum is built with the same transforms
+        that fit will use rather than re-estimating them from detections."""
+        movie = np.zeros((2, 8, 8), np.float32)
+        window = _sum_mode_window(movie, movie)
+        try:
+            window.parameters_dialog.channel_registration_calibration = {
+                "model": "channel-registration",
+                "n_channels": 2,
+                "channel_transforms": [
+                    IDENTITY,
+                    affine([[1.0, 0.0, 5.0], [0.0, 1.0, -2.0]]).to_dict(),
+                ],
+            }
+            transforms, regions, source = window._sum_channel_transforms(
+                estimate=False
+            )
+            assert regions is None
+            assert source == "the loaded channel registration"
+            np.testing.assert_allclose(
+                affine_matrix(transforms[1]),
+                [[1.0, 0.0, 5.0], [0.0, 1.0, -2.0]],
+            )
+        finally:
+            window.close()
+
+    def test_a_spline_calibration_wins_over_a_channel_registration(self):
+        """A spline calibration also describes the PSF, so when both are
+        loaded it is the one the fit will use."""
+        movie = np.zeros((2, 8, 8), np.float32)
+        window = _sum_mode_window(movie, movie)
+        try:
+            calibration = _fake_spline_calibration(
+                model="spline-3d-multichannel"
+            )
+            calibration["channel_transforms"] = [
+                IDENTITY,
+                affine([[1.0, 0.0, 7.0], [0.0, 1.0, -3.0]]).to_dict(),
+            ]
+            window.parameters_dialog.spline_calibration = calibration
+            window.parameters_dialog.channel_registration_calibration = {
+                "model": "channel-registration",
+                "n_channels": 2,
+                "channel_transforms": [
+                    IDENTITY,
+                    affine([[1.0, 0.0, 5.0], [0.0, 1.0, -2.0]]).to_dict(),
+                ],
+            }
+            transforms, _, source = window._sum_channel_transforms(
+                estimate=False
+            )
+            assert source == "the loaded spline calibration"
+            np.testing.assert_allclose(
+                affine_matrix(transforms[1]),
+                [[1.0, 0.0, 7.0], [0.0, 1.0, -3.0]],
+            )
+        finally:
+            window.close()
+
     def test_estimated_from_the_per_channel_identifications(self):
         """Without a calibration the channels register from their own
         detections - which is why the sum mode identifies them first."""
@@ -11362,5 +11423,1094 @@ class TestPreviewLinkColorsSplitFov:
             grey = localize_gui.LINK_UNMATCHED_COLOR.name()
             assert len(boxes) > len(self.POSITIONS)
             assert boxes == [grey] * len(boxes)
+        finally:
+            window.close()
+
+
+class TestFitGaussMultichannel:
+    """End to end through ``localize.fit_gauss_multichannel``: two registered
+    channels, a known sub-pixel inter-channel offset, and real ground truth."""
+
+    H = W = 48
+    BOX = 9
+    N_FRAMES = 60
+    SIGMA = 1.3
+    BASELINE = 100.0
+    # deliberately fractional, so a fit that ignored the sub-pixel ROI
+    # residual would be visibly biased
+    DX, DY = 7.35, -5.6
+
+    def _dataset(self, amps=(900.0, 340.0), bgs=(12.0, 7.0), seed=2):
+        rng = np.random.RandomState(seed)
+        truth_x = rng.uniform(16, 32, self.N_FRAMES)
+        truth_y = rng.uniform(16, 32, self.N_FRAMES)
+        j, i = np.mgrid[0 : self.H, 0 : self.W]
+        clean = [np.zeros((self.N_FRAMES, self.H, self.W)) for _ in amps]
+        for f in range(self.N_FRAMES):
+            for c, amp in enumerate(amps):
+                x = truth_x[f] + (self.DX if c else 0.0)
+                y = truth_y[f] + (self.DY if c else 0.0)
+                clean[c][f] += amp * np.exp(
+                    -0.5 * ((i - x) ** 2 + (j - y) ** 2) / self.SIGMA**2
+                )
+        movies = [
+            (rng.poisson(c + b) + self.BASELINE).astype(np.uint16)
+            for c, b in zip(clean, bgs)
+        ]
+        camera_infos = [
+            {
+                "Baseline": self.BASELINE,
+                "Sensitivity": 1.0,
+                "Gain": 1,
+                "Pixelsize": 130,
+            }
+        ] * len(amps)
+        identifications = pd.DataFrame(
+            {
+                "frame": np.arange(self.N_FRAMES),
+                "x": np.rint(truth_x).astype(np.int64),
+                "y": np.rint(truth_y).astype(np.int64),
+                "net_gradient": np.full(self.N_FRAMES, 1e4, np.float32),
+            }
+        )
+        return movies, camera_infos, identifications, truth_x, truth_y
+
+    def _registration(self, dx=None, dy=None, n_channels=2):
+        dx = self.DX if dx is None else dx
+        dy = self.DY if dy is None else dy
+        matrix = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy], [0.0, 0.0, 1.0]])
+        return {
+            "model": "channel-registration",
+            "n_channels": n_channels,
+            "channel_transforms": [
+                transforms.identity().to_dict(),
+                transforms.AffineTransform(matrix=matrix).to_dict(),
+            ],
+        }
+
+    @pytest.mark.parametrize("mle", [False, True], ids=["lsq", "mle"])
+    @pytest.mark.parametrize(
+        "link_photons", [False, True], ids=["decoupled", "linked"]
+    )
+    def test_recovers_ground_truth(self, mle, link_photons):
+        movies, camera_infos, ids, truth_x, truth_y = self._dataset()
+
+        locs = localize.fit_gauss_multichannel(
+            movies,
+            camera_infos,
+            ids,
+            self.BOX,
+            self._registration(),
+            mle=mle,
+            link_photons=link_photons,
+            use_gpu=False,
+            multiprocess=False,
+        )
+
+        assert len(locs) == self.N_FRAMES
+        frame = locs["frame"].to_numpy()
+        error_x = locs["x"].to_numpy() - truth_x[frame]
+        error_y = locs["y"].to_numpy() - truth_y[frame]
+        # the positions are in the reference channel's frame, and unbiased
+        # despite the fractional inter-channel offset
+        assert abs(np.nanmean(error_x)) < 0.05
+        assert abs(np.nanmean(error_y)) < 0.05
+        assert np.nanstd(error_x) < 0.1
+        assert np.nanstd(error_y) < 0.1
+        # a spherical fit has one width, reported in both columns
+        np.testing.assert_allclose(locs["sx"], locs["sy"])
+        assert "ellipticity" not in locs.columns
+
+    def test_reported_precision_matches_the_scatter(self):
+        """``lpx``/``lpy`` are the bound the MLE actually attains."""
+        movies, camera_infos, ids, truth_x, truth_y = self._dataset()
+
+        locs = localize.fit_gauss_multichannel(
+            movies,
+            camera_infos,
+            ids,
+            self.BOX,
+            self._registration(),
+            mle=True,
+            use_gpu=False,
+            multiprocess=False,
+        )
+
+        frame = locs["frame"].to_numpy()
+        scatter = np.nanstd(locs["x"].to_numpy() - truth_x[frame])
+        assert np.nanmedian(locs["lpx"]) == pytest.approx(scatter, rel=0.4)
+
+    def test_decoupled_model_splits_the_photons(self):
+        amps = (900.0, 340.0)
+        movies, camera_infos, ids, _, _ = self._dataset(amps=amps)
+
+        locs = localize.fit_gauss_multichannel(
+            movies,
+            camera_infos,
+            ids,
+            self.BOX,
+            self._registration(),
+            mle=True,
+            link_photons=False,
+            use_gpu=False,
+            multiprocess=False,
+        )
+
+        expected = [a * 2 * np.pi * self.SIGMA**2 for a in amps]
+        for c, want in enumerate(expected):
+            assert np.nanmedian(locs[f"photons_ch{c}"]) == pytest.approx(
+                want, rel=0.1
+            )
+            assert f"bg_ch{c}" in locs.columns
+        # the relative shares sum to one and reflect the true split
+        total = sum(expected)
+        assert np.nanmedian(locs["rel_photons_ch0"]) == pytest.approx(
+            expected[0] / total, abs=0.05
+        )
+        # and ``photons`` is the total across channels
+        assert np.nanmedian(locs["photons"]) == pytest.approx(total, rel=0.1)
+
+    def test_every_column_is_saveable(self):
+        """Anything the fit emits must be in ``LOCALIZATION_COLUMNS`` or it is
+        silently dropped on save."""
+        movies, camera_infos, ids, _, _ = self._dataset()
+        allowed = {
+            column
+            for columns in localize.LOCALIZATION_COLUMNS.values()
+            for column in columns
+        }
+
+        for link_photons in (False, True):
+            locs = localize.fit_gauss_multichannel(
+                movies,
+                camera_infos,
+                ids,
+                self.BOX,
+                self._registration(),
+                mle=True,
+                link_photons=link_photons,
+                use_gpu=False,
+                multiprocess=False,
+            )
+            assert set(locs.columns) <= allowed
+
+    def test_a_wrong_registration_is_worse_than_the_right_one(self):
+        """The registration is load-bearing: pointing channel 1 at the wrong
+        place must degrade the joint fit."""
+        movies, camera_infos, ids, truth_x, truth_y = self._dataset()
+
+        def bias(registration):
+            locs = localize.fit_gauss_multichannel(
+                movies,
+                camera_infos,
+                ids,
+                self.BOX,
+                registration,
+                mle=True,
+                use_gpu=False,
+                multiprocess=False,
+            )
+            frame = locs["frame"].to_numpy()
+            return abs(np.nanmean(locs["x"].to_numpy() - truth_x[frame]))
+
+        assert bias(self._registration()) < 0.05
+        assert bias(self._registration(dx=self.DX + 2.0)) > 0.2
+
+    def test_rejects_a_channel_count_mismatch(self):
+        movies, camera_infos, ids, _, _ = self._dataset()
+        with pytest.raises(ValueError, match="channel transforms"):
+            localize.fit_gauss_multichannel(
+                movies[:1],
+                camera_infos[:1],
+                ids,
+                self.BOX,
+                self._registration(),
+                use_gpu=False,
+            )
+
+    def test_rejects_a_registration_without_transforms(self):
+        movies, camera_infos, ids, _, _ = self._dataset()
+        with pytest.raises(ValueError, match="channel_transforms"):
+            localize.fit_gauss_multichannel(
+                movies, camera_infos, ids, self.BOX, {}, use_gpu=False
+            )
+
+    def test_per_channel_scmos_calibration_reaches_the_fit(self):
+        """A hot pixel in one channel's variance map must change the answer,
+        or the noise model is not plumbed through."""
+        movies, camera_infos, ids, _, _ = self._dataset()
+        registration = self._registration()
+
+        def fit(camera_calibrations):
+            return localize.fit_gauss_multichannel(
+                movies,
+                camera_infos,
+                ids,
+                self.BOX,
+                registration,
+                mle=True,
+                use_gpu=False,
+                multiprocess=False,
+                camera_calibrations=camera_calibrations,
+            )
+
+        maps = []
+        for c in range(2):
+            variance = np.full((self.H, self.W), 1.0, np.float32)
+            if c == 1:
+                variance[:] = 400.0
+            maps.append(
+                {
+                    "offset": np.full(
+                        (self.H, self.W), self.BASELINE, np.float32
+                    ),
+                    "variance": variance,
+                }
+            )
+
+        plain = fit(None)
+        modelled = fit(maps)
+        assert not np.allclose(
+            plain["lpx"].to_numpy(), modelled["lpx"].to_numpy()
+        )
+
+
+class TestMultichannelGaussianWorkerRouting:
+    """``MultichannelGaussianFitWorker`` passes the GUI's settings through to
+    ``localize.fit_gauss_multichannel`` (which is monkeypatched, so no GPU or
+    real movies are needed)."""
+
+    def _registration(self, n_channels=2):
+        return {
+            "model": "channel-registration",
+            "n_channels": n_channels,
+            "channel_transforms": [transforms.identity().to_dict()]
+            * n_channels,
+        }
+
+    def _run(self, monkeypatch, **worker_kwargs):
+        seen = {}
+        df = pd.DataFrame({"frame": [0], "x": [0.0], "y": [0.0]})
+
+        def fake_fit(*args, **kwargs):
+            seen.update(kwargs)
+            seen["n_movies"] = len(args[0])
+            return df
+
+        monkeypatch.setattr(localize, "fit_gauss_multichannel", fake_fit)
+        ids = pd.DataFrame(
+            {"frame": [0], "x": [6], "y": [6], "net_gradient": [1.0]}
+        )
+        worker = localize_gui.MultichannelGaussianFitWorker(
+            [None, None],
+            [{}, {}],
+            ids,
+            BOX,
+            self._registration(),
+            **worker_kwargs,
+        )
+        result = {}
+        worker.finished.connect(
+            lambda locs, dt, a, b: result.update(locs=locs)
+        )
+        worker.aborted.connect(lambda: result.update(aborted=True))
+        worker.run()
+        return seen, result
+
+    @pytest.mark.parametrize("link_photons", [False, True])
+    def test_link_photons_reaches_the_fitter(self, monkeypatch, link_photons):
+        seen, result = self._run(monkeypatch, link_photons=link_photons)
+        assert seen["link_photons"] is link_photons
+        assert "locs" in result
+
+    @pytest.mark.parametrize("mle", [False, True])
+    def test_the_estimator_reaches_the_fitter(self, monkeypatch, mle):
+        seen, _ = self._run(monkeypatch, mle=mle)
+        assert seen["mle"] is mle
+
+    def test_the_registration_is_handed_over(self, monkeypatch):
+        seen, _ = self._run(monkeypatch)
+        assert seen["n_movies"] == 2
+
+    def test_a_failed_fit_aborts_rather_than_raising(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise RuntimeError("no")
+
+        monkeypatch.setattr(localize, "fit_gauss_multichannel", boom)
+        ids = pd.DataFrame(
+            {"frame": [0], "x": [6], "y": [6], "net_gradient": [1.0]}
+        )
+        worker = localize_gui.MultichannelGaussianFitWorker(
+            [None, None], [{}, {}], ids, BOX, self._registration()
+        )
+        aborted = []
+        worker.aborted.connect(lambda: aborted.append(True))
+        worker.run()
+        assert aborted == [True]
+
+    def test_an_aborted_fit_emits_aborted(self, monkeypatch):
+        monkeypatch.setattr(
+            localize, "fit_gauss_multichannel", lambda *a, **k: None
+        )
+        ids = pd.DataFrame(
+            {"frame": [0], "x": [6], "y": [6], "net_gradient": [1.0]}
+        )
+        worker = localize_gui.MultichannelGaussianFitWorker(
+            [None, None], [{}, {}], ids, BOX, self._registration()
+        )
+        aborted = []
+        worker.aborted.connect(lambda: aborted.append(True))
+        worker.run()
+        assert aborted == [True]
+
+
+class TestChannelRegistrationParametersDialog:
+    """The channel-registration group box in the parameters dialog."""
+
+    def test_only_shown_for_the_spherical_gaussian(self):
+        window = localize_gui.Window()
+        try:
+            dialog = window.parameters_dialog
+            dialog.fit_model.setCurrentText("2D spherical Gaussian")
+            assert dialog.channel_registration_groupbox.isVisibleTo(dialog)
+            assert not dialog.spline_groupbox.isVisibleTo(dialog)
+
+            dialog.fit_model.setCurrentText("2D elliptical Gaussian")
+            assert not dialog.channel_registration_groupbox.isVisibleTo(dialog)
+            assert dialog.z_groupbox.isVisibleTo(dialog)
+
+            dialog.fit_model.setCurrentText("Experimental PSF (cubic spline)")
+            assert not dialog.channel_registration_groupbox.isVisibleTo(dialog)
+            assert dialog.spline_groupbox.isVisibleTo(dialog)
+        finally:
+            window.close()
+
+    def test_loading_a_registration_shows_the_link_photons_box(self, tmp_path):
+        window = localize_gui.Window()
+        try:
+            dialog = window.parameters_dialog
+            # the box lives in the registration group, which only the
+            # spherical Gaussian shows
+            dialog.fit_model.setCurrentText("2D spherical Gaussian")
+            assert not dialog.gauss_link_photons_checkbox.isVisibleTo(dialog)
+
+            path = str(tmp_path / "reg.yaml")
+            io.save_any_calibration(
+                path,
+                {
+                    "model": "channel-registration",
+                    "n_channels": 2,
+                    "channel_transforms": [transforms.identity().to_dict()]
+                    * 2,
+                },
+            )
+            dialog.update_channel_registration(path)
+
+            assert dialog.channel_registration_calibration["n_channels"] == 2
+            assert dialog.gauss_link_photons_checkbox.isVisibleTo(dialog)
+            # decoupled is the default: a Gaussian has no per-channel
+            # brightness scale, so linking would assume equal brightness
+            assert dialog._gauss_link_photons_enabled() is False
+        finally:
+            window.close()
+
+    def test_a_file_without_transforms_is_rejected(self, tmp_path):
+        window = localize_gui.Window()
+        try:
+            dialog = window.parameters_dialog
+            path = str(tmp_path / "not_a_registration.yaml")
+            io.save_any_calibration(path, {"model": "something-else"})
+
+            dialog.update_channel_registration(path)
+
+            assert dialog.channel_registration_calibration == {}
+            assert "not a channel registration" in (
+                dialog.channel_registration_label.text()
+            )
+        finally:
+            window.close()
+
+    def test_clearing_forgets_the_registration(self, tmp_path):
+        window = localize_gui.Window()
+        try:
+            dialog = window.parameters_dialog
+            path = str(tmp_path / "reg.yaml")
+            io.save_any_calibration(
+                path,
+                {
+                    "model": "channel-registration",
+                    "n_channels": 2,
+                    "channel_transforms": [transforms.identity().to_dict()]
+                    * 2,
+                },
+            )
+            dialog.update_channel_registration(path)
+            dialog.update_channel_registration(None)
+
+            assert dialog.channel_registration_calibration == {}
+            assert dialog.channel_registration_path is None
+            assert not dialog.gauss_link_photons_checkbox.isVisibleTo(dialog)
+        finally:
+            window.close()
+
+
+class TestMultichannelGaussianFitThroughTheWindow:
+    """The whole GUI path: two channels loaded, a registration loaded, and
+    ``Window.fit()`` dispatching to the joint Gaussian fit rather than to the
+    single-channel worker."""
+
+    H = W = 40
+    BOX = 9
+    N_FRAMES = 12
+    SIGMA = 1.3
+    DX, DY = 6.4, -4.35
+
+    def _movies(self):
+        rng = np.random.RandomState(11)
+        truth_x = rng.uniform(14, 26, self.N_FRAMES)
+        truth_y = rng.uniform(14, 26, self.N_FRAMES)
+        j, i = np.mgrid[0 : self.H, 0 : self.W]
+        movies = []
+        for c, amp in enumerate((900.0, 400.0)):
+            clean = np.zeros((self.N_FRAMES, self.H, self.W))
+            for f in range(self.N_FRAMES):
+                x = truth_x[f] + (self.DX if c else 0.0)
+                y = truth_y[f] + (self.DY if c else 0.0)
+                clean[f] = amp * np.exp(
+                    -0.5 * ((i - x) ** 2 + (j - y) ** 2) / self.SIGMA**2
+                )
+            movies.append(rng.poisson(clean + 10).astype(np.uint16))
+        return movies, truth_x, truth_y
+
+    def _registration_file(self, tmp_path):
+        matrix = np.array(
+            [[1.0, 0.0, self.DX], [0.0, 1.0, self.DY], [0.0, 0.0, 1.0]]
+        )
+        path = str(tmp_path / "reg.yaml")
+        io.save_any_calibration(
+            path,
+            {
+                "model": "channel-registration",
+                "n_channels": 2,
+                "channel_transforms": [
+                    transforms.identity().to_dict(),
+                    transforms.AffineTransform(matrix=matrix).to_dict(),
+                ],
+            },
+        )
+        return path
+
+    def _window(self, tmp_path, registration=True):
+        movies, truth_x, truth_y = self._movies()
+        window = localize_gui.Window()
+        dialog = window.parameters_dialog
+        dialog.baseline.setValue(0)
+        dialog.sensitivity.setValue(1.0)
+        dialog.gain.setValue(1)
+        window.parameters["Box Size"] = self.BOX
+        info = [{"Frames": self.N_FRAMES, "Height": self.H, "Width": self.W}]
+        window._set_channels(
+            movies, [info, info], ["ref.tif", "ch1.tif"], ["ch0", "ch1"]
+        )
+        dialog.fit_model.setCurrentText("2D spherical Gaussian")
+        dialog.fit_optimizer.setCurrentText("MLE")
+        if registration:
+            dialog.update_channel_registration(
+                self._registration_file(tmp_path)
+            )
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(self.N_FRAMES),
+                "x": np.rint(truth_x).astype(np.int64),
+                "y": np.rint(truth_y).astype(np.int64),
+                "net_gradient": np.full(self.N_FRAMES, 1e4, np.float32),
+            }
+        )
+        for channel in window.channels:
+            channel.identifications = ids
+            channel.ready_for_fit = True
+        window.identifications = ids
+        window.ready_for_fit = True
+        return window, truth_x, truth_y
+
+    @staticmethod
+    def _finish(window):
+        """Run the fit and let Qt deliver the worker's queued signals.
+
+        The worker runs on its own thread, so ``finished`` only reaches the
+        window once the event loop turns."""
+        window.fit()
+        worker = window.fit_worker
+        worker.wait()
+        QtWidgets.QApplication.processEvents()
+        return worker
+
+    def test_fit_dispatches_to_the_multichannel_worker(self, tmp_path):
+        window, truth_x, truth_y = self._window(tmp_path)
+        try:
+            worker = self._finish(window)
+
+            assert isinstance(
+                worker, localize_gui.MultichannelGaussianFitWorker
+            )
+            assert window.locs is not None
+            frame = window.locs["frame"].to_numpy()
+            error = window.locs["x"].to_numpy() - truth_x[frame]
+            assert abs(np.nanmean(error)) < 0.1
+            # decoupled is the default, so the per-channel columns are there
+            assert "photons_ch1" in window.locs.columns
+        finally:
+            window.close()
+
+    def test_without_a_registration_it_stays_single_channel(self, tmp_path):
+        window, _, _ = self._window(tmp_path, registration=False)
+        try:
+            worker = self._finish(window)
+            assert isinstance(worker, localize_gui.FitWorker)
+        finally:
+            window.close()
+
+    def test_the_fit_is_distributed_to_every_channel(self, tmp_path):
+        """Each channel gets the localizations mapped into its own frame, so
+        switching channels overlays them on that channel's movie."""
+        window, _, _ = self._window(tmp_path)
+        try:
+            self._finish(window)
+
+            display = [c.locs_display for c in window.channels]
+            assert all(d is not None for d in display)
+            shift = np.nanmedian(
+                display[1]["x"].to_numpy() - display[0]["x"].to_numpy()
+            )
+            assert shift == pytest.approx(self.DX, abs=0.2)
+        finally:
+            window.close()
+
+
+class TestRegisterChannelsFlow:
+    """Building a channel registration from the GUI, both ways."""
+
+    H = W = 48
+    BOX = 7
+    N_FRAMES = 60
+    DX, DY = 5.4, -3.7
+
+    def _blinking_movies(self):
+        rng = np.random.RandomState(3)
+        j, i = np.mgrid[0 : self.H, 0 : self.W]
+        movies = [np.zeros((self.N_FRAMES, self.H, self.W)) for _ in range(2)]
+        for f in range(self.N_FRAMES):
+            for _ in range(rng.randint(5, 8)):
+                x = rng.uniform(14, 34)
+                y = rng.uniform(14, 34)
+                amp = rng.uniform(2500, 4000)
+                for c, (dx, dy) in enumerate(((0.0, 0.0), (self.DX, self.DY))):
+                    movies[c][f] += amp * np.exp(
+                        -0.5
+                        * ((i - (x + dx)) ** 2 + (j - (y + dy)) ** 2)
+                        / 1.2**2
+                    )
+        return [
+            rng.poisson(np.maximum(m, 0) + 100).astype(np.uint16)
+            for m in movies
+        ]
+
+    def test_the_worker_builds_a_loadable_registration(self, tmp_path):
+        """The signal builder, run exactly as the GUI runs it."""
+        path = str(tmp_path / "reg.yaml")
+        worker = localize_gui.ChannelRegistrationWorker(
+            source="signal",
+            movies=self._blinking_movies(),
+            box=self.BOX,
+            minimum_ng=800.0,
+            path=path,
+            model="affine",
+        )
+        done, failed = [], []
+        worker.finished.connect(done.append)
+        worker.failed.connect(failed.append)
+
+        worker.run()
+
+        assert failed == [], failed
+        assert done == [path]
+        calibration = io.load_any_calibration(path)
+        matrix = transforms.from_dict(
+            calibration["channel_transforms"][1]
+        ).matrix[:2]
+        assert matrix[0, 2] == pytest.approx(self.DX, abs=0.4)
+        assert matrix[1, 2] == pytest.approx(self.DY, abs=0.4)
+
+    def test_a_failure_is_reported_rather_than_raised(self, tmp_path):
+        blank = [
+            np.full((10, self.H, self.W), 100, np.uint16) for _ in range(2)
+        ]
+        worker = localize_gui.ChannelRegistrationWorker(
+            source="signal",
+            movies=blank,
+            box=self.BOX,
+            minimum_ng=800.0,
+            path=str(tmp_path / "reg.yaml"),
+        )
+        failed = []
+        worker.failed.connect(failed.append)
+
+        worker.run()
+
+        assert len(failed) == 1
+
+    def test_the_menu_action_registers_and_loads(self, tmp_path, monkeypatch):
+        """``register_channels_from_signal`` builds the file and loads it into
+        the parameters dialog, so a fit can use it straight away."""
+        window = localize_gui.Window()
+        try:
+            info = [
+                {"Frames": self.N_FRAMES, "Height": self.H, "Width": self.W}
+            ]
+            window.parameters["Box Size"] = self.BOX
+            window.parameters["Min. Net Gradient"] = 800.0
+            window._set_channels(
+                self._blinking_movies(),
+                [info, info],
+                ["a.tif", "b.tif"],
+                ["ch0", "ch1"],
+            )
+            path = str(tmp_path / "reg.yaml")
+            monkeypatch.setattr(
+                localize_gui.RefineRegistrationDialog,
+                "getFrameSpecs",
+                staticmethod(
+                    lambda *a, **k: (
+                        [[0, self.N_FRAMES - 1]],
+                        40,
+                        "affine",
+                        True,
+                    )
+                ),
+            )
+            monkeypatch.setattr(
+                localize_gui.Window,
+                "_registration_save_path",
+                lambda self: path,
+            )
+            shown = []
+            monkeypatch.setattr(
+                QtWidgets.QMessageBox,
+                "information",
+                lambda *a, **k: shown.append(a),
+            )
+
+            window.register_channels_from_signal()
+            window.registration_worker.wait()
+            QtWidgets.QApplication.processEvents()
+
+            loaded = window.parameters_dialog.channel_registration_calibration
+            assert loaded.get("n_channels") == 2
+            assert window.parameters_dialog.channel_registration_path == path
+            assert shown, "the user is told what was built"
+        finally:
+            window.close()
+
+    def test_it_refuses_a_single_channel(self, monkeypatch):
+        window = localize_gui.Window()
+        try:
+            shown = []
+            monkeypatch.setattr(
+                QtWidgets.QMessageBox,
+                "information",
+                lambda *a, **k: shown.append(a),
+            )
+            window.register_channels_from_signal()
+            assert shown
+        finally:
+            window.close()
+
+
+class TestMultichannelGaussianUncertaintyColumns:
+    """Each reported uncertainty must describe its own parameter.
+
+    Position, width and photon variances differ by orders of magnitude, so a
+    column mix-up between the fit's parameter order and the CRLB's shows up
+    immediately here - unlike in a symmetric precision check, where var(x) and
+    var(y) are nearly equal and hide it.
+    """
+
+    BOX = 9
+    N_FRAMES = 40
+    SIGMA = 1.3
+
+    def _locs(self, link_photons):
+        rng = np.random.RandomState(17)
+        height = width = 44
+        truth_x = rng.uniform(16, 28, self.N_FRAMES)
+        truth_y = rng.uniform(16, 28, self.N_FRAMES)
+        j, i = np.mgrid[0:height, 0:width]
+        dx, dy = 6.4, -4.3
+        movies = []
+        for c, amp in enumerate((900.0, 500.0)):
+            clean = np.zeros((self.N_FRAMES, height, width))
+            for f in range(self.N_FRAMES):
+                x = truth_x[f] + (dx if c else 0.0)
+                y = truth_y[f] + (dy if c else 0.0)
+                clean[f] = amp * np.exp(
+                    -0.5 * ((i - x) ** 2 + (j - y) ** 2) / self.SIGMA**2
+                )
+            movies.append((rng.poisson(clean + 10) + 100).astype(np.uint16))
+        camera_infos = [{"Baseline": 100.0, "Sensitivity": 1.0, "Gain": 1}] * 2
+        ids = pd.DataFrame(
+            {
+                "frame": np.arange(self.N_FRAMES),
+                "x": np.rint(truth_x).astype(np.int64),
+                "y": np.rint(truth_y).astype(np.int64),
+                "net_gradient": np.full(self.N_FRAMES, 1e4, np.float32),
+            }
+        )
+        matrix = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy], [0.0, 0.0, 1.0]])
+        registration = {
+            "model": "channel-registration",
+            "n_channels": 2,
+            "channel_transforms": [
+                transforms.identity().to_dict(),
+                transforms.AffineTransform(matrix=matrix).to_dict(),
+            ],
+        }
+        return localize.fit_gauss_multichannel(
+            movies,
+            camera_infos,
+            ids,
+            self.BOX,
+            registration,
+            mle=True,
+            link_photons=link_photons,
+            use_gpu=False,
+            multiprocess=False,
+        )
+
+    @pytest.mark.parametrize(
+        "link_photons", [False, True], ids=["decoupled", "linked"]
+    )
+    def test_each_uncertainty_is_on_its_own_scale(self, link_photons):
+        locs = self._locs(link_photons)
+
+        photons = np.nanmedian(locs["photons"])
+        # a position precision is a small fraction of a pixel ...
+        assert 0.0 < np.nanmedian(locs["lpx"]) < 0.2
+        assert 0.0 < np.nanmedian(locs["lpy"]) < 0.2
+        # ... a width uncertainty likewise ...
+        assert 0.0 < np.nanmedian(locs["sx_unc"]) < 0.2
+        # ... while a photon uncertainty is on the order of sqrt(photons),
+        # hundreds of times larger. Reading a position variance into this
+        # column (or vice versa) cannot pass both bounds.
+        assert np.nanmedian(locs["photons_unc"]) == pytest.approx(
+            np.sqrt(photons), rel=0.7
+        )
+        assert 0.0 < np.nanmedian(locs["bg_unc"]) < 10.0
+
+    def test_the_width_uncertainty_matches_the_width_scatter(self):
+        """``sx_unc`` must track the width, not the photon count."""
+        locs = self._locs(link_photons=False)
+        assert np.nanmedian(locs["sx_unc"]) == pytest.approx(
+            np.nanstd(locs["sx"]), rel=0.6
+        )
+        np.testing.assert_allclose(locs["sx_unc"], locs["sy_unc"])
+
+
+class TestFitGaussSplitFov:
+    """The single-sensor split field of view: the channels are regions of one
+    movie rather than separate movies."""
+
+    H, W = 64, 128
+    BOX = 9
+    N_FRAMES = 40
+    SIGMA = 1.25
+    REGIONS = [[[0, 0], [64, 64]], [[0, 64], [64, 128]]]
+    FX, FY = 1.4, -0.85  # fine offset on top of the 64 px region step
+
+    def _render(self, frame, x, y, amp):
+        j, i = np.mgrid[0 : self.H, 0 : self.W]
+        frame += amp * np.exp(
+            -0.5 * ((i - x) ** 2 + (j - y) ** 2) / self.SIGMA**2
+        )
+
+    def _dataset(self, amps=(900.0, 400.0), seed=9):
+        rng = np.random.RandomState(seed)
+        truth_x = rng.uniform(14, 50, self.N_FRAMES)
+        truth_y = rng.uniform(14, 50, self.N_FRAMES)
+        movie = np.zeros((self.N_FRAMES, self.H, self.W))
+        for f in range(self.N_FRAMES):
+            self._render(movie[f], truth_x[f], truth_y[f], amps[0])
+            self._render(
+                movie[f],
+                truth_x[f] + 64 + self.FX,
+                truth_y[f] + self.FY,
+                amps[1],
+            )
+        movie = (rng.poisson(movie + 10) + 100).astype(np.uint16)
+        camera_info = {"Baseline": 100.0, "Sensitivity": 1.0, "Gain": 1}
+        # a movie-wide identification table, as the GUI produces: both regions
+        ids = pd.DataFrame(
+            {
+                "frame": np.concatenate([np.arange(self.N_FRAMES)] * 2),
+                "x": np.concatenate(
+                    [
+                        np.rint(truth_x),
+                        np.rint(truth_x + 64 + self.FX),
+                    ]
+                ).astype(np.int64),
+                "y": np.concatenate(
+                    [np.rint(truth_y), np.rint(truth_y + self.FY)]
+                ).astype(np.int64),
+                "net_gradient": np.full(2 * self.N_FRAMES, 1e4, np.float32),
+            }
+        )
+        return movie, camera_info, ids, truth_x, truth_y
+
+    def _registration(self):
+        matrix = np.array(
+            [
+                [1.0, 0.0, 64 + self.FX],
+                [0.0, 1.0, self.FY],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        transforms = [
+            transforms_mod.identity(),
+            transforms_mod.AffineTransform(matrix=matrix),
+        ]
+        rects = [localize._normalize_rect(r) for r in self.REGIONS]
+        return {
+            "model": "channel-registration",
+            "n_channels": 2,
+            "split_fov": True,
+            "reference": 0,
+            "regions": rects,
+            "channel_transforms": [t.to_dict() for t in transforms],
+            "channel_registration": [
+                a.to_dict()
+                for a in localize.decompose_region_transforms(
+                    rects, transforms
+                )
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        "link_photons", [False, True], ids=["decoupled", "linked"]
+    )
+    def test_recovers_ground_truth(self, link_photons):
+        movie, camera_info, ids, truth_x, truth_y = self._dataset()
+
+        locs = localize.fit_gauss_split_fov(
+            movie,
+            camera_info,
+            ids,
+            self.BOX,
+            self._registration(),
+            regions=self.REGIONS,
+            mle=True,
+            link_photons=link_photons,
+            use_gpu=False,
+            multiprocess=False,
+        )
+
+        # confined to the reference region, so one localization per molecule
+        assert len(locs) == self.N_FRAMES
+        frame = locs["frame"].to_numpy()
+        error_x = locs["x"].to_numpy() - truth_x[frame]
+        error_y = locs["y"].to_numpy() - truth_y[frame]
+        assert abs(np.nanmean(error_x)) < 0.06
+        assert abs(np.nanmean(error_y)) < 0.06
+        # and they are in the reference region's coordinates
+        assert locs["x"].max() < 64
+
+    def test_the_regions_can_be_redrawn(self):
+        """The registration is ROI-agnostic, so a split that sits elsewhere is
+        handled by moving the regions rather than re-calibrating."""
+        movie, camera_info, ids, truth_x, _ = self._dataset()
+        registration = self._registration()
+        # pretend the calibration was taken with the split 6 px further right
+        shifted = [[[0, 0], [64, 64]], [[0, 58], [64, 122]]]
+        registration["regions"] = shifted
+
+        locs = localize.fit_gauss_split_fov(
+            movie,
+            camera_info,
+            ids,
+            self.BOX,
+            registration,
+            regions=self.REGIONS,  # the ROIs actually in use
+            mle=True,
+            use_gpu=False,
+            multiprocess=False,
+        )
+
+        frame = locs["frame"].to_numpy()
+        assert abs(np.nanmean(locs["x"].to_numpy() - truth_x[frame])) < 0.06
+
+    def test_confining_to_the_reference_can_be_turned_off(self):
+        """The flag only says who does the confining, not whether it happens:
+        pre-confined detections must give the same fit."""
+        movie, camera_info, ids, _, _ = self._dataset()
+        registration = self._registration()
+        confined = localize.confine_to_region(ids, self.REGIONS[0])
+        assert len(confined) == self.N_FRAMES
+
+        internally = localize.fit_gauss_split_fov(
+            movie,
+            camera_info,
+            ids,
+            self.BOX,
+            registration,
+            regions=self.REGIONS,
+            mle=True,
+            use_gpu=False,
+            multiprocess=False,
+        )
+        externally = localize.fit_gauss_split_fov(
+            movie,
+            camera_info,
+            confined,
+            self.BOX,
+            registration,
+            regions=self.REGIONS,
+            confine_to_reference=False,
+            mle=True,
+            use_gpu=False,
+            multiprocess=False,
+        )
+
+        np.testing.assert_allclose(
+            externally["x"].to_numpy(), internally["x"].to_numpy()
+        )
+        np.testing.assert_allclose(
+            externally["photons"].to_numpy(), internally["photons"].to_numpy()
+        )
+
+    def test_rejects_a_registration_that_is_not_split_fov(self):
+        movie, camera_info, ids, _, _ = self._dataset()
+        registration = self._registration()
+        del registration["split_fov"]
+        with pytest.raises(ValueError, match="split-FOV"):
+            localize.fit_gauss_split_fov(
+                movie,
+                camera_info,
+                ids,
+                self.BOX,
+                registration,
+                use_gpu=False,
+            )
+
+
+class TestSplitFovGaussianThroughTheWindow:
+    """Split-FOV dispatch: one movie with ROIs, no separate channels loaded."""
+
+    H, W = 64, 128
+    BOX = 9
+    N_FRAMES = 12
+    REGIONS = [[[0, 0], [64, 64]], [[0, 64], [64, 128]]]
+    FX, FY = 1.4, -0.85
+
+    def _window(self, tmp_path):
+        rng = np.random.RandomState(21)
+        truth_x = rng.uniform(16, 46, self.N_FRAMES)
+        truth_y = rng.uniform(16, 46, self.N_FRAMES)
+        j, i = np.mgrid[0 : self.H, 0 : self.W]
+        movie = np.zeros((self.N_FRAMES, self.H, self.W))
+        for f in range(self.N_FRAMES):
+            for x, y, amp in (
+                (truth_x[f], truth_y[f], 900.0),
+                (truth_x[f] + 64 + self.FX, truth_y[f] + self.FY, 450.0),
+            ):
+                movie[f] += amp * np.exp(
+                    -0.5 * ((i - x) ** 2 + (j - y) ** 2) / 1.25**2
+                )
+        movie = (rng.poisson(movie + 10) + 100).astype(np.uint16)
+
+        rects = [localize._normalize_rect(r) for r in self.REGIONS]
+        matrix = np.array(
+            [[1.0, 0.0, 64 + self.FX], [0.0, 1.0, self.FY], [0.0, 0.0, 1.0]]
+        )
+        tfs = [
+            transforms_mod.identity(),
+            transforms_mod.AffineTransform(matrix=matrix),
+        ]
+        path = str(tmp_path / "sfov_reg.yaml")
+        io.save_any_calibration(
+            path,
+            {
+                "model": "channel-registration",
+                "n_channels": 2,
+                "split_fov": True,
+                "reference": 0,
+                "regions": rects,
+                "channel_transforms": [t.to_dict() for t in tfs],
+                "channel_registration": [
+                    a.to_dict()
+                    for a in localize.decompose_region_transforms(rects, tfs)
+                ],
+            },
+        )
+
+        window = localize_gui.Window()
+        dialog = window.parameters_dialog
+        dialog.baseline.setValue(100)
+        dialog.sensitivity.setValue(1.0)
+        dialog.gain.setValue(1)
+        window.parameters["Box Size"] = self.BOX
+        # split-FOV is a single loaded movie whose regions are the channels
+        window._set_channels(
+            [movie],
+            [[{"Frames": self.N_FRAMES, "Height": self.H, "Width": self.W}]],
+            ["split.tif"],
+            ["ch0"],
+        )
+        dialog.fit_model.setCurrentText("2D spherical Gaussian")
+        dialog.fit_optimizer.setCurrentText("MLE")
+        # loading the registration should drop its regions in and switch the
+        # view into split-FOV mode by itself
+        dialog.update_channel_registration(path)
+
+        ids = pd.DataFrame(
+            {
+                "frame": np.concatenate([np.arange(self.N_FRAMES)] * 2),
+                "x": np.concatenate(
+                    [np.rint(truth_x), np.rint(truth_x + 64 + self.FX)]
+                ).astype(np.int64),
+                "y": np.concatenate(
+                    [np.rint(truth_y), np.rint(truth_y + self.FY)]
+                ).astype(np.int64),
+                "net_gradient": np.full(2 * self.N_FRAMES, 1e4, np.float32),
+            }
+        )
+        window.identifications = ids
+        window.ready_for_fit = True
+        return window, truth_x
+
+    def test_loading_the_registration_enters_split_fov_mode(self, tmp_path):
+        window, _ = self._window(tmp_path)
+        try:
+            assert window.view.split_fov_mode
+            assert len(window.view.rois) == 2
+        finally:
+            window.close()
+
+    def test_fit_dispatches_to_the_split_fov_path(self, tmp_path):
+        window, truth_x = self._window(tmp_path)
+        try:
+            window.fit()
+            worker = window.fit_worker
+            assert isinstance(
+                worker, localize_gui.MultichannelGaussianFitWorker
+            )
+            assert worker.split_fov is True
+            worker.wait()
+            QtWidgets.QApplication.processEvents()
+
+            assert window.locs is not None
+            # one localization per molecule, in reference-region coordinates
+            assert len(window.locs) == self.N_FRAMES
+            frame = window.locs["frame"].to_numpy()
+            error = window.locs["x"].to_numpy() - truth_x[frame]
+            assert abs(np.nanmean(error)) < 0.1
+            assert window.locs["x"].max() < 64
         finally:
             window.close()

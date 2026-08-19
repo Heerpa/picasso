@@ -985,3 +985,819 @@ def fit_spots_async(
     ]
     executor.shutdown(wait=False)
     return AsyncFit(current, *outputs, fs, stop)
+
+
+# ----------------------------------------------------------------------
+# Multichannel (joint) spherical Gaussian
+#
+# Several registered channels are fitted at once with one shared position and
+# width, the globLoc arrangement ``picasso.fitting.splinefit`` already uses for
+# the spline PSF (Li et al., Nat. Commun. 13, 3133, 2022). Only the isotropic
+# Gaussian has a multichannel model.
+#
+# ``spots`` is channel-major ``(n_spots, n_channels, box, box)``, indexed
+# ``[spot, channel, row = y, column = x]``, as the spline kernels take it.
+#
+# Each channel sees the *shared* lateral shift through its own registration:
+# ``jac`` is that channel's local Jacobian ``[a00, a01, a10, a11]`` and ``res``
+# its sub-pixel ROI offset, the fractional part the integer box origin cannot
+# express. Together they place channel ``c``'s model at ``T_c(x + theta)`` to
+# first order; see ``picasso.localize.channel_roi_geometry``. The single-channel
+# fit is the identity-Jacobian, zero-residual case.
+# ----------------------------------------------------------------------
+
+#: One amplitude and one background shared by every channel;
+#: ``[amplitude, x_shift, y_shift, sigma, offset]``.
+MULTI_KIND_SHARED = 0
+#: Photon-decoupled: position and width shared, every channel its own photon
+#: count and background; ``[x_shift, y_shift, sigma, N_0.., bg_0..]``.
+MULTI_KIND_DECOUPLED = 1
+
+_N_PARAMS_MULTI_SHARED = 5
+
+
+@numba.njit(nogil=True, cache=True, fastmath=_FASTMATH)
+def _accumulate_spherical_multichannel(
+    spots: np.ndarray,
+    index: int,
+    variance: np.ndarray,
+    use_variance: bool,
+    jac: np.ndarray,
+    res: np.ndarray,
+    theta: np.ndarray,
+    mle: bool,
+    hess: np.ndarray,
+    grad: np.ndarray,
+) -> tuple:
+    """Shared-amplitude multichannel isotropic Gaussian.
+
+    Parameters are ``[amplitude, x_shift, y_shift, sigma, offset]`` - the same
+    five as the single-channel model, because the channels add pixels rather
+    than parameters. Every channel contributes to one combined 5x5 system.
+
+    The amplitude is shared *literally*: this model has no per-channel
+    brightness scale (unlike the spline model, whose per-channel coefficient
+    table carries one), so it assumes every channel collects the same number of
+    photons. Use :data:`MULTI_KIND_DECOUPLED` when they do not.
+    """
+    n_channels = spots.shape[1]
+    box = spots.shape[2]
+    amp = theta[0]
+    x_shift = theta[1]
+    y_shift = theta[2]
+    sigma = theta[3]
+    offset = theta[4]
+    if not (
+        np.isfinite(amp)
+        and np.isfinite(x_shift)
+        and np.isfinite(y_shift)
+        and np.isfinite(sigma)
+        and np.isfinite(offset)
+        # A zero width divides by zero in every derivative.
+        and abs(sigma) > 0.0
+    ):
+        return np.inf, False
+    inv_s2 = 1.0 / (sigma * sigma)
+    inv_s3 = 1.0 / (sigma * sigma * sigma)
+    chi_square = 0.0
+    g0 = g1 = g2 = g3 = g4 = 0.0
+    h00 = h01 = h02 = h03 = h04 = 0.0
+    h11 = h12 = h13 = h14 = 0.0
+    h22 = h23 = h24 = 0.0
+    h33 = h34 = 0.0
+    h44 = 0.0
+    # The channel Jacobian linearizes the *displacement* of the
+    # emitter from the box center, not the box coordinate itself:
+    # channel c sees center + J @ (shift - center) + residual. Off by
+    # the center, a mirrored or rotated channel lands outside its own
+    # box and its photon count runs away.
+    center = 0.5 * box - 0.5
+    dx_shift = x_shift - center
+    dy_shift = y_shift - center
+    for ch in range(n_channels):
+        # Constant over the box, so hoisted.
+        a00 = jac[index, ch, 0]
+        a01 = jac[index, ch, 1]
+        a10 = jac[index, ch, 2]
+        a11 = jac[index, ch, 3]
+        sx = center + a00 * dx_shift + a01 * dy_shift + res[index, ch, 0]
+        sy = center + a10 * dx_shift + a11 * dy_shift + res[index, ch, 1]
+        for j in range(box):
+            pos_y = j - sy
+            for i in range(box):
+                pos_x = i - sx
+                r2 = pos_x * pos_x + pos_y * pos_y
+                ex = np.exp(-0.5 * r2 * inv_s2)
+                value = amp * ex + offset
+                data = spots[index, ch, j, i]
+                # Local gradient of the unit-height Gaussian.
+                gx = -ex * pos_x * inv_s2
+                gy = -ex * pos_y * inv_s2
+                d0 = ex
+                # The lateral pair picks up the transpose of the channel
+                # Jacobian (shift = J @ theta, so d(shift_x)/d(theta_x) = a00
+                # and d(shift_y)/d(theta_x) = a10); the leading minus is the
+                # chain rule of position = pixel - shift.
+                d1 = -amp * (a00 * gx + a10 * gy)
+                d2 = -amp * (a01 * gx + a11 * gy)
+                # sigma is orthogonal to the lateral registration, so unlike
+                # x and y it needs no Jacobian.
+                d3 = amp * ex * r2 * inv_s3
+                # d4 == 1 (offset).
+                var = 0.0
+                if use_variance:
+                    var = variance[index, ch, j, i]
+                contrib, weight, factor, ok = _estimator_terms(
+                    mle, value, data, var
+                )
+                if not ok:
+                    return np.inf, False
+                chi_square += contrib
+                g0 += d0 * factor
+                g1 += d1 * factor
+                g2 += d2 * factor
+                g3 += d3 * factor
+                g4 += factor
+                w0 = weight * d0
+                w1 = weight * d1
+                w2 = weight * d2
+                w3 = weight * d3
+                h00 += w0 * d0
+                h01 += w0 * d1
+                h02 += w0 * d2
+                h03 += w0 * d3
+                h04 += w0
+                h11 += w1 * d1
+                h12 += w1 * d2
+                h13 += w1 * d3
+                h14 += w1
+                h22 += w2 * d2
+                h23 += w2 * d3
+                h24 += w2
+                h33 += w3 * d3
+                h34 += w3
+                h44 += weight
+    grad[0] = g0
+    grad[1] = g1
+    grad[2] = g2
+    grad[3] = g3
+    grad[4] = g4
+    hess[0, 0] = h00
+    hess[0, 1] = hess[1, 0] = h01
+    hess[0, 2] = hess[2, 0] = h02
+    hess[0, 3] = hess[3, 0] = h03
+    hess[0, 4] = hess[4, 0] = h04
+    hess[1, 1] = h11
+    hess[1, 2] = hess[2, 1] = h12
+    hess[1, 3] = hess[3, 1] = h13
+    hess[1, 4] = hess[4, 1] = h14
+    hess[2, 2] = h22
+    hess[2, 3] = hess[3, 2] = h23
+    hess[2, 4] = hess[4, 2] = h24
+    hess[3, 3] = h33
+    hess[3, 4] = hess[4, 3] = h34
+    hess[4, 4] = h44
+    return chi_square, True
+
+
+@numba.njit(nogil=True, cache=True, fastmath=_FASTMATH)
+def _accumulate_spherical_decoupled(
+    spots: np.ndarray,
+    index: int,
+    variance: np.ndarray,
+    use_variance: bool,
+    jac: np.ndarray,
+    res: np.ndarray,
+    theta: np.ndarray,
+    mle: bool,
+    hess: np.ndarray,
+    grad: np.ndarray,
+) -> tuple:
+    """Photon-decoupled multichannel isotropic Gaussian.
+
+    Parameters are ``[x_shift, y_shift, sigma, N_0..N_{C-1}, bg_0..bg_{C-1}]``:
+    position **and width** are shared across channels while every channel fits
+    its own photon count and background. Makes no assumption about the relative
+    brightness of the channels, so it is the safe choice for an unevenly split
+    beam.
+
+    A pixel of channel ``ch`` only ever sees five of the ``3 + 2C`` parameters,
+    so the gradient and Hessian are accumulated block-sparse. See
+    :func:`_accumulate_spherical_multichannel`."""
+    n_channels = spots.shape[1]
+    box = spots.shape[2]
+    n_params = 3 + 2 * n_channels
+    x_shift = theta[0]
+    y_shift = theta[1]
+    sigma = theta[2]
+    for p in range(n_params):
+        if not np.isfinite(theta[p]):
+            return np.inf, False
+        grad[p] = 0.0
+        for q in range(n_params):
+            hess[p, q] = 0.0
+    if not abs(sigma) > 0.0:
+        return np.inf, False
+    inv_s2 = 1.0 / (sigma * sigma)
+    inv_s3 = 1.0 / (sigma * sigma * sigma)
+    chi_square = 0.0
+    # The channel Jacobian linearizes the *displacement* of the
+    # emitter from the box center, not the box coordinate itself:
+    # channel c sees center + J @ (shift - center) + residual. Off by
+    # the center, a mirrored or rotated channel lands outside its own
+    # box and its photon count runs away.
+    center = 0.5 * box - 0.5
+    dx_shift = x_shift - center
+    dy_shift = y_shift - center
+    for ch in range(n_channels):
+        amp = theta[3 + ch]
+        offset = theta[3 + n_channels + ch]
+        # Global parameter indices of this channel's photon count and
+        # background; the three shared parameters are 0, 1, 2.
+        ia = 3 + ch
+        ib = 3 + n_channels + ch
+        a00 = jac[index, ch, 0]
+        a01 = jac[index, ch, 1]
+        a10 = jac[index, ch, 2]
+        a11 = jac[index, ch, 3]
+        sx = center + a00 * dx_shift + a01 * dy_shift + res[index, ch, 0]
+        sy = center + a10 * dx_shift + a11 * dy_shift + res[index, ch, 1]
+        for j in range(box):
+            pos_y = j - sy
+            for i in range(box):
+                pos_x = i - sx
+                r2 = pos_x * pos_x + pos_y * pos_y
+                ex = np.exp(-0.5 * r2 * inv_s2)
+                value = amp * ex + offset
+                data = spots[index, ch, j, i]
+                gx = -ex * pos_x * inv_s2
+                gy = -ex * pos_y * inv_s2
+                d0 = -amp * (a00 * gx + a10 * gy)
+                d1 = -amp * (a01 * gx + a11 * gy)
+                d2 = amp * ex * r2 * inv_s3
+                # d(value)/d(N_ch) = ex, d(value)/d(bg_ch) = 1; both zero for
+                # every other channel.
+                var = 0.0
+                if use_variance:
+                    var = variance[index, ch, j, i]
+                contrib, weight, factor, ok = _estimator_terms(
+                    mle, value, data, var
+                )
+                if not ok:
+                    return np.inf, False
+                chi_square += contrib
+                grad[0] += d0 * factor
+                grad[1] += d1 * factor
+                grad[2] += d2 * factor
+                grad[ia] += ex * factor
+                grad[ib] += factor
+                w0 = weight * d0
+                w1 = weight * d1
+                w2 = weight * d2
+                wa = weight * ex
+                hess[0, 0] += w0 * d0
+                hess[0, 1] += w0 * d1
+                hess[0, 2] += w0 * d2
+                hess[0, ia] += w0 * ex
+                hess[0, ib] += w0
+                hess[1, 1] += w1 * d1
+                hess[1, 2] += w1 * d2
+                hess[1, ia] += w1 * ex
+                hess[1, ib] += w1
+                hess[2, 2] += w2 * d2
+                hess[2, ia] += w2 * ex
+                hess[2, ib] += w2
+                hess[ia, ia] += wa * ex
+                hess[ia, ib] += wa
+                hess[ib, ib] += weight
+    # Only the upper triangle was filled (0 < 1 < 2 < ia < ib always holds);
+    # mirror it once at the end rather than per pixel.
+    for p in range(n_params):
+        for q in range(p):
+            hess[p, q] = hess[q, p]
+    return chi_square, True
+
+
+@numba.njit(nogil=True, cache=True, fastmath=_FASTMATH)
+def _accumulate_multichannel(
+    kind: int,
+    spots: np.ndarray,
+    index: int,
+    variance: np.ndarray,
+    use_variance: bool,
+    jac: np.ndarray,
+    res: np.ndarray,
+    theta: np.ndarray,
+    mle: bool,
+    hess: np.ndarray,
+    grad: np.ndarray,
+) -> tuple:
+    """Dispatch to the accumulator of ``kind``."""
+    if kind == MULTI_KIND_SHARED:
+        return _accumulate_spherical_multichannel(
+            spots,
+            index,
+            variance,
+            use_variance,
+            jac,
+            res,
+            theta,
+            mle,
+            hess,
+            grad,
+        )
+    return _accumulate_spherical_decoupled(
+        spots, index, variance, use_variance, jac, res, theta, mle, hess, grad
+    )
+
+
+@numba.njit(nogil=True, cache=True, fastmath=_FASTMATH)
+def _fit_gauss_spot_multichannel(
+    spots: np.ndarray,
+    index: int,
+    variance: np.ndarray,
+    use_variance: bool,
+    kind: int,
+    jac: np.ndarray,
+    res: np.ndarray,
+    init: np.ndarray,
+    mle: bool,
+    tolerance: float,
+    max_iterations: int,
+    thetas: np.ndarray,
+    chi_squares: np.ndarray,
+    states: np.ndarray,
+    iterations: np.ndarray,
+) -> None:
+    """Fit one multichannel spot. The driver of :func:`_fit_gauss_spot`, over
+    the multichannel accumulators."""
+    n_params = init.shape[1]
+    theta = np.empty(n_params)
+    theta_previous = np.empty(n_params)
+    grad = np.zeros(n_params)
+    grad_ok = np.zeros(n_params)
+    delta = np.empty(n_params)
+    scaling = np.empty(n_params)
+    hess = np.zeros((n_params, n_params))
+    hess_ok = np.zeros((n_params, n_params))
+    hess_damped = np.empty((n_params, n_params))
+    indxc = np.empty(n_params, dtype=np.int32)
+    indxr = np.empty(n_params, dtype=np.int32)
+    ipiv = np.empty(n_params, dtype=np.int32)
+
+    for p in range(n_params):
+        theta[p] = init[index, p]
+        scaling[p] = 0.0
+
+    state = FIT_STATE_CONVERGED
+    lam = _LAMBDA_INITIAL
+    n_iterations = 0
+
+    chi_square, ok = _accumulate_multichannel(
+        kind,
+        spots,
+        index,
+        variance,
+        use_variance,
+        jac,
+        res,
+        theta,
+        mle,
+        hess,
+        grad,
+    )
+    if not ok:
+        state = FIT_STATE_NEG_CURVATURE_MLE
+    else:
+        for p in range(n_params):
+            grad_ok[p] = grad[p]
+            for q in range(n_params):
+                hess_ok[p, q] = hess[p, q]
+    previous_chi_square = chi_square
+
+    for iteration in range(max_iterations):
+        if state != FIT_STATE_CONVERGED:
+            break
+        if not _lm_solve_step(
+            hess_ok,
+            grad_ok,
+            scaling,
+            lam,
+            hess_damped,
+            delta,
+            n_params,
+            indxc,
+            indxr,
+            ipiv,
+        ):
+            state = FIT_STATE_SINGULAR_HESSIAN
+            break
+        for p in range(n_params):
+            theta_previous[p] = theta[p]
+            theta[p] += delta[p]
+        new_chi_square, ok = _accumulate_multichannel(
+            kind,
+            spots,
+            index,
+            variance,
+            use_variance,
+            jac,
+            res,
+            theta,
+            mle,
+            hess,
+            grad,
+        )
+        n_iterations = iteration + 1
+        if not ok:
+            chi_square = previous_chi_square
+            for p in range(n_params):
+                theta[p] = theta_previous[p]
+            lam *= _LAMBDA_UP
+            if iteration == max_iterations - 1:
+                state = FIT_STATE_NEG_CURVATURE_MLE
+            continue
+        chi_square = new_chi_square
+        if chi_square < previous_chi_square or previous_chi_square == 0.0:
+            for p in range(n_params):
+                grad_ok[p] = grad[p]
+                for q in range(n_params):
+                    hess_ok[p, q] = hess[p, q]
+        converged = abs(chi_square - previous_chi_square) < max(
+            tolerance, tolerance * abs(chi_square)
+        )
+        if not converged and iteration == max_iterations - 1:
+            state = FIT_STATE_MAX_ITERATION
+        if chi_square < previous_chi_square:
+            lam *= _LAMBDA_DOWN
+            previous_chi_square = chi_square
+        else:
+            lam *= _LAMBDA_UP
+            chi_square = previous_chi_square
+            for p in range(n_params):
+                theta[p] = theta_previous[p]
+        if converged:
+            break
+
+    finite = np.isfinite(chi_square)
+    if finite:
+        for p in range(n_params):
+            if not np.isfinite(theta[p]):
+                finite = False
+                break
+    if finite:
+        for p in range(n_params):
+            thetas[index, p] = theta[p]
+        chi_squares[index] = chi_square
+        states[index] = state
+        iterations[index] = n_iterations
+    else:
+        for p in range(n_params):
+            thetas[index, p] = np.nan
+        chi_squares[index] = np.inf
+        if mle:
+            states[index] = FIT_STATE_NEG_CURVATURE_MLE
+        else:
+            states[index] = FIT_STATE_SINGULAR_HESSIAN
+        iterations[index] = n_iterations
+
+
+def n_parameters_multichannel(kind: int, n_channels: int) -> int:
+    """Parameter count of a multichannel model.
+
+    Parameters
+    ----------
+    kind : int
+        :data:`MULTI_KIND_SHARED` or :data:`MULTI_KIND_DECOUPLED`.
+    n_channels : int
+        Number of channels fitted jointly. Only the decoupled model's count
+        depends on it; the shared model has five parameters whatever it is.
+
+    Returns
+    -------
+    n_params : int
+        5 for the shared model, ``3 + 2 * n_channels`` for the decoupled one.
+
+    Raises
+    ------
+    ValueError
+        If ``kind`` is not one of the two multichannel models.
+    """
+    if kind == MULTI_KIND_SHARED:
+        return _N_PARAMS_MULTI_SHARED
+    if kind == MULTI_KIND_DECOUPLED:
+        return 3 + 2 * int(n_channels)
+    raise ValueError(f"Unknown multichannel Gaussian model {kind}.")
+
+
+def _check_inputs_multichannel(
+    kind: int,
+    spots: np.ndarray,
+    jacobians: np.ndarray,
+    residuals: np.ndarray,
+    initial_parameters: np.ndarray,
+) -> int:
+    """Validate the multichannel arrays and return the parameter count."""
+    if spots.ndim != 4 or spots.shape[2] != spots.shape[3]:
+        raise ValueError(
+            "spots must be channel-major (n_spots, n_channels, box, box), got "
+            f"{spots.shape}."
+        )
+    n_spots, n_channels = spots.shape[0], spots.shape[1]
+    n_params = n_parameters_multichannel(kind, n_channels)
+    if jacobians.shape != (n_spots, n_channels, 4):
+        raise ValueError(
+            f"jacobians must have shape {(n_spots, n_channels, 4)}, got "
+            f"{jacobians.shape}."
+        )
+    if residuals.shape != (n_spots, n_channels, 2):
+        raise ValueError(
+            f"residuals must have shape {(n_spots, n_channels, 2)}, got "
+            f"{residuals.shape}."
+        )
+    if initial_parameters.shape != (n_spots, n_params):
+        raise ValueError(
+            "initial_parameters must have shape "
+            f"{(n_spots, n_params)}, got {initial_parameters.shape}."
+        )
+    return n_params
+
+
+def _prepare_multichannel(
+    kind: int,
+    spots: np.ndarray,
+    jacobians: np.ndarray,
+    residuals: np.ndarray,
+    initial_parameters: np.ndarray,
+    tolerance: float | None,
+    max_iterations: int | None,
+    variance: np.ndarray | None = None,
+) -> tuple:
+    """Validate and normalize the inputs both multichannel entry points
+    share."""
+    spots = np.asarray(spots)
+    jacobians = np.asarray(jacobians)
+    residuals = np.asarray(residuals)
+    initial_parameters = np.asarray(initial_parameters)
+    n_params = _check_inputs_multichannel(
+        kind, spots, jacobians, residuals, initial_parameters
+    )
+    if tolerance is None:
+        tolerance = TOLERANCE
+    if max_iterations is None:
+        max_iterations = MAX_ITERATIONS
+    spots = np.ascontiguousarray(spots, dtype=np.float32)
+    jacobians = np.ascontiguousarray(jacobians, dtype=np.float64)
+    residuals = np.ascontiguousarray(residuals, dtype=np.float64)
+    initial_parameters = np.ascontiguousarray(
+        initial_parameters, dtype=np.float64
+    )
+    variance, use_variance = resolve_variance(variance, spots.shape, ndim=4)
+    outputs = _allocate_outputs(len(spots), n_params)
+    return (
+        spots,
+        variance,
+        use_variance,
+        jacobians,
+        residuals,
+        initial_parameters,
+        float(tolerance),
+        int(max_iterations),
+        outputs,
+    )
+
+
+def _kernel_args_multichannel(
+    variance: np.ndarray,
+    use_variance: bool,
+    kind: int,
+    jacobians: np.ndarray,
+    residuals: np.ndarray,
+    initial_parameters: np.ndarray,
+    mle: bool,
+    tolerance: float,
+    max_iterations: int,
+    outputs: tuple,
+) -> tuple:
+    """Freeze everything :func:`_fit_gauss_spot_multichannel` needs after
+    ``index``."""
+    thetas, chi_squares, states, iterations = outputs
+    return (
+        variance,
+        bool(use_variance),
+        int(kind),
+        jacobians,
+        residuals,
+        initial_parameters,
+        bool(mle),
+        float(tolerance),
+        int(max_iterations),
+        thetas,
+        chi_squares,
+        states,
+        iterations,
+    )
+
+
+def fit_spots_multichannel(
+    kind: int,
+    spots: np.ndarray,
+    jacobians: np.ndarray,
+    residuals: np.ndarray,
+    initial_parameters: np.ndarray,
+    mle: bool = False,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+    variance: np.ndarray | None = None,
+) -> tuple:
+    """Jointly fit several registered channels with an isotropic Gaussian.
+
+    Signature-compatible with
+    :func:`picasso.fitting.gaussfit_cuda.fit_spots_multichannel`, so the two
+    are interchangeable backends.
+
+    Parameters
+    ----------
+    kind : int
+        :data:`MULTI_KIND_SHARED` or :data:`MULTI_KIND_DECOUPLED`.
+    spots : np.ndarray
+        Channel-major ``(n_spots, n_channels, box, box)`` photon counts.
+    jacobians : np.ndarray
+        ``(n_spots, n_channels, 4)`` per-spot, per-channel local Jacobian
+        ``[a00, a01, a10, a11]`` of the channel transform.
+    residuals : np.ndarray
+        ``(n_spots, n_channels, 2)`` sub-pixel ROI offsets in ``[x, y]``, the
+        fractional part the integer box origin cannot express. Channel 0 is
+        zero.
+    initial_parameters : np.ndarray
+        ``(n_spots, n_params)`` seeds, from
+        ``localize._initial_parameters_gauss_multichannel``.
+    mle : bool, optional
+        Use the Poisson maximum-likelihood estimator instead of least squares.
+    tolerance, max_iterations : optional
+        ``None`` uses :data:`TOLERANCE` / :data:`MAX_ITERATIONS`.
+    progress_callback : callable, "console" or None, optional
+        Reported per spot.
+    variance : np.ndarray, optional
+        Per-pixel sCMOS readout variance laid out exactly like ``spots``.
+
+    Returns
+    -------
+    thetas, chi_squares, states, iterations
+    """
+    (
+        spots,
+        variance,
+        use_variance,
+        jacobians,
+        residuals,
+        initial_parameters,
+        tolerance,
+        max_iterations,
+        outputs,
+    ) = _prepare_multichannel(
+        kind,
+        spots,
+        jacobians,
+        residuals,
+        initial_parameters,
+        tolerance,
+        max_iterations,
+        variance,
+    )
+    args = _kernel_args_multichannel(
+        variance,
+        use_variance,
+        kind,
+        jacobians,
+        residuals,
+        initial_parameters,
+        mle,
+        tolerance,
+        max_iterations,
+        outputs,
+    )
+    use_tqdm = progress_callback == "console"
+    index_range = range(len(spots))
+    if use_tqdm:
+        index_range = tqdm(index_range, desc="Fitting", unit="spot")
+    for index in index_range:
+        _fit_gauss_spot_multichannel(spots, index, *args)
+        if callable(progress_callback):
+            progress_callback(index + 1)
+    return outputs
+
+
+def _worker_multichannel(
+    spots: np.ndarray, args: tuple, current: list, lock, stop: np.ndarray
+) -> None:
+    """Worker for asynchronous multichannel fitting."""
+    n_spots = len(spots)
+    while True:
+        with lock:
+            if stop[0] or current[0] == n_spots:
+                return
+            index = current[0]
+            current[0] += 1
+        _fit_gauss_spot_multichannel(spots, index, *args)
+
+
+def fit_spots_multichannel_async(
+    kind: int,
+    spots: np.ndarray,
+    jacobians: np.ndarray,
+    residuals: np.ndarray,
+    initial_parameters: np.ndarray,
+    mle: bool = False,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+    n_threads: int | None = None,
+    variance: np.ndarray | None = None,
+) -> AsyncFit:
+    """Jointly fit registered channels on several CPU threads.
+
+    The multichannel counterpart of :func:`fit_spots_async`: it returns
+    immediately and the caller polls the handle for progress, aborts it, or
+    checks it for worker errors. The kernels are ``nogil``, so this is
+    *threads*, not processes.
+
+    See :func:`fit_spots_multichannel` for the full description of the
+    arguments it shares with the serial fit.
+
+    Parameters
+    ----------
+    kind : int
+        :data:`MULTI_KIND_SHARED` or :data:`MULTI_KIND_DECOUPLED`.
+    spots : np.ndarray
+        Channel-major ``(n_spots, n_channels, box, box)`` photon counts.
+    jacobians : np.ndarray
+        ``(n_spots, n_channels, 4)`` per-spot, per-channel local Jacobian
+        ``[a00, a01, a10, a11]`` of the channel transform.
+    residuals : np.ndarray
+        ``(n_spots, n_channels, 2)`` sub-pixel ROI offsets in ``[x, y]``.
+    initial_parameters : np.ndarray
+        ``(n_spots, n_params)`` seeds.
+    mle : bool, optional
+        Use the Poisson maximum-likelihood estimator instead of least squares.
+    tolerance, max_iterations : optional
+        ``None`` uses :data:`TOLERANCE` / :data:`MAX_ITERATIONS`.
+    n_threads : int, optional
+        Worker threads to run. None (the default) uses :func:`n_workers`.
+    variance : np.ndarray, optional
+        Per-pixel sCMOS readout variance laid out exactly like ``spots``.
+
+    Returns
+    -------
+    job : picasso.fitting.splinefit.AsyncFit
+        Handle on the running fit. Its result arrays are filled in place, so
+        they are only meaningful once ``job.finished()`` is True.
+    """
+    (
+        spots,
+        variance,
+        use_variance,
+        jacobians,
+        residuals,
+        initial_parameters,
+        tolerance,
+        max_iterations,
+        outputs,
+    ) = _prepare_multichannel(
+        kind,
+        spots,
+        jacobians,
+        residuals,
+        initial_parameters,
+        tolerance,
+        max_iterations,
+        variance,
+    )
+    args = _kernel_args_multichannel(
+        variance,
+        use_variance,
+        kind,
+        jacobians,
+        residuals,
+        initial_parameters,
+        mle,
+        tolerance,
+        max_iterations,
+        outputs,
+    )
+    n_spots = len(spots)
+    if n_threads is None:
+        n_threads = n_workers()
+    n_threads = max(1, min(int(n_threads), max(n_spots, 1)))
+    lock = threading.Lock()
+    current = [0]
+    stop = np.zeros(1, dtype=np.uint8)
+    executor = futures.ThreadPoolExecutor(n_threads)
+    fs = [
+        executor.submit(_worker_multichannel, spots, args, current, lock, stop)
+        for _ in range(n_threads)
+    ]
+    executor.shutdown(wait=False)
+    return AsyncFit(current, *outputs, fs, stop)

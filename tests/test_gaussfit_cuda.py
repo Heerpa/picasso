@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 
 from picasso import localize
-from picasso.fitting import gaussfit_cuda, lmfit_cuda, splinefit
+from picasso.fitting import gaussfit, gaussfit_cuda, lmfit_cuda, splinefit
 
 pytestmark = pytest.mark.skipif(
     not lmfit_cuda.CUDA_AVAILABLE, reason="no CUDA device"
@@ -364,3 +364,182 @@ class TestApi:
         )
         assert states[0] != splinefit.FIT_STATE_CONVERGED
         assert np.isnan(thetas[0]).all()
+
+
+# ----------------------------------------------------------------------
+# Multichannel (joint) spherical Gaussian
+# ----------------------------------------------------------------------
+
+MULTI_BOX = 13
+MULTI_CENTRE = (MULTI_BOX - 1) / 2.0
+MULTI_JAC = np.array(
+    [[1.0, 0.0, 0.0, 1.0], [0.995, 0.03, -0.028, 1.004]], dtype=np.float64
+)
+MULTI_RES = np.array([[0.0, 0.0], [0.37, -0.22]], dtype=np.float64)
+
+
+def _multi_batch(n, amps, bgs, seed=1, box=MULTI_BOX):
+    """Two-channel spots, each channel rendered where its own Jacobian and
+    sub-pixel residual put the shared position."""
+    rng = np.random.RandomState(seed)
+    n_channels = len(amps)
+    j, i = np.mgrid[0:box, 0:box].astype(np.float64)
+    spots = np.zeros((n, n_channels, box, box), dtype=np.float32)
+    for k in range(n):
+        x = MULTI_CENTRE + rng.uniform(-1.5, 1.5)
+        y = MULTI_CENTRE + rng.uniform(-1.5, 1.5)
+        sigma = rng.uniform(1.1, 1.5)
+        for c in range(n_channels):
+            a00, a01, a10, a11 = MULTI_JAC[c]
+            dx, dy = x - MULTI_CENTRE, y - MULTI_CENTRE
+            sx = MULTI_CENTRE + a00 * dx + a01 * dy + MULTI_RES[c, 0]
+            sy = MULTI_CENTRE + a10 * dx + a11 * dy + MULTI_RES[c, 1]
+            spots[k, c] = rng.poisson(
+                amps[c]
+                * np.exp(-0.5 * ((i - sx) ** 2 + (j - sy) ** 2) / sigma**2)
+                + bgs[c]
+            )
+    jac = np.tile(MULTI_JAC[:n_channels], (n, 1, 1))
+    res = np.tile(MULTI_RES[:n_channels], (n, 1, 1))
+    return spots, jac, res
+
+
+def _multi_seed(spots, link_photons):
+    n, n_channels = spots.shape[0], spots.shape[1]
+    if link_photons:
+        seed = np.zeros((n, 5))
+        ref = spots[:, 0]
+        seed[:, 0] = ref.max(axis=(1, 2)) - ref.min(axis=(1, 2))
+        seed[:, 1] = MULTI_CENTRE
+        seed[:, 2] = MULTI_CENTRE
+        seed[:, 3] = 1.3
+        seed[:, 4] = ref.min(axis=(1, 2))
+        return seed
+    seed = np.zeros((n, 3 + 2 * n_channels))
+    seed[:, 0] = MULTI_CENTRE
+    seed[:, 1] = MULTI_CENTRE
+    seed[:, 2] = 1.3
+    for c in range(n_channels):
+        chan = spots[:, c]
+        seed[:, 3 + c] = chan.max(axis=(1, 2)) - chan.min(axis=(1, 2))
+        seed[:, 3 + n_channels + c] = chan.min(axis=(1, 2))
+    return seed
+
+
+class TestMultichannelCpuGpuEquivalence:
+    """The two devices run the identical algorithm, so in double precision and
+    under a fixed iteration budget they must agree to machine precision -
+    states and iteration counts included."""
+
+    @pytest.mark.parametrize(
+        "kind, link_photons",
+        [
+            (gaussfit_cuda.MULTI_KIND_SHARED, True),
+            (gaussfit_cuda.MULTI_KIND_DECOUPLED, False),
+        ],
+        ids=["shared", "decoupled"],
+    )
+    @pytest.mark.parametrize("mle", [False, True], ids=["lsq", "mle"])
+    def test_matches_the_cpu_backend(self, kind, link_photons, mle):
+        spots, jac, res = _multi_batch(60, [500.0, 220.0], [12.0, 6.0])
+        seed = _multi_seed(spots, link_photons)
+        kwargs = dict(mle=mle, tolerance=1e-6, max_iterations=60)
+
+        cpu = gaussfit.fit_spots_multichannel(
+            kind, spots, jac, res, seed, **kwargs
+        )
+        gpu = gaussfit_cuda.fit_spots_multichannel(
+            kind, spots, jac, res, seed, single_precision=False, **kwargs
+        )
+
+        np.testing.assert_allclose(gpu[0], cpu[0], rtol=1e-8, atol=1e-8)
+        np.testing.assert_allclose(gpu[1], cpu[1], rtol=1e-8, atol=1e-8)
+        np.testing.assert_array_equal(gpu[2], cpu[2])
+        np.testing.assert_array_equal(gpu[3], cpu[3])
+
+    def test_matches_the_cpu_backend_with_a_noise_model(self):
+        spots, jac, res = _multi_batch(40, [500.0, 220.0], [12.0, 6.0])
+        seed = _multi_seed(spots, True)
+        rng = np.random.RandomState(0)
+        variance = rng.uniform(1.0, 50.0, spots.shape).astype(np.float32)
+        kwargs = dict(mle=True, tolerance=1e-6, max_iterations=60)
+
+        cpu = gaussfit.fit_spots_multichannel(
+            gaussfit_cuda.MULTI_KIND_SHARED,
+            spots,
+            jac,
+            res,
+            seed,
+            variance=variance,
+            **kwargs,
+        )
+        gpu = gaussfit_cuda.fit_spots_multichannel(
+            gaussfit_cuda.MULTI_KIND_SHARED,
+            spots,
+            jac,
+            res,
+            seed,
+            variance=variance,
+            single_precision=False,
+            **kwargs,
+        )
+
+        np.testing.assert_allclose(gpu[0], cpu[0], rtol=1e-8, atol=1e-8)
+
+
+class TestMultichannelKernelCache:
+    def test_decoupled_compiles_one_kernel_per_channel_count(self):
+        """Its parameter count is ``3 + 2C`` and a device-local array needs a
+        compile-time shape, so C selects the kernel."""
+        kind = gaussfit_cuda.MULTI_KIND_DECOUPLED
+        first = gaussfit_cuda._get_kernel_multichannel(kind, 2, True)
+        again = gaussfit_cuda._get_kernel_multichannel(kind, 2, True)
+        other = gaussfit_cuda._get_kernel_multichannel(kind, 3, True)
+        assert first is again
+        assert first is not other
+
+    def test_shared_model_reuses_one_kernel_across_channel_counts(self):
+        """It has five parameters whatever C is, so it loops over the channels
+        at run time instead of specializing."""
+        kind = gaussfit_cuda.MULTI_KIND_SHARED
+        assert gaussfit_cuda._get_kernel_multichannel(
+            kind, 2, True
+        ) is gaussfit_cuda._get_kernel_multichannel(kind, 5, True)
+
+    def test_precision_selects_a_different_kernel(self):
+        kind = gaussfit_cuda.MULTI_KIND_SHARED
+        assert gaussfit_cuda._get_kernel_multichannel(
+            kind, 2, True
+        ) is not gaussfit_cuda._get_kernel_multichannel(kind, 2, False)
+
+    def test_rejects_an_unknown_model(self):
+        with pytest.raises(ValueError, match="Unknown multichannel"):
+            gaussfit_cuda._get_kernel_multichannel(99, 2, True)
+
+
+class TestMultichannelInputValidation:
+    """Shape checking is shared with the CPU backend, so it must still fire."""
+
+    def test_rejects_a_channel_mismatch_in_the_jacobians(self):
+        spots, jac, res = _multi_batch(4, [500.0, 220.0], [12.0, 6.0])
+        seed = _multi_seed(spots, True)
+        with pytest.raises(ValueError, match="jacobians"):
+            gaussfit_cuda.fit_spots_multichannel(
+                gaussfit_cuda.MULTI_KIND_SHARED,
+                spots,
+                jac[:, :1],
+                res,
+                seed,
+            )
+
+    def test_rejects_channel_minor_spots(self):
+        spots, jac, res = _multi_batch(4, [500.0, 220.0], [12.0, 6.0])
+        seed = _multi_seed(spots, True)
+        with pytest.raises(ValueError, match="channel-major"):
+            gaussfit_cuda.fit_spots_multichannel(
+                gaussfit_cuda.MULTI_KIND_SHARED,
+                spots.transpose(0, 2, 3, 1),
+                jac,
+                res,
+                seed,
+            )

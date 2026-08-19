@@ -10,9 +10,9 @@ Localize allows performing super-resolution reconstruction of image stacks. For 
 The following PSF models are implemented:
 
 - Elliptical Gaussian. Fits independent widths ``sx`` and ``sy``.
-- Spherical (isotropic) Gaussian. Fits a single shared width, so ``sx`` and ``sy`` are always equal. The ``ellipticity`` column is not saved for this model.
+- Spherical (isotropic) Gaussian. Fits a single shared width, so ``sx`` and ``sy`` are always equal. The ``ellipticity`` column is not saved for this model. Supports multichannel fitting as well, see `Multichannel 2D Gaussian fitting`_ below.
 - Rotated elliptical Gaussian. The fitted in-plane rotation angle is saved in the ``angle`` column, in degrees.
-- Experimental PSF (cubic spline). Fits an experimentally measured PSF; a 3D calibration recovers ``z`` directly; see `Experimental PSF (cubic-spline) fitting`_ below.
+- Experimental PSF (cubic spline). Fits an experimentally measured PSF; a 3D calibration recovers ``z`` directly; see `Experimental PSF (cubic-spline) fitting`_ below. Supports multichannel fitting as well, see `Multichannel spline PSF (e.g. biplane)`_ below.
 
 In addition, ``Average of ROI`` is available as a non-fitting option that simply sums the intensity of each spot.
 
@@ -540,3 +540,70 @@ A few things to be aware of in this mode:
 If the loaded calibration's registration is off, re-align it first: ``Calibration`` > ``Re-align channels (current signal)`` re-fits the inter-channel transform from the current blinking data (use a high ``Min. net gradient``, so only bright spots are paired) and updates the loaded calibration in memory. It keeps the calibration's own model unless another is picked in the dialog, and reports the model it actually fitted — if too few pairs survive for the model asked for, it falls back to an affine and says so. The channel sum is then built from the refined transforms — any sum made before the re-alignment is discarded, so run ``Identify`` again afterwards. This is worth doing whenever the bead stack and the measurement were not acquired one after another, since the sum is only as sharp as the registration: a misaligned channel smears the summed spot and lowers its net gradient, which is exactly the signal the mode relies on.
 
 The same is available from a script via :func:`picasso.localize.identify_multichannel_sum` (and :class:`picasso.localize.SummedChannelsMovie` for the summed view itself).
+
+Multichannel 2D Gaussian fitting
+--------------------------------
+
+Several spatially-registered channels can also be fitted jointly with a **spherical Gaussian**, sharing one ``x``, ``y`` and width per molecule. This is the same global-fitting idea as `Multichannel spline PSF (e.g. biplane)`_ above (globLoc, `Li et al., Nature Communications 13, 3133 (2022) <https://doi.org/10.1038/s41467-022-30719-4>`_), but it needs **no measured PSF** — only a *channel registration*, which says where each channel sits relative to the first.
+
+It is available for the ``2D spherical Gaussian`` model only: a joint fit ties the channels together through one shared width, which the elliptical and rotated models do not have.
+
+*This feature is experimental — please report any unexpected behavior on our* `GitHub issues page <https://github.com/jungmannlab/picasso/issues>`_.
+
+Registering the channels
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Load the channels first, in either of the two layouts:
+
+- **Separate movies** — ``File`` > ``Open channels from several movies``, or ``Open one multichannel movie`` for a single file holding several. **The first channel loaded is the reference channel.**
+- **Split field of view** — if the channels are imaged side by side on one sensor, load the single movie, tick **Regions = channels** in the ``Parameters`` dialog and drag one ROI onto each channel. **The first region is the reference channel**; all regions are kept the same size.
+
+Either way the localizations come out in the reference channel's coordinates.
+
+Then build a registration with ``Calibration`` > ``Register channels (2D)``, which offers two ways to measure it:
+
+- **From bead images...** — pick one image of fiducial beads per channel, reference first (in split-FOV mode, the single bead image holding every region). Beads are detected and fitted with the current ``Box side length`` and ``Min. net gradient``, matched to the reference channel's beads, and a transform is fitted per channel with outlier pairs dropped.
+
+  Tick **Each frame is a different field of view** when the bead movie scans several stage positions rather than repeating one field. Beads are then detected frame by frame and **only ever paired with beads in the same frame** — every field images onto the same sensor coordinates, so pooling them would pair beads that are nowhere near each other — while every field's pairs constrain the one transform. More fields means more correspondences and a better-conditioned fit, which matters most for the flexible models. Left unticked, the frames are treated as repeats of a single field and averaged to beat down the noise, which is what a plain bead acquisition wants.
+
+- **From current signal...** — measure the registration from the loaded movies themselves, with no extra acquisition. The channels are frame-synchronized, so the same molecule blinks in every channel in the *same* frame; pairing those detections frame by frame pins down the inter-channel transform. A dialog asks for the frame window and how many frames are evenly sampled from it, and the detection uses the current identification settings. **Use a high** ``Min. net gradient`` **so only bright, unambiguous spots are paired.**
+
+  This route both **builds** a registration from scratch and **re-aligns** one that has drifted: when a registration is already loaded it seeds the pairing, otherwise the pairing is bootstrapped from the data alone.
+
+``Transform model`` chooses how the channels are related — ``affine`` (the default), ``projective``, ``polynomial2`` or ``polynomial3`` — with the same trade-offs as described under *Lateral corrections of x and y* above.
+
+The registration is saved as a small ``.yaml`` (by default ``<movie>_channel_reg.yaml``) and loaded straight away. Picasso reports, per channel, how many correspondences were paired and the residual RMS in camera pixels — check those before fitting: a registration built from too few pairs, or with an RMS approaching a pixel, will hold the channels together at the wrong place.
+
+Fitting
+~~~~~~~
+
+1. Open ``Analyze`` > ``Parameters`` and set **Model** to ``2D spherical Gaussian``.
+2. In the **Multichannel: channel registration** box, click ``Load registration`` and choose the ``.yaml`` (``Clear`` drops it again).
+3. Choose the **Optimizer** — ``Least squares`` or ``MLE``. ``MLE`` is recommended.
+4. Decide whether to link the photon counts (below).
+5. Tick **Use GPU** to fit on the GPU; leave it unticked for the CPU.
+6. Identify the channels, then run ``Analyze`` > ``Fit`` (or ``Localize (Identify & Fit)``).
+
+Only molecules detected in *every* channel are fitted, so identify each channel first — with several channels loaded, ``Identify`` (Ctrl+I) analyzes all of them in turn. In split-FOV mode the whole movie is identified at once and the detections are split by region, so nothing extra is needed; they are confined to the reference region automatically, and one localization comes out per molecule. When one channel is much dimmer than the others, identify on the channel sum instead; see `Identifying on the sum of the channels`_ above, which works from a loaded channel registration exactly as it does from a spline calibration.
+
+**With no registration loaded, nothing changes:** the spherical Gaussian fits the active channel alone, as before. The joint fit runs only when a registration is loaded *and* the data actually has several channels — either several movies open, or ``Regions = channels`` with a split-FOV registration.
+
+Linking the photon counts
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Link photon counts across channels is off by default.
+
+A multichannel spline calibration carries one measured PSF per channel, and with it that channel's own brightness, so linking there means "one molecule's total emission, split as the calibration says". A channel registration carries no such brightness information — only geometry. Linking would therefore mean *the same photon count in every channel*, which is right for equally split, redundant channels and wrong for an uneven beam splitter or for channels of different spectral throughput.
+
+So, unless the channels are known to be balanced:
+
+- **Unlinked (default)** — each channel fits its own photon count and background; only ``x``, ``y`` and the width are shared. Adds per-channel columns, one set per channel ``c``:
+
+  - ``photons_ch<c>`` and ``bg_ch<c>`` — that channel's photon count and background,
+  - ``rel_photons_ch<c>`` — that channel's share of the total photons, so the values sum to 1 per localization.
+
+  Supported for 2 to 6 channels.
+
+- **Linked** — one photon count and background shared across the channels.
+
+In both modes ``photons`` and ``bg`` are the **totals across all channels**, so the two are directly comparable with each other and with the spline fit.
