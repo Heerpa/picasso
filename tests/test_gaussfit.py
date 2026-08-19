@@ -24,11 +24,19 @@ against, in two directions:
 
 from __future__ import annotations
 
+from concurrent import futures
+
 import numpy as np
 import pytest
 
 from picasso import gausslq, localize
-from picasso.fitting import gaussfit, gaussfit_cuda, lmfit_cuda, splinefit
+from picasso.fitting import (
+    gaussfit,
+    gaussfit_cuda,
+    lmfit_cuda,
+    precision,
+    splinefit,
+)
 
 BOX = 7
 CENTRE = (BOX - 1) / 2.0
@@ -607,3 +615,426 @@ class TestNonPositiveModelIsAbandoned:
         assert converged.sum() > 0.8 * len(noisy_batch)
         assert np.all(np.isfinite(chi[converged]))
         assert np.all(fitted[converged, 5] > 0)  # background stayed positive
+
+
+# ----------------------------------------------------------------------
+# Multichannel (joint) spherical Gaussian
+# ----------------------------------------------------------------------
+
+MULTI_BOX = 13
+MULTI_CENTRE = (MULTI_BOX - 1) / 2.0
+
+# Channel 1 carries a real rotation/scale AND a sub-pixel ROI residual, so a
+# kernel that dropped either would be caught.
+MULTI_JAC = np.array(
+    [[1.0, 0.0, 0.0, 1.0], [0.995, 0.03, -0.028, 1.004]], dtype=np.float64
+)
+MULTI_RES = np.array([[0.0, 0.0], [0.37, -0.22]], dtype=np.float64)
+
+
+def _multi_spot(box, sx, sy, amp, sigma, bg):
+    j, i = np.mgrid[0:box, 0:box].astype(np.float64)
+    return amp * np.exp(-0.5 * ((i - sx) ** 2 + (j - sy) ** 2) / sigma**2) + bg
+
+
+def _multi_batch(n, amps, bgs, seed=1, box=MULTI_BOX):
+    """``(spots, truth)`` for a two-channel joint fit.
+
+    Every channel's spot sits where the shared position maps to *through that
+    channel's own Jacobian and sub-pixel residual*, which is exactly where the
+    kernel evaluates its model."""
+    rng = np.random.RandomState(seed)
+    n_channels = len(amps)
+    spots = np.zeros((n, n_channels, box, box), dtype=np.float32)
+    truth = np.zeros((n, 3))
+    for k in range(n):
+        x = MULTI_CENTRE + rng.uniform(-1.5, 1.5)
+        y = MULTI_CENTRE + rng.uniform(-1.5, 1.5)
+        sigma = rng.uniform(1.1, 1.5)
+        truth[k] = (x, y, sigma)
+        for c in range(n_channels):
+            a00, a01, a10, a11 = MULTI_JAC[c]
+            sx = a00 * x + a01 * y + MULTI_RES[c, 0]
+            sy = a10 * x + a11 * y + MULTI_RES[c, 1]
+            spots[k, c] = rng.poisson(
+                _multi_spot(box, sx, sy, amps[c], sigma, bgs[c])
+            )
+    return spots, truth
+
+
+def _multi_geometry(n, n_channels=2):
+    jac = np.tile(MULTI_JAC[:n_channels], (n, 1, 1))
+    res = np.tile(MULTI_RES[:n_channels], (n, 1, 1))
+    return jac, res
+
+
+def _shared_seed(spots):
+    n = len(spots)
+    seed = np.zeros((n, 5))
+    ref = spots[:, 0]
+    seed[:, 0] = ref.max(axis=(1, 2)) - ref.min(axis=(1, 2))
+    seed[:, 1] = MULTI_CENTRE
+    seed[:, 2] = MULTI_CENTRE
+    seed[:, 3] = 1.3
+    seed[:, 4] = ref.min(axis=(1, 2))
+    return seed
+
+
+def _decoupled_seed(spots):
+    n, n_channels = spots.shape[0], spots.shape[1]
+    seed = np.zeros((n, 3 + 2 * n_channels))
+    seed[:, 0] = MULTI_CENTRE
+    seed[:, 1] = MULTI_CENTRE
+    seed[:, 2] = 1.3
+    for c in range(n_channels):
+        chan = spots[:, c]
+        seed[:, 3 + c] = chan.max(axis=(1, 2)) - chan.min(axis=(1, 2))
+        seed[:, 3 + n_channels + c] = chan.min(axis=(1, 2))
+    return seed
+
+
+class TestMultichannelReducesToSingleChannel:
+    """The single-channel fit is the identity-Jacobian, zero-residual case of
+    the multichannel one, so at one channel the two must agree exactly. This is
+    the cheapest possible check on the Jacobian chain rule and its signs."""
+
+    @pytest.mark.parametrize("mle", [False, True], ids=["lsq", "mle"])
+    def test_matches_the_single_channel_spherical_fit(self, mle):
+        rng = np.random.RandomState(0)
+        n = 30
+        spots = np.zeros((n, BOX, BOX), dtype=np.float32)
+        for k in range(n):
+            spots[k] = rng.poisson(
+                _multi_spot(
+                    BOX,
+                    CENTRE + rng.uniform(-1, 1),
+                    CENTRE + rng.uniform(-1, 1),
+                    rng.uniform(200, 500),
+                    rng.uniform(1.0, 1.6),
+                    rng.uniform(5, 20),
+                )
+            )
+        seed = localize._initial_parameters_gauss(
+            spots, BOX, spherical=True
+        ).astype(np.float64)
+
+        single = gaussfit.fit_spots(gaussfit.SPHERICAL, spots, seed, mle=mle)
+        multi = gaussfit.fit_spots_multichannel(
+            gaussfit.MULTI_KIND_SHARED,
+            spots[:, None, :, :],
+            np.tile(np.array([1.0, 0.0, 0.0, 1.0]), (n, 1, 1)),
+            np.zeros((n, 1, 2)),
+            seed,
+            mle=mle,
+        )
+
+        np.testing.assert_allclose(multi[0], single[0], rtol=0, atol=1e-9)
+        np.testing.assert_allclose(multi[1], single[1], rtol=0, atol=1e-8)
+        np.testing.assert_array_equal(multi[2], single[2])
+        np.testing.assert_array_equal(multi[3], single[3])
+
+
+class TestMultichannelFits:
+    """Joint fits across two registered channels."""
+
+    @pytest.mark.parametrize("mle", [False, True], ids=["lsq", "mle"])
+    def test_shared_model_recovers_the_shared_position(self, mle):
+        n = 200
+        spots, truth = _multi_batch(n, [400.0, 400.0], [10.0, 10.0])
+        jac, res = _multi_geometry(n)
+
+        theta, _, _, _ = gaussfit.fit_spots_multichannel(
+            gaussfit.MULTI_KIND_SHARED,
+            spots,
+            jac,
+            res,
+            _shared_seed(spots),
+            mle=mle,
+        )
+
+        ok = np.isfinite(theta).all(axis=1)
+        assert ok.sum() > 0.95 * n
+        # unbiased in the reference channel's frame, despite channel 1 sitting
+        # at a rotated, sub-pixel-shifted ROI
+        assert abs(np.mean(theta[ok, 1] - truth[ok, 0])) < 0.05
+        assert abs(np.mean(theta[ok, 2] - truth[ok, 1])) < 0.05
+        assert abs(np.mean(theta[ok, 3] - truth[ok, 2])) < 0.05
+
+    def test_dropping_the_sub_pixel_residual_biases_the_position(self):
+        """The residual is load-bearing: without it every non-reference
+        channel is evaluated at the nearest whole pixel, which pulls the
+        shared position off by a systematic fraction of a pixel."""
+        n = 200
+        spots, truth = _multi_batch(n, [400.0, 400.0], [10.0, 10.0])
+        jac, res = _multi_geometry(n)
+        seed = _shared_seed(spots)
+
+        with_res, _, _, _ = gaussfit.fit_spots_multichannel(
+            gaussfit.MULTI_KIND_SHARED, spots, jac, res, seed, mle=True
+        )
+        without, _, _, _ = gaussfit.fit_spots_multichannel(
+            gaussfit.MULTI_KIND_SHARED,
+            spots,
+            jac,
+            np.zeros_like(res),
+            seed,
+            mle=True,
+        )
+
+        ok = np.isfinite(with_res).all(axis=1) & np.isfinite(without).all(
+            axis=1
+        )
+        bias_with = abs(np.mean(with_res[ok, 1] - truth[ok, 0]))
+        bias_without = abs(np.mean(without[ok, 1] - truth[ok, 0]))
+        assert bias_with < 0.05
+        assert bias_without > 0.1
+        assert bias_without > 5 * bias_with
+
+    @pytest.mark.parametrize("mle", [False, True], ids=["lsq", "mle"])
+    def test_decoupled_model_recovers_per_channel_photons(self, mle):
+        n = 200
+        amps, bgs = [600.0, 220.0], [12.0, 6.0]
+        spots, truth = _multi_batch(n, amps, bgs, seed=3)
+        jac, res = _multi_geometry(n)
+
+        theta, _, _, _ = gaussfit.fit_spots_multichannel(
+            gaussfit.MULTI_KIND_DECOUPLED,
+            spots,
+            jac,
+            res,
+            _decoupled_seed(spots),
+            mle=mle,
+        )
+
+        ok = np.isfinite(theta).all(axis=1)
+        assert ok.sum() > 0.95 * n
+        assert abs(np.mean(theta[ok, 0] - truth[ok, 0])) < 0.05
+        assert abs(np.mean(theta[ok, 1] - truth[ok, 1])) < 0.05
+        # the channels are 3x apart in brightness and each is recovered
+        assert np.mean(theta[ok, 3]) == pytest.approx(amps[0], rel=0.1)
+        assert np.mean(theta[ok, 4]) == pytest.approx(amps[1], rel=0.1)
+        assert np.mean(theta[ok, 5]) == pytest.approx(bgs[0], abs=1.5)
+        assert np.mean(theta[ok, 6]) == pytest.approx(bgs[1], abs=1.5)
+
+    def test_async_matches_the_serial_fit(self):
+        n = 40
+        spots, _ = _multi_batch(n, [400.0, 400.0], [10.0, 10.0])
+        jac, res = _multi_geometry(n)
+        seed = _shared_seed(spots)
+
+        serial = gaussfit.fit_spots_multichannel(
+            gaussfit.MULTI_KIND_SHARED, spots, jac, res, seed, mle=True
+        )
+        job = gaussfit.fit_spots_multichannel_async(
+            gaussfit.MULTI_KIND_SHARED, spots, jac, res, seed, mle=True
+        )
+        futures.wait(job.futures)
+        job.raise_errors()
+
+        np.testing.assert_allclose(job.results()[0], serial[0])
+
+
+class TestMultichannelApi:
+    def test_parameter_counts(self):
+        assert (
+            gaussfit.n_parameters_multichannel(gaussfit.MULTI_KIND_SHARED, 4)
+            == 5
+        )
+        assert (
+            gaussfit.n_parameters_multichannel(
+                gaussfit.MULTI_KIND_DECOUPLED, 4
+            )
+            == 11
+        )
+        with pytest.raises(ValueError, match="Unknown multichannel"):
+            gaussfit.n_parameters_multichannel(99, 2)
+
+    @pytest.mark.parametrize(
+        "bad, match",
+        [
+            ("spots", "channel-major"),
+            ("jacobians", "jacobians must have shape"),
+            ("residuals", "residuals must have shape"),
+            ("initial", "initial_parameters must have shape"),
+        ],
+    )
+    def test_rejects_mismatched_shapes(self, bad, match):
+        n = 5
+        spots, _ = _multi_batch(n, [400.0, 400.0], [10.0, 10.0])
+        jac, res = _multi_geometry(n)
+        seed = _shared_seed(spots)
+        if bad == "spots":
+            spots = spots[:, 0]
+        elif bad == "jacobians":
+            jac = jac[:, :, :3]
+        elif bad == "residuals":
+            res = res[:, :, :1]
+        else:
+            seed = seed[:, :4]
+        with pytest.raises(ValueError, match=match):
+            gaussfit.fit_spots_multichannel(
+                gaussfit.MULTI_KIND_SHARED, spots, jac, res, seed
+            )
+
+    def test_variance_must_match_the_spots(self):
+        n = 5
+        spots, _ = _multi_batch(n, [400.0, 400.0], [10.0, 10.0])
+        jac, res = _multi_geometry(n)
+        with pytest.raises(ValueError, match="same shape as spots"):
+            gaussfit.fit_spots_multichannel(
+                gaussfit.MULTI_KIND_SHARED,
+                spots,
+                jac,
+                res,
+                _shared_seed(spots),
+                variance=np.zeros((n, 2, 3, 3), dtype=np.float32),
+            )
+
+
+class TestMultichannelCrlb:
+    """The reported precision must describe the fit that actually ran, so the
+    CRLB kernels see the same channel Jacobians and sub-pixel residuals the fit
+    kernels do. Checked against the empirical scatter of repeated noisy fits -
+    an efficient MLE attains its Cramer-Rao bound, so the two must agree."""
+
+    N_TRIALS = 4000
+    TRUTH_X, TRUTH_Y, TRUTH_SIGMA = 6.3, 5.8, 1.25
+
+    def _repeats(self, amps, bgs, seed):
+        """``N_TRIALS`` independent noisy realizations of one fixed spot."""
+        rng = np.random.RandomState(seed)
+        n_channels = len(amps)
+        spots = np.zeros(
+            (self.N_TRIALS, n_channels, MULTI_BOX, MULTI_BOX),
+            dtype=np.float32,
+        )
+        for c in range(n_channels):
+            a00, a01, a10, a11 = MULTI_JAC[c]
+            sx = a00 * self.TRUTH_X + a01 * self.TRUTH_Y + MULTI_RES[c, 0]
+            sy = a10 * self.TRUTH_X + a11 * self.TRUTH_Y + MULTI_RES[c, 1]
+            clean = _multi_spot(
+                MULTI_BOX, sx, sy, amps[c], self.TRUTH_SIGMA, bgs[c]
+            )
+            spots[:, c] = rng.poisson(
+                np.broadcast_to(clean, (self.N_TRIALS, MULTI_BOX, MULTI_BOX))
+            )
+        return spots
+
+    def test_shared_model_bound_matches_the_empirical_scatter(self):
+        spots = self._repeats([300.0, 300.0], [8.0, 8.0], seed=5)
+        jac, res = _multi_geometry(self.N_TRIALS)
+        seed = _shared_seed(spots)
+        seed[:, 1] = self.TRUTH_X
+        seed[:, 2] = self.TRUTH_Y
+        seed[:, 3] = self.TRUTH_SIGMA
+
+        theta, _, _, _ = gaussfit.fit_spots_multichannel(
+            gaussfit.MULTI_KIND_SHARED,
+            spots,
+            jac,
+            res,
+            seed,
+            mle=True,
+            tolerance=1e-6,
+            max_iterations=200,
+        )
+        ok = np.isfinite(theta).all(axis=1)
+        # the CRLB is parametrized in photons, not peak height, and takes the
+        # shared parameters first: [x, y, sigma, N, bg]
+        photons = theta[:, 0] * 2 * np.pi * theta[:, 3] ** 2
+        theta_n = np.column_stack(
+            [theta[:, 1], theta[:, 2], theta[:, 3], photons, theta[:, 4]]
+        )
+        crlb = precision._gauss_crlb_multichannel(
+            theta_n, MULTI_BOX, jac, res, mle=True, link_photons=True
+        )
+
+        # the variances come back in the order they were given
+        for column, empirical in (
+            (0, theta[ok, 1].std()),
+            (1, theta[ok, 2].std()),
+            (2, theta[ok, 3].std()),
+            (3, photons[ok].std()),
+            (4, theta[ok, 4].std()),
+        ):
+            predicted = np.sqrt(np.nanmedian(crlb[ok, column]))
+            assert predicted == pytest.approx(empirical, rel=0.1)
+
+    def test_decoupled_model_bound_matches_the_empirical_scatter(self):
+        amps, bgs = [500.0, 180.0], [10.0, 5.0]
+        spots = self._repeats(amps, bgs, seed=9)
+        jac, res = _multi_geometry(self.N_TRIALS)
+        seed = _decoupled_seed(spots)
+        seed[:, 0] = self.TRUTH_X
+        seed[:, 1] = self.TRUTH_Y
+        seed[:, 2] = self.TRUTH_SIGMA
+
+        theta, _, _, _ = gaussfit.fit_spots_multichannel(
+            gaussfit.MULTI_KIND_DECOUPLED,
+            spots,
+            jac,
+            res,
+            seed,
+            mle=True,
+            tolerance=1e-6,
+            max_iterations=200,
+        )
+        ok = np.isfinite(theta).all(axis=1)
+        n_channels = len(amps)
+        theta_n = theta.copy()
+        for c in range(n_channels):
+            theta_n[:, 3 + c] = theta[:, 3 + c] * 2 * np.pi * theta[:, 2] ** 2
+        crlb = precision._gauss_crlb_multichannel(
+            theta_n, MULTI_BOX, jac, res, mle=True, link_photons=False
+        )
+
+        for column in (0, 1, 2):  # shared x, y, sigma
+            predicted = np.sqrt(np.nanmedian(crlb[ok, column]))
+            assert predicted == pytest.approx(theta[ok, column].std(), rel=0.1)
+        for c in range(n_channels):
+            predicted = np.sqrt(np.nanmedian(crlb[ok, 3 + c]))
+            assert predicted == pytest.approx(
+                theta_n[ok, 3 + c].std(), rel=0.1
+            )
+            predicted_bg = np.sqrt(np.nanmedian(crlb[ok, 3 + n_channels + c]))
+            assert predicted_bg == pytest.approx(
+                theta[ok, 3 + n_channels + c].std(), rel=0.1
+            )
+
+    @staticmethod
+    def _crlb_theta(n):
+        """A plausible ``[x, y, sigma, N, bg]`` row per localization."""
+        theta = np.zeros((n, 5))
+        theta[:, 0] = MULTI_CENTRE
+        theta[:, 1] = MULTI_CENTRE
+        theta[:, 2] = 1.3
+        theta[:, 3] = 400.0 * 2 * np.pi * 1.3**2
+        theta[:, 4] = 10.0
+        return theta
+
+    def test_non_converged_rows_are_nan(self):
+        n = 6
+        jac, res = _multi_geometry(n)
+        theta = self._crlb_theta(n)
+        theta[2] = np.nan
+
+        crlb = precision._gauss_crlb_multichannel(
+            theta, MULTI_BOX, jac, res, mle=True, link_photons=True
+        )
+
+        assert np.all(np.isnan(crlb[2]))
+        assert np.all(np.isfinite(crlb[0]))
+
+    def test_em_gain_doubles_the_variance(self):
+        n = 20
+        jac, res = _multi_geometry(n)
+        theta = self._crlb_theta(n)
+
+        plain = precision._gauss_crlb_multichannel(
+            theta, MULTI_BOX, jac, res, mle=True, em=False
+        )
+        em = precision._gauss_crlb_multichannel(
+            theta, MULTI_BOX, jac, res, mle=True, em=True
+        )
+
+        np.testing.assert_allclose(em, 2.0 * plain, rtol=1e-9)

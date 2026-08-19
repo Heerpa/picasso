@@ -3842,6 +3842,534 @@ def _fit2d_gauss(
 
 
 # ----------------------------------------------------------------------
+# Multichannel (joint) spherical Gaussian fitting
+#
+# Several registered channels are fitted at once with one shared position and
+# width, the globLoc arrangement (Li et al., Nat. Commun. 13, 3133, 2022) the
+# spline models already use. The channel registration comes from a standalone
+# calibration (see ``picasso.registration``) rather than a PSF calibration, so
+# this needs no measured PSF - only where each channel sits.
+# ----------------------------------------------------------------------
+
+
+def _initial_parameters_gauss_multichannel(
+    spots: np.ndarray,
+    size: int,
+    link_photons: bool = True,
+) -> lib.FloatArray2D:
+    """Seeds for a multichannel spherical Gaussian fit.
+
+    ``spots`` is channel-major ``(n_spots, n_channels, box, box)``. The shared
+    position and width are seeded from the **reference channel**, which is
+    exactly right: its Jacobian is the identity and its ROI residual is zero, so
+    the position that describes its spot *is* the shared position the fit
+    solves for.
+
+    With ``link_photons`` the layout is the single-channel one
+    (``[amplitude, x, y, sigma, background]``) and
+    :func:`_initial_parameters_gauss` is reused unchanged. Otherwise each
+    channel's own photon count and background are seeded from that channel's
+    own spot, giving ``[x, y, sigma, N_0.., bg_0..]``.
+    """
+    n_channels = spots.shape[1]
+    reference = np.ascontiguousarray(spots[:, 0])
+    shared = _initial_parameters_gauss(reference, size, spherical=True)
+    if link_photons:
+        return shared
+    n_spots = len(spots)
+    initial = np.empty((n_spots, 3 + 2 * n_channels), dtype=np.float32)
+    initial[:, 0] = shared[:, 1]
+    initial[:, 1] = shared[:, 2]
+    initial[:, 2] = shared[:, 3]
+    for c in range(n_channels):
+        channel = spots[:, c]
+        channel_min = np.amin(channel, axis=(1, 2))
+        initial[:, 3 + c] = np.amax(channel, axis=(1, 2)) - channel_min
+        initial[:, 3 + n_channels + c] = channel_min
+    return initial
+
+
+def fit_spots_gauss_multichannel(
+    spots: np.ndarray,
+    residuals: np.ndarray,
+    jacobians: np.ndarray,
+    mle: bool = False,
+    link_photons: bool = True,
+    use_gpu: bool | None = None,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+    multiprocess: bool = True,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+    abort_callback: Callable[[], bool] | None = None,
+    variance: np.ndarray | None = None,
+    return_stats: bool = False,
+) -> np.ndarray | tuple | None:
+    """Jointly fit registered channels with a spherical Gaussian.
+
+    The Gaussian counterpart of :func:`fit_spots_spline`, and arranged the same
+    way: the channel-major reshape, the seeds and the convergence schedule are
+    computed once *here*, above the device dispatch, so the CPU and GPU
+    backends are guaranteed to see byte-identical inputs and a comparison
+    between them tests the algebra rather than two translation layers.
+
+    Parameters
+    ----------
+    spots : np.ndarray
+        ``(n_spots, box, box, n_channels)`` photon counts, as
+        :func:`get_spots_multichannel` returns them.
+    residuals, jacobians : np.ndarray
+        The channel geometry from the same call: ``(n_spots, n_channels, 2)``
+        sub-pixel ROI offsets and ``(n_spots, n_channels, 4)`` local Jacobians.
+    mle : bool, optional
+        Poisson maximum likelihood instead of least squares.
+    link_photons : bool, optional
+        Share one amplitude and background across the channels. This assumes
+        every channel collects the same number of photons - see
+        :func:`fit_gauss_multichannel`.
+    use_gpu : bool or None, optional
+        None uses a CUDA GPU when one is available.
+    tolerance, max_iterations : optional
+        Convergence schedule. None uses the method's own, see
+        :func:`gauss_schedule`.
+    multiprocess : bool, optional
+        Run the CPU kernels on a thread pool (they are ``nogil``). Ignored on
+        the GPU, where one launch fits every spot.
+    progress_callback : callable, "console" or None, optional
+        Called with the cumulative number of spots fitted; ``"console"`` shows
+        a progress bar instead.
+    abort_callback : callable, optional
+        Polled during the fit; returning True stops it.
+    variance : np.ndarray, optional
+        Per-pixel sCMOS readout variance in photoelectrons squared, laid out
+        like ``spots``. None fits the plain Poisson model.
+    return_stats : bool, optional
+        Also return ``(log_likelihood, iterations, chi_square)``.
+
+    Returns
+    -------
+    theta : np.ndarray
+        ``[amplitude, x, y, sigma, bg]`` (linked) or
+        ``[x, y, sigma, N_0.., bg_0..]`` (decoupled). The amplitude is a peak
+        height; :func:`locs_from_fits_gauss_multichannel` converts it.
+    log_likelihood, iterations, chi_square
+        Only if ``return_stats``. ``log_likelihood`` is None for least squares
+        and ``chi_square`` is None for maximum likelihood - each estimator
+        reports the goodness of fit that means something for it.
+    None
+        If ``abort_callback`` asked to stop.
+    """
+    n_channels = spots.shape[-1] if spots.ndim == 4 else 1
+    spots = precision._spline_channel_major(np.asarray(spots), n_channels)
+    variance = precision._crlb_variance_channel_major(variance, n_channels)
+    box = spots.shape[2]
+    kind = (
+        gaussfit.MULTI_KIND_SHARED
+        if link_photons
+        else gaussfit.MULTI_KIND_DECOUPLED
+    )
+    use_gpu = _spline_use_gpu(use_gpu)
+    tolerance, max_iterations = gauss_schedule(
+        mle, use_gpu, tolerance, max_iterations
+    )
+    if mle:
+        spots = _clip_for_mle(spots, variance)
+    initial_parameters = _initial_parameters_gauss_multichannel(
+        _seed_spots(spots, variance) if mle else spots,
+        box,
+        link_photons=link_photons,
+    ).astype(np.float64)
+
+    if use_gpu:
+        result = gaussfit_cuda.fit_spots_multichannel(
+            kind,
+            spots,
+            jacobians,
+            residuals,
+            initial_parameters,
+            mle=mle,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
+            progress_callback=progress_callback,
+            abort_callback=abort_callback,
+            variance=variance,
+        )
+        if result is None:
+            return None
+    elif not multiprocess or len(spots) == 0:
+        result = gaussfit.fit_spots_multichannel(
+            kind,
+            spots,
+            jacobians,
+            residuals,
+            initial_parameters,
+            mle=mle,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
+            progress_callback=progress_callback,
+            variance=variance,
+        )
+    else:
+        job = gaussfit.fit_spots_multichannel_async(
+            kind,
+            spots,
+            jacobians,
+            residuals,
+            initial_parameters,
+            mle=mle,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
+            variance=variance,
+        )
+        n_spots = len(spots)
+        while not job.finished():
+            job.raise_errors()
+            if abort_callback is not None and abort_callback():
+                job.stop()
+                return None
+            if callable(progress_callback):
+                progress_callback(min(job.current[0], n_spots))
+            time.sleep(0.1)
+        job.raise_errors()
+        if callable(progress_callback):
+            progress_callback(n_spots)
+        result = job.results()
+
+    theta, chi_squares, _states, iterations = result
+    theta = theta.astype(np.float32)
+    if return_stats:
+        # As for every other Picasso fit: the maximum-likelihood chi-square is
+        # twice the negative Poisson log-likelihood, the least-squares one the
+        # residual sum of squares.
+        log_likelihood = (
+            (-0.5 * chi_squares).astype(np.float32) if mle else None
+        )
+        chi_square = None if mle else chi_squares.astype(np.float32)
+        return theta, log_likelihood, iterations, chi_square
+    return theta
+
+
+def locs_from_fits_gauss_multichannel(
+    identifications: pd.DataFrame,
+    theta: np.ndarray,
+    box: int,
+    em: bool,
+    jacobians: np.ndarray,
+    residuals: np.ndarray,
+    link_photons: bool = True,
+    mle: bool = False,
+    log_likelihood: lib.FloatArray1D | None = None,
+    iterations: lib.FloatArray1D | None = None,
+    chi_square: lib.FloatArray1D | None = None,
+    variance: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Localizations from a multichannel spherical Gaussian fit.
+
+    The positions are in the **reference channel's** coordinates, as for the
+    multichannel spline fit: the fit solves for one shared position and the
+    reference channel's box sits on the detection itself.
+
+    Parameters
+    ----------
+    identifications : pd.DataFrame
+        The detections that were fitted, in the reference channel, with
+        ``frame``, ``x``, ``y`` and ``net_gradient``.
+    theta : np.ndarray
+        Fitted parameters from :func:`fit_spots_gauss_multichannel`, box-local
+        and with the amplitude as a peak height.
+    box : int
+        Box side length (camera pixels), used to place the box-local positions
+        back into the frame.
+    em : bool
+        Whether an EMCCD was used; its excess noise doubles every reported
+        variance.
+    jacobians, residuals : np.ndarray
+        The channel geometry the fit used: ``(n_locs, n_channels, 4)`` local
+        Jacobians and ``(n_locs, n_channels, 2)`` sub-pixel ROI offsets. Passed
+        on to the Cramer-Rao bound, so the reported precision describes the
+        geometry that was actually fitted.
+    link_photons : bool, optional
+        Which model produced ``theta``. Default False.
+    mle : bool, optional
+        Whether ``theta`` came from the maximum-likelihood estimator. Selects
+        the Poisson Cramer-Rao bound over the least-squares sandwich for the
+        reported uncertainties. Default False.
+    log_likelihood, iterations, chi_square : optional
+        Per-spot fit statistics; each is written to a column of the same name
+        when given.
+    variance : np.ndarray, optional
+        Channel-major per-pixel sCMOS readout variance, for the uncertainties.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        The localizations, sorted by ``frame`` (or by ``n_id`` when the
+        identifications carry one). ``photons`` and ``bg`` are the totals
+        **across all channels** in both models, so the two are directly
+        comparable with each other and with the spline path: the decoupled
+        model sums its per-channel counts, and the linked model - which fits
+        one amplitude shared *literally* by every channel - multiplies by the
+        channel count. The decoupled model additionally reports
+        ``photons_ch{c}``, ``bg_ch{c}`` and ``rel_photons_ch{c}`` per channel.
+        Widths appear as ``sx`` and ``sy``, both the single fitted sigma; no
+        ``ellipticity`` column is written, since a spherical fit constrains it
+        to zero and it would carry no information.
+    """
+    n_channels = jacobians.shape[1]
+    box_offset = int(box / 2)
+    theta = np.asarray(theta, dtype=np.float64)
+    if link_photons:
+        x_shift, y_shift, sigma = theta[:, 1], theta[:, 2], theta[:, 3]
+        # peak height -> photons, as the single-channel Gaussian fit does
+        photons_per_channel = theta[:, 0] * 2.0 * np.pi * sigma * sigma
+        photons = n_channels * photons_per_channel
+        bg = theta[:, 4]
+        crlb_theta = np.column_stack(
+            [x_shift, y_shift, sigma, photons_per_channel, bg]
+        )
+    else:
+        x_shift, y_shift, sigma = theta[:, 0], theta[:, 1], theta[:, 2]
+        scale = 2.0 * np.pi * sigma * sigma
+        photons_ch = theta[:, 3 : 3 + n_channels] * scale[:, None]
+        bg_ch = theta[:, 3 + n_channels :]
+        photons = photons_ch.sum(axis=1)
+        bg = bg_ch.sum(axis=1)
+        crlb_theta = np.column_stack(
+            [x_shift, y_shift, sigma, photons_ch, bg_ch]
+        )
+
+    crlb = precision._gauss_crlb_multichannel(
+        crlb_theta,
+        box,
+        jacobians,
+        residuals,
+        mle=mle,
+        em=em,
+        link_photons=link_photons,
+        variance=variance,
+    )
+    # Both models put the shared parameters first and the CRLB comes back in
+    # the order it was given, so x, y and sigma are always columns 0, 1, 2.
+    with np.errstate(invalid="ignore"):
+        lpx = np.sqrt(crlb[:, 0])
+        lpy = np.sqrt(crlb[:, 1])
+
+    x = x_shift + identifications["x"] - box_offset
+    y = y_shift + identifications["y"] - box_offset
+    columns = {
+        "frame": identifications["frame"].astype(np.uint32),
+        "x": np.asarray(x, dtype=np.float32),
+        "y": np.asarray(y, dtype=np.float32),
+        "photons": photons.astype(np.float32),
+        "sx": sigma.astype(np.float32),
+        "sy": sigma.astype(np.float32),
+        "bg": bg.astype(np.float32),
+        "lpx": lpx.astype(np.float32),
+        "lpy": lpy.astype(np.float32),
+        "net_gradient": identifications["net_gradient"].astype(np.float32),
+    }
+    if not link_photons:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            total = photons_ch.sum(axis=1)
+            relative = np.where(
+                total[:, None] > 0, photons_ch / total[:, None], np.nan
+            )
+        for c in range(n_channels):
+            columns[f"photons_ch{c}"] = photons_ch[:, c].astype(np.float32)
+            columns[f"bg_ch{c}"] = bg_ch[:, c].astype(np.float32)
+            columns[f"rel_photons_ch{c}"] = relative[:, c].astype(np.float32)
+    with np.errstate(invalid="ignore"):
+        if link_photons:
+            # ``photons`` is n_channels times the fitted per-channel count, so
+            # its uncertainty scales with it.
+            columns["photons_unc"] = (n_channels * np.sqrt(crlb[:, 3])).astype(
+                np.float32
+            )
+            columns["bg_unc"] = np.sqrt(crlb[:, 4]).astype(np.float32)
+        else:
+            photon_var = crlb[:, 3 : 3 + n_channels]
+            bg_var = crlb[:, 3 + n_channels :]
+            # independent per-channel estimates, so their variances add
+            columns["photons_unc"] = np.sqrt(
+                np.nansum(photon_var, axis=1)
+            ).astype(np.float32)
+            columns["bg_unc"] = np.sqrt(np.nansum(bg_var, axis=1)).astype(
+                np.float32
+            )
+        sigma_unc = np.sqrt(crlb[:, 2]).astype(np.float32)
+    columns["sx_unc"] = sigma_unc
+    columns["sy_unc"] = sigma_unc
+    if log_likelihood is not None:
+        columns["log_likelihood"] = np.asarray(log_likelihood).astype(
+            np.float32
+        )
+    if iterations is not None:
+        columns["iterations"] = np.asarray(iterations).astype(np.int32)
+    if chi_square is not None:
+        columns["chi_square"] = np.asarray(chi_square).astype(np.float32)
+    locs = pd.DataFrame(columns)
+    if "n_id" in identifications.columns:
+        locs["n_id"] = np.asarray(identifications["n_id"]).astype(np.uint32)
+        locs.sort_values(by="n_id", kind="quicksort", inplace=True)
+    else:
+        locs.sort_values(by="frame", kind="quicksort", inplace=True)
+    return locs
+
+
+def fit_gauss_multichannel(
+    movies: list,
+    camera_infos: list[dict],
+    identifications: pd.DataFrame,
+    box: int,
+    channel_registration: dict,
+    mle: bool = False,
+    link_photons: bool = False,
+    use_gpu: bool | None = None,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+    multiprocess: bool = True,
+    progress_callback: Callable[[int], None] | None = None,
+    abort_callback: Callable[[], bool] | None = None,
+    camera_calibrations: list[dict | None] | None = None,
+) -> pd.DataFrame | None:
+    """Fit a spherical Gaussian jointly across several registered channels.
+
+    Global fit in the sense of globLoc (Li et al., Nat. Commun. 13, 3133,
+    2022): every channel contributes to one fit with a linked x, y and width.
+    The Gaussian counterpart of :func:`fit_spline_multichannel`, needing only a
+    channel registration rather than a measured PSF.
+
+    Parameters
+    ----------
+    movies : list
+        One movie per channel; ``movies[0]`` is the reference channel and the
+        order must match the registration's channels.
+    camera_infos : list of dict
+        One camera-info dict per channel.
+    identifications : pd.DataFrame
+        Detections in the reference channel.
+    box : int
+        Box side length (camera pixels).
+    channel_registration : dict
+        A calibration carrying ``channel_transforms``, from
+        :mod:`picasso.registration`.
+    mle : bool, optional
+        Use the Poisson maximum-likelihood estimator. Default False.
+    link_photons : bool, optional
+        Share one photon count and background across the channels. Default
+        **False**, unlike the spline fit: this model has no per-channel
+        brightness scale (a spline calibration carries one in its coefficient
+        table), so linking assumes every channel collects the *same* number of
+        photons - true for equally split, redundant channels and wrong for an
+        uneven beam splitter. The decoupled default fits each channel its own
+        photon count and background, reported as ``photons_ch{c}`` /
+        ``bg_ch{c}`` / ``rel_photons_ch{c}``, and shares only x, y and the
+        width.
+    use_gpu : bool or None, optional
+        Fit on the GPU, the CPU, or (None, the default) whichever is available.
+    tolerance, max_iterations : optional
+        Convergence schedule. None uses the method's own, see
+        :func:`gauss_schedule`.
+    multiprocess : bool, optional
+        Run the CPU kernels on a thread pool (they are ``nogil``). Ignored on
+        the GPU. Default True.
+    progress_callback : callable, optional
+        Called with the cumulative number of spots processed, during both the
+        spot extraction and the fit.
+    abort_callback : callable, optional
+        Polled during the fit; returning True stops it and returns None.
+    camera_calibrations : list of dict or None, optional
+        One per-pixel sCMOS calibration per channel, or None. Individual
+        entries may be None when only some channels sit on a characterized
+        camera.
+
+    Returns
+    -------
+    locs : pd.DataFrame or None
+        Localizations in the reference channel's coordinates - see
+        :func:`locs_from_fits_gauss_multichannel` for the columns - or None if
+        ``abort_callback`` asked to stop.
+
+    Raises
+    ------
+    ValueError
+        If the registration carries no ``channel_transforms``, if the number of
+        movies does not match it, or if the photon-decoupled model is asked for
+        outside the 2 to 6 channel range it supports.
+    """
+    transforms = channel_registration.get("channel_transforms")
+    if not transforms:
+        raise ValueError(
+            "fit_gauss_multichannel needs a calibration with "
+            "'channel_transforms' (see picasso.registration)."
+        )
+    if len(movies) != len(transforms):
+        raise ValueError(
+            f"Got {len(movies)} channels but the registration has "
+            f"{len(transforms)} channel transforms."
+        )
+    if not link_photons:
+        n_channels = len(transforms)
+        if not (2 <= n_channels <= precision._LINK_XYZ_MAX_CHANNELS):
+            raise ValueError(
+                "The photon-decoupled multichannel Gaussian model supports 2 "
+                f"to {precision._LINK_XYZ_MAX_CHANNELS} channels, got "
+                f"{n_channels}."
+            )
+    identifications = multichannel_inbounds_ids(
+        identifications, box, movies, transforms
+    )
+    spots, residuals, variance, jacobians = get_spots_multichannel(
+        movies,
+        identifications,
+        box,
+        camera_infos,
+        transforms,
+        progress_callback=progress_callback,
+        return_residuals=True,
+        camera_calibrations=camera_calibrations,
+        return_variance=True,
+        return_jacobians=True,
+    )
+    result = fit_spots_gauss_multichannel(
+        spots,
+        residuals,
+        jacobians,
+        mle=mle,
+        link_photons=link_photons,
+        use_gpu=use_gpu,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        multiprocess=multiprocess,
+        progress_callback=progress_callback,
+        abort_callback=abort_callback,
+        variance=variance,
+        return_stats=True,
+    )
+    if result is None:
+        return None
+    theta, log_likelihood, iterations, chi_square = result
+    em = camera_infos[0].get("Gain", 1) > 1
+    return locs_from_fits_gauss_multichannel(
+        identifications,
+        theta,
+        box,
+        em,
+        jacobians,
+        residuals,
+        link_photons=link_photons,
+        mle=mle,
+        log_likelihood=log_likelihood,
+        iterations=iterations,
+        chi_square=chi_square,
+        variance=precision._crlb_variance_channel_major(
+            variance, len(transforms)
+        ),
+    )
+
+
+# ----------------------------------------------------------------------
 # Cubic-spline PSF fitting
 #
 # The spline models fit an experimentally measured PSF (a cubic-spline model

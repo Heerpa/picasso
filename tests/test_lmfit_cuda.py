@@ -324,11 +324,20 @@ class TestDeviceSignaturesAgree:
     """
 
     @pytest.mark.parametrize(
-        "module", ["gaussfit_cuda.py", "splinefit_cuda.py"]
+        "module, n_accumulators",
+        [
+            # three single-channel models plus the two multichannel ones
+            ("gaussfit_cuda.py", 5),
+            ("splinefit_cuda.py", 3),
+        ],
     )
-    def test_every_accumulator_matches_the_contract(self, module):
+    def test_every_accumulator_matches_the_contract(
+        self, module, n_accumulators
+    ):
         accumulators = _nested_functiondefs(_FITTING / module, "accumulate")
-        assert len(accumulators) == 3, module
+        # the count pins that the parse found them all, so a renamed or newly
+        # added model cannot quietly skip the contract check below
+        assert len(accumulators) == n_accumulators, module
         for node in accumulators:
             assert _params(node) == ACCUMULATE_PARAMS
 

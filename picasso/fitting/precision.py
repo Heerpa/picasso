@@ -610,6 +610,417 @@ def _gauss_crlb(
     return crlb
 
 
+# ----------------------------------------------------------------------
+# Multichannel spherical Gaussian
+#
+# The joint (globLoc) fit of several registered channels with one shared
+# position and width. Written as numba per-spot kernels rather than in the
+# vectorized style of :func:`_gauss_crlb`, because each channel is evaluated
+# through its own local Jacobian and sub-pixel ROI residual - the same geometry
+# the fit kernels use (``picasso.fitting.gaussfit._accumulate_spherical_*``).
+# This mirrors :func:`_spline_infomats_3d`.
+#
+# Parametrized directly in the **photon count N**, not the peak amplitude, so
+# the returned variances line up with the reported ``photons`` column with no
+# delta-method step - exactly as :func:`_gauss_crlb` does, and for the same
+# reason. The model per channel is
+#
+#     mu = N / (2 pi sigma^2) * exp(-r^2 / (2 sigma^2)) + bg
+#
+# Because sigma plays the sx *and* sy role at once, its derivative is the sum
+# of what an elliptical model's two width derivatives would be; do not "fix"
+# this back to the six-parameter (sx, sy) form of :func:`_gauss_crlb`.
+# ----------------------------------------------------------------------
+
+
+@numba.njit(parallel=True, cache=True, fastmath=True)
+def _gauss_infomats_multichannel(
+    jac,
+    res,
+    box,
+    n_photons,
+    x_shift,
+    y_shift,
+    sigma,
+    offset,
+    finite,
+    mu_floor,
+    mle,
+    var,
+    use_var,
+    bread,
+    meat,
+):
+    """Information matrices of the shared-amplitude multichannel Gaussian.
+
+    Parameter order ``[x, y, sigma, N, offset]``. ``bread`` is the Poisson
+    Fisher matrix when ``mle`` (its inverse is the Cramer-Rao bound) and the
+    Gauss-Newton normal matrix otherwise, with ``meat`` the least-squares
+    sandwich weight; see :func:`_spline_infomats_3d`, whose structure this
+    follows exactly."""
+    n_channels = jac.shape[1]
+    n_locs = n_photons.shape[0]
+    two_pi = 2.0 * np.pi
+    for m in numba.prange(n_locs):
+        if not finite[m]:
+            continue
+        N = n_photons[m]
+        sig = sigma[m]
+        o = offset[m]
+        if not (sig > 0.0):
+            continue
+        inv_s2 = 1.0 / (sig * sig)
+        peak = N / (two_pi * sig * sig)
+        f00 = f01 = f02 = f03 = f04 = 0.0
+        f11 = f12 = f13 = f14 = 0.0
+        f22 = f23 = f24 = 0.0
+        f33 = f34 = 0.0
+        f44 = 0.0
+        s00 = s01 = s02 = s03 = s04 = 0.0
+        s11 = s12 = s13 = s14 = 0.0
+        s22 = s23 = s24 = 0.0
+        s33 = s34 = 0.0
+        s44 = 0.0
+        for ch in range(n_channels):
+            a00 = jac[m, ch, 0]
+            a01 = jac[m, ch, 1]
+            a10 = jac[m, ch, 2]
+            a11 = jac[m, ch, 3]
+            sx = a00 * x_shift[m] + a01 * y_shift[m] + res[m, ch, 0]
+            sy = a10 * x_shift[m] + a11 * y_shift[m] + res[m, ch, 1]
+            for j in range(box):
+                pos_y = j - sy
+                for i in range(box):
+                    pos_x = i - sx
+                    r2 = pos_x * pos_x + pos_y * pos_y
+                    E = np.exp(-0.5 * r2 * inv_s2)
+                    s = peak * E
+                    mu = s + o
+                    if use_var:
+                        mu += var[m, ch, j, i]
+                    if mu < mu_floor:
+                        mu = mu_floor
+                    if mle:
+                        wa = 1.0 / mu
+                        wb = 0.0
+                    else:
+                        wa = 1.0
+                        wb = mu
+                    # d(mu)/d(parameter). The lateral pair picks up the
+                    # transpose of the channel Jacobian; the overall sign of a
+                    # parameter's derivative does not affect the inverse's
+                    # diagonal, so the native (positive) form is used.
+                    d0 = s * (a00 * pos_x + a10 * pos_y) * inv_s2
+                    d1 = s * (a01 * pos_x + a11 * pos_y) * inv_s2
+                    # sigma fills both elliptic width roles at once
+                    d2 = s * (r2 / (sig * sig * sig) - 2.0 / sig)
+                    d3 = E / (two_pi * sig * sig)
+                    # d4 == 1 (offset)
+                    f00 += d0 * d0 * wa
+                    f01 += d0 * d1 * wa
+                    f02 += d0 * d2 * wa
+                    f03 += d0 * d3 * wa
+                    f04 += d0 * wa
+                    f11 += d1 * d1 * wa
+                    f12 += d1 * d2 * wa
+                    f13 += d1 * d3 * wa
+                    f14 += d1 * wa
+                    f22 += d2 * d2 * wa
+                    f23 += d2 * d3 * wa
+                    f24 += d2 * wa
+                    f33 += d3 * d3 * wa
+                    f34 += d3 * wa
+                    f44 += wa
+                    s00 += d0 * d0 * wb
+                    s01 += d0 * d1 * wb
+                    s02 += d0 * d2 * wb
+                    s03 += d0 * d3 * wb
+                    s04 += d0 * wb
+                    s11 += d1 * d1 * wb
+                    s12 += d1 * d2 * wb
+                    s13 += d1 * d3 * wb
+                    s14 += d1 * wb
+                    s22 += d2 * d2 * wb
+                    s23 += d2 * d3 * wb
+                    s24 += d2 * wb
+                    s33 += d3 * d3 * wb
+                    s34 += d3 * wb
+                    s44 += wb
+        bread[m, 0, 0] = f00
+        bread[m, 0, 1] = bread[m, 1, 0] = f01
+        bread[m, 0, 2] = bread[m, 2, 0] = f02
+        bread[m, 0, 3] = bread[m, 3, 0] = f03
+        bread[m, 0, 4] = bread[m, 4, 0] = f04
+        bread[m, 1, 1] = f11
+        bread[m, 1, 2] = bread[m, 2, 1] = f12
+        bread[m, 1, 3] = bread[m, 3, 1] = f13
+        bread[m, 1, 4] = bread[m, 4, 1] = f14
+        bread[m, 2, 2] = f22
+        bread[m, 2, 3] = bread[m, 3, 2] = f23
+        bread[m, 2, 4] = bread[m, 4, 2] = f24
+        bread[m, 3, 3] = f33
+        bread[m, 3, 4] = bread[m, 4, 3] = f34
+        bread[m, 4, 4] = f44
+        if not mle:
+            meat[m, 0, 0] = s00
+            meat[m, 0, 1] = meat[m, 1, 0] = s01
+            meat[m, 0, 2] = meat[m, 2, 0] = s02
+            meat[m, 0, 3] = meat[m, 3, 0] = s03
+            meat[m, 0, 4] = meat[m, 4, 0] = s04
+            meat[m, 1, 1] = s11
+            meat[m, 1, 2] = meat[m, 2, 1] = s12
+            meat[m, 1, 3] = meat[m, 3, 1] = s13
+            meat[m, 1, 4] = meat[m, 4, 1] = s14
+            meat[m, 2, 2] = s22
+            meat[m, 2, 3] = meat[m, 3, 2] = s23
+            meat[m, 2, 4] = meat[m, 4, 2] = s24
+            meat[m, 3, 3] = s33
+            meat[m, 3, 4] = meat[m, 4, 3] = s34
+            meat[m, 4, 4] = s44
+
+
+@numba.njit(parallel=True, cache=True, fastmath=True)
+def _gauss_infomats_decoupled(
+    jac,
+    res,
+    box,
+    x_shift,
+    y_shift,
+    sigma,
+    n_photons,
+    offset,
+    finite,
+    mu_floor,
+    mle,
+    var,
+    use_var,
+    bread,
+    meat,
+):
+    """Information matrices of the photon-decoupled multichannel Gaussian.
+
+    Parameter order ``[x, y, sigma, N_0..N_{C-1}, bg_0..bg_{C-1}]``.
+    ``n_photons`` and ``offset`` are ``(n_locs, n_channels)``. A pixel of
+    channel ``ch`` touches only five of the ``3 + 2C`` parameters, so the
+    matrices are filled block-sparse and the upper triangle is mirrored once at
+    the end."""
+    n_channels = jac.shape[1]
+    n_locs = sigma.shape[0]
+    n_params = 3 + 2 * n_channels
+    two_pi = 2.0 * np.pi
+    for m in numba.prange(n_locs):
+        if not finite[m]:
+            continue
+        sig = sigma[m]
+        if not (sig > 0.0):
+            continue
+        inv_s2 = 1.0 / (sig * sig)
+        # This kernel accumulates in place rather than assigning at the end, so
+        # the caller's identity seed (which keeps *skipped* rows invertible)
+        # has to be cleared first or it would add a spurious 1 to every
+        # diagonal - swamping the photon block, whose entries are small.
+        for p in range(n_params):
+            for q in range(n_params):
+                bread[m, p, q] = 0.0
+                meat[m, p, q] = 0.0
+        for ch in range(n_channels):
+            N = n_photons[m, ch]
+            o = offset[m, ch]
+            ia = 3 + ch
+            ib = 3 + n_channels + ch
+            peak = N / (two_pi * sig * sig)
+            a00 = jac[m, ch, 0]
+            a01 = jac[m, ch, 1]
+            a10 = jac[m, ch, 2]
+            a11 = jac[m, ch, 3]
+            sx = a00 * x_shift[m] + a01 * y_shift[m] + res[m, ch, 0]
+            sy = a10 * x_shift[m] + a11 * y_shift[m] + res[m, ch, 1]
+            for j in range(box):
+                pos_y = j - sy
+                for i in range(box):
+                    pos_x = i - sx
+                    r2 = pos_x * pos_x + pos_y * pos_y
+                    E = np.exp(-0.5 * r2 * inv_s2)
+                    s = peak * E
+                    mu = s + o
+                    if use_var:
+                        mu += var[m, ch, j, i]
+                    if mu < mu_floor:
+                        mu = mu_floor
+                    if mle:
+                        wa = 1.0 / mu
+                        wb = 0.0
+                    else:
+                        wa = 1.0
+                        wb = mu
+                    d0 = s * (a00 * pos_x + a10 * pos_y) * inv_s2
+                    d1 = s * (a01 * pos_x + a11 * pos_y) * inv_s2
+                    d2 = s * (r2 / (sig * sig * sig) - 2.0 / sig)
+                    da = E / (two_pi * sig * sig)
+                    # db == 1 (this channel's background)
+                    bread[m, 0, 0] += d0 * d0 * wa
+                    bread[m, 0, 1] += d0 * d1 * wa
+                    bread[m, 0, 2] += d0 * d2 * wa
+                    bread[m, 0, ia] += d0 * da * wa
+                    bread[m, 0, ib] += d0 * wa
+                    bread[m, 1, 1] += d1 * d1 * wa
+                    bread[m, 1, 2] += d1 * d2 * wa
+                    bread[m, 1, ia] += d1 * da * wa
+                    bread[m, 1, ib] += d1 * wa
+                    bread[m, 2, 2] += d2 * d2 * wa
+                    bread[m, 2, ia] += d2 * da * wa
+                    bread[m, 2, ib] += d2 * wa
+                    bread[m, ia, ia] += da * da * wa
+                    bread[m, ia, ib] += da * wa
+                    bread[m, ib, ib] += wa
+                    if not mle:
+                        meat[m, 0, 0] += d0 * d0 * wb
+                        meat[m, 0, 1] += d0 * d1 * wb
+                        meat[m, 0, 2] += d0 * d2 * wb
+                        meat[m, 0, ia] += d0 * da * wb
+                        meat[m, 0, ib] += d0 * wb
+                        meat[m, 1, 1] += d1 * d1 * wb
+                        meat[m, 1, 2] += d1 * d2 * wb
+                        meat[m, 1, ia] += d1 * da * wb
+                        meat[m, 1, ib] += d1 * wb
+                        meat[m, 2, 2] += d2 * d2 * wb
+                        meat[m, 2, ia] += d2 * da * wb
+                        meat[m, 2, ib] += d2 * wb
+                        meat[m, ia, ia] += da * da * wb
+                        meat[m, ia, ib] += da * wb
+                        meat[m, ib, ib] += wb
+        # only the upper triangle was filled (0 < 1 < 2 < ia < ib always)
+        for p in range(n_params):
+            for q in range(p):
+                bread[m, p, q] = bread[m, q, p]
+                if not mle:
+                    meat[m, p, q] = meat[m, q, p]
+
+
+def _gauss_crlb_multichannel(
+    theta: lib.FloatArray2D,
+    box: int,
+    jacobians: np.ndarray,
+    residuals: np.ndarray,
+    mle: bool = True,
+    em: bool = False,
+    link_photons: bool = True,
+    variance: lib.FloatArray4D | None = None,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> lib.FloatArray2D:
+    """Parameter variances for a multichannel spherical Gaussian fit.
+
+    Parameters
+    ----------
+    theta : lib.FloatArray2D
+        Fitted parameters, **with the amplitude already expressed as a photon
+        count** (as ``picasso.localize`` converts it):
+        ``[x, y, sigma, N, bg]`` when ``link_photons``, else
+        ``[x, y, sigma, N_0.., bg_0..]``. Both put the shared parameters
+        first, and the returned variances are in this same column order, so a
+        caller indexes the result exactly as it indexed the input.
+    box : int
+        Fit box side length.
+    jacobians, residuals : np.ndarray
+        ``(n_locs, n_channels, 4)`` channel Jacobians and ``(n_locs,
+        n_channels, 2)`` sub-pixel ROI offsets - the same geometry the fit used.
+    mle : bool, optional
+        Poisson Cramer-Rao bound (True) or the least-squares sandwich.
+    em : bool, optional
+        EMCCD excess noise doubles every variance.
+    link_photons : bool, optional
+        Which model produced ``theta``.
+    variance : optional
+        ``(n_locs, n_channels, box, box)`` sCMOS readout variance, laid out
+        like the (channel-major) spots.
+
+    Returns
+    -------
+    crlb : lib.FloatArray2D
+        ``(n_locs, n_params)`` variances in ``theta``'s own column order.
+        Non-converged and numerically singular rows are NaN.
+    """
+    theta = np.asarray(theta, dtype=np.float64)
+    n_locs = len(theta)
+    jacobians = np.ascontiguousarray(jacobians, dtype=np.float64)
+    residuals = np.ascontiguousarray(residuals, dtype=np.float64)
+    n_channels = jacobians.shape[1]
+    n_params = 5 if link_photons else 3 + 2 * n_channels
+    if n_locs == 0:
+        return np.full((0, n_params), np.nan)
+    finite = np.isfinite(theta).all(axis=1)
+    if variance is not None:
+        variance = np.ascontiguousarray(variance, dtype=np.float64)
+
+    bread = np.tile(np.eye(n_params), (n_locs, 1, 1))
+    meat = np.zeros((n_locs, n_params, n_params))
+
+    use_tqdm = progress_callback == "console"
+    do_callback = callable(progress_callback)
+    chunk = (
+        max(1, min(n_locs, 100_000)) if (use_tqdm or do_callback) else n_locs
+    )
+    starts = range(0, n_locs, chunk)
+    if use_tqdm:
+        starts = tqdm(starts, desc="Computing Gaussian CRLB")
+
+    for start in starts:
+        stop = min(start + chunk, n_locs)
+        sl = slice(start, stop)
+        var_chunk = (
+            variance[sl] if variance is not None else np.zeros((1, 1, 1, 1))
+        )
+        if link_photons:
+            _gauss_infomats_multichannel(
+                jacobians[sl],
+                residuals[sl],
+                int(box),
+                theta[sl, 3],  # N
+                theta[sl, 0],  # x
+                theta[sl, 1],  # y
+                theta[sl, 2],  # sigma
+                theta[sl, 4],  # bg
+                finite[sl],
+                _GAUSS_CRLB_MU_FLOOR,
+                mle,
+                var_chunk,
+                variance is not None,
+                bread[sl],
+                meat[sl],
+            )
+        else:
+            _gauss_infomats_decoupled(
+                jacobians[sl],
+                residuals[sl],
+                int(box),
+                theta[sl, 0],
+                theta[sl, 1],
+                theta[sl, 2],
+                np.ascontiguousarray(theta[sl, 3 : 3 + n_channels]),
+                np.ascontiguousarray(theta[sl, 3 + n_channels :]),
+                finite[sl],
+                _GAUSS_CRLB_MU_FLOOR,
+                mle,
+                var_chunk,
+                variance is not None,
+                bread[sl],
+                meat[sl],
+            )
+        if do_callback:
+            progress_callback(stop)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        bread_inv = np.linalg.pinv(bread)
+        cov = bread_inv if mle else bread_inv @ meat @ bread_inv
+        crlb = np.diagonal(cov, axis1=1, axis2=2).copy()
+    crlb[~finite] = np.nan
+    if em:
+        crlb *= _EM_EXCESS_NOISE_FACTOR
+    return np.where(crlb > 0.0, crlb, np.nan)
+
+
 # ---------------------------------------------------------------------------
 # CPU (numba) spline information matrices
 # ---------------------------------------------------------------------------

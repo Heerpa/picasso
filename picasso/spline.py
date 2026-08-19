@@ -52,7 +52,6 @@ from __future__ import annotations
 
 import os
 import warnings
-from itertools import combinations
 from typing import Callable, Literal
 
 import numpy as np
@@ -61,7 +60,6 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from scipy.interpolate import CubicSpline, make_smoothing_spline
 from scipy.ndimage import shift as _ndi_shift, zoom as _ndi_zoom
-from scipy.spatial import KDTree
 
 from . import io, lib, localize, __version__
 
@@ -69,6 +67,14 @@ from . import io, lib, localize, __version__
 # transforms throughout this module
 from . import transforms as tform
 from .fitting import gaussfit, precision, splinefit
+from .registration import (
+    fit_registration,
+    frames_in_bounds,
+    match_points,
+    ransac_match,
+    register_from_point_sets,
+    resolve_model,
+)
 
 
 def _natural_spline_operator(n: int) -> np.ndarray:
@@ -1372,17 +1378,6 @@ def _normalized_region(
     return (y0, x0), (y1, x1)
 
 
-def _resolve_model(calibration: dict, model: str | None) -> str:
-    """The model to register with: the one asked for, else the one the
-    calibration already uses, else affine."""
-    if model is not None:
-        return model
-    stored = calibration.get("channel_transforms")
-    for entry in (stored or [])[1:] or (stored or [])[:1]:
-        return tform.from_dict(entry).model
-    return "affine"
-
-
 def registration_model_name(calibration: dict) -> str | None:
     """The model a multichannel calibration's channels were registered with.
 
@@ -1396,270 +1391,6 @@ def registration_model_name(calibration: dict) -> str | None:
     for entry in stored[1:] or stored[:1]:  # skip the identity reference
         return tform.from_dict(entry).model
     return None
-
-
-def _fit_registration(
-    src: np.ndarray,
-    dst: np.ndarray,
-    model: str,
-    final: bool = True,
-) -> tuple[tform.Transform, str]:
-    """Fit one ICP iteration's transform. Returns ``(transform, model_name)``.
-
-    Intermediate iterations (``final=False``) always fit an affine, however
-    flexible ``model`` is: the early pairing is deliberately loose and contains
-    cross-molecule mismatches, and a flexible model bends to accommodate them,
-    locking in the wrong correspondence field on the next pass - a failure an
-    affine cannot have. Only the final iteration, which pairs at the tightest
-    radius, fits the model the user asked for.
-
-    If too few correspondences survive for that model, an affine is fitted
-    instead and *named in the return value*, so the caller can report the
-    fallback rather than hide it.
-    """
-    if final and len(src) >= tform.min_points(model):
-        return tform.estimate(src, dst, model), model
-    with warnings.catch_warnings():
-        # An intermediate ICP pass is an internal step towards the pairing,
-        # not a registration anyone keeps, so its "thin data" warning would
-        # only be noise; the final fit above still warns.
-        if not final:
-            warnings.simplefilter("ignore")
-        return tform.estimate(src, dst, "affine"), "affine"
-
-
-def _similarity_from_two(
-    a0: np.ndarray, a1: np.ndarray, b0: np.ndarray, b1: np.ndarray
-) -> list[tform.AffineTransform]:
-    """Candidate similarity transforms mapping ``a -> b`` from two point pairs.
-
-    A similarity (translation + rotation + isotropic scale, optionally a
-    reflection) is fixed by two correspondences up to the reflection ambiguity,
-    so both the proper-rotation and the reflected solution are returned. Using a
-    *similarity* (4 DOF) as the RANSAC minimal model - rather than a full 6-DOF
-    affine, which three points always fit exactly - keeps
-    a spare bead to validate the sample, so correct correspondences can be told
-    from wrong ones even with only three beads. Empty if the two reference
-    points coincide.
-
-    This stays a similarity whatever model the registration is finally fitted
-    with: matching only needs a hypothesis good enough to rank correspondences,
-    and a higher-DOF minimal model would defeat the consensus vote - a degree-3
-    polynomial fits *any* 10 points exactly, so every sample would score the
-    maximum."""
-    va, vb = a1 - a0, b1 - b0
-    na = float(np.hypot(va[0], va[1]))
-    if na < 1e-9:
-        return []
-    s = float(np.hypot(vb[0], vb[1])) / na
-    ang_a = np.arctan2(va[1], va[0])
-    ang_b = np.arctan2(vb[1], vb[0])
-    out = []
-    # proper rotation (angle b - angle a) and reflection (across the a/b bisector)
-    th = ang_b - ang_a
-    r_rot = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
-    two_alpha = ang_a + ang_b
-    r_ref = np.array(
-        [
-            [np.cos(two_alpha), np.sin(two_alpha)],
-            [np.sin(two_alpha), -np.cos(two_alpha)],
-        ]
-    )
-    for r in (r_rot, r_ref):
-        A = s * r
-        t = b0 - A @ a0
-        matrix = np.eye(3)
-        matrix[:2, :2] = A
-        matrix[:2, 2] = t
-        out.append(tform.AffineTransform(matrix=matrix))
-    return out
-
-
-def _fov_groups(
-    ref_fov: np.ndarray | None,
-    c_fov: np.ndarray | None,
-    n_ref: int,
-    n_c: int,
-) -> list[tuple[np.ndarray, np.ndarray]] | None:
-    """Row blocks of the reference / channel bead clouds that share a field of
-    view, as ``[(ref_idx, c_idx), ...]``, or None to treat them as one pooled
-    cloud.
-
-    Fields present in only one of the two clouds are dropped: a bead with no
-    counterpart to pair against cannot contribute a correspondence, and letting
-    it search the other fields is exactly the mis-pairing this prevents. None
-    is returned when either label array is missing or does not describe its
-    cloud, so callers without FOV information keep the pooled behaviour.
-    """
-    if ref_fov is None or c_fov is None:
-        return None
-    ref_fov = np.asarray(ref_fov)
-    c_fov = np.asarray(c_fov)
-    if len(ref_fov) != n_ref or len(c_fov) != n_c:
-        return None
-    groups = []
-    for k in np.unique(ref_fov):
-        ri = np.flatnonzero(ref_fov == k)
-        ci = np.flatnonzero(c_fov == k)
-        if len(ri) and len(ci):
-            groups.append((ri, ci))
-    return groups or None
-
-
-def _ransac_match(
-    ref_xy: np.ndarray,
-    c_xy: np.ndarray,
-    aligned_c: np.ndarray,
-    inlier_tol: float,
-    radius: float,
-    max_iter: int = 20000,
-    ref_fov: np.ndarray | None = None,
-    c_fov: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Robustly match beads across channels via RANSAC on a similarity
-    transform.
-
-    Correspondence candidates are proposed from ``aligned_c`` (``c_xy`` coarsely
-    overlaid onto the reference frame - a flip orientation plus an approximate
-    shift), but the transform is fit on the original **absolute** ``ref_xy`` /
-    ``c_xy``. Two candidate pairs are sampled, the similarity transforms they
-    imply (see :func:`_similarity_from_two`) are formed, and the beads each maps
-    within ``inlier_tol`` are counted; the largest consensus wins and its
-    inliers (unique nearest-neighbour assignment) are returned. Because only the
-    *candidate proposal* uses the coarse overlay - not the fit - an inaccurate
-    overlay (e.g. an imperfectly placed split-FOV ROI) cannot mis-pair beads
-    and corrupt the transform, which otherwise makes the calibration
-    hypersensitive to ROI placement. Returns ``(ref_idx, c_idx)`` inliers.
-
-    ``ref_fov`` / ``c_fov`` are the field-of-view label of each bead. When both
-    are given, a correspondence may only pair beads of the **same** field, at
-    every stage: candidate proposal, the consensus count and the final
-    assignment. A multi-FOV stack images every field onto the same sensor
-    coordinates, so pooling the fields packs the cloud far denser than any one
-    field is - and a reference bead can then sit within ``inlier_tol`` of an
-    unrelated field's bead and be paired to it. Restricting the pairing removes
-    that ambiguity entirely; the transform itself stays global (one optical
-    mapping, identical at every stage position) and is still fitted by the
-    caller on the pooled inliers, so every field's beads constrain it. Without
-    the labels the pairing falls back to one pooled cloud.
-    """
-    ref_xy = np.asarray(ref_xy, dtype=np.float64)
-    c_xy = np.asarray(c_xy, dtype=np.float64)
-    aligned_c = np.asarray(aligned_c, dtype=np.float64)
-    empty = (np.array([], dtype=int), np.array([], dtype=int))
-    if min(len(ref_xy), len(c_xy)) < 3:
-        return empty
-
-    # per-field index blocks (ref rows, channel rows), or None to pool
-    groups = _fov_groups(ref_fov, c_fov, len(ref_xy), len(c_xy))
-
-    # candidate (ref_i, c_j) pairs: c beads near ref_i in the coarse overlay
-    if groups is None:
-        overlay_tree = KDTree(aligned_c)
-        pairs = [
-            (i, j)
-            for i in range(len(ref_xy))
-            for j in overlay_tree.query_ball_point(ref_xy[i], radius)
-        ]
-    else:
-        pairs = []
-        for ri, ci in groups:
-            overlay_tree = KDTree(aligned_c[ci])
-            for i in ri:
-                pairs.extend(
-                    (int(i), int(ci[j]))
-                    for j in overlay_tree.query_ball_point(ref_xy[i], radius)
-                )
-    if len(pairs) < 2:
-        return empty
-    pairs = np.asarray(pairs, dtype=int)
-
-    if groups is None:
-        c_tree = KDTree(c_xy)
-
-        def consensus(pred: np.ndarray) -> int:
-            dist, _ = c_tree.query(pred, k=1)
-            return int(np.count_nonzero(dist <= inlier_tol))
-
-    else:
-        # one tree per field, so a bead can only find partners in its own
-        group_trees = [(ri, KDTree(c_xy[ci])) for ri, ci in groups]
-
-        def consensus(pred: np.ndarray) -> int:
-            total = 0
-            for ri, tree in group_trees:
-                dist, _ = tree.query(pred[ri], k=1)
-                total += int(np.count_nonzero(dist <= inlier_tol))
-            return total
-
-    n_samples = len(pairs) * (len(pairs) - 1) // 2
-    if n_samples > max_iter:
-        rs = np.random.RandomState(0)  # deterministic for reproducible calib
-        samples = rs.randint(0, len(pairs), size=(max_iter, 2))
-    else:
-        samples = np.asarray(
-            list(combinations(range(len(pairs)), 2)), dtype=int
-        )
-
-    best_M, best_count = None, 0
-    for a, b in samples:
-        (i0, j0), (i1, j1) = pairs[a], pairs[b]
-        if i0 == i1 or j0 == j1:  # need two distinct ref and channel beads
-            continue
-        # the two sampled pairs may come from different fields - that is
-        # welcome, the transform is global and a longer baseline pins it down
-        # better; only the correspondences themselves stay within a field
-        for M in _similarity_from_two(
-            ref_xy[i0], ref_xy[i1], c_xy[j0], c_xy[j1]
-        ):
-            count = consensus(M.apply(ref_xy))
-            if count > best_count:
-                best_count, best_M = count, M
-
-    if best_M is None:
-        return empty
-    pred = best_M.apply(ref_xy)
-    if groups is None:
-        return _match_beads(pred, c_xy, inlier_tol)
-    acc_ref, acc_c = [], []
-    for ri, ci in groups:
-        a, b = _match_beads(pred[ri], c_xy[ci], inlier_tol)
-        if len(a):
-            acc_ref.append(ri[a])
-            acc_c.append(ci[b])
-    if not acc_ref:
-        return empty
-    return np.concatenate(acc_ref), np.concatenate(acc_c)
-
-
-def _match_beads(
-    ref_xy: np.ndarray, other_xy: np.ndarray, max_distance: float
-) -> tuple[np.ndarray, np.ndarray]:
-    """Nearest-neighbor match beads between two channels.
-
-    Returns ``(ref_idx, other_idx)`` index arrays of matched pairs within
-    ``max_distance``; each ``other`` bead is used at most once (closest match
-    wins)."""
-    ref_xy = np.asarray(ref_xy, dtype=np.float64)
-    other_xy = np.asarray(other_xy, dtype=np.float64)
-    if len(ref_xy) == 0 or len(other_xy) == 0:
-        empty = np.array([], dtype=int)
-        return empty, empty
-    tree = KDTree(other_xy)
-    dist, idx = tree.query(ref_xy, k=1)
-    keep = np.where(dist <= max_distance)[0]
-    # resolve duplicate targets: assign each target to its closest reference
-    order = keep[np.argsort(dist[keep])]
-    seen: set[int] = set()
-    ref_idx, other_idx = [], []
-    for r in order:
-        o = int(idx[r])
-        if o in seen:
-            continue
-        seen.add(o)
-        ref_idx.append(int(r))
-        other_idx.append(o)
-    return np.array(ref_idx, dtype=int), np.array(other_idx, dtype=int)
 
 
 def _estimate_channel_transform(
@@ -1688,7 +1419,7 @@ def _estimate_channel_transform(
     The matching itself is always done with a similarity minimal model
     regardless of ``model`` - only the final fit on the inliers uses it, so a
     flexible model cannot bend to accommodate wrong correspondences (see
-    :func:`_ransac_match`).
+    :func:`ransac_match`).
 
     Two coarse-alignment paths:
 
@@ -1709,7 +1440,7 @@ def _estimate_channel_transform(
     in split-FOV, where every field images into the same region rectangle.
 
     The labels are then carried into the matching, which pairs beads only
-    within their own field (see :func:`_ransac_match`). The transform itself
+    within their own field (see :func:`ransac_match`). The transform itself
     stays global and is fitted on the pooled inliers of all fields.
     """
     from . import imageprocess
@@ -1803,12 +1534,12 @@ def _estimate_channel_transform(
     # with the most inliers. The coarse overlay only proposes candidate pairs
     # (a generous radius covers an imperfectly placed ROI); the transform is fit
     # on absolute coordinates and mismatches are rejected, so the registration
-    # is independent of exact ROI placement (see _ransac_match).
+    # is independent of exact ROI placement (see ransac_match).
     radius = max(3.0 * box, float(max_distance))
     inlier_tol = max(3.0, 0.25 * box)
     best_ref_idx, best_c_idx = np.array([], int), np.array([], int)
     for _label, aligned in candidates:
-        ri, ci = _ransac_match(
+        ri, ci = ransac_match(
             ref_xy,
             c_xy,
             aligned,
@@ -2718,29 +2449,6 @@ def _split_fov_local_affines(
     return [tform.from_dict(a) for a in affines]
 
 
-def _frames_in_bounds(
-    n_frames: int, frame_bounds: tuple[int, int] | list | None
-) -> np.ndarray:
-    """Sorted array of the frame indices allowed by ``frame_bounds``.
-
-    ``frame_bounds`` follows :func:`localize.identify`.
-    """
-    n_frames = int(n_frames)
-    if frame_bounds is None:
-        return np.arange(n_frames, dtype=int)
-    segs = frame_bounds
-    first = segs[0] if len(segs) else None
-    if first is None or np.isscalar(first):
-        segs = [frame_bounds]  # a single (min, max) range
-    mask = np.zeros(n_frames, dtype=bool)
-    for lo, hi in segs:
-        lo = 0 if lo is None else max(0, int(lo))
-        hi = n_frames - 1 if hi is None else min(n_frames - 1, int(hi))
-        if hi >= lo:
-            mask[lo : hi + 1] = True
-    return np.nonzero(mask)[0]
-
-
 # the four mirror orientations tried when nothing is known about the optical
 # path (identity, flip-x, flip-y, flip-xy); (sx, sy) are the mirror signs
 _FLIP_SIGNS = ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0))
@@ -2921,7 +2629,7 @@ def estimate_transforms_from_identifications(
                 for f in common:
                     rxy, cxy = ref_by_frame[f], chan_by_frame[f]
                     pred = transform.apply(rxy)
-                    ri, ci = _match_beads(pred, cxy, tol)
+                    ri, ci = match_points(pred, cxy, tol)
                     if len(ri):
                         acc_ref.append(rxy[ri])
                         acc_c.append(cxy[ci])
@@ -2992,7 +2700,7 @@ def refine_split_fov_transforms_from_signal(
     ``model`` selects the transform model (see :mod:`picasso.transforms`);
     it defaults to the one the calibration was registered with, so a plain
     re-registration keeps it. Only the final ICP
-    iteration fits that model - see :func:`_fit_registration`.
+    iteration fits that model - see :func:`fit_registration`.
 
     Returns ``(calibration, reg_info)`` where ``reg_info`` lists, per channel,
     the number of matched pairs, their coordinates, the fitted transform, the
@@ -3062,7 +2770,7 @@ def refine_split_fov_transforms_from_signal(
     # detect only on a bounded, evenly-spaced sample of frames (several tens):
     # the same subset is used for every region so per-frame pairing stays aligned
     n_frames = int(movie.shape[0])
-    allowed = _frames_in_bounds(n_frames, frame_bounds)
+    allowed = frames_in_bounds(n_frames, frame_bounds)
     if allowed.size == 0:
         raise ValueError("No frames in the requested frame range.")
     pick = np.unique(
@@ -3098,7 +2806,7 @@ def refine_split_fov_transforms_from_signal(
         )
 
     # keep the calibration's own model unless the caller asks for another
-    model = _resolve_model(calibration, model)
+    model = resolve_model(calibration, model)
 
     # match radii shrink from generous (absorb the seed's residual drift) to
     # tight (sub-box) over the ICP iterations
@@ -3126,7 +2834,7 @@ def refine_split_fov_transforms_from_signal(
                 rxy = ref_by_frame[f]
                 cxy = chan_by_frame[f]
                 pred = transform.apply(rxy)
-                ri, ci = _match_beads(pred, cxy, tol)
+                ri, ci = match_points(pred, cxy, tol)
                 if len(ri):
                     acc_ref.append(rxy[ri])
                     acc_c.append(cxy[ci])
@@ -3136,7 +2844,7 @@ def refine_split_fov_transforms_from_signal(
             matched_c = np.vstack(acc_c)
             if len(matched_ref) < 3:
                 break
-            transform, fitted_model = _fit_registration(
+            transform, fitted_model = fit_registration(
                 matched_ref,
                 matched_c,
                 model,
@@ -3151,7 +2859,7 @@ def refine_split_fov_transforms_from_signal(
             if keep.sum() >= 3:
                 matched_ref = matched_ref[keep]
                 matched_c = matched_c[keep]
-                transform, fitted_model = _fit_registration(
+                transform, fitted_model = fit_registration(
                     matched_ref, matched_c, model
                 )
         n_pairs = int(len(matched_ref))
@@ -3278,7 +2986,7 @@ def refine_multichannel_transforms_from_signal(
     # detect on a bounded, evenly-spaced sample of frames shared by every movie,
     # so per-frame pairing across the synchronized movies stays aligned
     n_frames = min(int(m.shape[0]) for m in movies)
-    allowed = _frames_in_bounds(n_frames, frame_bounds)
+    allowed = frames_in_bounds(n_frames, frame_bounds)
     if allowed.size == 0:
         raise ValueError("No frames in the requested frame range.")
     pick = np.unique(
@@ -3313,13 +3021,7 @@ def refine_multichannel_transforms_from_signal(
         )
 
     # keep the calibration's own model unless the caller asks for another
-    model = _resolve_model(calibration, model)
-
-    # match radii shrink from generous (absorb the seed's residual drift) to
-    # tight (sub-box) over the ICP iterations
-    tol_hi = float(max_pair_distance)
-    tol_lo = max(2.0, 0.3 * box)
-    tols = np.linspace(tol_hi, tol_lo, max(1, int(n_iter)))
+    model = resolve_model(calibration, model)
 
     identity = tform.identity()
     transforms = [
@@ -3330,74 +3032,22 @@ def refine_multichannel_transforms_from_signal(
         if c == reference:
             continue
         chan_by_frame = _by_frame(movies[c])
-        common = sorted(set(ref_by_frame) & set(chan_by_frame))
-        if not common:
-            raise ValueError(
-                f"No frames with detections in both the reference and channel "
-                f"{c} movies; the channels may not share signal, or the movies "
-                "are not frame-synchronized."
-            )
-        transform = tform.from_dict(seed_transforms[c])
-        fitted_model = "affine"
-        matched_ref = matched_c = np.empty((0, 2))
-        for k, tol in enumerate(tols):
-            acc_ref, acc_c = [], []
-            for f in common:
-                rxy = ref_by_frame[f]
-                cxy = chan_by_frame[f]
-                pred = transform.apply(rxy)
-                ri, ci = _match_beads(pred, cxy, tol)
-                if len(ri):
-                    acc_ref.append(rxy[ri])
-                    acc_c.append(cxy[ci])
-            if not acc_ref:
-                break
-            matched_ref = np.vstack(acc_ref)
-            matched_c = np.vstack(acc_c)
-            if len(matched_ref) < 3:
-                break
-            transform, fitted_model = _fit_registration(
-                matched_ref,
-                matched_c,
+        try:
+            info = register_from_point_sets(
+                ref_by_frame,
+                chan_by_frame,
                 model,
-                final=k == len(tols) - 1,
+                box,
+                seed=seed_transforms[c],
+                n_iter=n_iter,
+                max_pair_distance=max_pair_distance,
+                min_pairs=min_pairs,
             )
-        # robust trim: drop coincidental pairs far from the converged transform,
-        # then re-fit once on the inliers
-        if len(matched_ref) >= 3:
-            resid = matched_c - transform.apply(matched_ref)
-            dist = np.sqrt(np.sum(resid**2, axis=1))
-            keep = dist <= max(tol_lo, 3.0 * np.median(dist))
-            if keep.sum() >= 3:
-                matched_ref = matched_ref[keep]
-                matched_c = matched_c[keep]
-                transform, fitted_model = _fit_registration(
-                    matched_ref, matched_c, model
-                )
-        n_pairs = int(len(matched_ref))
-        if n_pairs < min_pairs:
-            raise ValueError(
-                f"Only {n_pairs} signal correspondences for channel {c} "
-                f"(need >= {min_pairs}); use a longer / denser movie, lower the "
-                "minimum net gradient, or re-calibrate on beads instead."
-            )
-        resid = matched_c - transform.apply(matched_ref)
-        rms = float(np.sqrt(np.mean(np.sum(resid**2, axis=1))))
-        transforms[c] = transform
-        reg_info.append(
-            {
-                "channel": c,
-                "n_matches": n_pairs,
-                "ref_xy": matched_ref,
-                "c_xy": matched_c,
-                "transform": transform,
-                "rms": rms,
-                # what was actually fitted, and what was asked for: they
-                # differ when too few pairs survived for the chosen model
-                "model": fitted_model,
-                "model_requested": model,
-            }
-        )
+        except ValueError as e:
+            raise ValueError(f"Channel {c}: {e}") from e
+        info["channel"] = c
+        transforms[c] = info["transform"]
+        reg_info.append(info)
 
     if update:
         calibration["channel_transforms"] = [t.to_dict() for t in transforms]
