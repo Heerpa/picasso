@@ -562,7 +562,7 @@ Either way the localizations come out in the reference channel's coordinates.
 
 Then build a registration with ``Calibration`` > ``Register channels (2D)``, which offers two ways to measure it:
 
-- **From bead images...** — pick one image of fiducial beads per channel, reference first (in split-FOV mode, the single bead image holding every region). Beads are detected and fitted with the current ``Box side length`` and ``Min. net gradient``, matched to the reference channel's beads, and a transform is fitted per channel with outlier pairs dropped.
+- **From bead data...** — measure the registration from the movie(s) currently open, so load the bead images themselves as the channels: one bead movie per channel, reference first (in split-FOV mode, the single bead movie holding every region). Beads are detected and fitted with the current ``Box side length`` and ``Min. net gradient``, matched to the reference channel's beads, and a transform is fitted per channel with outlier pairs dropped.
 
   Tick **Each frame is a different field of view** when the bead movie scans several stage positions rather than repeating one field. Beads are then detected frame by frame and **only ever paired with beads in the same frame** — every field images onto the same sensor coordinates, so pooling them would pair beads that are nowhere near each other — while every field's pairs constrain the one transform. More fields means more correspondences and a better-conditioned fit, which matters most for the flexible models. Left unticked, the frames are treated as repeats of a single field and averaged to beat down the noise, which is what a plain bead acquisition wants.
 

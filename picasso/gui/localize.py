@@ -2320,8 +2320,9 @@ class RegisterChannelsDialog(lib.Dialog):
         vbox = QtWidgets.QVBoxLayout(self)
         vbox.addWidget(
             QtWidgets.QLabel(
-                "Beads are detected and fitted with the box size and\n"
-                "minimum net gradient set in the Parameters dialog."
+                "Beads are detected in the currently loaded channels\n"
+                "(or the drawn regions), with the box size and minimum\n"
+                "net gradient set in the Parameters dialog."
             )
         )
         grid = QtWidgets.QGridLayout()
@@ -5972,10 +5973,11 @@ class Window(QtWidgets.QMainWindow):
             "and save it as a standalone registration for the multichannel\n"
             "2D spherical Gaussian fit."
         )
-        register_beads_action = register_menu.addAction("From bead images...")
+        register_beads_action = register_menu.addAction("From bead data...")
         register_beads_action.setToolTip(
             "Register from images of fiducial beads, which appear in every\n"
-            "channel at once. Most accurate, but needs a bead acquisition."
+            "channel at once. Most accurate, but needs a bead acquisition:\n"
+            "load the bead movies as the channels first."
         )
         register_beads_action.triggered.connect(
             self.register_channels_from_beads
@@ -6441,33 +6443,12 @@ class Window(QtWidgets.QMainWindow):
         return True
 
     def register_channels_from_beads(self) -> None:
-        """Register the channels from separate bead images."""
+        """Register the channels from the bead movies loaded here.
+
+        The loaded channels (or the drawn regions of the loaded movie) are
+        taken to be the bead images themselves, so open the bead movies as
+        channels before running this."""
         if not self._check_registration_channels():
-            return
-        regions = self._registration_regions()
-        n_wanted = 1 if regions is not None else len(self.channels)
-        prompt = (
-            "Open the bead movie holding every region"
-            if regions is not None
-            else f"Open {n_wanted} bead movies, reference first"
-        )
-        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, prompt, filter=IMAGE_FILTER
-        )
-        if not paths:
-            return
-        if len(paths) != n_wanted:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Register channels",
-                (
-                    "Select the single bead movie whose regions are the "
-                    f"channels; {len(paths)} were selected."
-                    if regions is not None
-                    else f"Select one bead movie per channel ({n_wanted}), "
-                    f"reference first; {len(paths)} were selected."
-                ),
-            )
             return
         model, multi_fov, ok = RegisterChannelsDialog.getSpecs(self)
         if not ok:
@@ -6476,7 +6457,6 @@ class Window(QtWidgets.QMainWindow):
             "beads",
             model=model,
             multi_fov=multi_fov,
-            bead_paths=list(paths),
         )
 
     def register_channels_from_signal(self) -> None:
@@ -12233,7 +12213,6 @@ class ChannelRegistrationWorker(QtCore.QThread):
         path: str,
         model: str = "affine",
         channel_paths: list | None = None,
-        bead_paths: list | None = None,
         frame_bounds: list | None = None,
         max_frames: int = 50,
         seed_transforms: list | None = None,
@@ -12248,8 +12227,8 @@ class ChannelRegistrationWorker(QtCore.QThread):
             Which builder to run: fiducial bead images, or the loaded movies'
             own blinking signal.
         movies : list
-            The loaded channel movies, reference first. Used by the signal
-            builder; the bead builder reads ``bead_paths`` instead.
+            The loaded channel movies, reference first. Both builders read
+            them: the bead builder takes them as the bead images.
         box : int
             Box side length (camera pixels) used to detect and fit.
         minimum_ng : float
@@ -12261,9 +12240,6 @@ class ChannelRegistrationWorker(QtCore.QThread):
             ``"affine"``.
         channel_paths : list, optional
             The loaded channels' file paths, recorded for traceability.
-        bead_paths : list, optional
-            One bead movie path per channel, reference first. Required for
-            ``source="beads"``.
         frame_bounds : list, optional
             Frames the signal builder samples from. None uses all of them.
         max_frames : int, optional
@@ -12289,7 +12265,6 @@ class ChannelRegistrationWorker(QtCore.QThread):
         self.path = path
         self.model = model
         self.channel_paths = channel_paths
-        self.bead_paths = bead_paths
         self.frame_bounds = frame_bounds
         self.max_frames = max_frames
         self.seed_transforms = seed_transforms
@@ -12304,17 +12279,15 @@ class ChannelRegistrationWorker(QtCore.QThread):
         """
         try:
             if self.source == "beads":
-                self.statusChanged.emit("Loading bead movies...")
-                movies = [io.load_movie(p)[0] for p in self.bead_paths]
                 self.statusChanged.emit("Registering channels on beads...")
                 registration.calibrate_channel_registration_from_beads(
-                    movies,
+                    self.movies,
                     box=self.box,
                     minimum_ng=self.minimum_ng,
                     model=self.model,
                     regions=self.regions,
                     multi_fov=self.multi_fov,
-                    channel_paths=self.bead_paths,
+                    channel_paths=self.channel_paths,
                     path=self.path,
                 )
             else:
