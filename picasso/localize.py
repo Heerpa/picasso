@@ -17,7 +17,7 @@ Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
 "Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
 Scientific Reports 7, 15722 (2017).
 https://doi.org/10.1038/s41598-017-15313-9
-Licence (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
+License (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
 
 :authors: Joerg Schnitzbauer, Maximilian Thomas Strauss,
     Rafal Kowalewski
@@ -2949,7 +2949,7 @@ def fit(
         the fitted ``z`` directly. "avg" for taking the average of each
         spot.
     eps : float or None, optional
-        The convergence criterion, honoured by every iterating method on
+        The convergence criterion, honored by every iterating method on
         either device (all of them except "avg"). None (the default)
         picks the value that suits the method: 0.001 for "gaussmle",
         0.01 for "gausslq" and the GPU Gaussians, and for either spline
@@ -5385,7 +5385,7 @@ def _fit2d_spline_cpu(
     ``progress_callback`` here tracks the fit itself, one step per spot. The
     per-spot CRLB pass in ``locs_from_fits_spline`` is a second sweep over the
     same localizations, so it only gets the callback in ``"console"`` mode -
-    where it draws its own labelled progress bar - rather than rewinding a
+    where it draws its own labeled progress bar - rather than rewinding a
     GUI's counter back to zero.
 
     Returns None if ``abort_callback`` asked to stop."""
@@ -5785,7 +5785,7 @@ def filter_linked_identifications(
 
     Thin wrapper around :func:`link_identifications_multichannel`. If no other
     channel has identifications, the reference table is returned unchanged so
-    an un-identified set degrades to the previous behaviour instead of fitting
+    an un-identified set degrades to the previous behavior instead of fitting
     nothing.
 
     Parameters
@@ -7067,7 +7067,7 @@ def localize(
         Which 2D fitting algorithm to use, see ``fit``. Default is
         "gausslq".
     eps : float or None, optional
-        The convergence criterion, honoured by every iterating method on
+        The convergence criterion, honored by every iterating method on
         either device (all of them except "avg"). None (the default)
         picks the value that suits the method, see ``fit``.
     max_it : int or None, optional
@@ -7243,7 +7243,7 @@ def _localize_return(
     info: list[dict],
     return_info: bool,
 ) -> pd.DataFrame | tuple[pd.DataFrame, list[dict]]:
-    """``localize``'s return value, honouring the deprecated
+    """``localize``'s return value, honoring the deprecated
     ``return_info``."""
     if return_info:
         return locs, info
@@ -8036,12 +8036,12 @@ def _lateral_match_bead_pairs(
     coords_mov: np.ndarray,
     return_indices: bool = False,
 ) -> tuple:
-    """Match beads via mutual nearest-neighbour with a distance threshold.
+    """Match beads via mutual nearest-neighbor with a distance threshold.
     Returns (pairs_ref, pairs_mov), each (M, 2).
 
     With ``return_indices``, the indices the pairs have in ``coords_ref``
     and ``coords_mov`` are returned as well, so a caller can tell which
-    detections stayed unmatched - the Localize viewer greys those out when
+    detections stayed unmatched - the Localize viewer grays those out when
     it draws the pairing (see ``Window.draw_affine_pairing``)."""
     if len(coords_ref) == 0 or len(coords_mov) == 0:
         empty = np.empty((0, 2))
@@ -8088,7 +8088,7 @@ def _estimate_lateral_transform(
     Returns ``(transform, keep)``, where ``keep`` is the boolean mask of the
     pairs the returned transform was fitted on.
 
-    The pairs come from mutual-nearest-neighbour matching, which has no
+    The pairs come from mutual-nearest-neighbor matching, which has no
     outlier rejection of its own: a single mismatched bead barely perturbs a
     6-DOF affine but visibly warps an 8-DOF homography and wrecks a degree-3
     polynomial. So the transform is fitted once, the pairs whose residual is
@@ -8127,8 +8127,8 @@ def _lateral_plot_alignment(
     """Four-panel QC figure: overlay before/after correction and mean
     per-bead cross-correlation before/after correction.
 
-    If ``pixelsize`` is None, axes are labelled in pixels; otherwise
-    they are scaled to nm and labelled accordingly.
+    If ``pixelsize`` is None, axes are labeled in pixels; otherwise
+    they are scaled to nm and labeled accordingly.
     """
     nm = pixelsize if pixelsize is not None else 1.0
     unit = "nm" if pixelsize is not None else "px"
@@ -8538,7 +8538,7 @@ def calibrate_lateral_transform(
     The fit is performed in pixel coordinates on a per-pixel mean of
     each movie. Bead candidates are found by Gaussian-blur + local-max,
     refined to sub-pixel accuracy by a 2D Gaussian fit, then matched
-    between the two images by mutual nearest neighbour. The transform is
+    between the two images by mutual nearest neighbor. The transform is
     fitted by least squares (see :func:`picasso.transforms.estimate`) and
     decomposed into rotation / anisotropic scale / shear.
 

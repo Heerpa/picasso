@@ -1141,7 +1141,7 @@ class TestFit2DIntegration:
             calibration
         )
 
-    def test_explicit_schedule_is_honoured(self, scene):
+    def test_explicit_schedule_is_honored(self, scene):
         calibration, movie, info, camera_info, identifications, _ = scene
         _, fit_info = localize.fit2D(
             movie,

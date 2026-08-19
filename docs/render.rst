@@ -295,12 +295,12 @@ hides that channel. **Right click** on a checkbox displays that channel
 only - it is ticked and all other channels are unticked at once, which is
 convenient for quickly inspecting individual channels in multiplexed data.
 
-Each channel's *Color* dropdown is organised into three sections:
+Each channel's *Color* dropdown is organized into three sections:
 
 * **Solid colors** — the 14 default named colors (``red``, ``cyan``,
   ``green``, …). You can also type a hexadecimal code such as ``#FF5733``
   directly into the dropdown. Solid colors are rendered as a black →
-  color ramp, exactly matching the previous "intensity × RGB" behaviour.
+  color ramp, exactly matching the previous "intensity × RGB" behavior.
 * **Built-in colormaps** — one 3-stop *black → color → white* gradient
   per default solid color, named ``<color>_gradient`` (e.g.
   ``blue_gradient``, ``red_gradient``).

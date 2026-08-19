@@ -67,7 +67,7 @@ SPLINE_CRLB_DEVICES = [
 
 
 def _gradient_meshgrid(box: int) -> tuple[np.ndarray, np.ndarray]:
-    """Build the normalised (uy, ux) direction vectors that
+    """Build the normalized (uy, ux) direction vectors that
     ``identify_in_image`` constructs internally — needed to drive
     ``net_gradient`` directly. The center pixel is unused by
     ``net_gradient`` (it is skipped inside the loop) but its norm is 0,
@@ -1661,7 +1661,7 @@ class TestMovieLoadWorker:
         assert len(infos) == 3
 
     def test_none_result_is_skipped(self, monkeypatch):
-        """A loader returning None (e.g. a cancelled prompt) drops that
+        """A loader returning None (e.g. a canceled prompt) drops that
         file without aborting the rest of the batch."""
 
         def fake_load_movie(path, prompt_info=None, progress=None):
@@ -2075,7 +2075,7 @@ class TestInitialParametersGpufit:
         np.testing.assert_allclose(init[:, 2], center)
         # Spot 0's bright pixel sits on the central row and column, so its
         # second moment about them is zero and the width lands on the
-        # numerical floor. Spot 1's peak is at (2, 4), off both centre lines,
+        # numerical floor. Spot 1's peak is at (2, 4), off both center lines,
         # so those profiles are empty (0/0) and it falls back to box / 5.
         np.testing.assert_allclose(init[:, 3], [0.5, 1.4])
         np.testing.assert_allclose(init[:, 4], [0.5, 1.4])
@@ -2098,13 +2098,13 @@ class TestInitialParametersGpufit:
         truth = 1.4
         widths = {}
         for box in (13, 23, 31):
-            centre = (box - 1) / 2.0
+            center = (box - 1) / 2.0
             yy, xx = np.mgrid[0:box, 0:box].astype(np.float64)
             mu = (
                 500.0
                 * np.exp(
                     -0.5
-                    * (((xx - centre) ** 2 + (yy - centre) ** 2) / truth**2)
+                    * (((xx - center) ** 2 + (yy - center) ** 2) / truth**2)
                 )
                 + 10.0
             )
@@ -2151,7 +2151,7 @@ class TestInitialParametersGpufit:
         np.testing.assert_allclose(init[:, 0], [100.0, 50.0])  # amplitude
         np.testing.assert_allclose(init[:, 1], center)  # x
         np.testing.assert_allclose(init[:, 2], center)  # y
-        # As above: spot 0 on the centre lines, spot 1 off them.
+        # As above: spot 0 on the center lines, spot 1 off them.
         np.testing.assert_allclose(init[:, 3], [0.5, 1.4])  # single width
         np.testing.assert_allclose(init[:, 4], [3.0, 7.0])  # background
 
@@ -2695,7 +2695,7 @@ class TestSplineHelpers:
         init_3d = seeds.initial_parameters_spline(spots, calib_3d)
         assert init_3d.shape == (len(spots), 5)
         assert init_3d.dtype == np.float32
-        # z_shift is initialised to -z_init (the in-focus slice), so that the
+        # z_shift is initialized to -z_init (the in-focus slice), so that the
         # Gpufit model's native z = -z_shift starts at the focus (see
         # seeds.initial_parameters_spline / spline.calibrate_spline). z_init defaults
         # to z_center for this calibration.
@@ -2923,7 +2923,7 @@ class TestSplineHelpers:
         test is relative, so a different tolerance is a real difference - and
         the multi-start ranks its axial seeds on that chi-square.
 
-        Asserted behaviourally rather than by reading the source: whatever
+        Asserted behaviorally rather than by reading the source: whatever
         ``splinefit.convergence_schedule`` returns is what *both* backends are
         handed."""
         from picasso.fitting import splinefit, splinefit_cuda
@@ -3256,7 +3256,7 @@ class TestSplineHelpers:
         assert len(set(z_seeds.tolist())) == expected
         assert z_seeds.min() == pytest.approx(-(calib["n_data"][2] - 1))
         assert z_seeds.max() == pytest.approx(0.0)
-        # seeded runs must use the tight convergence, else neighbouring axial
+        # seeded runs must use the tight convergence, else neighboring axial
         # minima are indistinguishable and the multi-start is pointless
         assert kwargs["tolerance"] == 1e-4
         assert kwargs["max_iterations"] == 100
@@ -3422,7 +3422,7 @@ class TestSplineHelpers:
         )
         init = seeds.initial_parameters_spline(spots, calib)
         assert init.shape == (4, 5)
-        # z_shift initialised to -z_init (= -z_center here); see the
+        # z_shift initialized to -z_init (= -z_center here); see the
         # single-channel test above.
         np.testing.assert_allclose(init[:, 3], -calib["z_center"])
 
@@ -3453,7 +3453,7 @@ class TestSplineHelpers:
         ids = pd.DataFrame(
             {
                 "frame": [0, 0, 0, 0],
-                # centred (ok), top edge (box off the top), left edge, and a
+                # centered (ok), top edge (box off the top), left edge, and a
                 # spot that only leaves the frame once mapped in channel 1.
                 "x": [width // 2, width // 2, 0, width - r - 1],
                 "y": [height // 2, 0, height // 2, height // 2],
@@ -3466,7 +3466,7 @@ class TestSplineHelpers:
         kept = localize.multichannel_inbounds_ids(
             ids, BOX, [movie, movie], [identity, shift]
         )
-        # only the centred spot survives in both channels
+        # only the centered spot survives in both channels
         assert len(kept) == 1
         assert int(kept["x"].iloc[0]) == width // 2
         assert int(kept["y"].iloc[0]) == height // 2
@@ -3562,7 +3562,7 @@ class TestCrossChannelLinking:
         assert (n_kept, n_total) == (1, 2)
         assert len(kept) == 1 and kept["x"].iloc[0] == 10
         # without identifications in any other channel the table is unchanged,
-        # so an un-identified set degrades to the unfiltered behaviour
+        # so an un-identified set degrades to the unfiltered behavior
         same, n_kept, n_total = localize.filter_linked_identifications(
             [ref, None], [self.IDENTITY, self.IDENTITY], box=2
         )
@@ -3796,7 +3796,7 @@ class TestSplineCoefficients:
         calib, _, amplitude, offset = _synthetic_spline_3d_calibration()
         box = calib["n_data"][0]
         z_focus = calib["z_center"]
-        # a centred molecule a few slices below focus
+        # a centered molecule a few slices below focus
         theta = np.array(
             [[amplitude, 0.0, 0.0, -(z_focus - 5.0), offset]], np.float64
         )
@@ -4138,7 +4138,7 @@ class TestNoSelfDeprecation:
 class TestConvergenceSchedulePlumbing:
     """The convergence criterion and the iteration cap must reach *every*
     fitting method, on either device, and be recorded as what the fit actually
-    used. Both used to be greyed out for GPU fitting and unavailable for the
+    used. Both used to be grayed out for GPU fitting and unavailable for the
     least-squares Gaussians, so a user could not touch them at all for
     Picasso's default method."""
 
@@ -4210,7 +4210,7 @@ class TestConvergenceSchedulePlumbing:
             pytest.skip("no CUDA device")
         rng = np.random.default_rng(0)
         yy, xx = np.mgrid[0:BOX, 0:BOX].astype(float)
-        centre = (BOX - 1) / 2.0
+        center = (BOX - 1) / 2.0
         spots = np.stack(
             [
                 rng.poisson(
@@ -4218,8 +4218,8 @@ class TestConvergenceSchedulePlumbing:
                     * np.exp(
                         -0.5
                         * (
-                            ((xx - centre - dx) / 1.3) ** 2
-                            + ((yy - centre - dy) / 1.7) ** 2
+                            ((xx - center - dx) / 1.3) ** 2
+                            + ((yy - center - dy) / 1.7) ** 2
                         )
                     )
                     + 12.0
@@ -4242,7 +4242,7 @@ class TestConvergenceSchedulePlumbing:
             pytest.skip("no CUDA device")
         rng = np.random.default_rng(1)
         yy, xx = np.mgrid[0:BOX, 0:BOX].astype(float)
-        centre = (BOX - 1) / 2.0
+        center = (BOX - 1) / 2.0
         spots = np.stack(
             [
                 rng.poisson(
@@ -4250,8 +4250,8 @@ class TestConvergenceSchedulePlumbing:
                     * np.exp(
                         -0.5
                         * (
-                            ((xx - centre) / 1.3) ** 2
-                            + ((yy - centre) / 1.7) ** 2
+                            ((xx - center) / 1.3) ** 2
+                            + ((yy - center) / 1.7) ** 2
                         )
                     )
                     + 12.0
@@ -4269,7 +4269,7 @@ class TestConvergenceSchedulePlumbing:
 
     def test_spline_schedule_reaches_the_gpu_backend(self, monkeypatch):
         """``_fit2d_spline_gpu`` used to drop the caller's schedule on the
-        floor - the GPU boxes were greyed out, so there was never one to
+        floor - the GPU boxes were grayed out, so there was never one to
         pass."""
         calib = _fake_spline_calibration(model="spline-3d")
         box = calib["box"]
@@ -7887,7 +7887,7 @@ class TestFitAffineTransform:
             )
 
     def test_a_mismatched_pair_is_trimmed(self):
-        """Mutual-nearest-neighbour matching has no outlier rejection, so the
+        """Mutual-nearest-neighbor matching has no outlier rejection, so the
         fit must reject the bad pair itself - otherwise one mismatched bead
         visibly warps a projective and wrecks a polynomial."""
         ref_xy = _affine_bead_grid()
@@ -8029,7 +8029,7 @@ class TestFitAffineTransform:
             "target_path",
         }
         # every detection, and which of them were matched, so the viewer can
-        # color-code the pairing and grey out the beads that were dropped
+        # color-code the pairing and gray out the beads that were dropped
         assert len(qc["beads_ref"]) >= len(qc["pairs_ref"])
         assert len(qc["idx_ref"]) == len(qc["pairs_ref"])
         assert len(qc["idx_target"]) == len(qc["pairs_ref"])
@@ -8205,7 +8205,7 @@ class TestAffinePairingOverlayGUI:
         assert ref_colors[:2] == target_colors
         assert target_colors[0] != target_colors[1]
 
-    def test_unmatched_beads_are_grey(self, window):
+    def test_unmatched_beads_are_gray(self, window):
         _, ref_colors = self._draw(window, self.QC["ref_path"])
         assert ref_colors[2] == localize_gui.LINK_UNMATCHED_COLOR.name()
         assert "1 unpaired" in window.status_bar.currentMessage()
@@ -8928,7 +8928,7 @@ class TestCutMap:
 
         This is the only check that the map patch and the spot it accompanies
         describe the same pixels. An off-by-one here would put a hot pixel's
-        variance on its neighbour, silently.
+        variance on its neighbor, silently.
         """
         rng = np.random.default_rng(0)
         image = rng.normal(100.0, 5.0, (32, 30)).astype(np.float32)
@@ -9104,7 +9104,7 @@ def scmos_scene():
 
     Conditions follow the paper's own simulations - 200 photons per molecule,
     5 background photons per pixel - with one very noisy pixel inside the
-    fitting box but off-centre and off-axis, so a bias shows up in x and
+    fitting box but off-center and off-axis, so a bias shows up in x and
     cannot be mistaken for a symmetric artifact.
     """
     from picasso import scmos
@@ -9183,14 +9183,14 @@ class TestScmosFit2DIntegration:
         plain, _ = self._fit(
             scmos_scene, picasso_movie_factory, "gaussmle", None
         )
-        modelled, _ = self._fit(
+        modeled, _ = self._fit(
             scmos_scene,
             picasso_movie_factory,
             "gaussmle",
             scmos_scene["calibration"],
         )
         bias_plain = abs(plain["x"].mean() - x0)
-        bias_model = abs(modelled["x"].mean() - x0)
+        bias_model = abs(modeled["x"].mean() - x0)
         sem = plain["x"].std() / np.sqrt(len(plain))
 
         # The test is only meaningful if the conventional fit is measurably
@@ -9198,7 +9198,7 @@ class TestScmosFit2DIntegration:
         assert bias_plain > 3 * sem
         assert bias_model < bias_plain / 3
         # ... and the precision must not be paid for it.
-        assert modelled["x"].std() < plain["x"].std()
+        assert modeled["x"].std() < plain["x"].std()
 
     def test_mle_precision_estimate_becomes_honest(
         self, scmos_scene, picasso_movie_factory
@@ -9208,14 +9208,14 @@ class TestScmosFit2DIntegration:
         plain, _ = self._fit(
             scmos_scene, picasso_movie_factory, "gaussmle", None
         )
-        modelled, _ = self._fit(
+        modeled, _ = self._fit(
             scmos_scene,
             picasso_movie_factory,
             "gaussmle",
             scmos_scene["calibration"],
         )
         ratio_plain = plain["x"].std() / plain["lpx"].mean()
-        ratio_model = modelled["x"].std() / modelled["lpx"].mean()
+        ratio_model = modeled["x"].std() / modeled["lpx"].mean()
         assert ratio_plain > 1.3
         assert 0.85 < ratio_model < 1.15
 
@@ -9233,14 +9233,14 @@ class TestScmosFit2DIntegration:
         plain, _ = self._fit(
             scmos_scene, picasso_movie_factory, "gausslq", None
         )
-        modelled, _ = self._fit(
+        modeled, _ = self._fit(
             scmos_scene,
             picasso_movie_factory,
             "gausslq",
             scmos_scene["calibration"],
         )
-        assert modelled["lpx"].mean() > plain["lpx"].mean()
-        assert modelled["x"].std() == pytest.approx(plain["x"].std(), rel=0.05)
+        assert modeled["lpx"].mean() > plain["lpx"].mean()
+        assert modeled["x"].std() == pytest.approx(plain["x"].std(), rel=0.05)
 
     def test_metadata_records_provenance_not_arrays(
         self, scmos_scene, picasso_movie_factory
@@ -9361,13 +9361,13 @@ class TestScmosSplineIntegration:
 
     def test_mle_crlb_becomes_honest(self, scene, picasso_movie_factory):
         plain = self._fit(scene, picasso_movie_factory, "spline-mle", None)
-        modelled = self._fit(
+        modeled = self._fit(
             scene, picasso_movie_factory, "spline-mle", scene["calibration"]
         )
         assert plain["x"].std() / plain["lpx"].mean() > 1.15
-        ratio = modelled["x"].std() / modelled["lpx"].mean()
+        ratio = modeled["x"].std() / modeled["lpx"].mean()
         assert 0.85 < ratio < 1.15
-        assert modelled["x"].std() < plain["x"].std()
+        assert modeled["x"].std() < plain["x"].std()
 
     def test_lsq_fit_is_stable_but_its_uncertainty_grows(
         self, scene, picasso_movie_factory
@@ -9378,11 +9378,11 @@ class TestScmosSplineIntegration:
         under-reporting its own scatter.
         """
         plain = self._fit(scene, picasso_movie_factory, "spline", None)
-        modelled = self._fit(
+        modeled = self._fit(
             scene, picasso_movie_factory, "spline", scene["calibration"]
         )
-        assert modelled["x"].std() == pytest.approx(plain["x"].std(), rel=0.05)
-        assert modelled["lpx"].mean() > plain["lpx"].mean()
+        assert modeled["x"].std() == pytest.approx(plain["x"].std(), rel=0.05)
+        assert modeled["lpx"].mean() > plain["lpx"].mean()
 
 
 class TestScmosMultichannel:
@@ -9402,8 +9402,8 @@ class TestScmosMultichannel:
     def _scene(cls, shift=(6, 4), n_channels=2):
         """Two channels whose variance maps carry a unique marker each.
 
-        The markers sit exactly where each channel's box centre will land, so
-        a correctly cut patch puts them both at the centre pixel.
+        The markers sit exactly where each channel's box center will land, so
+        a correctly cut patch puts them both at the center pixel.
         """
         cx, cy = 20, 18
         dx, dy = shift
@@ -9450,10 +9450,10 @@ class TestScmosMultichannel:
             return_residuals=True,
             return_variance=True,
         )
-        centre = self.BOX // 2
+        center = self.BOX // 2
         assert variance.shape == (1, self.BOX, self.BOX, 2)
-        assert variance[0, centre, centre, 0] == 111.0
-        assert variance[0, centre, centre, 1] == 222.0
+        assert variance[0, center, center, 0] == 111.0
+        assert variance[0, center, center, 1] == 222.0
         # Nothing leaks between channels.
         assert variance[..., 0].sum() == 111.0
         assert variance[..., 1].sum() == 222.0
@@ -9541,10 +9541,10 @@ class TestScmosMultichannel:
             return_variance=True,
         )
         major = precision._crlb_variance_channel_major(variance, 2)
-        centre = self.BOX // 2
+        center = self.BOX // 2
         assert major.shape == (1, 2, self.BOX, self.BOX)
-        assert major[0, 0, centre, centre] == 111.0
-        assert major[0, 1, centre, centre] == 222.0
+        assert major[0, 0, center, center] == 111.0
+        assert major[0, 1, center, center] == 222.0
 
     def test_single_channel_patches_still_gain_their_axis(self):
         var = np.zeros((4, self.BOX, self.BOX), np.float32)
@@ -9652,7 +9652,7 @@ class TestScmosMultichannel:
             mle=mle,
             use_gpu=False,
         )
-        modelled = localize.fit_spline_multichannel(
+        modeled = localize.fit_spline_multichannel(
             movies,
             camera_infos,
             identifications,
@@ -9662,8 +9662,8 @@ class TestScmosMultichannel:
             use_gpu=False,
             camera_calibrations=calibrations,
         )
-        assert len(plain) == len(modelled) == n_frames
-        assert np.isfinite(modelled["lpx"]).any()
+        assert len(plain) == len(modeled) == n_frames
+        assert np.isfinite(modeled["lpx"]).any()
 
     def test_the_ratiometric_fitter_accepts_a_calibration(self):
         calibration = _fake_spline_calibration(
@@ -10454,7 +10454,7 @@ class TestIdentifyModeParameter:
 
     def test_hidden_for_single_channel_data(self):
         """Hidden, like every other multichannel-only widget - not merely
-        greyed out."""
+        grayed out."""
         window = localize_gui.Window()
         dialog = window.parameters_dialog
         try:
@@ -11198,7 +11198,7 @@ class TestPreviewLinkColors:
             assert not window.ready_for_fit
             colors = _preview_box_colors(window)
             assert len(colors) == len(self.POSITIONS)
-            # every spot is in both channels, so none of them stays grey ...
+            # every spot is in both channels, so none of them stays gray ...
             assert localize_gui.LINK_UNMATCHED_COLOR.name() not in colors
             # ... and none is drawn in the plain preview red
             assert _RED not in colors
@@ -11232,7 +11232,7 @@ class TestPreviewLinkColors:
         finally:
             window.close()
 
-    def test_a_spot_missing_from_the_other_channel_stays_grey(self):
+    def test_a_spot_missing_from_the_other_channel_stays_gray(self):
         window = self._with_calibration(
             self._window(positions=self.POSITIONS[:1])
         )
@@ -11294,8 +11294,8 @@ class TestPreviewLinkColors:
             colors = _preview_box_colors(window)
             # a couple of the random spots fall too close to resolve
             assert len(colors) >= len(positions) - 2
-            grey = localize_gui.LINK_UNMATCHED_COLOR.name()
-            assert sum(color != grey for color in colors) >= 10
+            gray = localize_gui.LINK_UNMATCHED_COLOR.name()
+            assert sum(color != gray for color in colors) >= 10
         finally:
             window.close()
 
@@ -11414,15 +11414,15 @@ class TestPreviewLinkColorsSplitFov:
         finally:
             window.close()
 
-    def test_a_misregistered_region_stays_grey(self):
+    def test_a_misregistered_region_stays_gray(self):
         """The registration is the calibration's, so a shift it does not
         know about shows up as unlinked spots rather than being absorbed."""
         window = self._window(shift=(48.0, 12.0))
         try:
             boxes = _preview_box_colors(window)[len(self.REGIONS) :]
-            grey = localize_gui.LINK_UNMATCHED_COLOR.name()
+            gray = localize_gui.LINK_UNMATCHED_COLOR.name()
             assert len(boxes) > len(self.POSITIONS)
-            assert boxes == [grey] * len(boxes)
+            assert boxes == [gray] * len(boxes)
         finally:
             window.close()
 
@@ -11669,9 +11669,9 @@ class TestFitGaussMultichannel:
             )
 
         plain = fit(None)
-        modelled = fit(maps)
+        modeled = fit(maps)
         assert not np.allclose(
-            plain["lpx"].to_numpy(), modelled["lpx"].to_numpy()
+            plain["lpx"].to_numpy(), modeled["lpx"].to_numpy()
         )
 
 

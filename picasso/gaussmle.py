@@ -20,7 +20,7 @@ Smith, et al. Nature Methods, 2010.
     ==========================  =============================================
 
     The replacement fits with Levenberg-Marquardt rather than the Newton
-    solver here, and evaluates the Gaussian at the pixel centre rather than
+    solver here, and evaluates the Gaussian at the pixel center rather than
     integrating it over the pixel, as every other Picasso Gaussian fit does.
     This leads only to a negligible difference in the results.
 

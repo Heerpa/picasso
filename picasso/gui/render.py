@@ -2771,7 +2771,7 @@ class HdbscanDialog(lib.Dialog):
     min_cluster : QSpinBox
         Contains the minimum number of locs in a cluster.
     min_samples : QSpinBox
-        Contains the number of locs in a neighbourhood for a loc to be
+        Contains the number of locs in a neighborhood for a loc to be
         considered a core point.
     save_areas : QCheckBox
         Whether to save cluster areas as .csv file.
@@ -7297,7 +7297,7 @@ class SlicerDialog(lib.Dialog):
         self.close()
 
 
-class _LoadCancelledError(Exception):
+class _LoadCanceledError(Exception):
     """Raised inside the loading worker to abort the current file."""
 
 
@@ -7374,32 +7374,32 @@ class LocsLoadWorker(QtCore.QObject):
     def __init__(self, jobs: list[tuple[str, float | None]]) -> None:
         super().__init__()
         self.jobs = jobs
-        self._cancelled = False
+        self._canceled = False
 
     def cancel(self) -> None:
         """Request cancellation; takes effect at the next block of
         localizations read, i.e. also within a file."""
-        self._cancelled = True
+        self._canceled = True
 
     def _report(self, done: int, total: int) -> None:
         """Report the read progress within the current file. Called
         between the blocks of localizations read, so it doubles as the
         mid-file cancellation point."""
-        if self._cancelled:
-            raise _LoadCancelledError
+        if self._canceled:
+            raise _LoadCanceledError
         self.subprogress.emit(done, total)
 
     def run(self) -> None:
         """Load each file in turn, emitting ``loaded`` for each one."""
         for i, (path, pixelsize) in enumerate(self.jobs):
-            if self._cancelled:
+            if self._canceled:
                 break
             self.progress.emit(i, os.path.basename(path))
             try:
                 locs, info = _read_locs_file(
                     path, pixelsize, progress=self._report
                 )
-            except _LoadCancelledError:
+            except _LoadCanceledError:
                 break
             except io.NoMetadataFileError:
                 self.failed.emit(
@@ -7415,13 +7415,13 @@ class LocsLoadWorker(QtCore.QObject):
             except Exception as e:  # noqa: BLE001 - reported to the GUI
                 self.failed.emit(path, str(e))
                 continue
-            if self._cancelled:
+            if self._canceled:
                 break
             try:
                 render_index = spatial_index.build_render_index(locs, info)
             except Exception:
                 render_index = None
-            if self._cancelled:
+            if self._canceled:
                 break
             self.loaded.emit(path, locs, info, render_index)
         self.finished.emit()
@@ -7594,7 +7594,7 @@ class View(QtWidgets.QLabel):
 
     def _prompt_pixelsize(self, path: str) -> float | None:
         """Ask for the camera pixel size of a file that does not store
-        it (ThunderSTORM .csv, SMAP _sml.mat). None if cancelled."""
+        it (ThunderSTORM .csv, SMAP _sml.mat). None if canceled."""
         pixelsize, ok = QtWidgets.QInputDialog.getDouble(
             self,
             "Camera pixel size",
@@ -7746,7 +7746,7 @@ class View(QtWidgets.QLabel):
         for path in sorted(paths):
             if path.endswith((".csv", ".mat")):
                 pixelsize = self._prompt_pixelsize(path)
-                if pixelsize is None:  # cancelled by the user
+                if pixelsize is None:  # canceled by the user
                     continue
             else:
                 pixelsize = None
@@ -7811,7 +7811,7 @@ class View(QtWidgets.QLabel):
     def _on_load_canceled(self) -> None:
         """Discard the progress dialog as soon as the user cancels: the
         worker may still emit progress that was queued before it saw the
-        cancellation, and ``setValue`` re-shows a cancelled dialog."""
+        cancellation, and ``setValue`` re-shows a canceled dialog."""
         if self._load_progress is not None:
             self._load_progress.close()
             self._load_progress = None
@@ -11279,7 +11279,7 @@ class View(QtWidgets.QLabel):
                     )
                 except ValueError:
                     warning = (
-                        "The color selection not recognised in the "
+                        "The color selection not recognized in the "
                         f"channel {dataset_dialog.checks[i].text()}. "
                         "Please choose one of the options provided, "
                         "type a hexadecimal code (e.g. '#ffcdff'), or "
@@ -12629,7 +12629,7 @@ class Window(QtWidgets.QMainWindow):
     slicer_dialog : SlicerDialog
         Instance of the dialog for slicing 3D data in z axis.
     tools_settings_dialog : ToolsSettingsDialog
-        Instance of the dialog for customising picks.
+        Instance of the dialog for customizing picks.
     view : View
         Instance of the class for displaying rendered localizations.
     window_rot : RotationWindow

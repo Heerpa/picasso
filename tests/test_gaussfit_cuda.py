@@ -275,7 +275,7 @@ class TestNonPositiveModelIsAbandoned:
     that pushes the background back up, so the chi-square would stop moving and
     the *relative* convergence test would then accept a badly wrong fit as
     converged. Reported as ``NEG_CURVATURE_MLE`` instead, matching the
-    behaviour Picasso shipped before the port.
+    behavior Picasso shipped before the port.
     """
 
     def test_negative_background_is_reported_not_floored(self):
@@ -376,7 +376,7 @@ class TestApi:
 # ----------------------------------------------------------------------
 
 MULTI_BOX = 13
-MULTI_CENTRE = (MULTI_BOX - 1) / 2.0
+MULTI_CENTER = (MULTI_BOX - 1) / 2.0
 MULTI_JAC = np.array(
     [[1.0, 0.0, 0.0, 1.0], [0.995, 0.03, -0.028, 1.004]], dtype=np.float64
 )
@@ -391,14 +391,14 @@ def _multi_batch(n, amps, bgs, seed=1, box=MULTI_BOX):
     j, i = np.mgrid[0:box, 0:box].astype(np.float64)
     spots = np.zeros((n, n_channels, box, box), dtype=np.float32)
     for k in range(n):
-        x = MULTI_CENTRE + rng.uniform(-1.5, 1.5)
-        y = MULTI_CENTRE + rng.uniform(-1.5, 1.5)
+        x = MULTI_CENTER + rng.uniform(-1.5, 1.5)
+        y = MULTI_CENTER + rng.uniform(-1.5, 1.5)
         sigma = rng.uniform(1.1, 1.5)
         for c in range(n_channels):
             a00, a01, a10, a11 = MULTI_JAC[c]
-            dx, dy = x - MULTI_CENTRE, y - MULTI_CENTRE
-            sx = MULTI_CENTRE + a00 * dx + a01 * dy + MULTI_RES[c, 0]
-            sy = MULTI_CENTRE + a10 * dx + a11 * dy + MULTI_RES[c, 1]
+            dx, dy = x - MULTI_CENTER, y - MULTI_CENTER
+            sx = MULTI_CENTER + a00 * dx + a01 * dy + MULTI_RES[c, 0]
+            sy = MULTI_CENTER + a10 * dx + a11 * dy + MULTI_RES[c, 1]
             spots[k, c] = rng.poisson(
                 amps[c]
                 * np.exp(-0.5 * ((i - sx) ** 2 + (j - sy) ** 2) / sigma**2)
@@ -415,14 +415,14 @@ def _multi_seed(spots, link_photons):
         seed = np.zeros((n, 5))
         ref = spots[:, 0]
         seed[:, 0] = ref.max(axis=(1, 2)) - ref.min(axis=(1, 2))
-        seed[:, 1] = MULTI_CENTRE
-        seed[:, 2] = MULTI_CENTRE
+        seed[:, 1] = MULTI_CENTER
+        seed[:, 2] = MULTI_CENTER
         seed[:, 3] = 1.3
         seed[:, 4] = ref.min(axis=(1, 2))
         return seed
     seed = np.zeros((n, 3 + 2 * n_channels))
-    seed[:, 0] = MULTI_CENTRE
-    seed[:, 1] = MULTI_CENTRE
+    seed[:, 0] = MULTI_CENTER
+    seed[:, 1] = MULTI_CENTER
     seed[:, 2] = 1.3
     for c in range(n_channels):
         chan = spots[:, c]

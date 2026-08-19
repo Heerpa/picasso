@@ -681,7 +681,7 @@ def _movie_metadata_fallback(
     Returns
     -------
     info : dict or None
-        The metadata dictionary, or None if the user cancelled the
+        The metadata dictionary, or None if the user canceled the
         prompt dialog.
 
     Raises
@@ -724,7 +724,7 @@ def _movie_info_or_prompt(
     cannot be read.
 
     Returns None only when the metadata could not be read and the user
-    cancelled the fallback dialog, in which case the caller should abort
+    canceled the fallback dialog, in which case the caller should abort
     loading. When no ``prompt_info`` callback is available (e.g.
     programmatic use), a ``NoMetadataFileError`` is raised instead of
     returning None.
@@ -755,7 +755,7 @@ def load_tif(
     prompt_info : Callable, optional
         Called with the readable movie dimensions if the embedded
         metadata cannot be parsed, so the user can enter it manually.
-        Must return ``(info, save)`` or None if cancelled.
+        Must return ``(info, save)`` or None if canceled.
     progress : callable, optional
         ``callable(done, total)`` invoked as the per-page IFD scan
         proceeds, so a smooth determinate progress bar can be shown while
@@ -770,7 +770,7 @@ def load_tif(
         A list containing a dictionary with metadata about the movie.
 
     Returns None if the metadata could not be read and the user
-    cancelled the manual-metadata fallback dialog.
+    canceled the manual-metadata fallback dialog.
     """
     # MicroManager can save an acquisition as one single-page TIFF per
     # frame ("separate image files"). If ``path`` is one such frame,
@@ -800,7 +800,7 @@ def load_nd2(
     prompt_info : Callable, optional
         Called with the readable movie dimensions if the embedded
         metadata cannot be parsed, so the user can enter it manually.
-        Must return ``(info, save)`` or None if cancelled.
+        Must return ``(info, save)`` or None if canceled.
 
     Returns
     -------
@@ -810,7 +810,7 @@ def load_nd2(
         A list containing a dictionary with metadata about the movie.
 
     Returns None if the metadata could not be read and the user
-    cancelled the manual-metadata fallback dialog.
+    canceled the manual-metadata fallback dialog.
     """
     movie = ND2Movie(path)
     info = _movie_info_or_prompt(movie, path, prompt_info)
@@ -836,7 +836,7 @@ def load_nd2_all(
     prompt_info : Callable, optional
         Called with the readable movie dimensions if the embedded metadata
         cannot be parsed, so the user can enter it manually. Must return
-        ``(info, save)`` or None if cancelled.
+        ``(info, save)`` or None if canceled.
 
     Returns
     -------
@@ -845,7 +845,7 @@ def load_nd2_all(
     infos : list of lists of dicts
         Per-channel metadata, each carrying a ``"Channel"`` key.
 
-    Returns None if the metadata could not be read and the user cancelled
+    Returns None if the metadata could not be read and the user canceled
     the manual-metadata fallback dialog.
     """
     probe = ND2Movie(path)
@@ -880,7 +880,7 @@ def load_stk(
     prompt_info : Callable, optional
         Called with the readable movie dimensions if the embedded
         metadata cannot be parsed, so the user can enter it manually.
-        Must return ``(info, save)`` or None if cancelled.
+        Must return ``(info, save)`` or None if canceled.
 
     Returns
     -------
@@ -891,7 +891,7 @@ def load_stk(
         A list containing a dictionary with metadata about the movie.
 
     Returns None if the metadata could not be read and the user
-    cancelled the manual-metadata fallback dialog.
+    canceled the manual-metadata fallback dialog.
     """
     movie = STKMultiMovie(path)
     info = _movie_info_or_prompt(movie, path, prompt_info)
@@ -1133,7 +1133,7 @@ def load_movie_all(
     infos : list of lists of dicts
         Per-channel metadata.
 
-    Returns None if metadata could not be read and the user cancelled the
+    Returns None if metadata could not be read and the user canceled the
     manual-metadata fallback dialog.
     """
     ext = os.path.splitext(path)[1].lower()
@@ -1780,7 +1780,7 @@ class ND2Movie(AbstractPicassoMovie):
             )
 
         # Channel selection. Single-channel files default to channel 0, so
-        # their behaviour is unchanged.
+        # their behavior is unchanged.
         self.n_channels = int(self.nd2file.sizes.get("C", 1))
         self._channel = channel if 0 <= channel < self.n_channels else 0
         self.channels = [f"Channel {i}" for i in range(self.n_channels)]
@@ -2212,7 +2212,7 @@ class _MultiDimMovie(AbstractPicassoMovie):
     pick the channel, and implement :meth:`_read_plane` (return the 2D
     image of one time point at the selected channel) and :meth:`info`.
     The array-like interface, channel selection and frame validation are
-    provided here. Mirrors the channel-prompt behaviour of ``load_ims``.
+    provided here. Mirrors the channel-prompt behavior of ``load_ims``.
     """
 
     def __init__(self):
@@ -2515,7 +2515,7 @@ class LIFMovie(_MultiDimMovie):
 
 
 def _yaml_safe(obj):
-    """Coerce arbitrary metadata into YAML/JSON-serialisable builtins so it
+    """Coerce arbitrary metadata into YAML/JSON-serializable builtins so it
     can be stored in the movie info dict (which gets written to
     ``_locs.yaml``)."""
     try:
@@ -4104,7 +4104,7 @@ def load_tif_concatenated(
     prompt_info : Callable, optional
         Called with the readable movie dimensions if the first file's
         metadata cannot be parsed, so the user can enter it manually.
-        Must return ``(info, save)`` or None if cancelled.
+        Must return ``(info, save)`` or None if canceled.
     progress : callable, optional
         ``callable(done, total)`` invoked as the files are scanned, so a
         determinate progress bar can be shown. Default is None.
@@ -4117,7 +4117,7 @@ def load_tif_concatenated(
         A list containing a dictionary with metadata about the movie.
 
     Returns None if the metadata could not be read and the user
-    cancelled the manual-metadata fallback dialog.
+    canceled the manual-metadata fallback dialog.
     """
     movie = ConcatenatedTiffMovie(paths, progress=progress)
     info = _movie_info_or_prompt(movie, movie.path, prompt_info)

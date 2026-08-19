@@ -23,8 +23,8 @@ The optimizer here is SciPy's ``leastsq`` (MINPACK) and is *not* derived from
 Gpufit. Its GPU counterpart is: ``fit_spots_gauss_gpu`` below is a thin shim
 onto :mod:`picasso.fitting.gaussfit_cuda`, whose Levenberg-Marquardt driver and
 models are a port of Gpufit (Przybylski et al., Scientific Reports 7,
-15722, 2017; licence in ``LICENSES/Gpufit-LICENSE.txt``). Both sample the
-Gaussian at the pixel centre, but they parameterize the amplitude differently
+15722, 2017; license in ``LICENSES/Gpufit-LICENSE.txt``). Both sample the
+Gaussian at the pixel center, but they parameterize the amplitude differently
 (here ``photons`` scales a normalized PDF; there it is the peak height, which
 ``picasso.localize`` converts afterwards), so the two are not interchangeable
 at the array level even though the fitted positions and widths agree.

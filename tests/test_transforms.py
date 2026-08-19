@@ -432,10 +432,10 @@ class TestDecompose:
         far = t.decompose(pixelsize=1.0, at=(CHIP - 100, CHIP - 100))
         assert near["scale_major"] != far["scale_major"]
 
-    def test_defaults_to_the_domain_centre(self, model):
+    def test_defaults_to_the_domain_center(self, model):
         _, _, _, t = model
-        centre = 0.5 * (t.domain[0] + t.domain[1])
-        assert t.decompose() == t.decompose(at=centre)
+        center = 0.5 * (t.domain[0] + t.domain[1])
+        assert t.decompose() == t.decompose(at=center)
 
 
 # ---------------------------------------------------------------------------

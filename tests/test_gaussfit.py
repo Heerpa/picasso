@@ -40,7 +40,7 @@ from picasso.fitting import (
 )
 
 BOX = 7
-CENTRE = (BOX - 1) / 2.0
+CENTER = (BOX - 1) / 2.0
 
 MODELS = [
     pytest.param(gaussfit.SPHERICAL, id="spherical"),
@@ -70,7 +70,7 @@ def _reference(model, theta, box=BOX):
 
 def _truth(model):
     """A deliberately asymmetric parameter set, so an x/y swap cannot hide."""
-    base = [220.0, CENTRE + 0.31, CENTRE - 0.22]
+    base = [220.0, CENTER + 0.31, CENTER - 0.22]
     if model == gaussfit.SPHERICAL:
         return np.array(base + [1.6, 9.0])
     if model == gaussfit.ELLIPTIC:
@@ -125,8 +125,8 @@ def noisy_batch():
     n = 120
     spots = np.empty((n, BOX, BOX), np.float32)
     for k in range(n):
-        cx = CENTRE + rng.uniform(-0.6, 0.6)
-        cy = CENTRE + rng.uniform(-0.6, 0.6)
+        cx = CENTER + rng.uniform(-0.6, 0.6)
+        cy = CENTER + rng.uniform(-0.6, 0.6)
         sx, sy = rng.uniform(1.0, 1.6), rng.uniform(1.0, 1.6)
         amp, bg = rng.uniform(300, 1500), rng.uniform(5, 30)
         mu = (
@@ -189,11 +189,11 @@ class TestGausslqParity:
     @staticmethod
     def _as_gausslq_layout(theta):
         """LM ``[peak, x, y, sx, sy, bg]`` -> gausslq's
-        ``[x, y, photons, bg, sx, sy]``, x/y relative to the box centre."""
+        ``[x, y, photons, bg, sx, sy]``, x/y relative to the box center."""
         peak, cx, cy, sx, sy, bg = theta.T
         photons = peak * 2.0 * np.pi * np.abs(sx * sy)
         return np.stack(
-            [cx - CENTRE, cy - CENTRE, photons, bg, np.abs(sx), np.abs(sy)],
+            [cx - CENTER, cy - CENTER, photons, bg, np.abs(sx), np.abs(sy)],
             axis=1,
         )
 
@@ -239,8 +239,8 @@ class TestGausslqParity:
         as_lm = np.stack(
             [
                 peak,
-                lq[:, 0] + CENTRE,
-                lq[:, 1] + CENTRE,
+                lq[:, 0] + CENTER,
+                lq[:, 1] + CENTER,
                 np.abs(lq[:, 4]),
                 np.abs(lq[:, 5]),
                 lq[:, 3],
@@ -420,12 +420,12 @@ def _poisson_spots(box, n=60, seed=3):
     point of ``TestWideSigmaSeedDoesNotAbortTheFit``.
     """
     rng = np.random.default_rng(seed)
-    centre = (box - 1) / 2.0
+    center = (box - 1) / 2.0
     yy, xx = np.mgrid[0:box, 0:box].astype(np.float64)
     spots = np.empty((n, box, box), np.float32)
     for k in range(n):
-        cx = centre + rng.uniform(-0.6, 0.6)
-        cy = centre + rng.uniform(-0.6, 0.6)
+        cx = center + rng.uniform(-0.6, 0.6)
+        cy = center + rng.uniform(-0.6, 0.6)
         sx, sy = rng.uniform(1.0, 1.6), rng.uniform(1.0, 1.6)
         amp, bg = rng.uniform(300, 1500), rng.uniform(5, 30)
         mu = (
@@ -445,7 +445,7 @@ class TestWideSigmaSeedDoesNotAbortTheFit:
     Seeded several times wider than the true PSF, the first (undamped) step
     overshoots and drives the background below zero - so the fit aborted on
     iteration 1, rolled the parameters back and wrote *the seed* out as the
-    result: sigma pinned to the seed width, x and y at the exact box centre.
+    result: sigma pinned to the seed width, x and y at the exact box center.
 
     Every other test in this module runs at ``BOX = 7``, where the seed lands
     within 0.4 px of the truth and the first step never overshoots, so none of
@@ -619,7 +619,7 @@ class TestNonPositiveModelIsAbandoned:
 # ----------------------------------------------------------------------
 
 MULTI_BOX = 13
-MULTI_CENTRE = (MULTI_BOX - 1) / 2.0
+MULTI_CENTER = (MULTI_BOX - 1) / 2.0
 
 # Channel 1 carries a real rotation/scale AND a sub-pixel ROI residual, so a
 # kernel that dropped either would be caught.
@@ -645,15 +645,15 @@ def _multi_batch(n, amps, bgs, seed=1, box=MULTI_BOX):
     spots = np.zeros((n, n_channels, box, box), dtype=np.float32)
     truth = np.zeros((n, 3))
     for k in range(n):
-        x = MULTI_CENTRE + rng.uniform(-1.5, 1.5)
-        y = MULTI_CENTRE + rng.uniform(-1.5, 1.5)
+        x = MULTI_CENTER + rng.uniform(-1.5, 1.5)
+        y = MULTI_CENTER + rng.uniform(-1.5, 1.5)
         sigma = rng.uniform(1.1, 1.5)
         truth[k] = (x, y, sigma)
         for c in range(n_channels):
             a00, a01, a10, a11 = MULTI_JAC[c]
-            dx, dy = x - MULTI_CENTRE, y - MULTI_CENTRE
-            sx = MULTI_CENTRE + a00 * dx + a01 * dy + MULTI_RES[c, 0]
-            sy = MULTI_CENTRE + a10 * dx + a11 * dy + MULTI_RES[c, 1]
+            dx, dy = x - MULTI_CENTER, y - MULTI_CENTER
+            sx = MULTI_CENTER + a00 * dx + a01 * dy + MULTI_RES[c, 0]
+            sy = MULTI_CENTER + a10 * dx + a11 * dy + MULTI_RES[c, 1]
             spots[k, c] = rng.poisson(
                 _multi_spot(box, sx, sy, amps[c], sigma, bgs[c])
             )
@@ -671,8 +671,8 @@ def _shared_seed(spots):
     seed = np.zeros((n, 5))
     ref = spots[:, 0]
     seed[:, 0] = ref.max(axis=(1, 2)) - ref.min(axis=(1, 2))
-    seed[:, 1] = MULTI_CENTRE
-    seed[:, 2] = MULTI_CENTRE
+    seed[:, 1] = MULTI_CENTER
+    seed[:, 2] = MULTI_CENTER
     seed[:, 3] = 1.3
     seed[:, 4] = ref.min(axis=(1, 2))
     return seed
@@ -681,8 +681,8 @@ def _shared_seed(spots):
 def _decoupled_seed(spots):
     n, n_channels = spots.shape[0], spots.shape[1]
     seed = np.zeros((n, 3 + 2 * n_channels))
-    seed[:, 0] = MULTI_CENTRE
-    seed[:, 1] = MULTI_CENTRE
+    seed[:, 0] = MULTI_CENTER
+    seed[:, 1] = MULTI_CENTER
     seed[:, 2] = 1.3
     for c in range(n_channels):
         chan = spots[:, c]
@@ -705,8 +705,8 @@ class TestMultichannelReducesToSingleChannel:
             spots[k] = rng.poisson(
                 _multi_spot(
                     BOX,
-                    CENTRE + rng.uniform(-1, 1),
-                    CENTRE + rng.uniform(-1, 1),
+                    CENTER + rng.uniform(-1, 1),
+                    CENTER + rng.uniform(-1, 1),
                     rng.uniform(200, 500),
                     rng.uniform(1.0, 1.6),
                     rng.uniform(5, 20),
@@ -833,15 +833,15 @@ class TestMultichannelFits:
         spots = np.zeros((n, 2, MULTI_BOX, MULTI_BOX), dtype=np.float32)
         truth = np.zeros((n, 3))
         for k in range(n):
-            x = MULTI_CENTRE + rng.uniform(-1.5, 1.5)
-            y = MULTI_CENTRE + rng.uniform(-1.5, 1.5)
+            x = MULTI_CENTER + rng.uniform(-1.5, 1.5)
+            y = MULTI_CENTER + rng.uniform(-1.5, 1.5)
             sigma = rng.uniform(1.1, 1.5)
             truth[k] = (x, y, sigma)
             for c in range(2):
                 a00, a01, a10, a11 = mirrored[c]
-                dx, dy = x - MULTI_CENTRE, y - MULTI_CENTRE
-                sx = MULTI_CENTRE + a00 * dx + a01 * dy + MULTI_RES[c, 0]
-                sy = MULTI_CENTRE + a10 * dx + a11 * dy + MULTI_RES[c, 1]
+                dx, dy = x - MULTI_CENTER, y - MULTI_CENTER
+                sx = MULTI_CENTER + a00 * dx + a01 * dy + MULTI_RES[c, 0]
+                sy = MULTI_CENTER + a10 * dx + a11 * dy + MULTI_RES[c, 1]
                 spots[k, c] = rng.poisson(
                     _multi_spot(MULTI_BOX, sx, sy, amps[c], sigma, bgs[c])
                 )
@@ -960,10 +960,10 @@ class TestMultichannelCrlb:
         )
         for c in range(n_channels):
             a00, a01, a10, a11 = MULTI_JAC[c]
-            dx = self.TRUTH_X - MULTI_CENTRE
-            dy = self.TRUTH_Y - MULTI_CENTRE
-            sx = MULTI_CENTRE + a00 * dx + a01 * dy + MULTI_RES[c, 0]
-            sy = MULTI_CENTRE + a10 * dx + a11 * dy + MULTI_RES[c, 1]
+            dx = self.TRUTH_X - MULTI_CENTER
+            dy = self.TRUTH_Y - MULTI_CENTER
+            sx = MULTI_CENTER + a00 * dx + a01 * dy + MULTI_RES[c, 0]
+            sy = MULTI_CENTER + a10 * dx + a11 * dy + MULTI_RES[c, 1]
             clean = _multi_spot(
                 MULTI_BOX, sx, sy, amps[c], self.TRUTH_SIGMA, bgs[c]
             )
@@ -1057,8 +1057,8 @@ class TestMultichannelCrlb:
     def _crlb_theta(n):
         """A plausible ``[x, y, sigma, N, bg]`` row per localization."""
         theta = np.zeros((n, 5))
-        theta[:, 0] = MULTI_CENTRE
-        theta[:, 1] = MULTI_CENTRE
+        theta[:, 0] = MULTI_CENTER
+        theta[:, 1] = MULTI_CENTER
         theta[:, 2] = 1.3
         theta[:, 3] = 400.0 * 2 * np.pi * 1.3**2
         theta[:, 4] = 10.0

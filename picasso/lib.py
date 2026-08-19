@@ -1205,7 +1205,7 @@ def hist2d_numba(
     """Fast 2D histogram with uniform bin edges.
 
     Non-finite points are skipped. Edge values (== x_max / == y_max) are
-    folded into the last bin to match the inclusive-right behaviour of
+    folded into the last bin to match the inclusive-right behavior of
     ``np.histogram2d``.
 
     Parameters

@@ -243,7 +243,7 @@ if colorscheme:
     rgbcolors[6] = [227, 26, 28]
     rgbcolors[7] = [255, 255, 255]
     rgbcolors[8] = [205, 205, 205]
-    allcolors[0] = QtGui.QColor(205, 205, 205, 255)  # DEFAULT,  GREY
+    allcolors[0] = QtGui.QColor(205, 205, 205, 255)  # DEFAULT,  GRAY
     allcolors[1] = QtGui.QColor(166, 206, 227, 255)
     allcolors[2] = QtGui.QColor(31, 120, 180, 255)
     allcolors[3] = QtGui.QColor(178, 223, 138, 255)
@@ -263,7 +263,7 @@ else:
     rgbcolors[6] = [227, 26, 28]
     rgbcolors[7] = [253, 191, 111]
     rgbcolors[8] = [205, 205, 205]
-    allcolors[0] = QtGui.QColor(205, 205, 205, 255)  # DEFAULT,  GREY
+    allcolors[0] = QtGui.QColor(205, 205, 205, 255)  # DEFAULT,  GRAY
     allcolors[1] = QtGui.QColor(166, 206, 227, 255)
     allcolors[2] = QtGui.QColor(31, 120, 180, 255)
     allcolors[3] = QtGui.QColor(178, 223, 138, 255)
@@ -840,7 +840,7 @@ class BindingSiteItem(QtWidgets.QGraphicsPolygonItem):
         hexagonPointsF = QtGui.QPolygonF(points)
         super().__init__(hexagonPointsF)
         self.setPen(HEX_PEN)
-        self.setBrush(defaultcolor)  # initialize all as grey
+        self.setBrush(defaultcolor)  # initialize all as gray
 
 
 class Scene(QtWidgets.QGraphicsScene):
@@ -1054,7 +1054,7 @@ class Scene(QtWidgets.QGraphicsScene):
                     allitems[paletteindex + i]: allcolors[i]
                     for i in range(1, maxcolor + 1)
                 }
-                # index 8 (last) resets to default grey
+                # index 8 (last) resets to default gray
                 palette_map[allitems[paletteindex + maxcolor]] = defaultcolor
 
                 if clicked_item == allitems[paletteindex]:

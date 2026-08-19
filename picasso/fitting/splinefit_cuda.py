@@ -59,7 +59,7 @@ Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
 "Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
 Scientific Reports 7, 15722 (2017).
 https://doi.org/10.1038/s41598-017-15313-9
-Licence (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
+License (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
 
 The cubic-spline PSF model and its use for single-molecule localization:
 
@@ -791,7 +791,7 @@ def fit_spots(
         per spot.
     abort_callback : callable or None, optional
         Polled between chunks; returning True stops the fit. A launched kernel
-        cannot be cancelled, so chunk boundaries are the only points at which an
+        cannot be canceled, so chunk boundaries are the only points at which an
         abort can take effect. Spots not reached keep their NaN parameters and
         infinite chi-square.
     single_precision : bool, optional

@@ -79,7 +79,7 @@ IMAGE_FILTER = (
     ";;STK files (*.stk)"
 )
 
-# Distinct box colors for the cross-channel link overlay (grey is kept
+# Distinct box colors for the cross-channel link overlay (gray is kept
 # out of the palette so it reads as "unmatched"). tab20-style hues.
 LINK_COLORS = [
     QtGui.QColor(*_rgb)
@@ -185,7 +185,7 @@ def _normalized_path(path: str) -> str:
 def _nearest_unique_match(
     pred_xy: np.ndarray, target_xy: np.ndarray, tol: float
 ) -> dict[int, int]:
-    """Nearest-neighbour match within ``tol``.
+    """Nearest-neighbor match within ``tol``.
 
     ``pred_xy`` are reference points predicted into a channel (via the
     calibration transform); ``target_xy`` are that channel's own detections.
@@ -481,8 +481,8 @@ def _format_mng(minimum_ng: float | list) -> str:
     return f"{int(minimum_ng):,}"
 
 
-class _LoadCancelledError(Exception):
-    """Raised inside the loader's progress callback to abort a cancelled
+class _LoadCanceledError(Exception):
+    """Raised inside the loader's progress callback to abort a canceled
     load mid-file (the io calls are otherwise uninterruptible)."""
 
 
@@ -527,11 +527,11 @@ class MovieLoadWorker(QtCore.QObject):
         # along the frame axis (``io.load_tif_concatenated``).
         self.concat = concat
         self._prompt_event = threading.Event()
-        self._cancelled = False
+        self._canceled = False
 
     def cancel(self) -> None:
         """Request cancellation; takes effect before the next file."""
-        self._cancelled = True
+        self._canceled = True
         # Release the worker if it is currently blocked on a prompt.
         self._prompt_event.set()
 
@@ -556,7 +556,7 @@ class MovieLoadWorker(QtCore.QObject):
             # yields one movie.
             jobs = [self.paths] if self.concat else [[_] for _ in self.paths]
             for i, job in enumerate(jobs):
-                if self._cancelled:
+                if self._canceled:
                     break
                 path = job[0]
                 label = (
@@ -573,8 +573,8 @@ class MovieLoadWorker(QtCore.QObject):
                 # *during* the otherwise-blocking io call, so it doubles
                 # as the mid-file cancellation point.
                 def report(done: int, total: int) -> None:
-                    if self._cancelled:
-                        raise _LoadCancelledError
+                    if self._canceled:
+                        raise _LoadCanceledError
                     self.subprogress.emit(done, total)
 
                 if self.concat:
@@ -609,12 +609,12 @@ class MovieLoadWorker(QtCore.QObject):
                     infos.append(info)
                     paths.append(path)
         except Exception as e:  # noqa: BLE001 - reported to the GUI
-            if not self._cancelled:
+            if not self._canceled:
                 self.failed.emit(str(e))
                 return
             movies, infos, paths = [], [], []
-        if self._cancelled:
-            # The file being read when the user cancelled has still been
+        if self._canceled:
+            # The file being read when the user canceled has still been
             # loaded to completion (the blocking io call cannot be
             # interrupted); discard it instead of delivering it.
             movies, infos, paths = [], [], []
@@ -879,7 +879,7 @@ class View(QtWidgets.QGraphicsView):
     def _release_split_fov_region(self, dx: int, dy: int) -> None:
         """Finish a left-drag/click in split-FOV mode: the first region (a real
         drag) fixes the shared size; later releases drop a same-size region
-        centred on the release point."""
+        centered on the release point."""
         self.rubberband.hide()
         origin = self.mapToScene(self.roi_origin)
         end = self.mapToScene(self.roi_end)
@@ -2369,7 +2369,7 @@ class RegisterChannelsDialog(lib.Dialog):
         multi_fov : bool
             Whether each frame of the bead movie is its own field of view.
         accepted : bool
-            False if the dialog was cancelled, in which case the other two
+            False if the dialog was canceled, in which case the other two
             should be ignored.
         """
         dialog = RegisterChannelsDialog(parent)
@@ -3095,7 +3095,7 @@ class ParametersDialog(lib.Dialog):
         self._syncing_mng = False
         # last value the slider settled on. Split-FOV regions drawn later
         # inherit it, so a slider move that edits one region cannot also
-        # seed its neighbours with the value being typed.
+        # seed its neighbors with the value being typed.
         self._last_mng = DEFAULT_PARAMETERS["Min. Net Gradient"]
 
         self.scroll_area = QtWidgets.QScrollArea()
@@ -3781,7 +3781,7 @@ class ParametersDialog(lib.Dialog):
             "Experimental PSF (spline)"
         )
         spline_groupbox.setToolTip(
-            "Fit an experimentally measured PSF, modelled as a cubic "
+            "Fit an experimentally measured PSF, modeled as a cubic "
             "spline. Runs on the CPU, or on a CUDA-capable GPU.\n\n"
             "Li, Y., Mund, M., Hoess, P. et al. Real-time 3D "
             "single-molecule localization using experimental point "
@@ -4675,7 +4675,7 @@ class ParametersDialog(lib.Dialog):
     def _link_photons_enabled(self) -> bool:
         """Whether the multichannel spline fit should link photons across
         channels (shared amplitude, model 11). True when the checkbox is absent
-        (no GPU / non-multichannel) so behaviour is unchanged by default."""
+        (no GPU / non-multichannel) so behavior is unchanged by default."""
         cb = getattr(self, "link_photons_checkbox", None)
         return cb.isChecked() if cb is not None else True
 
@@ -5614,7 +5614,7 @@ class Window(QtWidgets.QMainWindow):
         self._load_worker = None
         self._load_progress = None
         self._load_filename = ""
-        # Cancelled loads, winding down on their own (see
+        # Canceled loads, winding down on their own (see
         # ``_on_load_canceled``); kept referenced until their thread ends.
         self._detached_loads = []
         self._load_t0 = 0.0
@@ -6139,7 +6139,7 @@ class Window(QtWidgets.QMainWindow):
         worker.promptRequested.connect(self._on_affine_prompt_requested)
         worker.finished.connect(self.on_affine_calibration_finished)
         worker.failed.connect(self.on_affine_calibration_failed)
-        worker.cancelled.connect(self.on_affine_calibration_cancelled)
+        worker.canceled.connect(self.on_affine_calibration_canceled)
         self.affine_calibration_worker = worker
         self.status_bar.showMessage("Calibrating lateral transform ...")
         worker.start()
@@ -6199,10 +6199,10 @@ class Window(QtWidgets.QMainWindow):
             self, "Calibrate lateral transform", message
         )
 
-    def on_affine_calibration_cancelled(self) -> None:
-        """The user cancelled one of the worker's prompts."""
+    def on_affine_calibration_canceled(self) -> None:
+        """The user canceled one of the worker's prompts."""
         self.affine_calibration_worker = None
-        self.status_bar.showMessage("Lateral calibration cancelled.")
+        self.status_bar.showMessage("Lateral calibration canceled.")
 
     def calibrate_camera(self) -> None:
         """Characterize the sCMOS camera from a dark movie.
@@ -6981,7 +6981,7 @@ class Window(QtWidgets.QMainWindow):
         """
         if self._load_thread is not None:
             # A load is already in progress; ignore re-entrant requests.
-            # (A cancelled one is detached immediately, see
+            # (A canceled one is detached immediately, see
             # ``_on_load_canceled``, so it never blocks a new load.)
             return
 
@@ -7072,7 +7072,7 @@ class Window(QtWidgets.QMainWindow):
         """Run a worker-requested metadata prompt on the GUI thread and
         hand the result back, then unblock the worker."""
         # the asking worker, which is not necessarily the current one
-        # anymore (it may have been cancelled and detached meanwhile)
+        # anymore (it may have been canceled and detached meanwhile)
         worker = self.sender()
         if not isinstance(worker, MovieLoadWorker):
             worker = self._load_worker
@@ -7092,7 +7092,7 @@ class Window(QtWidgets.QMainWindow):
         worker is *detached*: its signals are disconnected (its result is
         no longer wanted) and it is left to wind down on its own, so a
         new movie can be opened right away. Dropping the progress dialog
-        is part of that - ``setValue()`` re-shows a cancelled one."""
+        is part of that - ``setValue()`` re-shows a canceled one."""
         progress, self._load_progress = self._load_progress, None
         if progress is not None:
             # disconnect first: closing re-emits ``canceled``
@@ -7131,12 +7131,12 @@ class Window(QtWidgets.QMainWindow):
         # having finished already, just before this cancellation.
         thread.quit()
         self.status_bar.showMessage(
-            "Load cancelled (the file is still being released in the "
+            "Load canceled (the file is still being released in the "
             "background)."
         )
 
     def _on_detached_load_done(self, thread: QtCore.QThread) -> None:
-        """Drop a cancelled load's worker thread once it has stopped."""
+        """Drop a canceled load's worker thread once it has stopped."""
         for i, (detached, worker) in enumerate(self._detached_loads):
             if detached is thread:
                 del self._detached_loads[i]
@@ -7769,7 +7769,7 @@ class Window(QtWidgets.QMainWindow):
         """Prompt for movie metadata when it cannot be read from the
         file (fallback for .tif/.stk/.nd2 movies). Pre-filled with the
         dimensions that could still be read. Returns ``(info, save)`` or
-        None if cancelled."""
+        None if canceled."""
         info, save, ok = PromptMovieInfoDialog.getMovieSpecs(
             self, partial_info
         )
@@ -8102,7 +8102,7 @@ class Window(QtWidgets.QMainWindow):
         A bead and the bead it was matched with carry the same color in the
         reference and in the target image, so switching between the two
         (the calibration dialog's "Show" buttons) shows which bead went with
-        which; detections that stayed unmatched are grey. This is the same
+        which; detections that stayed unmatched are gray. This is the same
         reading as the cross-channel link colors
         (:meth:`_draw_linked_identifications`), and it uses the same palette.
 
@@ -8148,7 +8148,7 @@ class Window(QtWidgets.QMainWindow):
         self.status_bar.showMessage(
             f"{pairing['transform_type'].capitalize()} calibration: "
             f"{n_pairs:,} bead pairs shown"
-            + (f", {n_unmatched:,} unpaired (grey)" if n_unmatched else "")
+            + (f", {n_unmatched:,} unpaired (gray)" if n_unmatched else "")
             + "."
         )
         return True
@@ -8421,7 +8421,7 @@ class Window(QtWidgets.QMainWindow):
 
         Spots paired across channels (matched to the reference channel via the
         calibration's inter-channel transform, as the signal re-registration
-        does) share a color; unmatched spots are grey. Returns True if it
+        does) share a color; unmatched spots are gray. Returns True if it
         handled the drawing, False to fall back to plain single-color boxes.
 
         Drawn from the identifications of the last Identify run, or - while the
@@ -8492,7 +8492,7 @@ class Window(QtWidgets.QMainWindow):
 
         The calibration is *always* the source of the inter-channel transform
         when one is loaded - the link colors then show exactly the pairing the
-        fit will use, so a stale registration shows up as grey boxes and can be
+        fit will use, so a stale registration shows up as gray boxes and can be
         re-registered on purpose rather than being silently papered over. Only
         the placement is adapted when the layout differs from the calibration's:
 
@@ -8609,7 +8609,7 @@ class Window(QtWidgets.QMainWindow):
 
     def _estimated_link_calibration(self, box: int) -> dict | None:
         """A calibration-shaped dict whose inter-channel transforms are
-        estimated from the identifications themselves, for link colouring
+        estimated from the identifications themselves, for link coloring
         without a loaded spline calibration.
 
         The transforms come from
@@ -8623,7 +8623,7 @@ class Window(QtWidgets.QMainWindow):
 
         In the preview the detections are the current frame's alone, so the
         registration is estimated from that one frame - enough for a dense
-        frame, and the channels simply stay grey (unregistered) where it is
+        frame, and the channels simply stay gray (unregistered) where it is
         not. The cached result is therefore also keyed by the frame.
         """
         split_fov = self.view.split_fov_mode
@@ -8764,7 +8764,7 @@ class Window(QtWidgets.QMainWindow):
         colors = [LINK_UNMATCHED_COLOR] * len(xy)
         # A reference spot links only if matched in EVERY other region/channel
         # (the bead is found in all channels). Count per reference spot, then
-        # color; spots missing from any channel stay grey.
+        # color; spots missing from any channel stay gray.
         n_ref = len(ref_local)
         match_count = np.zeros(n_ref, dtype=int)
         per_channel: list = []
@@ -8790,7 +8790,7 @@ class Window(QtWidgets.QMainWindow):
             for tj, rk in matches.items():
                 if complete[rk]:
                     colors[chan_local[tj]] = LINK_COLORS[rk % len(LINK_COLORS)]
-        # a reference spot is coloured only if it links across all channels
+        # a reference spot is colored only if it links across all channels
         for rk, gi in enumerate(ref_local):
             if complete[rk]:
                 colors[gi] = LINK_COLORS[rk % len(LINK_COLORS)]
@@ -8826,7 +8826,7 @@ class Window(QtWidgets.QMainWindow):
         # A reference spot counts as linked only if it is matched in EVERY
         # other channel (i.e. the bead is found in all channels). Count, per
         # reference spot, the channels it matches; "complete" requires a match
-        # in each channel checked. Spots missing from any channel stay grey.
+        # in each channel checked. Spots missing from any channel stay gray.
         n_ref = len(ref_xy)
         match_count = np.zeros(n_ref, dtype=int)
         n_checked = 0
@@ -8863,7 +8863,7 @@ class Window(QtWidgets.QMainWindow):
             ]
         # a non-reference channel: color its detections by the reference spot
         # they pair with, but only when that reference spot links across ALL
-        # channels; otherwise grey (matches that spot's box in channel 0)
+        # channels; otherwise gray (matches that spot's box in channel 0)
         cur_xy = frame_xy(self.link_identifications(c))
         if len(cur_xy) == 0:
             return []
@@ -12468,7 +12468,7 @@ class AffineCalibrationWorker(QtCore.QThread):
     # (calibration path, number of matched bead pairs, qc dict for the plot)
     finished = QtCore.pyqtSignal(str, int, object)
     failed = QtCore.pyqtSignal(str)
-    cancelled = QtCore.pyqtSignal()
+    canceled = QtCore.pyqtSignal()
     statusChanged = QtCore.pyqtSignal(str)
     # callback, (args, kwargs), holder dict for the return value
     promptRequested = QtCore.pyqtSignal(object, object, object)
@@ -12513,7 +12513,7 @@ class AffineCalibrationWorker(QtCore.QThread):
 
     def _load(self, path: str, label: str):
         """Load one bead movie, prompting for metadata on the GUI thread.
-        Returns ``None`` if the user cancelled the prompt."""
+        Returns ``None`` if the user canceled the prompt."""
         self.statusChanged.emit(f"Loading {label} image ...")
         prompt = self._proxy(self._prompt_for_path(path))
         # io.load_movie returns None when the user cancels the info prompt
@@ -12523,7 +12523,7 @@ class AffineCalibrationWorker(QtCore.QThread):
         try:
             loaded_ref = self._load(self.ref_path, "reference")
             if loaded_ref is None:
-                self.cancelled.emit()
+                self.canceled.emit()
                 return
             movie_ref, info_ref = loaded_ref
             label = (
@@ -12533,7 +12533,7 @@ class AffineCalibrationWorker(QtCore.QThread):
             )
             loaded_target = self._load(self.target_path, label)
             if loaded_target is None:
-                self.cancelled.emit()
+                self.canceled.emit()
                 return
             movie_target, _ = loaded_target
             # An existing calibration of any kind is appended to; a path
@@ -12550,8 +12550,8 @@ class AffineCalibrationWorker(QtCore.QThread):
         pixelsize = lib.get_from_metadata(info_ref, "Pixelsize", default=None)
         if pixelsize is None:
             pixelsize = self._proxy(self._pixelsize_prompt)()
-            if pixelsize is None:  # prompt cancelled
-                self.cancelled.emit()
+            if pixelsize is None:  # prompt canceled
+                self.canceled.emit()
                 return
 
         self.statusChanged.emit("Fitting affine transform ...")

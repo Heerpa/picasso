@@ -3638,7 +3638,7 @@ class SPINNA:
         callback,
         title: str,
     ) -> None:
-        """Run Phase 1 of Bayesian optimisation: farthest-point sampling.
+        """Run Phase 1 of Bayesian optimization: farthest-point sampling.
 
         Modifies ``evaluated`` and ``scores`` in place.
         """
@@ -3678,7 +3678,7 @@ class SPINNA:
         callback,
         eval_count: int,
     ) -> tuple[np.ndarray, np.ndarray, int]:
-        """Run the GP-guided acquisition phase of Bayesian optimisation.
+        """Run the GP-guided acquisition phase of Bayesian optimization.
 
         Iteratively fits a Gaussian Process on evaluated candidates,
         computes Expected Improvement on the remaining ones, evaluates
@@ -3812,12 +3812,12 @@ class SPINNA:
         """Bootstrap the best-fit result to estimate uncertainty.
 
         Repeatedly simulates from ``opt_N_structures``, re-runs
-        NN_scorer on a local neighbourhood, and collects statistics.
+        NN_scorer on a local neighborhood, and collects statistics.
 
         Parameters
         ----------
         N_structures : lib.IntArray2D
-            Full search space (used to derive the neighbourhood).
+            Full search space (used to derive the neighborhood).
         opt_N_structures : lib.IntArray1D
             Best-fit structure counts.
         opt_proportions : lib.FloatArray1D

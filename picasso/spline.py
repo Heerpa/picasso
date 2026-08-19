@@ -38,10 +38,10 @@ References
   DOI: 10.1038/s41467-022-30719-4. (globLoc)
 - Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
   "Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
-  Scientific Reports 7, 15722 (2017). Licence (MIT):
+  Scientific Reports 7, 15722 (2017). License (MIT):
   ``LICENSES/Gpufit-LICENSE.txt``.
 - Gpuspline (https://github.com/gpufit/Gpuspline), whose coefficient scheme
-  and buffer layout :func:`spline_coefficients` follows. Licence (MIT):
+  and buffer layout :func:`spline_coefficients` follows. License (MIT):
   ``LICENSES/Gpuspline-LICENSE.txt``.
 
 :authors: Rafal Kowalewski
@@ -96,7 +96,7 @@ def spline_coefficients(data: np.ndarray) -> np.ndarray:
     Tensor product of 1D natural cubic interpolating splines (zero second
     derivative at the boundaries) along each axis, computed in float64 and
     cast to float32. Drop-in replacement for ``spline_coefficients`` of
-    Gpuspline (https://github.com/gpufit/Gpuspline. Licence (MIT):
+    Gpuspline (https://github.com/gpufit/Gpuspline. License (MIT):
     ``LICENSES/Gpuspline-LICENSE.txt``.
 
     Parameters
@@ -611,11 +611,11 @@ def _keep_inliers(
 _RECENTER_MIN_SHIFT = 1e-3
 # Largest offset worth correcting, in pixels. The physical worst case is 1.0: a
 # bead is detected on the integer grid, so its average sits within half a pixel
-# of the box centre, plus (for a mapped channel) its sub-pixel ROI residual,
+# of the box center, plus (for a mapped channel) its sub-pixel ROI residual,
 # another half. The cap sits just above that so a genuine worst-case offset is
 # not refused on fit noise, while a plainly wrong estimate still is - and past
 # roughly here the correction cannot be delivered anyway: on a 7 px box a 1.0
-# px shift lands within 0.01 px of the centre and a 1.3 px one within 0.04, but
+# px shift lands within 0.01 px of the center and a 1.3 px one within 0.04, but
 # a 1.7 px one leaves 0.44 px behind, because the PSF runs off the edge and
 # ``mode="nearest"`` smears it. Refusing to shift leaves the template as it
 # was, which is the safe direction.
@@ -625,8 +625,8 @@ _RECENTER_MAX_SHIFT = 1.25
 def _focus_center_offset(
     volume: np.ndarray, z_center: int
 ) -> tuple[float, float]:
-    """Lateral ``(row, col)`` offset of the in-focus PSF centre from the box
-    centre, in pixels.
+    """Lateral ``(row, col)`` offset of the in-focus PSF center from the box
+    center, in pixels.
 
     Uses the same least-squares Gaussian fitter as :func:`_focus_step` (whose
     sigma already defines "in focus" here), falling back to the
@@ -640,7 +640,7 @@ def _focus_center_offset(
     # theta is [photons, x, y, sx, sy, bg] in box-local pixels, x the column
     # and y the row (see picasso.fitting.seeds.initial_parameters_gauss). A
     # slice no Gaussian can describe either aborts the fit or "converges" to
-    # one with no photons or a width beyond the box - neither is a centre
+    # one with no photons or a width beyond the box - neither is a center
     # estimate, and both are a reason to fall back rather than to fail the
     # calibration.
     photons, x, y, sx, sy = (float(_) for _ in thetas[0, :5])
@@ -780,7 +780,7 @@ def _register_and_average(
         )
     # The rounds above align every bead to ONE anchor - the brightest in-focus
     # bead of round 0 - so the average inherits that bead's own sub-pixel
-    # offset instead of sitting at the box centre. Put it back on the centre,
+    # offset instead of sitting at the box center. Put it back on the center,
     # which is where the fit model's zero lateral shift evaluates the spline.
     # Left in, the offset is a constant lateral bias: harmless for a single
     # channel, where it just translates the whole reconstruction, but not
@@ -819,7 +819,7 @@ def _bead_quality_summary(
 
     Reduces the registered volumes of every bead (kept and rejected alike, see
     ``_register_and_average``) to the three central views the diagnostics draw
-    - xy at focus, xz and yz through the box centre - each background-shifted
+    - xy at focus, xz and yz through the box center - each background-shifted
     and peak-normalized so beads are compared by *shape* rather than by
     brightness, and attaches each bead's position in the movie.
     """
@@ -1363,8 +1363,8 @@ def calibrate_spline(
         # lateral template sampling equals the camera pixel grid, so shifts
         # are already in camera pixels
         "oversampling": 1.0,
-        # the template is centred on the box (see _register_and_average), so a
-        # zero fitted lateral shift means "emitter at the box centre"
+        # the template is centered on the box (see _register_and_average), so a
+        # zero fitted lateral shift means "emitter at the box center"
         "lateral_centered": True,
         "z_center": float(z_origin),
         "z_init": float(z_init),
@@ -1976,9 +1976,9 @@ def calibrate_spline_multichannel(
         "n_channels": n_channels,
         "channel_transforms": [t.to_dict() for t in transforms],
         "oversampling": 1.0,
-        # every channel's template is centred on its own box, so the channels
+        # every channel's template is centered on its own box, so the channels
         # share one lateral origin and the linked fit is free of the constant
-        # inter-channel offset an anchor-bead-centred template would carry
+        # inter-channel offset an anchor-bead-centered template would carry
         "lateral_centered": True,
         "z_center": float(z_origin),
         "z_init": float(z_init),
@@ -2630,7 +2630,7 @@ def estimate_transforms_from_identifications(
     transform and no access to the movies, only the per-channel detections that
     the Localize preview has already computed. Each mirror orientation
     (identity / flip-x / flip-y / flip-xy, see :data:`_FLIP_SIGNS`) is used as a
-    coarse seed and refined by ICP - per-frame nearest-neighbour pairing with a
+    coarse seed and refined by ICP - per-frame nearest-neighbor pairing with a
     shrinking radius, re-fitting the affine on the pooled correspondences - and
     the orientation that still holds the most pairs at the tightest radius wins.
     Mirrored channels (the common case for image splitters) are therefore picked
@@ -2919,7 +2919,7 @@ def refine_split_fov_transforms_from_signal(
     identity = tform.identity()
     seed_local_affines = [identity]
     for c in range(1, n_channels):
-        # at the region centre: the only place the question is well posed
+        # at the region center: the only place the question is well posed
         # for a non-linear map (identical everywhere for an affine)
         dec = affines[c].decompose(pixelsize=1.0, at=(w / 2.0, h / 2.0))
         if dec["mirror"] and dec["flip_axis"] == "x":
@@ -4007,7 +4007,7 @@ def plot_bead_gallery(
     were applied.
 
     Rejected beads are laid out first, since they are what the user is
-    checking; each cell is labelled with the bead's index and its position in
+    checking; each cell is labeled with the bead's index and its position in
     the movie, so a suspicious one can be found in the raw z-stack.
 
     Parameters

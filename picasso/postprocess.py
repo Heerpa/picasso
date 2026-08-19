@@ -1776,7 +1776,7 @@ def get_block_locs_at_numba(
     Parameters
     ----------
     x_index, y_index : int
-        Block indices of the block whose 3x3 neighbourhood is collected.
+        Block indices of the block whose 3x3 neighborhood is collected.
     locs_xy : lib.FloatArray2D
         ``(2, n_locs)`` block-sorted x and y coordinates.
     block_starts, block_ends : lib.IntArray2D
@@ -1788,8 +1788,8 @@ def get_block_locs_at_numba(
     Returns
     -------
     locs_xy : lib.FloatArray2D
-        ``(2, n_neighbours)`` coordinates of the localizations in the
-        neighbourhood.
+        ``(2, n_neighbors)`` coordinates of the localizations in the
+        neighborhood.
     """
     indices = _get_block_locs_at_numba(
         x_index,

@@ -28,7 +28,7 @@ registers the channels of its own multichannel PSF calibration the same way.
 That shared part is public API rather than module-private:
 
 ===============================  =============================================
-:func:`match_points`             nearest-neighbour pairing of two point clouds
+:func:`match_points`             nearest-neighbor pairing of two point clouds
 :func:`ransac_match`             robust pairing with no prior estimate
 :func:`fit_registration`         one ICP iteration's transform
 :func:`register_from_point_sets` the whole bootstrap + ICP + trim loop
@@ -201,7 +201,7 @@ def _fov_groups(
     counterpart to pair against cannot contribute a correspondence, and letting
     it search the other fields is exactly the mis-pairing this prevents. None
     is returned when either label array is missing or does not describe its
-    cloud, so callers without FOV information keep the pooled behaviour.
+    cloud, so callers without FOV information keep the pooled behavior.
     """
     if ref_fov is None or c_fov is None:
         return None
@@ -237,7 +237,7 @@ def ransac_match(
     ``c_xy``. Two candidate pairs are sampled, the similarity transforms they
     imply (see :func:`_similarity_from_two`) are formed, and the beads each maps
     within ``inlier_tol`` are counted; the largest consensus wins and its
-    inliers (unique nearest-neighbour assignment) are returned. Because only the
+    inliers (unique nearest-neighbor assignment) are returned. Because only the
     *candidate proposal* uses the coarse overlay - not the fit - an inaccurate
     overlay (e.g. an imperfectly placed split-FOV ROI) cannot mis-pair beads
     and corrupt the transform, which otherwise makes the calibration
@@ -378,7 +378,7 @@ def ransac_match(
 def match_points(
     ref_xy: np.ndarray, other_xy: np.ndarray, max_distance: float
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Nearest-neighbour match two point clouds across channels.
+    """Nearest-neighbor match two point clouds across channels.
 
     The points are fiducial beads when registering on beads and
     single-molecule detections when registering on signal; the matching is the
@@ -584,7 +584,7 @@ def _bootstrap_transform(
 
     Pairing normally starts from a seed that is already close. Without one,
     propose correspondences with :func:`ransac_match` on the pooled
-    detections, labelling every point with its **frame** so a molecule can only
+    detections, labeling every point with its **frame** so a molecule can only
     pair with one that blinked in the same frame - the constraint that makes
     signal registration work at all, and exactly what the field-of-view
     grouping already implements. The overlay is the identity, which only has to

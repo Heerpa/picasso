@@ -12,7 +12,7 @@ dispatch between them on a single flag - the arrangement
 spline models. The models, the Levenberg-Marquardt driver, the damping rule and
 the estimators are the same port of Gpufit.
 
-Three models, all evaluated at the pixel centre:
+Three models, all evaluated at the pixel center:
 
 ===================  ==========  ==============================================
 model                parameters  layout
@@ -35,7 +35,7 @@ Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
 "Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
 Scientific Reports 7, 15722 (2017).
 https://doi.org/10.1038/s41598-017-15313-9
-Licence (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
+License (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
 
 :authors: Rafal Kowalewski
 :copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry

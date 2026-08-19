@@ -300,7 +300,7 @@ class Transform:
     # -- shared -----------------------------------------------------------
 
     def _at(self, at=None) -> np.ndarray:
-        """Point to linearize about: ``at`` if given, else the centre of
+        """Point to linearize about: ``at`` if given, else the center of
         :attr:`domain`, else the origin."""
         if at is not None:
             return np.asarray(at, dtype=np.float64).reshape(2)
@@ -311,7 +311,7 @@ class Transform:
     def decompose(self, pixelsize: float | None = None, at=None) -> dict:
         """Human-readable decomposition of the transform at one point.
 
-        The linear part is the local Jacobian at ``at`` (the centre of
+        The linear part is the local Jacobian at ``at`` (the center of
         :attr:`domain` by default, the origin if there is none), which for an
         affine is simply the constant linear part. It is split two ways,
         because the two are useful for different things:
@@ -335,7 +335,7 @@ class Transform:
             Camera pixel size (nm). If given, the translation is additionally
             reported in nanometres.
         at : array, optional
-            ``(2,)`` point to linearize about. Defaults to the centre of
+            ``(2,)`` point to linearize about. Defaults to the center of
             :attr:`domain`, or the origin if the transform has no domain.
 
         Returns
@@ -685,14 +685,14 @@ class PolynomialTransform(Transform):
         ``(2, n_terms)`` source -> destination coefficients, one row per
         output coordinate, ordered as :attr:`powers`.
     center : np.ndarray
-        ``(2,)`` centre of the forward input normalization.
+        ``(2,)`` center of the forward input normalization.
     scale : float
         Isotropic scale of the forward input normalization.
     reverse : np.ndarray
         ``(2, n_terms)`` destination -> source coefficients, fitted
         independently of ``forward``.
     reverse_center : np.ndarray
-        ``(2,)`` centre of the reverse input normalization.
+        ``(2,)`` center of the reverse input normalization.
     reverse_scale : float
         Isotropic scale of the reverse input normalization.
     roundtrip_rms_px : float

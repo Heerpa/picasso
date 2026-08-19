@@ -57,11 +57,11 @@ def _synthetic_multifov_movie(
 ):
     """A genuine multi-FOV bead z-stack: ``n_fov`` fields, each with beads at
     *different* positions, each scanned over ``n_steps`` z positions (focus at
-    the centre). Frames are laid out in ``order`` ("z": each FOV is a full z
+    the center). Frames are laid out in ``order`` ("z": each FOV is a full z
     stack, then the next FOV; "fov": the FOVs are interleaved at each z).
 
     Returns ``(movie, fov_beads, focus)`` where ``fov_beads[k]`` are the bead
-    centres of FOV ``k``. The total number of physical beads is
+    centers of FOV ``k``. The total number of physical beads is
     ``sum(len(b) for b in fov_beads)`` - more than any single field holds.
     """
     fov_beads = [
@@ -276,7 +276,7 @@ class TestTemplateHelpers:
 
     def test_focus_center_offset_is_accurate_within_its_bound(self):
         # inside the cap the measurement plus one cubic shift must land on the
-        # centre; this is what makes a single centring pass enough
+        # center; this is what makes a single centering pass enough
         from scipy.ndimage import shift as ndi_shift
 
         box, nz = BOX, 5
@@ -312,7 +312,7 @@ class TestTemplateHelpers:
         assert spline._focus_center_offset(volume, 2) == (0.0, 0.0)
 
     def test_focus_center_offset_rejects_implausible_shifts(self):
-        # a bead average is centred to well under a pixel; a large estimate
+        # a bead average is centered to well under a pixel; a large estimate
         # means the estimate is wrong, and shifting on it would do harm
         box, nz = BOX, 3
         volume = np.zeros((box, box, nz), dtype=np.float32)
@@ -587,7 +587,7 @@ class TestBuildPsfTemplate:
         assert built["effective_sigma"] > 0
 
 
-def _labelled_bead_movie(n_frames, fov_of=None, h=48, w=48):
+def _labeled_bead_movie(n_frames, fov_of=None, h=48, w=48):
     """Beads with distinguishable brightness, so a spot can be traced back to
     the bead it came from by its peak value alone."""
     bead_xy = [(12, 14), (30, 28), (16, 33)]
@@ -613,7 +613,7 @@ class TestSpotBeadIndex:
         import pandas as pd
 
         n = 6
-        movie, bead_xy, amps = _labelled_bead_movie(n)
+        movie, bead_xy, amps = _labeled_bead_movie(n)
         step_of_frame, _, step_range = spline._step_of_frame(
             n, 20.0, 1, "fov", None
         )
@@ -641,7 +641,7 @@ class TestSpotBeadIndex:
         # order is neither bead-major nor frame-major-with-all-beads
         n_fov, n_steps = 2, 5
         n_frames = n_fov * n_steps
-        movie, bead_xy, amps = _labelled_bead_movie(n_frames)
+        movie, bead_xy, amps = _labeled_bead_movie(n_frames)
         step_of_frame, _, step_range = spline._step_of_frame(
             n_frames, 20.0, n_fov, "z", None
         )
@@ -932,7 +932,7 @@ class TestRansacMatch:
         the correct correspondences and transform are recovered regardless."""
         ref, c, linear, offset = self._mirrored_pair()
         # the coarse overlay maps c back near ref but is deliberately off; a plain
-        # nearest-neighbour match at this offset would mis-pair some beads
+        # nearest-neighbor match at this offset would mis-pair some beads
         inv = np.linalg.inv(linear)
         aligned = (c - offset) @ inv.T + np.asarray(overlay_offset)
         ref_idx, c_idx = spline.ransac_match(
@@ -1384,7 +1384,7 @@ class TestChannelTransformMultiFov:
         The registration is the identity, so every legitimate pair is exact.
         Reference bead (100, 100) belongs to FOV 0, which has no counterpart
         for it; FOV 1 has an unpaired channel bead 1.4 px away. Pooled, that
-        bead is the nearest neighbour and wins - a correspondence between two
+        bead is the nearest neighbor and wins - a correspondence between two
         different physical beads in two different fields.
         """
         ref_xy = np.array(
@@ -2056,7 +2056,7 @@ class TestCliWiring:
         assert os.path.exists(str(tmp_path / "cli_spline_calib_beads.png"))
 
     def test_backend_accepts_both_spline_codes(self):
-        # both spline codes must be recognised model ids by the backend
+        # both spline codes must be recognized model ids by the backend
         # (guards the fit / localize dispatch strings)
         import inspect
 
@@ -2089,7 +2089,7 @@ class TestGuiWiring:
             == "spline-mle"
         )
 
-    def test_spline_honours_the_convergence_controls(self):
+    def test_spline_honors_the_convergence_controls(self):
         """The CPU spline iterates under both estimators, so both must show
         the convergence page - and with the spline's own schedule, not the
         Gaussian MLE's."""

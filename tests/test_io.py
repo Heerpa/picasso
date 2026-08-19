@@ -1620,7 +1620,7 @@ class TestMovieMetadataFallback:
         finally:
             movie.close()
 
-    def test_cancelled_prompt_returns_none(self, tmp_path, monkeypatch):
+    def test_canceled_prompt_returns_none(self, tmp_path, monkeypatch):
         rng = np.random.default_rng(8)
         data = rng.integers(0, 60000, size=(3, 16, 16), dtype="<u2")
         path = tmp_path / "broken2.tif"

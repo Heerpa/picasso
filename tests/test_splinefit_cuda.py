@@ -395,7 +395,7 @@ class TestConvergedFits:
         )
 
 
-class TestDeviceBehaviour:
+class TestDeviceBehavior:
     def test_two_runs_are_bitwise_identical(self):
         """One thread per spot, no atomics, no reduction - so reproducible."""
         calibration, spots, initial = TestConvergedFits._noisy_batch(n=64)

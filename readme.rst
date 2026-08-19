@@ -137,7 +137,7 @@ If you use Picasso in your research, please cite our Nature Protocols publicatio
 - Experimental PSF (cubic-spline) fitting. DOIs: `10.1038/nmeth.4661 <https://doi.org/10.1038/nmeth.4661>`__ (Li et al., experimental-PSF localization and bead alignment) and `10.1038/s41598-017-00622-w <https://doi.org/10.1038/s41598-017-00622-w>`__ (Babcock & Zhuang, cubic-spline PSF model). The spline calibration follows the coefficient scheme of Gpuspline; license can be found `here <https://github.com/jungmannlab/picasso/blob/master/LICENSES/Gpuspline-LICENSE.txt>`__.
 - Multichannel (global) experimental-PSF fitting. DOI: `10.1038/s41467-022-30719-4 <https://doi.org/10.1038/s41467-022-30719-4>`__ (Li et al., globLoc).
 - 3D fitting via astigmatism. DOI: `10.1126/science.1153529 <https://www.science.org/doi/10.1126/science.1153529>`__.
-- sCMOS pixel-dependent noise modelling. DOI: `10.1038/nmeth.2488 <https://doi.org/10.1038/nmeth.2488>`__.
+- sCMOS pixel-dependent noise modeling. DOI: `10.1038/nmeth.2488 <https://doi.org/10.1038/nmeth.2488>`__.
 - NeNA. DOI: `10.1007/s00418-014-1192-3 <https://doi.org/10.1007/s00418-014-1192-3>`__
 - FRC. DOI: `10.1038/nmeth.2448 <https://doi.org/10.1038/nmeth.2448>`__
 - Theoretical lateral localization precision (``lpx`` / ``lpy``, Gaussian least-squares). DOI: `10.1038/nmeth.1447 <https://doi.org/10.1038/nmeth.1447>`__

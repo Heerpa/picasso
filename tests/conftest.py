@@ -61,7 +61,7 @@ def affine_matrix_3x3(transform) -> np.ndarray:
 
 
 def linear_part(transform) -> np.ndarray:
-    """The ``(2, 2)`` local linear part of a transform at its domain centre -
+    """The ``(2, 2)`` local linear part of a transform at its domain center -
     what the old ``transform[:, :2]`` slice used to be."""
     return transforms.from_dict(transform).jacobian([[0.0, 0.0]])[0]
 

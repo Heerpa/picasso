@@ -41,7 +41,7 @@ GPU fitting
 
 Picasso can run all of its Gaussian and cubic-spline fitting on a CUDA-capable NVIDIA GPU. The fitting kernels are written in Python and compiled for the GPU at run time by numba.
 
-The fitting algorithm — the Levenberg-Marquardt driver, its damping rule, its estimators and its PSF models — is a port of `Gpufit <https://github.com/gpufit/Gpufit>`_ (Przybylski et al., *Scientific Reports* **7**, 15722, 2017), which earlier versions of Picasso used as a compiled dependency. Picasso no longer ships or links against the Gpufit binary; its licence is reproduced in ``LICENSES/Gpufit-LICENSE.txt``.
+The fitting algorithm — the Levenberg-Marquardt driver, its damping rule, its estimators and its PSF models — is a port of `Gpufit <https://github.com/gpufit/Gpufit>`_ (Przybylski et al., *Scientific Reports* **7**, 15722, 2017), which earlier versions of Picasso used as a compiled dependency. Picasso no longer ships or links against the Gpufit binary; its license is reproduced in ``LICENSES/Gpufit-LICENSE.txt``.
 
 Installation
 ~~~~~~~~~~~~
@@ -132,7 +132,7 @@ Extra features
 
 When more than one channel is loaded (by either of the two actions above), a channel selector appears below the image so you can switch between channels; identification, fitting and saving then operate on the currently active channel.
 
-Loading runs in the background, so the window stays responsive while the files are read, and a progress dialog with a ``Cancel`` button is shown. Cancelling stops before the next file begins (a file already being read is finished first). This also applies to opening a single movie. Because the load no longer blocks the interface, large or multi-file datasets can be opened without freezing Picasso.
+Loading runs in the background, so the window stays responsive while the files are read, and a progress dialog with a ``Cancel`` button is shown. Canceling stops before the next file begins (a file already being read is finished first). This also applies to opening a single movie. Because the load no longer blocks the interface, large or multi-file datasets can be opened without freezing Picasso.
 
 sCMOS camera calibration
 ------------------------
@@ -364,7 +364,7 @@ Open ``3D`` > ``Calibrate lateral transform (astigmatism / chromatic)`` and choo
 - **Astigmatism (cylindrical lens)** — a reference image of in-focus beads *without* the cylindrical lens, and an image of the same beads *with* it.
 - **Chromatic aberration** — an image of in-focus beads in the reference color channel, and an image of the same beads in the channel to be corrected.
 
-Beads are detected with the current ``Box side length`` and ``Min. net gradient`` (use ``Show`` to tune them on either image with a live preview), refined by a 2D Gaussian fit, matched by mutual nearest neighbour, and a transform mapping the second image onto the reference is fitted by least squares. Bead pairs whose residual is far from the median are dropped and the transform is refitted, so a single mismatched bead cannot warp the result.
+Beads are detected with the current ``Box side length`` and ``Min. net gradient`` (use ``Show`` to tune them on either image with a live preview), refined by a 2D Gaussian fit, matched by mutual nearest neighbor, and a transform mapping the second image onto the reference is fitted by least squares. Bead pairs whose residual is far from the median are dropped and the transform is refitted, so a single mismatched bead cannot warp the result.
 
 ``Transform model`` chooses how the two frames are related:
 
@@ -374,7 +374,7 @@ Beads are detected with the current ``Box side length`` and ``Min. net gradient`
 
 The stated minima are hard requirements — fitting fails below them — but about three times as many pairs are wanted, otherwise the transform interpolates the noise in the bead positions instead of averaging it out. A diagnostic figure is shown and saved next to the calibration as ``<base>_lateral_<type>.png``: overlays before and after the correction, and the mean per-bead cross-correlation before and after, whose peak should sit at the origin once the correction is applied.
 
-After the fit, the bead pairing is drawn in the main window as color-coded identification boxes: load either bead image (the ``Show`` buttons in the calibration dialog) and every detected bead is boxed — a bead and the bead it was matched with carry the **same color** in the reference and in the target image, while detections that stayed unmatched are grey. Hovering a box says which pair it belongs to. This is the same reading as the cross-channel link colors used for multichannel data, and it makes a wrong or missing match visible on the data itself.
+After the fit, the bead pairing is drawn in the main window as color-coded identification boxes: load either bead image (the ``Show`` buttons in the calibration dialog) and every detected bead is boxed — a bead and the bead it was matched with carry the **same color** in the reference and in the target image, while detections that stayed unmatched are gray. Hovering a box says which pair it belongs to. This is the same reading as the cross-channel link colors used for multichannel data, and it makes a wrong or missing match visible on the data itself.
 
 The transform is stored as one entry of an ordered ``Lateral transforms`` list in the calibration file you select, which can be:
 
@@ -425,7 +425,7 @@ Picasso can fit an **experimentally measured PSF** to every spot. The measured P
 
 *This feature is experimental — please report any unexpected behavior on our `GitHub issues page <https://github.com/jungmannlab/picasso/issues>`_.*
 
-Fitting runs on the CPU, or on any CUDA-capable GPU — see `GPU fitting`_ above; the kernels are compiled at run time by Numba, so no platform-specific binary is involved. *Building* a calibration follows the scheme of `Gpuspline <https://github.com/gpufit/Gpuspline>`_, its licence is reproduced in ``LICENSES/Gpuspline-LICENSE.txt``.
+Fitting runs on the CPU, or on any CUDA-capable GPU — see `GPU fitting`_ above; the kernels are compiled at run time by Numba, so no platform-specific binary is involved. *Building* a calibration follows the scheme of `Gpuspline <https://github.com/gpufit/Gpuspline>`_, its license is reproduced in ``LICENSES/Gpuspline-LICENSE.txt``.
 
 **Localization precision.** The fit returns the fitted parameters but no uncertainties, so Picasso evaluates the Cramer-Rao lower bound separately to fill ``lpx``, ``lpy``, ``lpz``, ``photons_unc`` and ``bg_unc``. GPU with CUDA is used if detected, otherwise the process runs on the CPU.
 

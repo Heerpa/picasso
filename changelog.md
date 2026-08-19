@@ -26,7 +26,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - **Standalone channel registration** (`Calibration` > `Register channels (2D)`, new module `picasso.registration`), which measures where each loaded channel sits relative to the first and saves it as its own small `.yaml`.
 - New fitting algorithms supported: 2D rotated Gaussian, 2D spherical Gaussian
 - **GPU fitting is now implemented in Numba CUDA instead of Gpufit.** All seven models Picasso fits on the GPU — the spherical, elliptical and rotated 2D Gaussians and the cubic splines — now run through kernels written in Python and compiled at run time (`picasso.fitting.splinefit_cuda`, `picasso.fitting.gaussfit_cuda`, `picasso.fitting.lmfit_cuda`). The fitting algorithm itself is unchanged — it remains a port of [Gpufit](https://github.com/gpufit/Gpufit) (Przybylski et al., Scientific Reports 7, 15722, 2017). All CRLB calculations and parameter uncertainties are calculated in `picasso.fitting.precision`. Note that all the models are also available on the CPU.
-- **sCMOS pixel-dependent noise model.** Picasso can now use a per-pixel camera calibration — offset, readout variance and, optionally, amplification gain — instead of the scalar `Baseline` and `Sensitivity`, and applies the noise model of [Huang et al., Nat. Methods 10, 653-658 (2013)](https://doi.org/10.1038/nmeth.2488) to MLE fitting. See the [Localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html) for the acquisition protocol and the per-method behaviour.
+- **sCMOS pixel-dependent noise model.** Picasso can now use a per-pixel camera calibration — offset, readout variance and, optionally, amplification gain — instead of the scalar `Baseline` and `Sensitivity`, and applies the noise model of [Huang et al., Nat. Methods 10, 653-658 (2013)](https://doi.org/10.1038/nmeth.2488) to MLE fitting. See the [Localize documentation](https://picassosr.readthedocs.io/en/latest/localize.html) for the acquisition protocol and the per-method behavior.
 - **`picasso.gausslq` and `picasso.gaussmle` are deprecated and the whole modules will be removed in Picasso 1.0**, so that all fitting lives in the `picasso.fitting` subpackage. Every public name in them now raises a `DeprecationWarning` naming its replacement:
   - the fitters (`fit_spot`, `fit_spots`, `fit_spots_parallel`, `gaussmle`, `gaussmle_async`) → `picasso.fitting.gaussfit.fit_spots` / `fit_spots_async`
   - `fit_spots_gauss_gpu` → `picasso.fitting.gaussfit_cuda.fit_spots`
@@ -139,7 +139,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - `picasso.localize.localize` will only accept the movie as a positional argument in v0.12.0; `camera_info` and `identification_parameters` become keyword-only
 - `picasso.localize.localize`'s `parameters` argument was renamed to `identification_parameters` and now also carries the spatial Gaussian filter (as the `Gaussian Filter Sigma` key, replacing the `gaussian_filter_sigma` argument added earlier in this release); `parameters` will be removed in v0.12.0
 - `picasso.localize.localize`'s `mle_method` argument is ignored and will be removed in v0.12.0
-- `eps` and `max_it` are honoured by every iterating fitting method on either device (all of them except `avg`)
+- `eps` and `max_it` are honored by every iterating fitting method on either device (all of them except `avg`)
 
 ## 0.10.3
 - Fixed total pick area in the .yamls for circular and square picks (Render)
@@ -803,7 +803,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 
 - Added more docstrings / documentation for Picasso Server
 - Import and export for handling IMS (Imaris) files
-- Fixed a bug where GPUFit was greyed out, added better installation instructions for GPUfit
+- Fixed a bug where GPUFit was grayed out, added better installation instructions for GPUfit
 - More documentation
 - Added dockerfile
 

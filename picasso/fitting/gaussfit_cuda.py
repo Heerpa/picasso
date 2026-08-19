@@ -31,7 +31,7 @@ Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
 "Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
 Scientific Reports 7, 15722 (2017).
 https://doi.org/10.1038/s41598-017-15313-9
-Licence (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
+License (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
 
 :authors: Rafal Kowalewski
 :copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry

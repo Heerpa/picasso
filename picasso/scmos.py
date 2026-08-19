@@ -589,7 +589,7 @@ def save_calibration_plot(calibration: dict, path: str) -> str:
     amplifiers in the gain, a bright corner in the offset, a cluster of hot
     pixels - which a histogram averages away. The histogram shows the
     *distribution*, in particular the tail of high-variance pixels the noise
-    model exists for, which a map on a linear colour scale cannot resolve
+    model exists for, which a map on a linear color scale cannot resolve
     against its own outliers.
 
     Parameters

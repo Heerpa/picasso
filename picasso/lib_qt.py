@@ -842,7 +842,7 @@ class RangeSlider(QtWidgets.QWidget):
         return max(1.0, self.width() - self.HANDLE_WIDTH)
 
     def _value_to_x(self, value: float) -> float:
-        """Pixel position of a handle's centre, inset by half a handle so
+        """Pixel position of a handle's center, inset by half a handle so
         that the handles stay inside the widget at both ends."""
         span = self._maximum - self._minimum
         fraction = (value - self._minimum) / span if span else 0.0

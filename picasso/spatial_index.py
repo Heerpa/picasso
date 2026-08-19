@@ -237,7 +237,7 @@ def _select_level(pyramid: RenderIndexPyramid, viewport: tuple) -> int:
     """Pick the smallest level whose blocks per viewport edge <= target.
 
     Walking from finest to coarsest means we pick the finest level that
-    keeps block iteration bounded -- which also minimises the gathered
+    keeps block iteration bounded -- which also minimizes the gathered
     locs count (more blocks per coarse cell at coarser levels).
     """
     (y_min, x_min), (y_max, x_max) = viewport

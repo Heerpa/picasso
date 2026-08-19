@@ -42,7 +42,7 @@ Przybylski, A., Thiel, B., Keller-Findeisen, J., Stock, B. & Bates, M.
 "Gpufit: An open-source toolkit for GPU-accelerated curve fitting."
 Scientific Reports 7, 15722 (2017).
 https://doi.org/10.1038/s41598-017-15313-9
-Licence (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
+License (MIT): ``LICENSES/Gpufit-LICENSE.txt``.
 
 Li, Y., Mund, M., Hoess, P. et al. "Real-time 3D single-molecule
 localization using experimental point spread functions." Nature Methods

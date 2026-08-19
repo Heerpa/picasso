@@ -2199,11 +2199,11 @@ def get_rectangle_pick_polygon(
     Parameters
     ----------
     start_x, start_y : float
-        One end of the rectangle's centre line.
+        One end of the rectangle's center line.
     end_x, end_y : float
-        The other end of the centre line.
+        The other end of the center line.
     width : float
-        Width of the rectangle, perpendicular to the centre line.
+        Width of the rectangle, perpendicular to the center line.
     return_most_right : bool, optional
         Also return the rightmost corner, where the GUI anchors the pick
         label. Default False.
@@ -3137,7 +3137,7 @@ def _render_multi_channel(
     (numpy array). See ``render_scene`` for more details.
 
     ``colors`` may be either a list of ``(r, g, b)`` triplets (legacy
-    behaviour: each channel rendered as ``intensity × rgb``, additive
+    behavior: each channel rendered as ``intensity × rgb``, additive
     blend) or a list of ``(256, 3)`` LUTs (each channel indexed into
     its LUT before additive blending — supports per-channel
     matplotlib colormaps and user-defined colormaps from the GUI)."""

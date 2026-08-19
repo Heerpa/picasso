@@ -142,7 +142,7 @@ class TestConvergenceSchedule:
     def test_defaults_reproduce_minpacks_own(self):
         """MAX_ITERATIONS must map to exactly ``leastsq``'s default
         ``maxfev``, so passing the default explicitly is a no-op and the
-        historical behaviour of ``gausslq`` is unchanged."""
+        historical behavior of ``gausslq`` is unchanged."""
         for n_parameters in (5, 6, 7):
             assert gausslq._max_function_evaluations(
                 gausslq.MAX_ITERATIONS, n_parameters
