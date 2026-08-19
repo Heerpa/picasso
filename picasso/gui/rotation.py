@@ -2105,15 +2105,15 @@ class RotationWindow(QtWidgets.QMainWindow):
 
         # menu bar - File
         file_menu = self.menu_bar.addMenu("File")
-        save_action = file_menu.addAction("Save rotated localizations")
+        save_action = file_menu.addAction("Save rotated localizations...")
         save_action.setShortcut("Ctrl+S")
         save_action.triggered.connect(self.save_locs_rotated)
 
         file_menu.addSeparator()
-        export_view = file_menu.addAction("Export current view")
+        export_view = file_menu.addAction("Export current view...")
         export_view.setShortcut("Ctrl+E")
         export_view.triggered.connect(self.view_rot.export_current_view)
-        animation = file_menu.addAction("Build an animation")
+        animation = file_menu.addAction("Build an animation...")
         animation.setShortcut("Ctrl+Shift+E")
         animation.triggered.connect(self.animation_dialog.show)
         help_action = file_menu.addAction("Help")
@@ -2123,7 +2123,7 @@ class RotationWindow(QtWidgets.QMainWindow):
 
         # menu bar - View
         view_menu = self.menu_bar.addMenu("View")
-        display_settings_action = view_menu.addAction("Display settings")
+        display_settings_action = view_menu.addAction("Display settings...")
         display_settings_action.setShortcut("Ctrl+D")
         display_settings_action.triggered.connect(
             self.display_settings_dlg.show
@@ -2145,7 +2145,7 @@ class RotationWindow(QtWidgets.QMainWindow):
         self.angles_action.triggered.connect(self.update_scene)
 
         view_menu.addSeparator()
-        rotation_action = view_menu.addAction("Rotate by angle")
+        rotation_action = view_menu.addAction("Rotate by angle...")
         rotation_action.triggered.connect(self.view_rot.rotation_input)
         rotation_action.setShortcut("Ctrl+Shift+R")
 

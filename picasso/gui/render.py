@@ -12717,54 +12717,58 @@ class Window(QtWidgets.QMainWindow):
 
         # menu bar - File
         file_menu = self.menu_bar.addMenu("File")
-        open_action = file_menu.addAction("Open")
+        open_action = file_menu.addAction("Open...")
         open_action.setShortcut(QtGui.QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.open_file_dialog)
-        open_rot_action = file_menu.addAction("Open rotated localizations")
+        open_rot_action = file_menu.addAction("Open rotated localizations...")
         open_rot_action.setShortcut("Ctrl+Shift+O")
         open_rot_action.triggered.connect(self.open_rotated_locs)
-        save_action = file_menu.addAction("Save localizations")
+        save_action = file_menu.addAction("Save localizations...")
         save_action.setShortcut("Ctrl+S")
         save_action.triggered.connect(self.save_locs)
-        save_picked_action = file_menu.addAction("Save picked localizations")
+        save_picked_action = file_menu.addAction(
+            "Save picked localizations..."
+        )
         save_picked_action.setShortcut("Ctrl+Shift+S")
         save_picked_action.triggered.connect(self.save_picked_locs)
         save_picked_sep_action = file_menu.addAction(
-            "Save picked localizations separately"
+            "Save picked localizations separately..."
         )
         save_picked_sep_action.triggered.connect(
             self.save_picked_locs_separately
         )
         save_pick_properties_action = file_menu.addAction(
-            "Save pick/group properties"
+            "Save pick/group properties..."
         )
         save_pick_properties_action.triggered.connect(
             self.save_pick_properties
         )
-        save_picks_action = file_menu.addAction("Save pick regions")
+        save_picks_action = file_menu.addAction("Save pick regions...")
         save_picks_action.triggered.connect(self.save_picks)
-        load_picks_action = file_menu.addAction("Load pick regions")
+        load_picks_action = file_menu.addAction("Load pick regions...")
         load_picks_action.triggered.connect(self.load_picks)
 
         file_menu.addSeparator()
-        export_current_action = file_menu.addAction("Export current view")
+        export_current_action = file_menu.addAction("Export current view...")
         export_current_action.setShortcut("Ctrl+E")
         export_current_action.triggered.connect(self.export_current)
-        export_complete_action = file_menu.addAction("Export complete image")
+        export_complete_action = file_menu.addAction(
+            "Export complete image..."
+        )
         export_complete_action.setShortcut("Ctrl+Shift+E")
         export_complete_action.triggered.connect(self.export_complete)
-        export_kwargs_action = file_menu.addAction("Export view manually")
+        export_kwargs_action = file_menu.addAction("Export view manually...")
         export_kwargs_action.triggered.connect(self.export_kwargs)
         export_grayscale_action = file_menu.addAction(
-            "Export channels in grayscale"
+            "Export channels in grayscale..."
         )
         export_grayscale_action.triggered.connect(self.export_grayscale)
 
         file_menu.addSeparator()
-        export_multi_action = file_menu.addAction("Export localizations")
+        export_multi_action = file_menu.addAction("Export localizations...")
         export_multi_action.triggered.connect(self.export_multi)
         if IMSWRITER:
-            export_ims_action = file_menu.addAction("Export ROI for Imaris")
+            export_ims_action = file_menu.addAction("Export ROI for Imaris...")
             export_ims_action.triggered.connect(self.export_fov_ims)
 
         # sound notification submenu
@@ -12799,7 +12803,7 @@ class Window(QtWidgets.QMainWindow):
         )
         delete_action.triggered.connect(self.remove_locs)
 
-        picasso_settings_action = file_menu.addAction("Picasso settings")
+        picasso_settings_action = file_menu.addAction("Picasso settings...")
         picasso_settings_action.triggered.connect(
             self.user_settings_dialog.show
         )
@@ -12810,13 +12814,13 @@ class Window(QtWidgets.QMainWindow):
 
         # menu bar - View
         view_menu = self.menu_bar.addMenu("View")
-        display_settings_action = view_menu.addAction("Display settings")
+        display_settings_action = view_menu.addAction("Display settings...")
         display_settings_action.setShortcut("Ctrl+D")
         display_settings_action.triggered.connect(
             self.display_settings_dlg.show
         )
         view_menu.addAction(display_settings_action)
-        dataset_action = view_menu.addAction("Files")
+        dataset_action = view_menu.addAction("Files...")
         dataset_action.setShortcut("Ctrl+F")
         dataset_action.triggered.connect(self.dataset_dialog.show)
 
@@ -12849,14 +12853,14 @@ class Window(QtWidgets.QMainWindow):
         view_menu.addAction(fit_in_view_action)
 
         view_menu.addSeparator()
-        info_action = view_menu.addAction("Show info")
+        info_action = view_menu.addAction("Show info...")
         info_action.setShortcut("Ctrl+I")
         info_action.triggered.connect(self.info_dialog.show)
         view_menu.addAction(info_action)
-        metadata_action = view_menu.addAction("Show metadata")
+        metadata_action = view_menu.addAction("Show metadata...")
         metadata_action.setShortcut("Ctrl+Shift+M")
         metadata_action.triggered.connect(self.show_metadata)
-        slicer_action = view_menu.addAction("Slice")
+        slicer_action = view_menu.addAction("Slice...")
         slicer_action.triggered.connect(self.slicer_dialog.initialize)
         rot_win_action = view_menu.addAction("Update rotation window")
         rot_win_action.setShortcut("Ctrl+Shift+R")
@@ -12884,7 +12888,7 @@ class Window(QtWidgets.QMainWindow):
         tools_actiongroup.triggered.connect(self.view.set_mode)
 
         tools_menu.addSeparator()
-        tools_settings_action = tools_menu.addAction("Tools settings")
+        tools_settings_action = tools_menu.addAction("Tools settings...")
         tools_settings_action.setShortcut("Ctrl+T")
         tools_settings_action.triggered.connect(
             self.tools_settings_dialog.show
@@ -12905,7 +12909,7 @@ class Window(QtWidgets.QMainWindow):
             self.view.remove_picked_locs
         )
 
-        move_to_pick_action = tools_menu.addAction("Move to pick")
+        move_to_pick_action = tools_menu.addAction("Move to pick...")
         move_to_pick_action.triggered.connect(self.view.move_to_pick)
 
         pick_fiducials_action = tools_menu.addAction("Pick fiducials")
@@ -12920,42 +12924,44 @@ class Window(QtWidgets.QMainWindow):
         show_trace_action.triggered.connect(self.view.show_trace)
 
         tools_menu.addSeparator()
-        select_traces_action = tools_menu.addAction("Select picks (trace)")
+        select_traces_action = tools_menu.addAction("Select picks (trace)...")
         select_traces_action.triggered.connect(self.view.select_traces)
 
-        plotpick_action = tools_menu.addAction("Select picks (XY scatter)")
+        plotpick_action = tools_menu.addAction("Select picks (XY scatter)...")
         plotpick_action.triggered.connect(self.view.show_pick)
-        plotpick3d_action = tools_menu.addAction("Select picks (XYZ scatter)")
+        plotpick3d_action = tools_menu.addAction(
+            "Select picks (XYZ scatter)..."
+        )
         plotpick3d_action.triggered.connect(self.view.show_pick_3d)
         plotpick3d_iso_action = tools_menu.addAction(
-            "Select picks (XYZ scatter, 4 panels)"
+            "Select picks (XYZ scatter, 4 panels)..."
         )
         plotpick3d_iso_action.triggered.connect(self.view.show_pick_3d_iso)
 
         filter_picks_action = tools_menu.addAction(
-            "Filter picks by number of localizations"
+            "Filter picks by number of localizations..."
         )
         filter_picks_action.triggered.connect(self.view.filter_picks)
 
-        pickadd_action = tools_menu.addAction("Subtract pick regions")
+        pickadd_action = tools_menu.addAction("Subtract pick regions...")
         pickadd_action.triggered.connect(self.subtract_picks)
 
         tools_menu.addSeparator()
-        cluster_action = tools_menu.addAction("Cluster in pick (k-means)")
+        cluster_action = tools_menu.addAction("Cluster in pick (k-means)...")
         cluster_action.triggered.connect(self.view.analyze_cluster)
 
         tools_menu.addSeparator()
-        mask_action = tools_menu.addAction("Mask image")
+        mask_action = tools_menu.addAction("Mask image...")
         mask_action.triggered.connect(self.mask_settings_dialog.init_dialog)
 
         tools_menu.addSeparator()
-        fast_render_action = tools_menu.addAction("Fast rendering")
+        fast_render_action = tools_menu.addAction("Fast rendering...")
         fast_render_action.triggered.connect(self.fast_render_dialog.show)
 
         # menu bar - Postprocess
         postprocess_menu = self.menu_bar.addMenu("Postprocess")
 
-        undrift_aim_action = postprocess_menu.addAction("Undrift by AIM")
+        undrift_aim_action = postprocess_menu.addAction("Undrift by AIM...")
         undrift_aim_action.setShortcut("Ctrl+U")
         undrift_aim_action.triggered.connect(self.view.undrift_aim)
         undrift_from_picked_action = postprocess_menu.addAction(
@@ -12971,36 +12977,36 @@ class Window(QtWidgets.QMainWindow):
         undrift_from_picked2d_action.triggered.connect(
             self.view.undrift_from_picked2d
         )
-        undrift_action = postprocess_menu.addAction("Undrift by RCC")
+        undrift_action = postprocess_menu.addAction("Undrift by RCC...")
         undrift_action.triggered.connect(self.view.undrift_rcc)
         drift_action = postprocess_menu.addAction("Undo drift")
         drift_action.triggered.connect(self.view.undo_drift)
         drift_action = postprocess_menu.addAction("Show drift")
         drift_action.triggered.connect(self.view.show_drift)
         apply_drift_action = postprocess_menu.addAction(
-            "Apply drift from an external file"
+            "Apply drift from an external file..."
         )
         apply_drift_action.triggered.connect(self.view.apply_drift)
 
         postprocess_menu.addSeparator()
-        columns_action = postprocess_menu.addAction("Remove columns")
+        columns_action = postprocess_menu.addAction("Remove columns...")
         columns_action.triggered.connect(self.remove_columns)
         sync_group_action = postprocess_menu.addAction(
             "Synchronize groups across channels"
         )
         sync_group_action.triggered.connect(self.view.sync_groups)
         unfold_action_square = postprocess_menu.addAction(
-            "Unfold groups/picks (square grid)"
+            "Unfold groups/picks (square grid)..."
         )
         unfold_action_square.triggered.connect(self.view.unfold_groups_square)
 
         postprocess_menu.addSeparator()
         link_action = postprocess_menu.addAction(
-            "Link localizations (binding events)"
+            "Link localizations (binding events)..."
         )
         link_action.triggered.connect(self.view.link)
         event_cores_action = postprocess_menu.addAction(
-            "Select central frames localizations"
+            "Select central frames localizations..."
         )
         event_cores_action.triggered.connect(
             self.view.select_binding_event_cores
@@ -13016,34 +13022,34 @@ class Window(QtWidgets.QMainWindow):
 
         postprocess_menu.addSeparator()
         apply_action = postprocess_menu.addAction(
-            "Apply expression to localizations"
+            "Apply expression to localizations..."
         )
         apply_action.setShortcut("Ctrl+A")
         apply_action.triggered.connect(self.open_apply_dialog)
 
         postprocess_menu.addSeparator()
         clustering_menu = postprocess_menu.addMenu("Clustering")
-        dbscan_action = clustering_menu.addAction("DBSCAN")
+        dbscan_action = clustering_menu.addAction("DBSCAN...")
         dbscan_action.triggered.connect(self.view.dbscan)
-        hdbscan_action = clustering_menu.addAction("HDBSCAN")
+        hdbscan_action = clustering_menu.addAction("HDBSCAN...")
         hdbscan_action.triggered.connect(self.view.hdbscan)
-        clusterer_action = clustering_menu.addAction("SMLM clusterer")
+        clusterer_action = clustering_menu.addAction("SMLM clusterer...")
         clusterer_action.triggered.connect(self.view.smlm_clusterer)
-        test_cluster_action = clustering_menu.addAction("Test clustering")
+        test_cluster_action = clustering_menu.addAction("Test clustering...")
         test_cluster_action.triggered.connect(self.test_clusterer_dialog.show)
 
         postprocess_menu.addSeparator()
         nn_action = postprocess_menu.addAction(
-            "Calculate nearest neighbor distances"
+            "Calculate nearest neighbor distances..."
         )
         nn_action.triggered.connect(self.view.nearest_neighbor)
 
         postprocess_menu.addSeparator()
-        resi_action = postprocess_menu.addAction("RESI")
+        resi_action = postprocess_menu.addAction("RESI...")
         resi_action.triggered.connect(self.open_resi_dialog)
 
         postprocess_menu.addSeparator()
-        g5m_action = postprocess_menu.addAction("Molecular mapping (G5M)")
+        g5m_action = postprocess_menu.addAction("Molecular mapping (G5M)...")
         g5m_action.triggered.connect(self.view.g5m)
 
         self.load_user_settings()

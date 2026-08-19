@@ -240,7 +240,7 @@ def add_plugins_menu_actions(window, app_name: str) -> None:
         )
         pending_action.triggered.connect(lambda: _open_store(window, app_name))
 
-    store_action = menu.addAction("Browse online plugins")
+    store_action = menu.addAction("Browse online plugins...")
     store_action.triggered.connect(lambda: _open_store(window, app_name))
 
     open_action = menu.addAction("Open plugins folder...")

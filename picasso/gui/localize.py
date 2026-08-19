@@ -5735,12 +5735,12 @@ class Window(QtWidgets.QMainWindow):
 
         """ File """
         file_menu = menu_bar.addMenu("File")
-        open_action = file_menu.addAction("Open movie")
+        open_action = file_menu.addAction("Open movie...")
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self.open_file_dialog)
         file_menu.addAction(open_action)
         open_multichannel_action = file_menu.addAction(
-            "Open one multichannel movie"
+            "Open one multichannel movie..."
         )
         open_multichannel_action.setShortcut("Ctrl+Shift+O")
         open_multichannel_action.triggered.connect(
@@ -5748,54 +5748,58 @@ class Window(QtWidgets.QMainWindow):
         )
         file_menu.addAction(open_multichannel_action)
         open_channels_action = file_menu.addAction(
-            "Open channels from several movies"
+            "Open channels from several movies..."
         )
         open_channels_action.triggered.connect(
             self.open_channels_from_files_dialog
         )
         file_menu.addAction(open_channels_action)
         open_mm_folder_action = file_menu.addAction(
-            "Open MicroManager image folder"
+            "Open MicroManager image folder..."
         )
         open_mm_folder_action.triggered.connect(self.open_mm_folder_dialog)
         file_menu.addAction(open_mm_folder_action)
-        open_concat_action = file_menu.addAction("Concatenate movies")
+        open_concat_action = file_menu.addAction("Concatenate movies...")
         open_concat_action.triggered.connect(self.open_concatenated_dialog)
         file_menu.addAction(open_concat_action)
         save_identifications_action = file_menu.addAction(
-            "Save identifications"
+            "Save identifications..."
         )
         save_identifications_action.triggered.connect(
             self.save_identifications_dialog
         )
         load_identifications_action = file_menu.addAction(
-            "Load identifications"
+            "Load identifications..."
         )
         load_identifications_action.triggered.connect(
             self.open_identifications
         )
         load_picks_action = file_menu.addAction(
-            "Load picks as identifications"
+            "Load picks as identifications..."
         )
         load_picks_action.triggered.connect(self.open_picks)
-        load_locs_action = file_menu.addAction("Load locs as identifications")
+        load_locs_action = file_menu.addAction(
+            "Load locs as identifications..."
+        )
         load_locs_action.triggered.connect(self.open_locs)
-        save_action = file_menu.addAction("Save localizations")
+        save_action = file_menu.addAction("Save localizations...")
         save_action.setShortcut("Ctrl+S")
         save_action.triggered.connect(self.save_locs_dialog)
         file_menu.addAction(save_action)
-        save_spots_action = file_menu.addAction("Save spots")
+        save_spots_action = file_menu.addAction("Save spots...")
         save_spots_action.setShortcut("Ctrl+Shift+S")
         save_spots_action.triggered.connect(self.save_spots_dialog)
         file_menu.addAction(save_spots_action)
-        select_columns_action = file_menu.addAction("Select columns to save")
+        select_columns_action = file_menu.addAction(
+            "Select columns to save..."
+        )
         select_columns_action.triggered.connect(self.columns_dialog.show)
         file_menu.addAction(select_columns_action)
         file_menu.addSeparator()
-        export_current_action = file_menu.addAction("Export current view")
+        export_current_action = file_menu.addAction("Export current view...")
         export_current_action.setShortcut("Ctrl+E")
         export_current_action.triggered.connect(self.export_current)
-        metadata_action = file_menu.addAction("Metadata")
+        metadata_action = file_menu.addAction("Show metadata...")
         metadata_action.setShortcut("Ctrl+M")
         metadata_action.triggered.connect(self.show_metadata)
         file_menu.addAction(metadata_action)
@@ -5822,7 +5826,7 @@ class Window(QtWidgets.QMainWindow):
         open_sounds_action.triggered.connect(
             lib.open_sound_notifications_folder
         )
-        picasso_settings_action = file_menu.addAction("Picasso settings")
+        picasso_settings_action = file_menu.addAction("Picasso settings...")
         picasso_settings_action.triggered.connect(
             self.user_settings_dialog.show
         )
@@ -5876,7 +5880,7 @@ class Window(QtWidgets.QMainWindow):
         last_frame_action.setShortcut("End")
         last_frame_action.triggered.connect(self.last_frame)
         view_menu.addAction(last_frame_action)
-        go_to_frame_action = view_menu.addAction("Go to frame")
+        go_to_frame_action = view_menu.addAction("Go to frame...")
         go_to_frame_action.setShortcut("Ctrl+G")
         go_to_frame_action.triggered.connect(self.to_frame)
         view_menu.addAction(go_to_frame_action)
@@ -5909,7 +5913,7 @@ class Window(QtWidgets.QMainWindow):
         fit_in_view_action.triggered.connect(self.fit_in_view)
         view_menu.addAction(fit_in_view_action)
         view_menu.addSeparator()
-        constract_action = view_menu.addAction("Contrast")
+        constract_action = view_menu.addAction("Contrast...")
         constract_action.setShortcut("Ctrl+C")
         constract_action.triggered.connect(self.contrast_dialog.show)
         view_menu.addAction(constract_action)
@@ -5921,7 +5925,7 @@ class Window(QtWidgets.QMainWindow):
 
         """ Analyze """
         analyze_menu = menu_bar.addMenu("Analyze")
-        parameters_action = analyze_menu.addAction("Parameters")
+        parameters_action = analyze_menu.addAction("Parameters...")
         parameters_action.setShortcut("Ctrl+P")
         parameters_action.triggered.connect(self.parameters_dialog.show)
         analyze_menu.addAction(parameters_action)
@@ -5954,7 +5958,7 @@ class Window(QtWidgets.QMainWindow):
         calibrate_z_action.triggered.connect(self.calibrate_z)
 
         calibrate_affine_action = threed_menu.addAction(
-            "Calibrate lateral transform (astigmatism / chromatic)"
+            "Calibrate lateral transform (astigmatism / chromatic)..."
         )
         calibrate_affine_action.setToolTip(
             "Fit a lateral correction from two bead images and append\n"

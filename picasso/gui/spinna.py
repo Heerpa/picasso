@@ -5257,7 +5257,7 @@ class Window(QtWidgets.QMainWindow):
         open_sounds_action.triggered.connect(
             lib.open_sound_notifications_folder
         )
-        picasso_settings_action = file_menu.addAction("Picasso settings")
+        picasso_settings_action = file_menu.addAction("Picasso settings...")
         picasso_settings_action.triggered.connect(
             self.user_settings_dialog.show
         )

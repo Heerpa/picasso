@@ -616,19 +616,19 @@ class Window(QtWidgets.QMainWindow):
         self.user_settings_dialog = lib.UserSettingsDialog(self)
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("File")
-        open_action = file_menu.addAction("Open")
+        open_action = file_menu.addAction("Open...")
         open_action.setShortcut(QtGui.QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.open_file_dialog)
         file_menu.addAction(open_action)
-        save_action = file_menu.addAction("Save")
+        save_action = file_menu.addAction("Save...")
         save_action.setShortcut(QtGui.QKeySequence.StandardKey.Save)
         save_action.triggered.connect(self.save_file_dialog)
-        export_csv_action = file_menu.addAction("Export as CSV")
+        export_csv_action = file_menu.addAction("Export as CSV...")
         export_csv_action.triggered.connect(self.export_csv_dialog)
-        metadata_action = file_menu.addAction("Show metadata")
+        metadata_action = file_menu.addAction("Show metadata...")
         metadata_action.setShortcut("Ctrl+M")
         metadata_action.triggered.connect(self.show_metadata)
-        picasso_settings_action = file_menu.addAction("Picasso settings")
+        picasso_settings_action = file_menu.addAction("Picasso settings...")
         picasso_settings_action.triggered.connect(
             self.user_settings_dialog.show
         )
@@ -643,20 +643,20 @@ class Window(QtWidgets.QMainWindow):
         scatter_action = plot_menu.addAction("2D Histogram")
         scatter_action.setShortcut("Ctrl+D")
         scatter_action.triggered.connect(self.plot_hist2d)
-        test_subcluster_action = plot_menu.addAction("Test subclustering")
+        test_subcluster_action = plot_menu.addAction("Test subclustering...")
         test_subcluster_action.triggered.connect(self.plot_subclustering)
 
         filter_menu = menu_bar.addMenu("Filter")
-        filter_action = filter_menu.addAction("Filter numerically")
+        filter_action = filter_menu.addAction("Filter numerically...")
         filter_action.setShortcut("Ctrl+F")
         filter_action.triggered.connect(self.filter_num.show)
         apply_from_metadata_action = filter_menu.addAction(
-            "Apply filters from metadata"
+            "Apply filters from metadata..."
         )
         apply_from_metadata_action.triggered.connect(
             self.apply_filters_from_metadata
         )
-        remove_columns_action = filter_menu.addAction("Remove columns")
+        remove_columns_action = filter_menu.addAction("Remove columns...")
         remove_columns_action.triggered.connect(self.remove_columns)
         main_widget = QtWidgets.QWidget()
         hbox = QtWidgets.QHBoxLayout(main_widget)
