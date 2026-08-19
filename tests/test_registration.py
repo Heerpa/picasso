@@ -312,3 +312,304 @@ class TestCalibrationFile:
         assert residuals.shape == (2, 2, 2)
         # the reference channel's box sits on the detection itself
         np.testing.assert_array_equal(residuals[:, 0, :], 0.0)
+
+
+class TestSplitFovRegistration:
+    """Channels imaged side by side on one sensor, registered from that single
+    movie's own regions."""
+
+    H, W = 64, 128
+    REGIONS = [[[0, 0], [64, 64]], [[0, 64], [64, 128]]]
+    # the fine misregistration on top of the 64 px region offset
+    FX, FY = 1.4, -0.85
+
+    def _render(self, frame, x, y, amp, sigma=1.25):
+        j, i = np.mgrid[0 : self.H, 0 : self.W]
+        frame += amp * np.exp(-0.5 * ((i - x) ** 2 + (j - y) ** 2) / sigma**2)
+
+    def _blinking_movie(self, n_frames=70, seed=4):
+        rng = np.random.RandomState(seed)
+        movie = np.zeros((n_frames, self.H, self.W))
+        for f in range(n_frames):
+            for _ in range(rng.randint(4, 7)):
+                x = rng.uniform(12, 52)
+                y = rng.uniform(12, 52)
+                amp = rng.uniform(2500, 4000)
+                self._render(movie[f], x, y, amp)
+                self._render(movie[f], x + 64 + self.FX, y + self.FY, amp)
+        return rng.poisson(np.maximum(movie, 0) + 100).astype(np.uint16)
+
+    def _bead_movie(self, seed=1):
+        rng = np.random.RandomState(seed)
+        img = np.zeros((self.H, self.W))
+        for x in range(10, 56, 11):
+            for y in range(10, 56, 11):
+                self._render(img, x, y, 4000.0, 1.3)
+                self._render(img, x + 64 + self.FX, y + self.FY, 4000.0, 1.3)
+        return rng.poisson(img + 100).astype(np.uint16)[None]
+
+    def _local_shift(self, calibration):
+        """The region-local translation the registration recovered."""
+        matrix = _matrix(calibration["channel_registration"][1])
+        return matrix[0, 2], matrix[1, 2]
+
+    def test_beads_recover_the_fine_offset(self):
+        calibration = registration.calibrate_channel_registration_from_beads(
+            [self._bead_movie()],
+            box=BOX,
+            minimum_ng=2000.0,
+            regions=self.REGIONS,
+        )
+
+        assert calibration["split_fov"] is True
+        assert calibration["n_channels"] == 2
+        dx, dy = self._local_shift(calibration)
+        assert dx == pytest.approx(self.FX, abs=0.15)
+        assert dy == pytest.approx(self.FY, abs=0.15)
+
+    def test_signal_recovers_the_fine_offset(self):
+        calibration = registration.calibrate_channel_registration_from_signal(
+            [self._blinking_movie()],
+            box=BOX,
+            minimum_ng=800.0,
+            regions=self.REGIONS,
+        )
+
+        assert calibration["split_fov"] is True
+        dx, dy = self._local_shift(calibration)
+        # `identify` reports a centroid, so a sub-pixel bias remains - as for
+        # the separate-movie signal path
+        assert dx == pytest.approx(self.FX, abs=0.35)
+        assert dy == pytest.approx(self.FY, abs=0.35)
+
+    def test_the_registration_stores_the_region_layout(self):
+        calibration = registration.calibrate_channel_registration_from_beads(
+            [self._bead_movie()],
+            box=BOX,
+            minimum_ng=2000.0,
+            regions=self.REGIONS,
+        )
+
+        assert calibration["regions"] == self.REGIONS
+        assert calibration["reference"] == 0
+        # the absolute transform carries the region offset, the region-local
+        # one does not - that is what lets the ROIs be re-drawn
+        absolute = _matrix(calibration["channel_transforms"][1])
+        assert absolute[0, 2] == pytest.approx(64 + self.FX, abs=0.2)
+        assert self._local_shift(calibration)[0] == pytest.approx(
+            self.FX, abs=0.15
+        )
+
+    def test_the_channels_can_be_replaced_at_redrawn_rois(self):
+        """The stored registration is ROI-agnostic, so moving the ROIs moves
+        the channels with them."""
+        from picasso import localize
+
+        calibration = registration.calibrate_channel_registration_from_beads(
+            [self._bead_movie()],
+            box=BOX,
+            minimum_ng=2000.0,
+            regions=self.REGIONS,
+        )
+        moved = [[[0, 0], [64, 64]], [[0, 70], [64, 134]]]
+
+        _, _, transforms = localize.split_fov_fit_geometry(calibration, moved)
+
+        placed = transforms[1].matrix[:2]
+        assert placed[0, 2] == pytest.approx(70 + self.FX, abs=0.2)
+
+    def test_rejects_more_than_one_movie(self):
+        movie = self._bead_movie()
+        with pytest.raises(ValueError, match="single bead movie"):
+            registration.calibrate_channel_registration_from_beads(
+                [movie, movie],
+                box=BOX,
+                minimum_ng=2000.0,
+                regions=self.REGIONS,
+            )
+
+    def test_signal_rejects_more_than_one_movie(self):
+        movie = self._blinking_movie(n_frames=10)
+        with pytest.raises(ValueError, match="single movie"):
+            registration.calibrate_channel_registration_from_signal(
+                [movie, movie],
+                box=BOX,
+                minimum_ng=800.0,
+                regions=self.REGIONS,
+            )
+
+
+class TestSplitFovFlips:
+    """A splitter commonly folds one channel about an axis. The drawn ROIs fix
+    where a channel sits but not how it is oriented, so every mirror is tried
+    and the one that pairs the most beads wins."""
+
+    H, W = 64, 128
+    REGIONS = [[[0, 0], [64, 64]], [[0, 64], [64, 128]]]
+    FX, FY = 1.4, -0.85
+
+    def _render(self, img, x, y, amp=4000.0, sigma=1.3):
+        yy, xx = np.mgrid[0 : self.H, 0 : self.W]
+        img += amp * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma**2))
+
+    def _random_beads(self, rng, n=34):
+        """Randomly placed beads. A regular lattice will not do: its mirror is
+        indistinguishable from a translation, so the orientation would be
+        genuinely ambiguous rather than merely hard."""
+        pts = []
+        while len(pts) < n:
+            p = rng.uniform(8, 55, 2)
+            if all(np.hypot(*(p - q)) > 6 for q in pts):
+                pts.append(p)
+        return np.array(pts)
+
+    def _movie(self, map_fn, seed=3, n_fov=1):
+        rng = np.random.RandomState(seed)
+        frames = []
+        for _ in range(n_fov):
+            img = np.zeros((self.H, self.W))
+            for x, y in self._random_beads(rng):
+                self._render(img, x, y)
+                self._render(img, *map_fn(x, y))
+            frames.append(rng.poisson(img + 100))
+        return np.stack(frames).astype(np.uint16)
+
+    # (sx, sy) mirror signs -> the mapping the channel actually applies
+    ORIENTATIONS = {
+        "none": (lambda s, x, y: (x + 64 + s.FX, y + s.FY), 1.0),
+        "flip-x": (lambda s, x, y: (64 + (63 - x) + s.FX, y + s.FY), -1.0),
+        "flip-y": (lambda s, x, y: (x + 64 + s.FX, (63 - y) + s.FY), -1.0),
+        "flip-xy": (
+            lambda s, x, y: (64 + (63 - x) + s.FX, (63 - y) + s.FY),
+            1.0,
+        ),
+    }
+
+    @pytest.mark.parametrize("orientation", sorted(ORIENTATIONS))
+    def test_every_mirror_orientation_is_recovered(self, orientation):
+        map_fn, expected_det = self.ORIENTATIONS[orientation]
+        movie = self._movie(lambda x, y: map_fn(self, x, y))
+
+        calibration = registration.calibrate_channel_registration_from_beads(
+            [movie], box=BOX, minimum_ng=2000.0, regions=self.REGIONS
+        )
+
+        matrix = _matrix(calibration["channel_registration"][1])
+        # a single mirror flips the sign of the determinant; two restore it
+        assert np.linalg.det(matrix[:, :2]) == pytest.approx(
+            expected_det, abs=0.05
+        )
+        assert calibration["rms"][0] < 0.15
+        # and the fine offset is recovered in whichever axis is not mirrored
+        if orientation in ("none", "flip-y"):
+            assert matrix[0, 2] == pytest.approx(self.FX, abs=0.2)
+        if orientation in ("none", "flip-x"):
+            assert matrix[1, 2] == pytest.approx(self.FY, abs=0.2)
+
+    def test_a_mirrored_channel_maps_beads_onto_beads(self):
+        """The end-to-end property: the recovered transform must actually send
+        each reference bead onto its own partner."""
+        map_fn, _ = self.ORIENTATIONS["flip-x"]
+        movie = self._movie(lambda x, y: map_fn(self, x, y))
+
+        calibration = registration.calibrate_channel_registration_from_beads(
+            [movie], box=BOX, minimum_ng=2000.0, regions=self.REGIONS
+        )
+
+        transform = tform.from_dict(calibration["channel_transforms"][1])
+        rng = np.random.RandomState(3)
+        beads = self._random_beads(rng)
+        expected = np.array([map_fn(self, x, y) for x, y in beads])
+        np.testing.assert_allclose(transform.apply(beads), expected, atol=0.3)
+
+    def test_signal_registration_also_searches_orientations(self):
+        """The same seeding is used when registering on blinking signal."""
+        rng = np.random.RandomState(11)
+        n_frames = 60
+        movie = np.zeros((n_frames, self.H, self.W))
+        for f in range(n_frames):
+            for _ in range(rng.randint(4, 7)):
+                x, y = rng.uniform(12, 52), rng.uniform(12, 52)
+                amp = rng.uniform(2500, 4000)
+                self._render(movie[f], x, y, amp, 1.2)
+                # channel 1 is mirrored in x
+                self._render(
+                    movie[f], 64 + (63 - x) + self.FX, y + self.FY, amp, 1.2
+                )
+        movie = rng.poisson(np.maximum(movie, 0) + 100).astype(np.uint16)
+
+        calibration = registration.calibrate_channel_registration_from_signal(
+            [movie], box=BOX, minimum_ng=800.0, regions=self.REGIONS
+        )
+
+        matrix = _matrix(calibration["channel_registration"][1])
+        assert np.linalg.det(matrix[:, :2]) == pytest.approx(-1.0, abs=0.1)
+
+
+class TestMultiFovBeads:
+    """Several fields of view in one bead movie. Different fields land on the
+    same sensor coordinates, so a bead may only ever be paired with one in the
+    *same* frame."""
+
+    H, W = 64, 128
+    REGIONS = [[[0, 0], [64, 64]], [[0, 64], [64, 128]]]
+    FX, FY = 1.4, -0.85
+
+    def _movie(self, n_fov, seed=5):
+        rng = np.random.RandomState(seed)
+        yy, xx = np.mgrid[0 : self.H, 0 : self.W]
+        frames = []
+        for _ in range(n_fov):
+            img = np.zeros((self.H, self.W))
+            # a fresh, randomly placed field each frame
+            pts = []
+            while len(pts) < 18:
+                p = rng.uniform(8, 55, 2)
+                if all(np.hypot(*(p - q)) > 7 for q in pts):
+                    pts.append(p)
+            for x, y in pts:
+                for cx, cy in (
+                    (x, y),
+                    (x + 64 + self.FX, y + self.FY),
+                ):
+                    img += 4000 * np.exp(
+                        -((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * 1.3**2)
+                    )
+            frames.append(rng.poisson(img + 100))
+        return np.stack(frames).astype(np.uint16)
+
+    def _register(self, movie, multi_fov):
+        return registration.calibrate_channel_registration_from_beads(
+            [movie],
+            box=BOX,
+            minimum_ng=2000.0,
+            regions=self.REGIONS,
+            multi_fov=multi_fov,
+        )
+
+    def test_every_field_contributes_correspondences(self):
+        one = self._register(self._movie(1), multi_fov=True)
+        three = self._register(self._movie(3), multi_fov=True)
+
+        # three fields give about three times the pairs, all constraining one
+        # global transform
+        assert three["n_pairs"][0] > 2.5 * one["n_pairs"][0]
+        matrix = _matrix(three["channel_registration"][1])
+        assert matrix[0, 2] == pytest.approx(self.FX, abs=0.15)
+        assert matrix[1, 2] == pytest.approx(self.FY, abs=0.15)
+
+    def test_averaging_distinct_fields_is_worse(self):
+        """Without ``multi_fov`` the frames are averaged, which smears beads
+        of different fields together - the reason the flag exists."""
+        movie = self._movie(3)
+
+        pooled = self._register(movie, multi_fov=False)
+        per_field = self._register(movie, multi_fov=True)
+
+        assert per_field["n_pairs"][0] > pooled["n_pairs"][0]
+
+    def test_a_single_frame_movie_is_unaffected(self):
+        movie = self._movie(1)
+        assert self._register(movie, multi_fov=True)["n_pairs"] == (
+            self._register(movie, multi_fov=False)["n_pairs"]
+        )

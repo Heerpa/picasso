@@ -61,6 +61,11 @@ from . import transforms as tform
 #: transforms.
 REGISTRATION_MODEL = "channel-registration"
 
+#: How far apart matched beads may start out when registering separate bead
+#: movies of the same field, which overlap to begin with. Mirrors the radius
+#: ``picasso.localize.calibrate_lateral_transform`` has always paired at.
+_BEAD_MATCH_RADIUS_PX = 40.0
+
 
 def resolve_model(calibration: dict, model: str | None) -> str:
     """The transform model to register with.
@@ -457,6 +462,105 @@ def frames_in_bounds(
     return np.nonzero(mask)[0]
 
 
+# The four mirror orientations tried when nothing is known about the optical
+# path (identity, flip-x, flip-y, flip-xy); (sx, sy) are the mirror signs. A
+# splitter that folds one channel about an axis is common, and no amount of
+# ICP recovers from starting at the wrong orientation - the pairing has to be
+# seeded at each in turn and the winner kept.
+_FLIP_SIGNS = ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0))
+
+
+def flip_affine(
+    sx: float, sy: float, w: float, h: float
+) -> tform.AffineTransform:
+    """A pure mirror about a ``w`` x ``h`` box, per axis sign.
+
+    Parameters
+    ----------
+    sx, sy : float
+        ``-1`` to mirror that axis, ``+1`` to leave it.
+    w, h : float
+        Width and height of the box the mirror is taken about.
+
+    Returns
+    -------
+    transform : picasso.transforms.AffineTransform
+    """
+    matrix = np.array(
+        [
+            [sx, 0.0, w if sx < 0 else 0.0],
+            [0.0, sy, h if sy < 0 else 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    return tform.AffineTransform(matrix=matrix)
+
+
+def flip_seed_transforms(
+    channel: int,
+    region_rects: list | None,
+    frame_shape: tuple[int, int] | None,
+    ref_xy: np.ndarray,
+    chan_xy: np.ndarray,
+) -> list[tform.AffineTransform]:
+    """Coarse reference->channel seed transforms, one per mirror orientation.
+
+    Split-FOV (``region_rects`` given): the mirror is taken about the channel's
+    region and the region origins supply the placement. Separate movies
+    (``frame_shape`` given): the mirror is taken about the frame and the
+    translation comes from aligning the pooled detection centroids.
+
+    Seeds are always affine, whatever the registration is finally fitted with:
+    they only have to get the pairing started.
+
+    Parameters
+    ----------
+    channel : int
+        Index of the channel being seeded.
+    region_rects : list or None
+        Split-FOV region rectangles, reference first. None for separate movies.
+    frame_shape : tuple or None
+        ``(height, width)`` of the frame, for the separate-movie case.
+    ref_xy, chan_xy : np.ndarray
+        Pooled detections of the reference and of this channel, used to line up
+        the centroids in the separate-movie case.
+
+    Returns
+    -------
+    seeds : list of picasso.transforms.AffineTransform
+        One per mirror orientation, to be tried in turn.
+    """
+    seeds = []
+    identity = tform.identity()
+    if region_rects is not None:
+        (cy0, cx0), (cy1, cx1) = region_rects[channel]
+        h, w = float(cy1 - cy0), float(cx1 - cx0)
+        for sx, sy in _FLIP_SIGNS:
+            seeds.append(
+                localize.compose_region_transforms(
+                    [region_rects[0], region_rects[channel]],
+                    [identity, flip_affine(sx, sy, w, h)],
+                )[1]
+            )
+        return seeds
+    if len(ref_xy) == 0 or len(chan_xy) == 0:
+        return [identity]
+    h, w = (
+        (float(frame_shape[0] - 1), float(frame_shape[1] - 1))
+        if frame_shape is not None
+        else (0.0, 0.0)
+    )
+    for sx, sy in _FLIP_SIGNS:
+        seed = flip_affine(sx, sy, w, h)
+        pred = seed.apply(ref_xy)
+        seeds.append(
+            seed.compose_translations(
+                post=chan_xy.mean(axis=0) - pred.mean(axis=0)
+            )
+        )
+    return seeds
+
+
 def _pooled(by_frame: dict, frames: list) -> tuple[np.ndarray, np.ndarray]:
     """One ``(xy, frame_label)`` cloud from a per-frame mapping."""
     if not frames:
@@ -509,6 +613,58 @@ def _bootstrap_transform(
     return transform
 
 
+def _icp_from_seed(
+    ref_by_frame: dict,
+    chan_by_frame: dict,
+    common: list,
+    seed: tform.Transform,
+    model: str,
+    tols: np.ndarray,
+    tol_lo: float,
+) -> tuple:
+    """One ICP run from one seed, plus the closing robust trim.
+
+    Returns ``(transform, matched_ref, matched_c, fitted_model)``. Split out of
+    :func:`register_from_point_sets` so several candidate seeds - the mirror
+    orientations - can be run and compared."""
+    transform = seed
+    fitted_model = "affine"
+    matched_ref = matched_c = np.empty((0, 2))
+    for k, tol in enumerate(tols):
+        acc_ref, acc_c = [], []
+        for f in common:
+            rxy = ref_by_frame[f]
+            cxy = chan_by_frame[f]
+            pred = transform.apply(rxy)
+            ri, ci = match_points(pred, cxy, tol)
+            if len(ri):
+                acc_ref.append(rxy[ri])
+                acc_c.append(cxy[ci])
+        if not acc_ref:
+            break
+        matched_ref = np.vstack(acc_ref)
+        matched_c = np.vstack(acc_c)
+        if len(matched_ref) < 3:
+            break
+        transform, fitted_model = fit_registration(
+            matched_ref, matched_c, model, final=k == len(tols) - 1
+        )
+
+    # robust trim: drop coincidental pairs far from the converged transform,
+    # then re-fit once on the inliers
+    if len(matched_ref) >= 3:
+        resid = matched_c - transform.apply(matched_ref)
+        dist = np.sqrt(np.sum(resid**2, axis=1))
+        keep = dist <= max(tol_lo, 3.0 * np.median(dist))
+        if keep.sum() >= 3:
+            matched_ref = matched_ref[keep]
+            matched_c = matched_c[keep]
+            transform, fitted_model = fit_registration(
+                matched_ref, matched_c, model
+            )
+    return transform, matched_ref, matched_c, fitted_model
+
+
 def register_from_point_sets(
     ref_by_frame: dict,
     chan_by_frame: dict,
@@ -538,10 +694,14 @@ def register_from_point_sets(
         Transform model to fit, as in :mod:`picasso.transforms`.
     box : int
         Box side length (camera pixels). Sets the default pairing radii.
-    seed : picasso.transforms.Transform, optional
+    seed : picasso.transforms.Transform or list, optional
         The transform the first pass pairs at. Pass a stored one to *refine* a
         registration that has drifted. None (the default) builds one from
-        scratch, bootstrapping the pairing with a RANSAC consensus.
+        scratch, bootstrapping the pairing with a RANSAC consensus. A **list**
+        of candidate seeds - e.g. the mirror orientations from
+        :func:`flip_seed_transforms` - runs the pairing from each and keeps the
+        one that ends with the most correspondences and a geometrically sane
+        transform, which is how a mirrored channel is recovered.
     n_iter : int, optional
         Number of ICP passes, over which the pairing radius shrinks from
         ``max_pair_distance`` to ``max(2, 0.3 * box)``. Default 4.
@@ -606,49 +766,60 @@ def register_from_point_sets(
                 "signal, or the offset between them may exceed the search "
                 "radius."
             )
+    seeds = list(seed) if isinstance(seed, (list, tuple)) else [seed]
 
-    transform = seed
-    fitted_model = "affine"
-    matched_ref = matched_c = np.empty((0, 2))
     tols = np.linspace(tol_hi, tol_lo, max(1, int(n_iter)))
-    for k, tol in enumerate(tols):
-        acc_ref, acc_c = [], []
-        for f in common:
-            rxy = ref_by_frame[f]
-            cxy = chan_by_frame[f]
-            pred = transform.apply(rxy)
-            ri, ci = match_points(pred, cxy, tol)
-            if len(ri):
-                acc_ref.append(rxy[ri])
-                acc_c.append(cxy[ci])
-        if not acc_ref:
-            break
-        matched_ref = np.vstack(acc_ref)
-        matched_c = np.vstack(acc_c)
-        if len(matched_ref) < 3:
-            break
-        transform, fitted_model = fit_registration(
-            matched_ref, matched_c, model, final=k == len(tols) - 1
-        )
-
-    # robust trim: drop coincidental pairs far from the converged transform,
-    # then re-fit once on the inliers
-    if len(matched_ref) >= 3:
-        resid = matched_c - transform.apply(matched_ref)
-        dist = np.sqrt(np.sum(resid**2, axis=1))
-        keep = dist <= max(tol_lo, 3.0 * np.median(dist))
-        if keep.sum() >= 3:
-            matched_ref = matched_ref[keep]
-            matched_c = matched_c[keep]
-            transform, fitted_model = fit_registration(
-                matched_ref, matched_c, model
+    with warnings.catch_warnings():
+        if len(seeds) > 1:
+            # Only one candidate is kept, so a losing orientation's "thin data"
+            # warning would be noise about a registration nobody sees. The
+            # winner is refitted below, outside this block, so a genuine
+            # warning about the *kept* transform still reaches the user.
+            warnings.simplefilter("ignore")
+        best = None
+        for candidate in seeds:
+            result = _icp_from_seed(
+                ref_by_frame,
+                chan_by_frame,
+                common,
+                candidate,
+                model,
+                tols,
+                tol_lo,
             )
+            # A wrong mirror orientation converges onto coincidental pairs,
+            # which are few at the tightest radius and usually imply an absurd
+            # scale - so the most pairs wins, among the geometrically sane.
+            if not tform.is_plausible(result[0]):
+                continue
+            if best is None or len(result[1]) > len(best[1]):
+                best = result
+        if best is None:
+            # every orientation folded over; keep the first so the pair-count
+            # check below reports the real problem rather than a bare
+            # implausibility
+            best = _icp_from_seed(
+                ref_by_frame,
+                chan_by_frame,
+                common,
+                seeds[0],
+                model,
+                tols,
+                tol_lo,
+            )
+    transform, matched_ref, matched_c, fitted_model = best
+    if len(seeds) > 1 and len(matched_ref) >= 3:
+        # refit the winner audibly, so a thin-data warning is raised for the
+        # registration that is actually kept
+        transform, fitted_model = fit_registration(
+            matched_ref, matched_c, model
+        )
     n_pairs = int(len(matched_ref))
     if n_pairs < min_pairs:
+        # Neutral wording: this is shared by the bead and the signal builders,
+        # each of which appends the advice that applies to its own input.
         raise ValueError(
-            f"Only {n_pairs} signal correspondences (need >= {min_pairs}); "
-            "use a longer / denser movie, lower the minimum net gradient, or "
-            "register on beads instead."
+            f"Only {n_pairs} correspondences survived (need >= {min_pairs})."
         )
     resid = matched_c - transform.apply(matched_ref)
     rms = float(np.sqrt(np.mean(np.sum(resid**2, axis=1))))
@@ -717,6 +888,70 @@ def _minimum_ng_for(minimum_ng: float | list, channel: int) -> float:
     return float(minimum_ng)
 
 
+def _region_mask(xy: np.ndarray, region: list) -> np.ndarray:
+    """Which rows of ``xy`` (in ``[x, y]``) fall inside a
+    ``[[y_min, x_min], [y_max, x_max]]`` rectangle."""
+    (y0, x0), (y1, x1) = localize._normalize_rect(region)
+    xy = np.asarray(xy, dtype=np.float64)
+    if not len(xy):
+        return np.zeros(0, dtype=bool)
+    return (
+        (xy[:, 0] >= x0) & (xy[:, 0] < x1) & (xy[:, 1] >= y0) & (xy[:, 1] < y1)
+    )
+
+
+def _by_frame_in_region(by_frame: dict, region: list) -> dict:
+    """Per-frame detections restricted to one region, frames with none
+    dropped."""
+    out = {}
+    for f, xy in by_frame.items():
+        kept = np.asarray(xy)[_region_mask(xy, region)]
+        if len(kept):
+            out[f] = kept
+    return out
+
+
+def _split_fov_flip_seeds(regions: list, reference: int, channel: int) -> list:
+    """Candidate reference->channel seeds for a split-FOV channel, one per
+    mirror orientation.
+
+    The drawn ROIs fix where the channel sits, so no search over *placement* is
+    needed - but not how it is oriented, and a splitter that folds one channel
+    about an axis is common. :func:`flip_seed_transforms` reads the reference as
+    ``region_rects[0]``, so the pair is handed over reference-first.
+    """
+    rects = [
+        localize._normalize_rect(regions[reference]),
+        localize._normalize_rect(regions[channel]),
+    ]
+    return flip_seed_transforms(
+        1, rects, None, np.empty((0, 2)), np.empty((0, 2))
+    )
+
+
+def _split_fov_calibration_keys(
+    regions: list, reference: int, transforms: list
+) -> dict:
+    """The split-FOV half of a registration calibration.
+
+    The inter-channel registration is stored *region-local* (relative to the
+    region origins), so the channels can be re-placed at fit time by re-drawing
+    the ROIs; the absolute ``channel_transforms`` are rebuilt from these plus
+    the ROIs actually in use. Same layout as a split-FOV spline calibration, so
+    :func:`picasso.localize.split_fov_fit_geometry` reads either.
+    """
+    rects = [localize._normalize_rect(r) for r in regions]
+    return {
+        "split_fov": True,
+        "reference": int(reference),
+        "regions": rects,
+        "channel_registration": [
+            a.to_dict()
+            for a in localize.decompose_region_transforms(rects, transforms)
+        ],
+    }
+
+
 def _registration_calibration(
     transforms: list,
     reference: int,
@@ -763,20 +998,23 @@ def calibrate_channel_registration_from_beads(
     minimum_ng: float | list,
     model: str = "affine",
     reference: int = 0,
+    regions: list | None = None,
+    multi_fov: bool = False,
+    min_pairs: int | None = None,
     channel_paths: list[str] | None = None,
     path: str | None = None,
 ) -> dict:
     """Register channels from images of fiducial beads.
 
-    Each channel's movie is collapsed to one image, beads are detected and
-    refined to sub-pixel accuracy, matched to the reference channel's beads by
-    mutual nearest neighbour, and a transform is fitted per channel.
+    Beads are detected and refined to sub-pixel accuracy, matched to the
+    reference channel's beads, and a transform is fitted per channel.
 
     Parameters
     ----------
     movies : list
-        One bead movie per channel, in channel order. Multi-frame movies are
-        averaged.
+        One bead movie per channel, in channel order. For split field of view
+        (``regions`` given) the single bead movie whose regions are the
+        channels. Multi-frame movies are averaged unless ``multi_fov``.
     box : int
         Box size used to detect and fit the beads.
     minimum_ng : float or list
@@ -785,6 +1023,23 @@ def calibrate_channel_registration_from_beads(
         Transform model, as in :mod:`picasso.transforms`. Default "affine".
     reference : int, optional
         Index of the reference channel. Default 0.
+    regions : list, optional
+        Split field of view: one ``[[y_min, x_min], [y_max, x_max]]`` rectangle
+        per channel, reference first, marking where each channel sits on the
+        single sensor. The beads are detected once and split by region, and
+        every mirror orientation is tried so a folded channel is recovered.
+        Default None (separate bead movies per channel).
+    multi_fov : bool, optional
+        Each **frame** of the bead movie images a different field of view. The
+        beads are then detected frame by frame and a bead is only ever paired
+        with one in the *same* frame - different fields land on the same sensor
+        coordinates, so pooling them would pair beads that are nowhere near
+        each other - while every field's pairs constrain the one global
+        transform. Default False: the frames are repeats of a single field and
+        are averaged into one image, which is what a plain bead acquisition is.
+    min_pairs : int, optional
+        Fewest correspondences a channel may end with. None (the default) uses
+        the minimum the transform model needs.
     channel_paths : list of str, optional
         Source paths, recorded in the calibration for traceability.
     path : str, optional
@@ -795,68 +1050,107 @@ def calibrate_channel_registration_from_beads(
     calibration : dict
         See :func:`_registration_calibration`. The transforms map **reference
         channel coordinates into each channel**, the direction
-        ``picasso.localize.get_spots_multichannel`` expects.
+        ``picasso.localize.get_spots_multichannel`` expects. A split-FOV
+        registration additionally carries ``split_fov``, ``regions`` and the
+        ROI-agnostic ``channel_registration``, so it can be re-placed at
+        re-drawn ROIs.
     """
-    n_channels = len(movies)
+    split_fov = regions is not None
+    n_channels = len(regions) if split_fov else len(movies)
     if n_channels < 2:
         raise ValueError(
             f"Channel registration needs at least 2 channels, got {n_channels}."
         )
+    if split_fov and len(movies) != 1:
+        raise ValueError(
+            "Split-FOV registration takes the single bead movie whose regions "
+            f"are the channels, got {len(movies)} movies."
+        )
     if not (0 <= reference < n_channels):
         raise ValueError(f"reference={reference} out of range.")
 
-    img_ref = localize._movie_to_image(movies[reference])
-    coarse_ref = localize._lateral_detect_beads(
-        img_ref, box, _minimum_ng_for(minimum_ng, reference)
-    )
-    refined_ref = localize._lateral_refine_bead_positions(
-        img_ref, coarse_ref, box
-    )
-
     needed = tform.min_points(model)
+    if min_pairs is None:
+        min_pairs = needed
+
+    def beads_by_frame(index: int) -> dict:
+        """Sub-pixel bead positions of one channel, keyed by field of view.
+
+        ``[x, y]``, in the per-frame form :func:`register_from_point_sets`
+        takes. With ``multi_fov`` each frame is its own field and keeps its own
+        key, so a bead can only ever be paired within it; otherwise the frames
+        are averaged into one image under a single key."""
+        movie = movies[0] if split_fov else movies[index]
+        mng = _minimum_ng_for(minimum_ng, index)
+        frames = (
+            range(int(np.asarray(movie).shape[0])) if multi_fov else [None]
+        )
+        out = {}
+        for f in frames:
+            image = (
+                np.asarray(np.asarray(movie)[f], dtype=np.float32)
+                if multi_fov
+                else localize._movie_to_image(movie)
+            )
+            coarse = localize._lateral_detect_beads(image, box, mng)
+            refined = localize._lateral_refine_bead_positions(
+                image, coarse, box
+            )
+            if split_fov and len(refined):
+                # one image holds every channel, so keep this region's beads
+                refined = refined[
+                    _region_mask(refined[:, ::-1], regions[index])
+                ]
+            if len(refined):
+                # the matching machinery works in [x, y]
+                out[0 if f is None else int(f)] = refined[:, ::-1]
+        return out
+
+    ref_by_frame = beads_by_frame(reference)
+    if not ref_by_frame:
+        raise ValueError(
+            "No beads detected in the reference channel; lower the minimum "
+            "net gradient or check the bead image."
+        )
+
     transforms: list = [None] * n_channels
     transforms[reference] = tform.identity(model)
     infos = []
     for c in range(n_channels):
         if c == reference:
             continue
-        img_c = localize._movie_to_image(movies[c])
-        coarse_c = localize._lateral_detect_beads(
-            img_c, box, _minimum_ng_for(minimum_ng, c)
-        )
-        refined_c = localize._lateral_refine_bead_positions(
-            img_c, coarse_c, box
-        )
-        pairs_ref, pairs_c = localize._lateral_match_bead_pairs(
-            refined_ref, refined_c
-        )
-        if len(pairs_ref) < needed:
-            raise ValueError(
-                f"Only {len(pairs_ref)} matched bead pair(s) for channel {c} "
-                f"- a {model} transform needs at least {needed}. Check the "
-                "bead images / detection parameters, or choose a simpler "
-                "model."
+        chan_by_frame = beads_by_frame(c)
+        if split_fov:
+            # The ROIs fix where the channel sits but not how it is oriented,
+            # so every mirror orientation is tried and the best kept.
+            seed, radius = _split_fov_flip_seeds(regions, reference, c), None
+        else:
+            # Separate bead movies of the same field: the channels overlap to
+            # begin with, so the pairing starts from the identity and only has
+            # to close the residual misalignment. This is the assumption the
+            # single-pair bead calibration has always made - a mirrored or
+            # far-displaced channel needs the split-FOV form or a signal
+            # registration, which search for the orientation.
+            seed, radius = tform.identity(model), _BEAD_MATCH_RADIUS_PX
+        try:
+            info = register_from_point_sets(
+                ref_by_frame,
+                chan_by_frame,
+                model,
+                box,
+                seed=seed,
+                max_pair_distance=radius,
+                min_pairs=min_pairs,
             )
-        # src = reference beads, dst = this channel's: the transform must map
-        # the reference INTO the channel, the opposite direction from
-        # localize.fit_lateral_transform, which corrects a channel back into
-        # the reference frame.
-        transform, keep = localize._estimate_lateral_transform(
-            pairs_ref, pairs_c, model
-        )
-        # _estimate_lateral_transform works in [row, col]; the pairs are too.
-        resid = pairs_c[keep][:, ::-1] - transform.apply(
-            pairs_ref[keep][:, ::-1]
-        )
-        transforms[c] = transform
-        infos.append(
-            {
-                "channel": c,
-                "n_matches": int(keep.sum()),
-                "rms": float(np.sqrt(np.mean(np.sum(resid**2, axis=1)))),
-                "model": model,
-            }
-        )
+        except ValueError as e:
+            raise ValueError(
+                f"Channel {c}: {e} Too few matched bead pairs - check the "
+                "bead images and the detection parameters, or choose a "
+                "simpler transform model."
+            ) from e
+        transforms[c] = info["transform"]
+        info["channel"] = c
+        infos.append(info)
 
     calibration = _registration_calibration(
         transforms,
@@ -867,6 +1161,11 @@ def calibrate_channel_registration_from_beads(
         "beads",
         infos,
         channel_paths,
+        extra=(
+            _split_fov_calibration_keys(regions, reference, transforms)
+            if split_fov
+            else None
+        ),
     )
     if path:
         io.save_any_calibration(path, calibration)
@@ -884,6 +1183,7 @@ def calibrate_channel_registration_from_signal(
     seed_transforms: list | None = None,
     n_iter: int = 4,
     min_pairs: int = 20,
+    regions: list | None = None,
     channel_paths: list[str] | None = None,
     path: str | None = None,
     progress_callback: Callable[[int], None] | None = None,
@@ -898,7 +1198,8 @@ def calibrate_channel_registration_from_signal(
     Parameters
     ----------
     movies : list
-        One movie per channel, in channel order.
+        One movie per channel, in channel order. For split field of view
+        (``regions`` given) the single movie whose regions are the channels.
     box, minimum_ng : int, float or list
         Detection settings, as used for localization. ``minimum_ng`` may be
         per channel.
@@ -918,6 +1219,12 @@ def calibrate_channel_registration_from_signal(
         registration from scratch, bootstrapping the pairing.
     n_iter, min_pairs : int, optional
         ICP passes, and the fewest correspondences a channel may end with.
+    regions : list, optional
+        Split field of view: one ``[[y_min, x_min], [y_max, x_max]]`` rectangle
+        per channel, reference first, marking where each channel sits on the
+        single sensor. The movie is detected once and the detections split by
+        region. The drawn regions also seed the pairing, so no search is
+        needed to get started. Default None (separate movies per channel).
     channel_paths : list of str, optional
         Source paths, recorded for traceability.
     path : str, optional
@@ -930,10 +1237,16 @@ def calibrate_channel_registration_from_signal(
     calibration : dict
         As :func:`calibrate_channel_registration_from_beads`.
     """
-    n_channels = len(movies)
+    split_fov = regions is not None
+    n_channels = len(regions) if split_fov else len(movies)
     if n_channels < 2:
         raise ValueError(
             f"Channel registration needs at least 2 channels, got {n_channels}."
+        )
+    if split_fov and len(movies) != 1:
+        raise ValueError(
+            "Split-FOV registration takes the single movie whose regions are "
+            f"the channels, got {len(movies)} movies."
         )
     if not (0 <= reference < n_channels):
         raise ValueError(f"reference={reference} out of range.")
@@ -955,12 +1268,23 @@ def calibrate_channel_registration_from_signal(
     )
     sample_frames = allowed[pick]
 
-    ref_by_frame = detections_by_frame(
-        movies[reference],
-        _minimum_ng_for(minimum_ng, reference),
-        box,
-        sample_frames,
-    )
+    if split_fov:
+        # One movie holds every channel, so it is detected once and the
+        # detections are split by region afterwards.
+        movie_by_frame = detections_by_frame(
+            movies[0],
+            _minimum_ng_for(minimum_ng, reference),
+            box,
+            sample_frames,
+        )
+        ref_by_frame = _by_frame_in_region(movie_by_frame, regions[reference])
+    else:
+        ref_by_frame = detections_by_frame(
+            movies[reference],
+            _minimum_ng_for(minimum_ng, reference),
+            box,
+            sample_frames,
+        )
     if not ref_by_frame:
         raise ValueError(
             "No detections in the reference channel; lower the minimum net "
@@ -974,13 +1298,21 @@ def calibrate_channel_registration_from_signal(
     for c in range(n_channels):
         if c == reference:
             continue
-        chan_by_frame = detections_by_frame(
-            movies[c], _minimum_ng_for(minimum_ng, c), box, sample_frames
-        )
+        if split_fov:
+            chan_by_frame = _by_frame_in_region(movie_by_frame, regions[c])
+        else:
+            chan_by_frame = detections_by_frame(
+                movies[c], _minimum_ng_for(minimum_ng, c), box, sample_frames
+            )
         seed = None
         if seed_transforms is not None:
             entry = seed_transforms[c]
             seed = tform.from_dict(entry) if isinstance(entry, dict) else entry
+        elif split_fov:
+            # The drawn ROIs say where the channel sits, but not how it is
+            # oriented: a splitter commonly folds one channel about an axis.
+            # Seed at every mirror orientation and let the best one win.
+            seed = _split_fov_flip_seeds(regions, reference, c)
         try:
             info = register_from_point_sets(
                 ref_by_frame,
@@ -992,7 +1324,10 @@ def calibrate_channel_registration_from_signal(
                 min_pairs=min_pairs,
             )
         except ValueError as e:
-            raise ValueError(f"Channel {c}: {e}") from e
+            raise ValueError(
+                f"Channel {c}: {e} Use a longer / denser movie, lower the "
+                "minimum net gradient, or register on beads instead."
+            ) from e
         transforms[c] = info["transform"]
         info["channel"] = c
         infos.append(info)
@@ -1000,6 +1335,15 @@ def calibrate_channel_registration_from_signal(
         if callable(progress_callback):
             progress_callback(done)
 
+    extra = {
+        "frame_bounds": frame_bounds,
+        "max_frames": int(max_frames),
+        "n_sampled_frames": int(len(sample_frames)),
+    }
+    if split_fov:
+        extra.update(
+            _split_fov_calibration_keys(regions, reference, transforms)
+        )
     calibration = _registration_calibration(
         transforms,
         reference,
@@ -1009,11 +1353,7 @@ def calibrate_channel_registration_from_signal(
         "signal",
         infos,
         channel_paths,
-        extra={
-            "frame_bounds": frame_bounds,
-            "max_frames": int(max_frames),
-            "n_sampled_frames": int(len(sample_frames)),
-        },
+        extra=extra,
     )
     if path:
         io.save_any_calibration(path, calibration)

@@ -26,6 +26,7 @@ from scipy.interpolate import CubicSpline
 from PyQt6 import QtWidgets
 
 from picasso import gaussmle, gausslq, io, lib, localize, spline, transforms
+from picasso import transforms as transforms_mod
 from picasso.fitting import gaussfit_cuda, precision, splinefit
 from picasso.gui import localize as localize_gui
 
@@ -12212,3 +12213,304 @@ class TestMultichannelGaussianUncertaintyColumns:
             np.nanstd(locs["sx"]), rel=0.6
         )
         np.testing.assert_allclose(locs["sx_unc"], locs["sy_unc"])
+
+
+class TestFitGaussSplitFov:
+    """The single-sensor split field of view: the channels are regions of one
+    movie rather than separate movies."""
+
+    H, W = 64, 128
+    BOX = 9
+    N_FRAMES = 40
+    SIGMA = 1.25
+    REGIONS = [[[0, 0], [64, 64]], [[0, 64], [64, 128]]]
+    FX, FY = 1.4, -0.85  # fine offset on top of the 64 px region step
+
+    def _render(self, frame, x, y, amp):
+        j, i = np.mgrid[0 : self.H, 0 : self.W]
+        frame += amp * np.exp(
+            -0.5 * ((i - x) ** 2 + (j - y) ** 2) / self.SIGMA**2
+        )
+
+    def _dataset(self, amps=(900.0, 400.0), seed=9):
+        rng = np.random.RandomState(seed)
+        truth_x = rng.uniform(14, 50, self.N_FRAMES)
+        truth_y = rng.uniform(14, 50, self.N_FRAMES)
+        movie = np.zeros((self.N_FRAMES, self.H, self.W))
+        for f in range(self.N_FRAMES):
+            self._render(movie[f], truth_x[f], truth_y[f], amps[0])
+            self._render(
+                movie[f],
+                truth_x[f] + 64 + self.FX,
+                truth_y[f] + self.FY,
+                amps[1],
+            )
+        movie = (rng.poisson(movie + 10) + 100).astype(np.uint16)
+        camera_info = {"Baseline": 100.0, "Sensitivity": 1.0, "Gain": 1}
+        # a movie-wide identification table, as the GUI produces: both regions
+        ids = pd.DataFrame(
+            {
+                "frame": np.concatenate([np.arange(self.N_FRAMES)] * 2),
+                "x": np.concatenate(
+                    [
+                        np.rint(truth_x),
+                        np.rint(truth_x + 64 + self.FX),
+                    ]
+                ).astype(np.int64),
+                "y": np.concatenate(
+                    [np.rint(truth_y), np.rint(truth_y + self.FY)]
+                ).astype(np.int64),
+                "net_gradient": np.full(2 * self.N_FRAMES, 1e4, np.float32),
+            }
+        )
+        return movie, camera_info, ids, truth_x, truth_y
+
+    def _registration(self):
+        matrix = np.array(
+            [
+                [1.0, 0.0, 64 + self.FX],
+                [0.0, 1.0, self.FY],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        transforms = [
+            transforms_mod.identity(),
+            transforms_mod.AffineTransform(matrix=matrix),
+        ]
+        rects = [localize._normalize_rect(r) for r in self.REGIONS]
+        return {
+            "model": "channel-registration",
+            "n_channels": 2,
+            "split_fov": True,
+            "reference": 0,
+            "regions": rects,
+            "channel_transforms": [t.to_dict() for t in transforms],
+            "channel_registration": [
+                a.to_dict()
+                for a in localize.decompose_region_transforms(
+                    rects, transforms
+                )
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        "link_photons", [False, True], ids=["decoupled", "linked"]
+    )
+    def test_recovers_ground_truth(self, link_photons):
+        movie, camera_info, ids, truth_x, truth_y = self._dataset()
+
+        locs = localize.fit_gauss_split_fov(
+            movie,
+            camera_info,
+            ids,
+            self.BOX,
+            self._registration(),
+            regions=self.REGIONS,
+            mle=True,
+            link_photons=link_photons,
+            use_gpu=False,
+            multiprocess=False,
+        )
+
+        # confined to the reference region, so one localization per molecule
+        assert len(locs) == self.N_FRAMES
+        frame = locs["frame"].to_numpy()
+        error_x = locs["x"].to_numpy() - truth_x[frame]
+        error_y = locs["y"].to_numpy() - truth_y[frame]
+        assert abs(np.nanmean(error_x)) < 0.06
+        assert abs(np.nanmean(error_y)) < 0.06
+        # and they are in the reference region's coordinates
+        assert locs["x"].max() < 64
+
+    def test_the_regions_can_be_redrawn(self):
+        """The registration is ROI-agnostic, so a split that sits elsewhere is
+        handled by moving the regions rather than re-calibrating."""
+        movie, camera_info, ids, truth_x, _ = self._dataset()
+        registration = self._registration()
+        # pretend the calibration was taken with the split 6 px further right
+        shifted = [[[0, 0], [64, 64]], [[0, 58], [64, 122]]]
+        registration["regions"] = shifted
+
+        locs = localize.fit_gauss_split_fov(
+            movie,
+            camera_info,
+            ids,
+            self.BOX,
+            registration,
+            regions=self.REGIONS,  # the ROIs actually in use
+            mle=True,
+            use_gpu=False,
+            multiprocess=False,
+        )
+
+        frame = locs["frame"].to_numpy()
+        assert abs(np.nanmean(locs["x"].to_numpy() - truth_x[frame])) < 0.06
+
+    def test_confining_to_the_reference_can_be_turned_off(self):
+        """The flag only says who does the confining, not whether it happens:
+        pre-confined detections must give the same fit."""
+        movie, camera_info, ids, _, _ = self._dataset()
+        registration = self._registration()
+        confined = localize.confine_to_region(ids, self.REGIONS[0])
+        assert len(confined) == self.N_FRAMES
+
+        internally = localize.fit_gauss_split_fov(
+            movie,
+            camera_info,
+            ids,
+            self.BOX,
+            registration,
+            regions=self.REGIONS,
+            mle=True,
+            use_gpu=False,
+            multiprocess=False,
+        )
+        externally = localize.fit_gauss_split_fov(
+            movie,
+            camera_info,
+            confined,
+            self.BOX,
+            registration,
+            regions=self.REGIONS,
+            confine_to_reference=False,
+            mle=True,
+            use_gpu=False,
+            multiprocess=False,
+        )
+
+        np.testing.assert_allclose(
+            externally["x"].to_numpy(), internally["x"].to_numpy()
+        )
+        np.testing.assert_allclose(
+            externally["photons"].to_numpy(), internally["photons"].to_numpy()
+        )
+
+    def test_rejects_a_registration_that_is_not_split_fov(self):
+        movie, camera_info, ids, _, _ = self._dataset()
+        registration = self._registration()
+        del registration["split_fov"]
+        with pytest.raises(ValueError, match="split-FOV"):
+            localize.fit_gauss_split_fov(
+                movie,
+                camera_info,
+                ids,
+                self.BOX,
+                registration,
+                use_gpu=False,
+            )
+
+
+class TestSplitFovGaussianThroughTheWindow:
+    """Split-FOV dispatch: one movie with ROIs, no separate channels loaded."""
+
+    H, W = 64, 128
+    BOX = 9
+    N_FRAMES = 12
+    REGIONS = [[[0, 0], [64, 64]], [[0, 64], [64, 128]]]
+    FX, FY = 1.4, -0.85
+
+    def _window(self, tmp_path):
+        rng = np.random.RandomState(21)
+        truth_x = rng.uniform(16, 46, self.N_FRAMES)
+        truth_y = rng.uniform(16, 46, self.N_FRAMES)
+        j, i = np.mgrid[0 : self.H, 0 : self.W]
+        movie = np.zeros((self.N_FRAMES, self.H, self.W))
+        for f in range(self.N_FRAMES):
+            for x, y, amp in (
+                (truth_x[f], truth_y[f], 900.0),
+                (truth_x[f] + 64 + self.FX, truth_y[f] + self.FY, 450.0),
+            ):
+                movie[f] += amp * np.exp(
+                    -0.5 * ((i - x) ** 2 + (j - y) ** 2) / 1.25**2
+                )
+        movie = (rng.poisson(movie + 10) + 100).astype(np.uint16)
+
+        rects = [localize._normalize_rect(r) for r in self.REGIONS]
+        matrix = np.array(
+            [[1.0, 0.0, 64 + self.FX], [0.0, 1.0, self.FY], [0.0, 0.0, 1.0]]
+        )
+        tfs = [
+            transforms_mod.identity(),
+            transforms_mod.AffineTransform(matrix=matrix),
+        ]
+        path = str(tmp_path / "sfov_reg.yaml")
+        io.save_any_calibration(
+            path,
+            {
+                "model": "channel-registration",
+                "n_channels": 2,
+                "split_fov": True,
+                "reference": 0,
+                "regions": rects,
+                "channel_transforms": [t.to_dict() for t in tfs],
+                "channel_registration": [
+                    a.to_dict()
+                    for a in localize.decompose_region_transforms(rects, tfs)
+                ],
+            },
+        )
+
+        window = localize_gui.Window()
+        dialog = window.parameters_dialog
+        dialog.baseline.setValue(100)
+        dialog.sensitivity.setValue(1.0)
+        dialog.gain.setValue(1)
+        window.parameters["Box Size"] = self.BOX
+        # split-FOV is a single loaded movie whose regions are the channels
+        window._set_channels(
+            [movie],
+            [[{"Frames": self.N_FRAMES, "Height": self.H, "Width": self.W}]],
+            ["split.tif"],
+            ["ch0"],
+        )
+        dialog.fit_model.setCurrentText("2D spherical Gaussian")
+        dialog.fit_optimizer.setCurrentText("MLE")
+        # loading the registration should drop its regions in and switch the
+        # view into split-FOV mode by itself
+        dialog.update_channel_registration(path)
+
+        ids = pd.DataFrame(
+            {
+                "frame": np.concatenate([np.arange(self.N_FRAMES)] * 2),
+                "x": np.concatenate(
+                    [np.rint(truth_x), np.rint(truth_x + 64 + self.FX)]
+                ).astype(np.int64),
+                "y": np.concatenate(
+                    [np.rint(truth_y), np.rint(truth_y + self.FY)]
+                ).astype(np.int64),
+                "net_gradient": np.full(2 * self.N_FRAMES, 1e4, np.float32),
+            }
+        )
+        window.identifications = ids
+        window.ready_for_fit = True
+        return window, truth_x
+
+    def test_loading_the_registration_enters_split_fov_mode(self, tmp_path):
+        window, _ = self._window(tmp_path)
+        try:
+            assert window.view.split_fov_mode
+            assert len(window.view.rois) == 2
+        finally:
+            window.close()
+
+    def test_fit_dispatches_to_the_split_fov_path(self, tmp_path):
+        window, truth_x = self._window(tmp_path)
+        try:
+            window.fit()
+            worker = window.fit_worker
+            assert isinstance(
+                worker, localize_gui.MultichannelGaussianFitWorker
+            )
+            assert worker.split_fov is True
+            worker.wait()
+            QtWidgets.QApplication.processEvents()
+
+            assert window.locs is not None
+            # one localization per molecule, in reference-region coordinates
+            assert len(window.locs) == self.N_FRAMES
+            frame = window.locs["frame"].to_numpy()
+            error = window.locs["x"].to_numpy() - truth_x[frame]
+            assert abs(np.nanmean(error)) < 0.1
+            assert window.locs["x"].max() < 64
+        finally:
+            window.close()

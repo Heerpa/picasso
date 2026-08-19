@@ -69,6 +69,8 @@ from . import transforms as tform
 from .fitting import gaussfit, precision, splinefit
 from .registration import (
     fit_registration,
+    flip_affine,
+    flip_seed_transforms,
     frames_in_bounds,
     match_points,
     ransac_match,
@@ -2449,73 +2451,6 @@ def _split_fov_local_affines(
     return [tform.from_dict(a) for a in affines]
 
 
-# the four mirror orientations tried when nothing is known about the optical
-# path (identity, flip-x, flip-y, flip-xy); (sx, sy) are the mirror signs
-_FLIP_SIGNS = ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0))
-
-
-def _flip_seed_transforms(
-    channel: int,
-    region_rects: list | None,
-    frame_shape: tuple[int, int] | None,
-    ref_xy: np.ndarray,
-    chan_xy: np.ndarray,
-) -> list[tform.AffineTransform]:
-    """Coarse reference->channel seed transforms, one per mirror orientation.
-
-    Split-FOV (``region_rects`` given): the mirror is taken about the channel's
-    region and the region origins supply the placement. Separate movies
-    (``frame_shape`` given): the mirror is taken about the frame and the
-    translation comes from aligning the pooled detection centroids.
-
-    Seeds are always affine, whatever the registration is finally fitted with:
-    they only have to get the pairing started.
-    """
-    seeds = []
-    identity = tform.identity()
-    if region_rects is not None:
-        (cy0, cx0), (cy1, cx1) = region_rects[channel]
-        h, w = float(cy1 - cy0), float(cx1 - cx0)
-        for sx, sy in _FLIP_SIGNS:
-            seeds.append(
-                localize.compose_region_transforms(
-                    [region_rects[0], region_rects[channel]],
-                    [identity, _flip_affine(sx, sy, w, h)],
-                )[1]
-            )
-        return seeds
-    if len(ref_xy) == 0 or len(chan_xy) == 0:
-        return [identity]
-    h, w = (
-        (float(frame_shape[0] - 1), float(frame_shape[1] - 1))
-        if frame_shape is not None
-        else (0.0, 0.0)
-    )
-    for sx, sy in _FLIP_SIGNS:
-        seed = _flip_affine(sx, sy, w, h)
-        pred = seed.apply(ref_xy)
-        seeds.append(
-            seed.compose_translations(
-                post=chan_xy.mean(axis=0) - pred.mean(axis=0)
-            )
-        )
-    return seeds
-
-
-def _flip_affine(
-    sx: float, sy: float, w: float, h: float
-) -> tform.AffineTransform:
-    """A pure mirror about a ``w`` x ``h`` box, per axis sign."""
-    matrix = np.array(
-        [
-            [sx, 0.0, w if sx < 0 else 0.0],
-            [0.0, sy, h if sy < 0 else 0.0],
-            [0.0, 0.0, 1.0],
-        ]
-    )
-    return tform.AffineTransform(matrix=matrix)
-
-
 def estimate_transforms_from_identifications(
     identifications: list,
     box: int,
@@ -2619,7 +2554,7 @@ def estimate_transforms_from_identifications(
         ref_pool = np.vstack([ref_by_frame[f] for f in common])
         chan_pool = np.vstack([chan_by_frame[f] for f in common])
         best_pairs, best_transform = 0, None
-        for seed in _flip_seed_transforms(
+        for seed in flip_seed_transforms(
             c, region_rects, frame_shape, ref_pool, chan_pool
         ):
             transform = seed
@@ -2754,11 +2689,11 @@ def refine_split_fov_transforms_from_signal(
         dec = affines[c].decompose(pixelsize=1.0, at=(w / 2.0, h / 2.0))
         if dec["mirror"] and dec["flip_axis"] == "x":
             seed_local_affines.append(
-                _flip_affine(-1.0, 1.0, float(w), float(h))
+                flip_affine(-1.0, 1.0, float(w), float(h))
             )
         elif dec["mirror"] and dec["flip_axis"] == "y":
             seed_local_affines.append(
-                _flip_affine(1.0, -1.0, float(w), float(h))
+                flip_affine(1.0, -1.0, float(w), float(h))
             )
         else:
             # transforms are immutable, so the identity can be shared

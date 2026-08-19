@@ -4369,6 +4369,109 @@ def fit_gauss_multichannel(
     )
 
 
+def fit_gauss_split_fov(
+    movie,
+    camera_info: dict,
+    identifications: pd.DataFrame,
+    box: int,
+    channel_registration: dict,
+    regions: list | None = None,
+    mle: bool = False,
+    link_photons: bool = False,
+    confine_to_reference: bool = True,
+    use_gpu: bool | None = None,
+    tolerance: float | None = None,
+    max_iterations: int | None = None,
+    multiprocess: bool = True,
+    progress_callback: Callable[[int], None] | None = None,
+    abort_callback: Callable[[], bool] | None = None,
+    camera_calibration: dict | None = None,
+) -> pd.DataFrame | None:
+    """Fit a spherical Gaussian jointly across the regions of one movie.
+
+    The split-FOV counterpart of :func:`fit_gauss_multichannel`, for channels
+    imaged side by side on a single sensor, and the Gaussian counterpart of
+    :func:`fit_spline_split_fov`.
+
+    The registration stores the *inter-channel* mapping region-locally (see
+    :func:`decompose_region_transforms`), independent of where the channels sit
+    on the chip, so the same file applies to data whose split sits elsewhere -
+    the regions in use are re-drawn at fit time. This function repeats the one
+    ``movie`` / ``camera_info`` once per channel and delegates to the standard
+    multichannel fitter.
+
+    Parameters
+    ----------
+    movie, camera_info
+        The single loaded movie and its camera info dict.
+    identifications : pd.DataFrame
+        Detections. With ``confine_to_reference`` (the default) they are
+        filtered to the reference region, so each molecule yields one spot that
+        is mapped into the other regions via the transforms.
+    box : int
+        Box side length (camera pixels).
+    channel_registration : dict
+        A split-FOV registration, from :mod:`picasso.registration`.
+    regions : list, optional
+        The channel ROIs *for this data*, one ``[[y_min, x_min], [y_max,
+        x_max]]`` per channel, reference first. When given, the absolute
+        channel transforms are rebuilt at these positions from the stored
+        region-local ones. None uses the registration's own regions.
+    confine_to_reference : bool, optional
+        Restrict the detections to the reference region first. Default True.
+    mle, link_photons, use_gpu, tolerance, max_iterations, multiprocess, \
+    progress_callback, abort_callback
+        As :func:`fit_gauss_multichannel`.
+    camera_calibration : dict, optional
+        One per-pixel sCMOS calibration for the single camera. Split-FOV is one
+        sensor and the maps are indexed by absolute frame coordinates, so the
+        same full-frame calibration serves every region.
+
+    Returns
+    -------
+    locs : pd.DataFrame or None
+        Localizations in the reference region's coordinates, or None if
+        ``abort_callback`` asked to stop.
+    """
+    fit_regions, reference, transforms = split_fov_fit_geometry(
+        channel_registration, regions
+    )
+    n_channels = len(fit_regions)
+
+    ids = identifications
+    if confine_to_reference:
+        ids = confine_to_region(ids, fit_regions[reference])
+
+    # the fitter reads channel_transforms off the registration; hand it the
+    # transforms placed at the regions actually in use
+    channel_registration = dict(channel_registration)
+    channel_registration["channel_transforms"] = list(transforms)
+
+    return fit_gauss_multichannel(
+        [movie] * n_channels,
+        [camera_info] * n_channels,
+        ids,
+        box,
+        channel_registration,
+        mle=mle,
+        link_photons=link_photons,
+        use_gpu=use_gpu,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        multiprocess=multiprocess,
+        progress_callback=progress_callback,
+        abort_callback=abort_callback,
+        # one physical camera, so every region reads the same maps; _cut_map
+        # indexes them with absolute frame coordinates, which is what makes one
+        # full-frame calibration serve all regions
+        camera_calibrations=(
+            None
+            if camera_calibration is None
+            else [camera_calibration] * n_channels
+        ),
+    )
+
+
 # ----------------------------------------------------------------------
 # Cubic-spline PSF fitting
 #

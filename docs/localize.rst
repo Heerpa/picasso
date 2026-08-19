@@ -553,11 +553,18 @@ It is available for the ``2D spherical Gaussian`` model only: a joint fit ties t
 Registering the channels
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-Load the channels first — ``File`` > ``Open channels from several movies``, or ``Open one multichannel movie`` for a single file holding several. **The first channel loaded is the reference channel**, and the localizations come out in its coordinates. (Split field of view — channels imaged side by side on one sensor — is supported by the spline fit only; see `Multichannel spline PSF (e.g. biplane)`_.)
+Load the channels first, in either of the two layouts:
+
+- **Separate movies** — ``File`` > ``Open channels from several movies``, or ``Open one multichannel movie`` for a single file holding several. **The first channel loaded is the reference channel.**
+- **Split field of view** — if the channels are imaged side by side on one sensor, load the single movie, tick **Regions = channels** in the ``Parameters`` dialog and drag one ROI onto each channel. **The first region is the reference channel**; all regions are kept the same size.
+
+Either way the localizations come out in the reference channel's coordinates.
 
 Then build a registration with ``Calibration`` > ``Register channels (2D)``, which offers two ways to measure it:
 
-- **From bead images...** — pick one image of fiducial beads per channel, reference first. Beads are detected and fitted with the current ``Box side length`` and ``Min. net gradient``, matched to the reference channel's beads by mutual nearest neighbour, and a transform is fitted per channel with outlier pairs dropped. This is the most accurate route, but it needs a bead acquisition.
+- **From bead images...** — pick one image of fiducial beads per channel, reference first (in split-FOV mode, the single bead image holding every region). Beads are detected and fitted with the current ``Box side length`` and ``Min. net gradient``, matched to the reference channel's beads, and a transform is fitted per channel with outlier pairs dropped.
+
+  Tick **Each frame is a different field of view** when the bead movie scans several stage positions rather than repeating one field. Beads are then detected frame by frame and **only ever paired with beads in the same frame** — every field images onto the same sensor coordinates, so pooling them would pair beads that are nowhere near each other — while every field's pairs constrain the one transform. More fields means more correspondences and a better-conditioned fit, which matters most for the flexible models. Left unticked, the frames are treated as repeats of a single field and averaged to beat down the noise, which is what a plain bead acquisition wants.
 
 - **From current signal...** — measure the registration from the loaded movies themselves, with no extra acquisition. The channels are frame-synchronized, so the same molecule blinks in every channel in the *same* frame; pairing those detections frame by frame pins down the inter-channel transform. A dialog asks for the frame window and how many frames are evenly sampled from it, and the detection uses the current identification settings. **Use a high** ``Min. net gradient`` **so only bright, unambiguous spots are paired.**
 
@@ -577,9 +584,9 @@ Fitting
 5. Tick **Use GPU** to fit on the GPU; leave it unticked for the CPU.
 6. Identify the channels, then run ``Analyze`` > ``Fit`` (or ``Localize (Identify & Fit)``).
 
-Only molecules detected in *every* channel are fitted, so identify each channel first — with several channels loaded, ``Identify`` (Ctrl+I) analyzes all of them in turn. When one channel is much dimmer than the others, identify on the channel sum instead; see `Identifying on the sum of the channels`_ above, which works from a loaded channel registration exactly as it does from a spline calibration.
+Only molecules detected in *every* channel are fitted, so identify each channel first — with several channels loaded, ``Identify`` (Ctrl+I) analyzes all of them in turn. In split-FOV mode the whole movie is identified at once and the detections are split by region, so nothing extra is needed; they are confined to the reference region automatically, and one localization comes out per molecule. When one channel is much dimmer than the others, identify on the channel sum instead; see `Identifying on the sum of the channels`_ above, which works from a loaded channel registration exactly as it does from a spline calibration.
 
-**With no registration loaded, nothing changes:** the spherical Gaussian fits the active channel alone, as before. The joint fit runs only when a registration is loaded *and* several channels are open.
+**With no registration loaded, nothing changes:** the spherical Gaussian fits the active channel alone, as before. The joint fit runs only when a registration is loaded *and* the data actually has several channels — either several movies open, or ``Regions = channels`` with a split-FOV registration.
 
 Linking the photon counts
 ~~~~~~~~~~~~~~~~~~~~~~~~~

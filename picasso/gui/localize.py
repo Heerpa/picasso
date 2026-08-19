@@ -2331,6 +2331,19 @@ class RegisterChannelsDialog(lib.Dialog):
         grid.addWidget(QtWidgets.QLabel("Transform model:"), 0, 0)
         self.registration_model = _transform_model_combo()
         grid.addWidget(self.registration_model, 0, 1)
+        self.multi_fov = QtWidgets.QCheckBox(
+            "Each frame is a different field of view"
+        )
+        self.multi_fov.setToolTip(
+            "CHECK when the bead movie images a different field of view in\n"
+            "every frame, e.g. a stage scan over several positions. Beads are\n"
+            "then detected frame by frame and only ever paired within the\n"
+            "same frame.\n\n"
+            "UNCHECK for a plain bead acquisition, where the frames are\n"
+            "repeats of one field and are averaged to beat down the noise."
+        )
+        self.multi_fov.setTristate(False)
+        grid.addWidget(self.multi_fov, 1, 0, 1, 2)
         self.buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
@@ -2342,8 +2355,8 @@ class RegisterChannelsDialog(lib.Dialog):
         self.buttons.rejected.connect(self.reject)
 
     @staticmethod
-    def getModel(parent: QtWidgets.QWidget) -> tuple[str, bool]:
-        """Show the dialog and read the chosen transform model back.
+    def getSpecs(parent: QtWidgets.QWidget) -> tuple[str, bool, bool]:
+        """Show the dialog and read the chosen settings back.
 
         Parameters
         ----------
@@ -2354,14 +2367,17 @@ class RegisterChannelsDialog(lib.Dialog):
         -------
         model : str
             The chosen transform model.
+        multi_fov : bool
+            Whether each frame of the bead movie is its own field of view.
         accepted : bool
-            False if the dialog was cancelled, in which case ``model`` should
-            be ignored.
+            False if the dialog was cancelled, in which case the other two
+            should be ignored.
         """
         dialog = RegisterChannelsDialog(parent)
         result = dialog.exec()
         return (
             _transform_model_of(dialog.registration_model),
+            dialog.multi_fov.isChecked(),
             result == QtWidgets.QDialog.DialogCode.Accepted,
         )
 
@@ -4726,6 +4742,26 @@ class ParametersDialog(lib.Dialog):
             self.channel_registration_path = path
             self.channel_registration_label.setText(os.path.basename(path))
             self.channel_registration_label.setToolTip(path)
+            # split-FOV: drop the registration's regions into the view and
+            # enter split-FOV mode, as loading a split-FOV spline calibration
+            # does. They are only the defaults - the ROIs can be re-drawn and
+            # the channels are re-placed at them.
+            if calibration.get("split_fov"):
+                regions = calibration.get("regions") or []
+                self.window.view.rois = [
+                    [
+                        [int(r[0][0]), int(r[0][1])],
+                        [int(r[1][0]), int(r[1][1])],
+                    ]
+                    for r in regions
+                ]
+                self.window.view.selected_roi = None
+                self.split_fov_checkbox.blockSignals(True)
+                self.split_fov_checkbox.setChecked(True)
+                self.split_fov_checkbox.blockSignals(False)
+                self.window.set_split_fov_mode(True)
+                self.update_roi_display()
+                self.window.draw_frame()
         else:
             self.channel_registration_calibration = {}
             self.channel_registration_path = None
@@ -6331,12 +6367,21 @@ class Window(QtWidgets.QMainWindow):
         if not path:
             return
         self._snapshot_current_channel()
+        regions = self._registration_regions()
+        if regions is not None:
+            # split field of view: one movie, its regions are the channels
+            movies = [self.movie]
+            channel_paths = [self.movie_path]
+        else:
+            movies = [channel.movie for channel in self.channels]
+            channel_paths = [channel.path for channel in self.channels]
         self.registration_worker = ChannelRegistrationWorker(
             source=source,
-            movies=[channel.movie for channel in self.channels],
+            movies=movies,
             box=self.parameters["Box Size"],
             minimum_ng=self.parameters["Min. Net Gradient"],
-            channel_paths=[channel.path for channel in self.channels],
+            channel_paths=channel_paths,
+            regions=regions,
             path=path,
             **kwargs,
         )
@@ -6352,15 +6397,25 @@ class Window(QtWidgets.QMainWindow):
         self.status_bar.showMessage("Registering channels...")
         self.registration_worker.start()
 
+    def _registration_regions(self) -> list | None:
+        """The drawn ROIs as channel regions, or None for separate movies."""
+        if not self.view.split_fov_mode or len(self.view.rois) < 2:
+            return None
+        return [list(map(list, r)) for r in self.view.rois]
+
     def _check_registration_channels(self) -> bool:
         """Whether enough channels are loaded to register anything."""
+        if self._registration_regions() is not None:
+            return True
         if len(self.channels) < 2:
             QtWidgets.QMessageBox.information(
                 self,
                 "Register channels",
                 "Load at least two channels first, with "
                 "'File > Open channels from several movies' or "
-                "'File > Open one multichannel movie'.",
+                "'File > Open one multichannel movie' - or tick "
+                "'Regions = channels' and draw one ROI per channel "
+                "(reference first) to register a split field of view.",
             )
             return False
         return True
@@ -6369,26 +6424,39 @@ class Window(QtWidgets.QMainWindow):
         """Register the channels from separate bead images."""
         if not self._check_registration_channels():
             return
+        regions = self._registration_regions()
+        n_wanted = 1 if regions is not None else len(self.channels)
+        prompt = (
+            "Open the bead movie holding every region"
+            if regions is not None
+            else f"Open {n_wanted} bead movies, reference first"
+        )
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self,
-            f"Open {len(self.channels)} bead movies, reference first",
-            filter=IMAGE_FILTER,
+            self, prompt, filter=IMAGE_FILTER
         )
         if not paths:
             return
-        if len(paths) != len(self.channels):
+        if len(paths) != n_wanted:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Register channels",
-                f"Select one bead movie per channel ({len(self.channels)}), "
-                f"reference first; {len(paths)} were selected.",
+                (
+                    "Select the single bead movie whose regions are the "
+                    f"channels; {len(paths)} were selected."
+                    if regions is not None
+                    else f"Select one bead movie per channel ({n_wanted}), "
+                    f"reference first; {len(paths)} were selected."
+                ),
             )
             return
-        model, ok = RegisterChannelsDialog.getModel(self)
+        model, multi_fov, ok = RegisterChannelsDialog.getSpecs(self)
         if not ok:
             return
         self._start_channel_registration(
-            "beads", model=model, bead_paths=list(paths)
+            "beads",
+            model=model,
+            multi_fov=multi_fov,
+            bead_paths=list(paths),
         )
 
     def register_channels_from_signal(self) -> None:
@@ -6408,10 +6476,22 @@ class Window(QtWidgets.QMainWindow):
         )
         if not ok:
             return
+        regions = self._registration_regions()
+        n_channels = (
+            len(regions) if regions is not None else len(self.channels)
+        )
         seed_transforms = loaded.get("channel_transforms")
-        if seed_transforms is not None and len(seed_transforms) != len(
-            self.channels
-        ):
+        if regions is not None and loaded.get("split_fov"):
+            # place the stored inter-channel registration at the ROIs in use,
+            # so a re-alignment starts from the fine offset rather than only
+            # from where the regions sit
+            try:
+                _, _, seed_transforms = localize.split_fov_fit_geometry(
+                    loaded, regions
+                )
+            except (ValueError, KeyError):
+                seed_transforms = None
+        if seed_transforms is not None and len(seed_transforms) != n_channels:
             seed_transforms = None
         self._start_channel_registration(
             "signal",
@@ -10084,7 +10164,12 @@ class Window(QtWidgets.QMainWindow):
             registration = (
                 self.parameters_dialog.channel_registration_calibration
             )
-            if registration and len(self.channels) > 1:
+            # separate movies loaded as channels, or one movie whose drawn
+            # regions are the channels
+            split_fov = bool(registration.get("split_fov")) and (
+                self.view.split_fov_mode
+            )
+            if registration and (len(self.channels) > 1 or split_fov):
                 self._start_multichannel_gauss_fit(
                     registration, method, use_gpu, eps, max_it
                 )
@@ -10171,6 +10256,11 @@ class Window(QtWidgets.QMainWindow):
                 "n_channels", len(registration.get("channel_transforms", []))
             )
         )
+        if registration.get("split_fov"):
+            self._start_split_fov_gauss_fit(
+                registration, method, use_gpu, eps, max_it
+            )
+            return
         # persist the displayed channel's identifications, so the per-channel
         # tables read below are complete even if no channel switch happened
         # since the last Identify run
@@ -10246,6 +10336,101 @@ class Window(QtWidgets.QMainWindow):
             link_photons=link_photons,
             identifications_per_channel=ids_per_channel,
             link_identifications=link_identifications,
+            eps=eps,
+            max_it=max_it,
+            camera_calibration=(
+                self.parameters_dialog.camera_calibration or None
+            ),
+        )
+        self.fit_worker.linkMade.connect(self.on_link_progress)
+        self.fit_worker.linkFinished.connect(self.on_link_finished)
+        self.fit_worker.progressMade.connect(self.on_fit_progress)
+        self.fit_worker.finished.connect(self.on_fit_finished)
+        self.fit_worker.aborted.connect(self.on_worker_aborted)
+        self._active_worker = self.fit_worker
+        self.abort_action.setEnabled(True)
+        self.fit_worker.start()
+
+    def _start_split_fov_gauss_fit(
+        self,
+        registration: dict,
+        method: str,
+        use_gpu: bool = False,
+        eps: float | None = None,
+        max_it: int | None = None,
+    ) -> None:
+        """Fit a spherical Gaussian across the regions of the single movie.
+
+        The channels are placed at the drawn ROIs when they match the
+        registration's channel count - so a moved split is handled by
+        re-drawing them - otherwise at the registration's stored regions. The
+        Gaussian counterpart of :meth:`_start_split_fov_spline_fit`."""
+        if self.identifications is None or len(self.identifications) == 0:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Split-FOV Gaussian fit",
+                "Identify spots first (they are confined to the reference "
+                "region automatically).",
+            )
+            self.status_bar.showMessage("")
+            return
+        n_channels = int(registration.get("n_channels", 0))
+        regions = None
+        if self.view.split_fov_mode and len(self.view.rois) == n_channels:
+            regions = [list(map(list, r)) for r in self.view.rois]
+        link_photons = self.parameters_dialog._gauss_link_photons_enabled()
+        if not link_photons and not (
+            2 <= n_channels <= precision._LINK_XYZ_MAX_CHANNELS
+        ):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Split-FOV Gaussian fit",
+                "The photon-decoupled model supports 2 to "
+                f"{precision._LINK_XYZ_MAX_CHANNELS} channels, but this "
+                f"registration has {n_channels}. Tick 'Link photon counts "
+                "across channels' to fit them with a shared photon count.",
+            )
+            self.status_bar.showMessage("")
+            return
+        # A reference region in the wrong place would otherwise fit nothing,
+        # so say so rather than returning an empty result.
+        ref_rect = (regions or registration.get("regions"))[
+            0 if regions else int(registration.get("reference", 0))
+        ]
+        (ry0, rx0), (ry1, rx1) = ref_rect
+        rx = np.asarray(self.identifications["x"], dtype=float)
+        ry = np.asarray(self.identifications["y"], dtype=float)
+        n_in = int(
+            np.count_nonzero(
+                (rx >= min(rx0, rx1))
+                & (rx < max(rx0, rx1))
+                & (ry >= min(ry0, ry1))
+                & (ry < max(ry0, ry1))
+            )
+        )
+        if n_in == 0:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Split-FOV Gaussian fit",
+                f"{len(self.identifications)} spots were identified but none "
+                "fall inside the reference region, so there is nothing to "
+                "fit. The reference region is probably in the wrong place for "
+                "this data: enable 'Regions = channels' and drag the ROIs onto "
+                "the channels (reference first), or re-register the channels.",
+            )
+            self.status_bar.showMessage("")
+            return
+        self.fit_worker = MultichannelGaussianFitWorker(
+            [self.movie],
+            [self.camera_info],
+            self.identifications,
+            self.parameters["Box Size"],
+            registration,
+            mle=method.startswith("gaussmle"),
+            use_gpu=use_gpu,
+            link_photons=link_photons,
+            split_fov=True,
+            regions=regions,
             eps=eps,
             max_it=max_it,
             camera_calibration=(
@@ -11696,6 +11881,8 @@ class MultichannelGaussianFitWorker(QtCore.QThread):
         eps: float | None = None,
         max_it: int | None = None,
         camera_calibration: dict | None = None,
+        split_fov: bool = False,
+        regions: list | None = None,
     ) -> None:
         """Set up a joint fit of every channel.
 
@@ -11703,7 +11890,7 @@ class MultichannelGaussianFitWorker(QtCore.QThread):
         ----------
         movies : list
             One movie per channel, reference first, in the registration's own
-            channel order.
+            channel order. For split field of view, the single loaded movie.
         camera_infos : list
             One camera-info dict per channel, for the photon conversion.
         identifications : pd.DataFrame
@@ -11734,6 +11921,12 @@ class MultichannelGaussianFitWorker(QtCore.QThread):
             schedule.
         camera_calibration : dict, optional
             One per-pixel sCMOS calibration, applied to every channel.
+        split_fov : bool, optional
+            The channels are regions of one movie rather than separate movies.
+            Default False.
+        regions : list, optional
+            Split-FOV only: the channel ROIs in use, reference first. None uses
+            the registration's own.
         """
         super().__init__()
         self.movies = movies
@@ -11756,6 +11949,11 @@ class MultichannelGaussianFitWorker(QtCore.QThread):
         self.eps = eps
         self.max_it = max_it
         self.link_photons = link_photons
+        # Split-FOV: ``movies`` holds a single entry (one loaded movie); the
+        # channels are regions of it, handled by ``fit_gauss_split_fov``.
+        # ``regions`` (optional) places the channels at the current ROIs.
+        self.split_fov = split_fov
+        self.regions = regions
         self.N = len(identifications)
 
     def on_progress(self, n_done: int) -> None:
@@ -11797,6 +11995,8 @@ class MultichannelGaussianFitWorker(QtCore.QThread):
         """
         if not self.link_identifications:
             return True
+        if self.split_fov:
+            return self._link_across_regions()
         ids_per_channel = self.identifications_per_channel
         if not ids_per_channel or len(ids_per_channel) < 2:
             return True
@@ -11809,6 +12009,50 @@ class MultichannelGaussianFitWorker(QtCore.QThread):
             transforms,
             self.box,
             progress_callback=self.on_link_progress,
+        )
+        self.linkFinished.emit(n_kept, n_total)
+        if n_kept == 0:
+            return False
+        self.identifications = linked
+        self.N = len(linked)
+        return True
+
+    def _link_across_regions(self) -> bool:
+        """Split-FOV counterpart of :meth:`_link_across_channels`.
+
+        One identification table holds every region's detections, so it is
+        split by region and linked across them, keeping the reference-region
+        detections found in all the others - one fitted spot per molecule.
+
+        Returns
+        -------
+        ok : bool
+            False if nothing links across the regions.
+        """
+        all_regions = self.identifications
+        try:
+            fit_regions, reference, _ = localize.split_fov_fit_geometry(
+                self.channel_registration, self.regions
+            )
+        except (ValueError, KeyError):
+            # geometry unavailable: fit the whole identification table, as
+            # before
+            return True
+        # only the reference region is fitted (the others are cut from it via
+        # the transforms), so it - not the movie-wide count - is the
+        # denominator of the linking and fit progress
+        self.identifications = localize.confine_to_region(
+            all_regions, fit_regions[reference]
+        )
+        self.N = len(self.identifications)
+        linked, n_kept, n_total = (
+            localize.filter_linked_identifications_split_fov(
+                all_regions,
+                self.channel_registration,
+                self.box,
+                regions=self.regions,
+                progress_callback=self.on_link_progress,
+            )
         )
         self.linkFinished.emit(n_kept, n_total)
         if n_kept == 0:
@@ -11830,27 +12074,46 @@ class MultichannelGaussianFitWorker(QtCore.QThread):
                 self.channel_registration.get("n_channels", len(self.movies))
             )
             if not self._link_across_channels(n_channels):
+                where = "regions" if self.split_fov else "channels"
                 print(
                     "Multichannel Gaussian fit: no detection is linked across "
-                    "all channels - check the channel registration."
+                    f"all {where} - check the channel registration."
                 )
                 self.aborted.emit()
                 return
-            locs = localize.fit_gauss_multichannel(
-                self.movies,
-                self.camera_infos,
-                self.identifications,
-                self.box,
-                self.channel_registration,
-                mle=self.mle,
-                link_photons=self.link_photons,
-                use_gpu=self.use_gpu,
-                tolerance=self.eps,
-                max_iterations=self.max_it,
-                progress_callback=self.on_progress,
-                abort_callback=self.isInterruptionRequested,
-                camera_calibrations=self.camera_calibrations,
-            )
+            if self.split_fov:
+                locs = localize.fit_gauss_split_fov(
+                    self.movies[0],
+                    self.camera_infos[0],
+                    self.identifications,
+                    self.box,
+                    self.channel_registration,
+                    regions=self.regions,
+                    mle=self.mle,
+                    link_photons=self.link_photons,
+                    use_gpu=self.use_gpu,
+                    tolerance=self.eps,
+                    max_iterations=self.max_it,
+                    progress_callback=self.on_progress,
+                    abort_callback=self.isInterruptionRequested,
+                    camera_calibration=self.camera_calibration,
+                )
+            else:
+                locs = localize.fit_gauss_multichannel(
+                    self.movies,
+                    self.camera_infos,
+                    self.identifications,
+                    self.box,
+                    self.channel_registration,
+                    mle=self.mle,
+                    link_photons=self.link_photons,
+                    use_gpu=self.use_gpu,
+                    tolerance=self.eps,
+                    max_iterations=self.max_it,
+                    progress_callback=self.on_progress,
+                    abort_callback=self.isInterruptionRequested,
+                    camera_calibrations=self.camera_calibrations,
+                )
         except Exception as e:
             print(f"Multichannel Gaussian fit failed: {e}")
             self.aborted.emit()
@@ -11948,6 +12211,8 @@ class ChannelRegistrationWorker(QtCore.QThread):
         frame_bounds: list | None = None,
         max_frames: int = 50,
         seed_transforms: list | None = None,
+        regions: list | None = None,
+        multi_fov: bool = False,
     ) -> None:
         """Set up a channel-registration measurement.
 
@@ -11981,6 +12246,14 @@ class ChannelRegistrationWorker(QtCore.QThread):
             One transform per channel to start the pairing from, when
             re-aligning a registration that has drifted. None builds one from
             scratch.
+        regions : list, optional
+            Split field of view: one ROI per channel, reference first. The
+            single movie is then split by region instead of one movie per
+            channel.
+        multi_fov : bool, optional
+            Beads only: each frame of the bead movie is a different field of
+            view, so beads are paired within a frame rather than the frames
+            being averaged. Default False.
         """
         super().__init__()
         self.source = source
@@ -11994,6 +12267,8 @@ class ChannelRegistrationWorker(QtCore.QThread):
         self.frame_bounds = frame_bounds
         self.max_frames = max_frames
         self.seed_transforms = seed_transforms
+        self.regions = regions
+        self.multi_fov = multi_fov
 
     def run(self) -> None:
         """Measure and save the registration.
@@ -12011,6 +12286,8 @@ class ChannelRegistrationWorker(QtCore.QThread):
                     box=self.box,
                     minimum_ng=self.minimum_ng,
                     model=self.model,
+                    regions=self.regions,
+                    multi_fov=self.multi_fov,
                     channel_paths=self.bead_paths,
                     path=self.path,
                 )
@@ -12026,6 +12303,7 @@ class ChannelRegistrationWorker(QtCore.QThread):
                     frame_bounds=self.frame_bounds,
                     max_frames=self.max_frames,
                     seed_transforms=self.seed_transforms,
+                    regions=self.regions,
                     channel_paths=self.channel_paths,
                     path=self.path,
                     progress_callback=lambda n: self.statusChanged.emit(
