@@ -127,6 +127,13 @@ def _case(kind, n_channels=1):
 def _args(kind, calibration, spots, initial, jacobians, seeds=None):
     coefficients = precision._spline_coeff_reshaped(calibration)
     n_spots, n_channels = spots.shape[0], spots.shape[1]
+    jacobians = np.asarray(jacobians, dtype=np.float64)
+    if jacobians.ndim == 2:
+        # (n_channels, 4) -> the per-spot (n_spots, n_channels, 4) the kernels
+        # take; an affine registration is the same Jacobian at every spot
+        jacobians = np.ascontiguousarray(
+            np.tile(jacobians, (max(n_spots, 1), 1, 1))
+        )
     residuals = np.zeros((max(n_spots, 1), n_channels, 2))
     apply_seeds = seeds is not None
     z_seeds = np.asarray(seeds, float) if apply_seeds else np.zeros(1)

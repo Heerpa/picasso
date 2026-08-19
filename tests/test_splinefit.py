@@ -802,7 +802,12 @@ class TestNoisyBatch:
 
     def test_stop_halts_the_workers(self):
         """``AsyncFit.stop`` must actually stop the fit, so an aborted GUI run
-        does not keep burning CPU into arrays nobody will read."""
+        does not keep burning CPU into arrays nobody will read.
+
+        A single worker on purpose: ``stop`` is set from this thread only once
+        the pool is already running, so a full pool on a loaded machine can
+        claim every spot before it gets there and the test would fail for a
+        reason that has nothing to do with the flag."""
         calibration, spots, initial, _, _, _ = self._batch(n_spots=2000)
         n_spots = len(spots)
         fit = splinefit.fit_spots_async(
@@ -816,6 +821,7 @@ class TestNoisyBatch:
             True,
             tolerance=splinefit.TOLERANCE_MULTI_START,
             max_iterations=splinefit.MAX_ITERATIONS_MULTI_START,
+            n_threads=1,
         )
         fit.stop()
         _drain(fit)

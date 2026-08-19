@@ -300,7 +300,7 @@ def _estimator_terms_strict(mle, value, data, var):
     """
     if mle:
         shifted_value = value + var
-        if not (math.isfinite(shifted_value) and shifted_value >= MU_FLOOR):
+        if not (math.isfinite(shifted_value) and shifted_value > 0.0):
             return _INF, 0.0, 0.0, False
         chi, weight, factor = _poisson_terms(shifted_value, data + var)
         return chi, weight, factor, True
