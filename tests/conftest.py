@@ -9,6 +9,8 @@ Provides:
 - ``locs_data`` / ``locs`` / ``info`` / ``movie_data`` / ``movie`` /
   ``movie_info``: shared loaders for the bundled test data, so individual
   test files don't reload the same files.
+- ``qapp`` / ``qt_offscreen``: the single ``QApplication`` every GUI test
+  shares, and a per-test wrapper that closes the widgets a test opened.
 
 :author: Rafal Kowalewski, 2026
 :copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry
@@ -16,11 +18,84 @@ Provides:
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from picasso import io, transforms
+
+# Qt must be told to run without a display before the first QApplication is
+# built, and the environment is read once at that point - hence a module-level
+# default rather than a fixture. ``setdefault`` keeps an explicit
+# ``QT_QPA_PLATFORM=xcb pytest`` (to watch the widgets) working.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+# ---------------------------------------------------------------------------
+# Qt
+# ---------------------------------------------------------------------------
+
+
+def pytest_collection_modifyitems(items):
+    """Mark every test that builds Qt widgets as ``gui``.
+
+    Deriving the marker from the fixtures a test requests keeps it from
+    drifting out of date, and lets a headless run skip the lot with
+    ``pytest -m "not gui"``.
+
+    Only fixtures named in the test's own signature count. A module that
+    keeps a ``QApplication`` alive with an autouse fixture (test_localize
+    does) would otherwise mark its every test as a GUI test, including the
+    numerical ones that never build a widget.
+    """
+    for item in items:
+        info = getattr(item, "_fixtureinfo", None)
+        argnames = getattr(info, "argnames", None)
+        if argnames is None:  # pragma: no cover - non-Function items
+            argnames = getattr(item, "fixturenames", ())
+        if {"qapp", "qt_offscreen"} & set(argnames):
+            item.add_marker(pytest.mark.gui)
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    """The one ``QApplication`` for the whole session.
+
+    Qt allows a single application object per process and it must outlive
+    every widget built from it, so this is session scoped and never torn
+    down. Skips rather than errors where Qt cannot start, so the suite stays
+    usable on machines without a working Qt platform plugin.
+    """
+    pytest.importorskip("PyQt6.QtWidgets")
+    from PyQt6 import QtWidgets
+
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        try:
+            app = QtWidgets.QApplication([])
+        except Exception as exc:  # pragma: no cover - environment issue
+            pytest.skip(f"Qt could not be initialized: {exc}")
+    return app
+
+
+@pytest.fixture
+def qt_offscreen(qapp):
+    """``qapp``, plus cleanup of the widgets the test opened.
+
+    A widget that outlives its test keeps receiving events and can crash the
+    interpreter during interpreter shutdown, so anything top level the test
+    left behind is closed and scheduled for deletion here.
+    """
+    before = set(qapp.topLevelWidgets())
+    yield qapp
+    for widget in qapp.topLevelWidgets():
+        if widget not in before:
+            widget.close()
+            widget.deleteLater()
+    qapp.processEvents()
+
 
 # ---------------------------------------------------------------------------
 # Geometric transforms

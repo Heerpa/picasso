@@ -150,6 +150,7 @@ picasso = [
 [tool.pytest.ini_options]
 markers = [
     "slow: long-running tests (multiprocessing, Bayesian fits, compare_models)",
+    "gui: tests that build Qt widgets (applied automatically to anything using the qapp / qt_offscreen fixtures); deselect with -m \"not gui\"",
 ]
 
 [tool.black]

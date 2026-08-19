@@ -170,29 +170,6 @@ GOLDEN_3D = {
 }
 
 
-# The QApplication must outlive every widget built from it, so it is
-# kept here rather than in a fixture local.
-_QT_APP = None
-
-
-@pytest.fixture
-def qt_offscreen(monkeypatch):
-    """Run Qt widgets without a display. Skips if Qt cannot start, so
-    the suite stays usable on machines without a working Qt platform."""
-    global _QT_APP
-    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    pytest.importorskip("PyQt6.QtWidgets")
-    from PyQt6 import QtWidgets
-
-    if _QT_APP is None:
-        _QT_APP = QtWidgets.QApplication.instance()
-    if _QT_APP is None:
-        try:
-            _QT_APP = QtWidgets.QApplication([])
-        except Exception as exc:  # pragma: no cover - environment issue
-            pytest.skip(f"Qt could not be initialized: {exc}")
-
-
 @pytest.fixture
 def dbscan_locs(locs):
     """2D clustered localizations, no ``angle`` column."""

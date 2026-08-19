@@ -1584,12 +1584,12 @@ def _keep_user_settings(monkeypatch):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _qt_app():
-    """A QApplication must exist before any QObject (the worker) is built."""
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        app = QtWidgets.QApplication(sys.argv)
-    yield app
+def _qt_app(qapp):
+    """A QApplication must exist before any QObject (the worker) is built.
+
+    Autouse because widgets are built throughout this module; the application
+    itself is the shared one from conftest."""
+    return qapp
 
 
 class _Collector:
@@ -1616,6 +1616,7 @@ def _info(name="Channel 0"):
     return [{"Frames": 1, "Height": 4, "Width": 4, "Channel": name}]
 
 
+@pytest.mark.gui
 class TestMovieLoadWorker:
     def test_load_movie_per_file(self, monkeypatch):
         """load_all=False loads one channel per path via io.load_movie."""
@@ -4388,6 +4389,7 @@ class TestGaussCodeGrammar:
             )
 
 
+@pytest.mark.gui
 class TestGuiConvergenceDefaults:
     """The GUI's per-method default table has to agree with the values the
     backends use when asked for None; otherwise the boxes show one schedule
@@ -6271,6 +6273,7 @@ class TestFitSplineSplitFov:
         assert len(locs_orig) < len(locs)
 
 
+@pytest.mark.gui
 class TestMultichannelWorkerRouting:
     """MultichannelSplineFitWorker routes to the ratiometric fitter iff the
     calibration carries photon_ratios (no GPU; the fit fns are monkeypatched).
@@ -6434,6 +6437,7 @@ class TestMultichannelWorkerRouting:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.gui
 class TestHoverTooltips:
     def test_format_hover_tooltip_lists_all_columns(self):
         row = pd.Series(
@@ -6758,6 +6762,7 @@ class TestTemporalMedian:
         assert counting.reads == 0
 
 
+@pytest.mark.gui
 class TestTemporalMedianGui:
     """Wiring of the temporal median filter into Picasso: Localize.
 
@@ -7220,6 +7225,7 @@ class TestGaussianFilter:
         assert (smoothed_ids["y"] - center).abs().max() <= 1
 
 
+@pytest.mark.gui
 class TestGaussianFilterGui:
     """Wiring of the Gaussian filter into Picasso: Localize.
 
@@ -7532,6 +7538,7 @@ class TestPerRoiMinNetGradient:
         assert sorted(set(ids["x"])) == [30, 94]
 
 
+@pytest.mark.gui
 class TestPerRegionMinNetGradientGui:
     """The split-FOV region <-> min. net gradient slider binding.
 
@@ -8087,6 +8094,7 @@ class TestFitAffineTransform:
         assert drawn["qc"]["n_pairs"] == 25
 
 
+@pytest.mark.gui
 class TestShortMovieDisplayGUI:
     """A movie too short for the temporal median filter must still be
     visible: the in-focus bead images an affine calibration uses are single
@@ -8161,6 +8169,7 @@ class TestShortMovieDisplayGUI:
         assert brightest == 0  # uniform data really is featureless
 
 
+@pytest.mark.gui
 class TestAffinePairingOverlayGUI:
     """The bead pairing of an affine calibration, drawn in the Localize
     viewer as color-coded identification boxes."""
@@ -8232,6 +8241,7 @@ class TestAffinePairingOverlayGUI:
             window.close()
 
 
+@pytest.mark.gui
 class TestCalibrateAffineDialogGUI:
     """The calibration dialog serves both transform types and can start a
     standalone calibration file."""
@@ -8306,6 +8316,7 @@ class TestCalibrateAffineDialogGUI:
         assert not dialog.isVisible()
 
 
+@pytest.mark.gui
 class TestAffineCalibrationWorkerGUI:
     """The worker appends to an existing calibration of any format and
     starts a new standalone one when the path does not exist yet."""
@@ -8365,6 +8376,7 @@ class TestAffineCalibrationWorkerGUI:
         assert len(lib.lateral_transforms(calibration)) == 1
 
 
+@pytest.mark.gui
 class TestAffineDuplicateGuardsGUI:
     """A correction the loaded calibration already carries must not be
     taken a second time through the 2D lateral correction box."""
@@ -8707,6 +8719,7 @@ class TestRangeSlider:
             slider.deleteLater()
 
 
+@pytest.mark.gui
 class TestContrastSliderGUI:
     """The contrast slider below the frame slider is a second view onto the
     contrast dialog's spinboxes; the two must never drift apart."""
@@ -8806,6 +8819,7 @@ class TestContrastSliderGUI:
         assert not window.contrast_slider.isEnabled()
 
 
+@pytest.mark.gui
 class TestContrastDialog:
     """The contrast mapping is shared by the Auto and the manual branch, so
     unchecking Auto must freeze what is on screen rather than re-scale it on
@@ -9762,6 +9776,7 @@ class TestScmosMultichannel:
         assert np.isfinite(locs["lpx"]).all()
 
 
+@pytest.mark.gui
 class TestCameraCalibrationConfigLookup:
     """``camera-calibrations`` in ``config.yaml``, keyed camera -> wavelength.
 
@@ -9906,6 +9921,7 @@ class TestCameraCalibrationConfigLookup:
         assert "update_z_calib_with_config_path" in body
 
 
+@pytest.mark.gui
 class TestCameraCalibrationProvenance:
     """A saved file must say whether the noise model was used.
 
@@ -10003,6 +10019,7 @@ class TestCameraCalibrationProvenance:
             window.close()
 
 
+@pytest.mark.gui
 class TestCameraCalibrationScalars:
     """A loaded calibration supersedes Baseline, Sensitivity and EM gain.
 
@@ -10153,6 +10170,7 @@ class TestCameraCalibrationScalars:
             dialog.close()
 
 
+@pytest.mark.gui
 class TestCameraCalibrationDialogs:
     """The dialog that collects the inputs of a characterization."""
 
@@ -10449,6 +10467,7 @@ def _sum_mode_window(reference, channel):
     return window
 
 
+@pytest.mark.gui
 class TestIdentifyModeParameter:
     """The 'Identify on' setting and how it reaches the identification."""
 
@@ -10743,6 +10762,7 @@ class TestChannelSumRegistration:
             window.close()
 
 
+@pytest.mark.gui
 class TestChannelSumState:
     """The summed view behind the display, the preview and the fit."""
 
@@ -10813,6 +10833,7 @@ class TestChannelSumState:
             window.close()
 
 
+@pytest.mark.gui
 class TestChannelSumPreview:
     """The summed view is on screen as soon as the mode is selected, so the
     display and the identification preview show the image the identification
@@ -10956,6 +10977,7 @@ class TestChannelSumPreview:
         assert "self.window.drop_channel_sum()" in source
 
 
+@pytest.mark.gui
 class TestSumIdentificationsSkipLinking:
     """Identifications made on the sum go into the joint fit as they are."""
 
@@ -11039,6 +11061,7 @@ class TestEstimateTransformsDiagnostics:
         )
 
 
+@pytest.mark.gui
 class TestChannelSumAfterRealignment:
     """``Calibration > Re-align channels (current signal)`` updates the loaded
     calibration in place, so the channel sum has to follow it."""
@@ -11159,6 +11182,7 @@ def _preview_box_colors(window):
     ]
 
 
+@pytest.mark.gui
 class TestPreviewLinkColors:
     """'Link colors' on top of the identification preview: the cross-channel
     links are shown for the displayed frame before anything is identified, so
@@ -11357,6 +11381,7 @@ class TestPreviewLinkColors:
             window.close()
 
 
+@pytest.mark.gui
 class TestPreviewLinkColorsSplitFov:
     """The same on split-FOV data, where the channels are regions of the one
     displayed frame - the preview already searches all of them."""
@@ -11675,6 +11700,7 @@ class TestFitGaussMultichannel:
         )
 
 
+@pytest.mark.gui
 class TestMultichannelGaussianWorkerRouting:
     """``MultichannelGaussianFitWorker`` passes the GUI's settings through to
     ``localize.fit_gauss_multichannel`` (which is monkeypatched, so no GPU or
@@ -11764,6 +11790,7 @@ class TestMultichannelGaussianWorkerRouting:
         assert aborted == [True]
 
 
+@pytest.mark.gui
 class TestChannelRegistrationParametersDialog:
     """The channel-registration group box in the parameters dialog."""
 
@@ -11854,6 +11881,7 @@ class TestChannelRegistrationParametersDialog:
             window.close()
 
 
+@pytest.mark.gui
 class TestMultichannelGaussianFitThroughTheWindow:
     """The whole GUI path: two channels loaded, a registration loaded, and
     ``Window.fit()`` dispatching to the joint Gaussian fit rather than to the
@@ -11987,6 +12015,7 @@ class TestMultichannelGaussianFitThroughTheWindow:
             window.close()
 
 
+@pytest.mark.gui
 class TestRegisterChannelsFlow:
     """Building a channel registration from the GUI, both ways."""
 
@@ -12400,6 +12429,7 @@ class TestFitGaussSplitFov:
             )
 
 
+@pytest.mark.gui
 class TestSplitFovGaussianThroughTheWindow:
     """Split-FOV dispatch: one movie with ROIs, no separate channels loaded."""
 

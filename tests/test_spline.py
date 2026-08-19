@@ -2105,14 +2105,11 @@ class TestGuiWiring:
 
     @staticmethod
     def _fit_worker(method, use_gpufit, calib):
-        import sys
+        """Build a FitWorker. Callers must hold the ``qt_offscreen`` fixture -
+        a QObject cannot be built before the QApplication exists."""
         import pandas as pd
-        from PyQt6 import QtWidgets
         from picasso.gui import localize as glocalize
 
-        app = QtWidgets.QApplication.instance()
-        if app is None:
-            app = QtWidgets.QApplication(sys.argv)
         return glocalize.FitWorker(
             None,
             [],
@@ -2128,7 +2125,9 @@ class TestGuiWiring:
             spline_calibration=calib,
         )
 
-    def test_fit_worker_preserves_spline_method_and_calibration(self):
+    def test_fit_worker_preserves_spline_method_and_calibration(
+        self, qt_offscreen
+    ):
         calib = {"model": "spline-3d"}
         worker = self._fit_worker("spline-mle-gpu", True, calib)
         # the "-gpu" suffix must not be appended to an already-gpu spline code
@@ -2145,18 +2144,16 @@ class TestGuiWiring:
         ],
     )
     def test_fit_worker_routes_spline_by_gpufit_checkbox(
-        self, method, use_gpufit, expected
+        self, qt_offscreen, method, use_gpufit, expected
     ):
         """The GPUfit checkbox selects the device for the spline model exactly
         as it does for the Gaussian ones."""
         worker = self._fit_worker(method, use_gpufit, {"model": "spline-3d"})
         assert worker.method == expected
 
-    def test_bead_inspection_dialog_shows_the_filtering(self):
+    def test_bead_inspection_dialog_shows_the_filtering(self, qt_offscreen):
         """The bead inspector must render the calibration's per-bead record,
         so the user can check the outlier filtering instead of trusting it."""
-        import sys
-        from PyQt6 import QtWidgets
         from picasso.gui import localize as glocalize
 
         movie, _, _ = _synthetic_bead_movie()
@@ -2169,9 +2166,6 @@ class TestGuiWiring:
         )
         n_beads = len(data["keep"])
 
-        app = QtWidgets.QApplication.instance()
-        if app is None:
-            app = QtWidgets.QApplication(sys.argv)
         dialog = glocalize.BeadInspectionDialog([data, data])
         assert f"of {n_beads} beads" in dialog.summary.text()
         assert "1 rejected" in dialog.summary.text()
@@ -2182,12 +2176,13 @@ class TestGuiWiring:
         assert len(dialog.figure.axes) == 3 * 2 + 1
         dialog.close()
 
-    def test_bead_inspection_dialog_scrolls_the_gallery(self):
+    def test_bead_inspection_dialog_scrolls_the_gallery(self, qt_offscreen):
         """The gallery is taller than any window, so it must scroll - and a
         matplotlib canvas swallows wheel events unless they are forwarded."""
-        import sys
         from PyQt6 import QtCore, QtGui, QtWidgets
         from picasso.gui import localize as glocalize
+
+        app = qt_offscreen
 
         movie, _, _ = _synthetic_bead_movie()
         built = spline.build_psf_template(
@@ -2197,9 +2192,6 @@ class TestGuiWiring:
             built, {"z_center": float(built["z_center"]), "pixelsize": 130.0}
         )
 
-        app = QtWidgets.QApplication.instance()
-        if app is None:
-            app = QtWidgets.QApplication(sys.argv)
         dialog = glocalize.BeadInspectionDialog([data])
         dialog.show()
         app.processEvents()
