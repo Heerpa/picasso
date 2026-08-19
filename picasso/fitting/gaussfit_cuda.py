@@ -733,13 +733,21 @@ def _make_accumulate_spherical_multichannel(ftype):
         h22 = h23 = h24 = 0.0
         h33 = h34 = 0.0
         h44 = 0.0
+        # The channel Jacobian linearizes the *displacement* of the
+        # emitter from the box center, not the box coordinate itself:
+        # channel c sees center + J @ (shift - center) + residual. Off by
+        # the center, a mirrored or rotated channel lands outside its own
+        # box and its photon count runs away.
+        center = 0.5 * box - 0.5
+        dx_shift = x_shift - center
+        dy_shift = y_shift - center
         for ch in range(n_channels):
             a00 = jac[index, ch, 0]
             a01 = jac[index, ch, 1]
             a10 = jac[index, ch, 2]
             a11 = jac[index, ch, 3]
-            sx = a00 * x_shift + a01 * y_shift + res[index, ch, 0]
-            sy = a10 * x_shift + a11 * y_shift + res[index, ch, 1]
+            sx = center + a00 * dx_shift + a01 * dy_shift + res[index, ch, 0]
+            sy = center + a10 * dx_shift + a11 * dy_shift + res[index, ch, 1]
             for j in range(box):
                 pos_y = ftype(j - sy)
                 for i in range(box):
@@ -861,6 +869,14 @@ def _make_accumulate_spherical_decoupled(ftype, n_channels: int):
         h00 = h01 = h02 = 0.0
         h11 = h12 = 0.0
         h22 = 0.0
+        # The channel Jacobian linearizes the *displacement* of the
+        # emitter from the box center, not the box coordinate itself:
+        # channel c sees center + J @ (shift - center) + residual. Off by
+        # the center, a mirrored or rotated channel lands outside its own
+        # box and its photon count runs away.
+        center = 0.5 * box - 0.5
+        dx_shift = x_shift - center
+        dy_shift = y_shift - center
         for ch in range(n_ch):
             amp = theta[3 + ch]
             offset = theta[3 + n_ch + ch]
@@ -870,8 +886,8 @@ def _make_accumulate_spherical_decoupled(ftype, n_channels: int):
             a01 = jac[index, ch, 1]
             a10 = jac[index, ch, 2]
             a11 = jac[index, ch, 3]
-            sx = a00 * x_shift + a01 * y_shift + res[index, ch, 0]
-            sy = a10 * x_shift + a11 * y_shift + res[index, ch, 1]
+            sx = center + a00 * dx_shift + a01 * dy_shift + res[index, ch, 0]
+            sy = center + a10 * dx_shift + a11 * dy_shift + res[index, ch, 1]
             # This channel's own photon (a) and background (b) entries.
             ga = gb = 0.0
             h0a = h1a = h2a = 0.0

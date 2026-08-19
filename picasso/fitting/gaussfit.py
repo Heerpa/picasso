@@ -1027,14 +1027,22 @@ def _accumulate_spherical_multichannel(
     h22 = h23 = h24 = 0.0
     h33 = h34 = 0.0
     h44 = 0.0
+    # The channel Jacobian linearizes the *displacement* of the
+    # emitter from the box center, not the box coordinate itself:
+    # channel c sees center + J @ (shift - center) + residual. Off by
+    # the center, a mirrored or rotated channel lands outside its own
+    # box and its photon count runs away.
+    center = 0.5 * box - 0.5
+    dx_shift = x_shift - center
+    dy_shift = y_shift - center
     for ch in range(n_channels):
         # Constant over the box, so hoisted.
         a00 = jac[index, ch, 0]
         a01 = jac[index, ch, 1]
         a10 = jac[index, ch, 2]
         a11 = jac[index, ch, 3]
-        sx = a00 * x_shift + a01 * y_shift + res[index, ch, 0]
-        sy = a10 * x_shift + a11 * y_shift + res[index, ch, 1]
+        sx = center + a00 * dx_shift + a01 * dy_shift + res[index, ch, 0]
+        sy = center + a10 * dx_shift + a11 * dy_shift + res[index, ch, 1]
         for j in range(box):
             pos_y = j - sy
             for i in range(box):
@@ -1154,6 +1162,14 @@ def _accumulate_spherical_decoupled(
     inv_s2 = 1.0 / (sigma * sigma)
     inv_s3 = 1.0 / (sigma * sigma * sigma)
     chi_square = 0.0
+    # The channel Jacobian linearizes the *displacement* of the
+    # emitter from the box center, not the box coordinate itself:
+    # channel c sees center + J @ (shift - center) + residual. Off by
+    # the center, a mirrored or rotated channel lands outside its own
+    # box and its photon count runs away.
+    center = 0.5 * box - 0.5
+    dx_shift = x_shift - center
+    dy_shift = y_shift - center
     for ch in range(n_channels):
         amp = theta[3 + ch]
         offset = theta[3 + n_channels + ch]
@@ -1165,8 +1181,8 @@ def _accumulate_spherical_decoupled(
         a01 = jac[index, ch, 1]
         a10 = jac[index, ch, 2]
         a11 = jac[index, ch, 3]
-        sx = a00 * x_shift + a01 * y_shift + res[index, ch, 0]
-        sy = a10 * x_shift + a11 * y_shift + res[index, ch, 1]
+        sx = center + a00 * dx_shift + a01 * dy_shift + res[index, ch, 0]
+        sy = center + a10 * dx_shift + a11 * dy_shift + res[index, ch, 1]
         for j in range(box):
             pos_y = j - sy
             for i in range(box):

@@ -4770,6 +4770,28 @@ class ParametersDialog(lib.Dialog):
             )
             self.channel_registration_label.setToolTip("")
         self._update_gauss_link_photons_visibility()
+        try:
+            if self.window.movie is not None:
+                self.window.draw_frame()
+        except (AttributeError, RuntimeError):
+            pass  # called during startup, before the window is fully built
+
+    def link_calibration(self) -> dict:
+        """The loaded calibration whose registration the link colors pair by.
+
+        Either box can hold one - a spline PSF calibration or a standalone
+        channel registration - and only the one belonging to the selected fit
+        model is even shown (see ``_update_calib_group_visibility``), so that
+        model decides which comes first. The other is still used when it is
+        the only one loaded: it registers the same channels either way, and
+        showing its pairing beats falling back to the estimate.
+        """
+        spline = self.spline_calibration or {}
+        registration = self.channel_registration_calibration or {}
+        entry = FIT_MODELS[self.fit_model.currentText()]
+        if entry.get("needs_channel_registration"):
+            return registration or spline
+        return spline or registration
 
     def _update_gauss_link_photons_visibility(self) -> None:
         """Show the Gaussian 'Link photons' checkbox only for a registration
@@ -8438,7 +8460,7 @@ class Window(QtWidgets.QMainWindow):
             # the detections come from the channel sum, so every one of them
             # is a cross-channel spot already - there is nothing to pair
             return False
-        cal = pdialog.spline_calibration or {}
+        cal = pdialog.link_calibration()
         n_channels = int(cal.get("n_channels", 0))
         if n_channels >= 2:
             # a loaded calibration always provides the registration - the
@@ -9393,18 +9415,20 @@ class Window(QtWidgets.QMainWindow):
         self.status_bar.showMessage(message)
 
     def _linked_count_phrase(self, n_detections: int) -> str | None:
-        """How many identified spots a joint spline fit would actually fit.
+        """How many identified spots a joint fit would actually fit.
 
-        A multichannel (or split-FOV) spline fit fits one spot per molecule:
-        the reference detections that are found in every channel / region are
-        fitted jointly, everything else is dropped (see
-        ``localize.filter_linked_identifications``).
+        A multichannel (or split-FOV) fit - spline or Gaussian - fits one spot
+        per molecule: the reference detections that are found in every channel
+        / region are fitted jointly, everything else is dropped (see
+        ``localize.filter_linked_identifications``). The pairing uses whichever
+        registration the fit would (see
+        ``ParametersDialog.link_calibration``).
         """
         if self.sum_identifications is not None:
             # identified on the channel sum: every detection is fitted, there
             # is no linking step (see Window.identify_channel_sum)
             return None
-        cal = self.parameters_dialog.spline_calibration or {}
+        cal = self.parameters_dialog.link_calibration()
         box = self.parameters["Box Size"]
         split_fov = bool(cal.get("split_fov"))
         self.status_bar.showMessage(
@@ -9685,7 +9709,13 @@ class Window(QtWidgets.QMainWindow):
         Gaussian fit uses. Whichever describes this data is the one the fit will
         use, so the sum is built with exactly those transforms. ``(None, "")``
         if neither describes the data's layout."""
-        cal = self.parameters_dialog.spline_calibration or {}
+        pdialog = self.parameters_dialog
+        cal = pdialog.link_calibration()
+        source = (
+            "the loaded channel registration"
+            if cal is pdialog.channel_registration_calibration
+            else "the loaded spline calibration"
+        )
         if int(cal.get("n_channels", 0)) == n_channels:
             link_cal = self._link_calibration_for_mode(cal, n_channels)
             if link_cal is not None:
@@ -9705,15 +9735,13 @@ class Window(QtWidgets.QMainWindow):
                             transforms_mod.from_dict(t)
                             for t in transforms[:n_channels]
                         ],
-                        "the loaded spline calibration",
+                        source,
                     )
-        # A standalone channel registration is separate-movie only; split-FOV
-        # channels are regions of one movie and only a spline calibration
-        # describes where they sit.
+        # Whichever of the two was not tried above, for separate movies: their
+        # transforms need no region placement, so a registration that does not
+        # name this data's channel count still maps them.
         if regions is None:
-            registration = (
-                self.parameters_dialog.channel_registration_calibration or {}
-            )
+            registration = pdialog.channel_registration_calibration or {}
             transforms = registration.get("channel_transforms")
             if transforms and len(transforms) >= n_channels:
                 return (

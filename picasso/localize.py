@@ -5971,6 +5971,14 @@ def channel_roi_geometry(
     is ``T_c(x + theta)`` to first order. So the ROI residual and the local
     Jacobian belong together, and both are per localization.
 
+    ``theta`` there is the emitter's *displacement* from the box center. The
+    Gaussian models parameterize the position by its box coordinate instead,
+    so their kernels linearize around the center explicitly: channel ``c``
+    sits at ``center + J_c @ (theta - center) + residual``. Feeding the box
+    coordinate straight into the Jacobian only looks right for a nearly
+    identity registration - a mirrored (split field of view) or strongly
+    rotated channel then lands outside its own box.
+
     They are returned separately rather than bundled because the fitters may
     zero the residuals (``apply_roi_residuals=False``) while still needing the
     geometry.

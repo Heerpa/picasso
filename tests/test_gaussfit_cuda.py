@@ -391,8 +391,9 @@ def _multi_batch(n, amps, bgs, seed=1, box=MULTI_BOX):
         sigma = rng.uniform(1.1, 1.5)
         for c in range(n_channels):
             a00, a01, a10, a11 = MULTI_JAC[c]
-            sx = a00 * x + a01 * y + MULTI_RES[c, 0]
-            sy = a10 * x + a11 * y + MULTI_RES[c, 1]
+            dx, dy = x - MULTI_CENTRE, y - MULTI_CENTRE
+            sx = MULTI_CENTRE + a00 * dx + a01 * dy + MULTI_RES[c, 0]
+            sy = MULTI_CENTRE + a10 * dx + a11 * dy + MULTI_RES[c, 1]
             spots[k, c] = rng.poisson(
                 amps[c]
                 * np.exp(-0.5 * ((i - sx) ** 2 + (j - sy) ** 2) / sigma**2)

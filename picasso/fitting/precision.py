@@ -681,13 +681,20 @@ def _gauss_infomats_multichannel(
         s22 = s23 = s24 = 0.0
         s33 = s34 = 0.0
         s44 = 0.0
+        # The channel Jacobian linearizes the emitter's *displacement*
+        # from the box center, not the box coordinate itself: channel ch
+        # sits at center + J @ (shift - center) + residual (see
+        # localize.channel_roi_geometry).
+        center = 0.5 * box - 0.5
+        dx_shift = x_shift[m] - center
+        dy_shift = y_shift[m] - center
         for ch in range(n_channels):
             a00 = jac[m, ch, 0]
             a01 = jac[m, ch, 1]
             a10 = jac[m, ch, 2]
             a11 = jac[m, ch, 3]
-            sx = a00 * x_shift[m] + a01 * y_shift[m] + res[m, ch, 0]
-            sy = a10 * x_shift[m] + a11 * y_shift[m] + res[m, ch, 1]
+            sx = center + a00 * dx_shift + a01 * dy_shift + res[m, ch, 0]
+            sy = center + a10 * dx_shift + a11 * dy_shift + res[m, ch, 1]
             for j in range(box):
                 pos_y = j - sy
                 for i in range(box):
@@ -823,6 +830,13 @@ def _gauss_infomats_decoupled(
             for q in range(n_params):
                 bread[m, p, q] = 0.0
                 meat[m, p, q] = 0.0
+        # The channel Jacobian linearizes the emitter's *displacement*
+        # from the box center, not the box coordinate itself: channel ch
+        # sits at center + J @ (shift - center) + residual (see
+        # localize.channel_roi_geometry).
+        center = 0.5 * box - 0.5
+        dx_shift = x_shift[m] - center
+        dy_shift = y_shift[m] - center
         for ch in range(n_channels):
             N = n_photons[m, ch]
             o = offset[m, ch]
@@ -833,8 +847,8 @@ def _gauss_infomats_decoupled(
             a01 = jac[m, ch, 1]
             a10 = jac[m, ch, 2]
             a11 = jac[m, ch, 3]
-            sx = a00 * x_shift[m] + a01 * y_shift[m] + res[m, ch, 0]
-            sy = a10 * x_shift[m] + a11 * y_shift[m] + res[m, ch, 1]
+            sx = center + a00 * dx_shift + a01 * dy_shift + res[m, ch, 0]
+            sy = center + a10 * dx_shift + a11 * dy_shift + res[m, ch, 1]
             for j in range(box):
                 pos_y = j - sy
                 for i in range(box):

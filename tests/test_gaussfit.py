@@ -654,8 +654,9 @@ def _multi_batch(n, amps, bgs, seed=1, box=MULTI_BOX):
         truth[k] = (x, y, sigma)
         for c in range(n_channels):
             a00, a01, a10, a11 = MULTI_JAC[c]
-            sx = a00 * x + a01 * y + MULTI_RES[c, 0]
-            sy = a10 * x + a11 * y + MULTI_RES[c, 1]
+            dx, dy = x - MULTI_CENTRE, y - MULTI_CENTRE
+            sx = MULTI_CENTRE + a00 * dx + a01 * dy + MULTI_RES[c, 0]
+            sy = MULTI_CENTRE + a10 * dx + a11 * dy + MULTI_RES[c, 1]
             spots[k, c] = rng.poisson(
                 _multi_spot(box, sx, sy, amps[c], sigma, bgs[c])
             )
@@ -816,6 +817,58 @@ class TestMultichannelFits:
         assert np.mean(theta[ok, 5]) == pytest.approx(bgs[0], abs=1.5)
         assert np.mean(theta[ok, 6]) == pytest.approx(bgs[1], abs=1.5)
 
+    @pytest.mark.parametrize("mle", [False, True], ids=["lsq", "mle"])
+    def test_mirrored_channel_is_fitted_where_its_spot_is(self, mle):
+        """A split field of view flips one half onto the other, so its
+        Jacobian has a negative determinant. The channel geometry is a
+        linearization of the *displacement* from the box center, not of the
+        box coordinate: applied to the coordinate, a mirrored channel is
+        evaluated a whole box width away from its own spot and its photon
+        count runs off to absurd values while the reference channel still
+        looks fine."""
+        n = 200
+        amps, bgs = [500.0, 500.0], [10.0, 10.0]
+        mirrored = np.array(
+            [[1.0, 0.0, 0.0, 1.0], [0.999, 0.05, 0.049, -0.996]],
+            dtype=np.float64,
+        )
+        rng = np.random.RandomState(11)
+        spots = np.zeros((n, 2, MULTI_BOX, MULTI_BOX), dtype=np.float32)
+        truth = np.zeros((n, 3))
+        for k in range(n):
+            x = MULTI_CENTRE + rng.uniform(-1.5, 1.5)
+            y = MULTI_CENTRE + rng.uniform(-1.5, 1.5)
+            sigma = rng.uniform(1.1, 1.5)
+            truth[k] = (x, y, sigma)
+            for c in range(2):
+                a00, a01, a10, a11 = mirrored[c]
+                dx, dy = x - MULTI_CENTRE, y - MULTI_CENTRE
+                sx = MULTI_CENTRE + a00 * dx + a01 * dy + MULTI_RES[c, 0]
+                sy = MULTI_CENTRE + a10 * dx + a11 * dy + MULTI_RES[c, 1]
+                spots[k, c] = rng.poisson(
+                    _multi_spot(MULTI_BOX, sx, sy, amps[c], sigma, bgs[c])
+                )
+        jac = np.tile(mirrored, (n, 1, 1))
+        res = np.tile(MULTI_RES[:2], (n, 1, 1))
+
+        theta, _, _, _ = gaussfit.fit_spots_multichannel(
+            gaussfit.MULTI_KIND_DECOUPLED,
+            spots,
+            jac,
+            res,
+            _decoupled_seed(spots),
+            mle=mle,
+        )
+
+        ok = np.isfinite(theta).all(axis=1)
+        assert ok.sum() > 0.95 * n
+        assert abs(np.mean(theta[ok, 0] - truth[ok, 0])) < 0.05
+        assert abs(np.mean(theta[ok, 1] - truth[ok, 1])) < 0.05
+        # both channels, not just the reference one, keep a sane amplitude
+        assert np.mean(theta[ok, 3]) == pytest.approx(amps[0], rel=0.1)
+        assert np.mean(theta[ok, 4]) == pytest.approx(amps[1], rel=0.1)
+        assert (theta[ok, 4] > 0).all()
+
     def test_async_matches_the_serial_fit(self):
         n = 40
         spots, _ = _multi_batch(n, [400.0, 400.0], [10.0, 10.0])
@@ -910,8 +963,10 @@ class TestMultichannelCrlb:
         )
         for c in range(n_channels):
             a00, a01, a10, a11 = MULTI_JAC[c]
-            sx = a00 * self.TRUTH_X + a01 * self.TRUTH_Y + MULTI_RES[c, 0]
-            sy = a10 * self.TRUTH_X + a11 * self.TRUTH_Y + MULTI_RES[c, 1]
+            dx = self.TRUTH_X - MULTI_CENTRE
+            dy = self.TRUTH_Y - MULTI_CENTRE
+            sx = MULTI_CENTRE + a00 * dx + a01 * dy + MULTI_RES[c, 0]
+            sy = MULTI_CENTRE + a10 * dx + a11 * dy + MULTI_RES[c, 1]
             clean = _multi_spot(
                 MULTI_BOX, sx, sy, amps[c], self.TRUTH_SIGMA, bgs[c]
             )
