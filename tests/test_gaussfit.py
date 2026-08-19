@@ -29,12 +29,13 @@ from concurrent import futures
 import numpy as np
 import pytest
 
-from picasso import gausslq, localize
+from picasso import gausslq
 from picasso.fitting import (
     gaussfit,
     gaussfit_cuda,
     lmfit_cuda,
     precision,
+    seeds,
     splinefit,
 )
 
@@ -96,7 +97,7 @@ def _seed(model, spots):
         gaussfit.ELLIPTIC: {},
         gaussfit.ROTATED: dict(rotated=True),
     }[model]
-    return localize._initial_parameters_gauss(spots, BOX, **kwargs).astype(
+    return seeds.initial_parameters_gauss(spots, BOX, **kwargs).astype(
         np.float64
     )
 
@@ -108,9 +109,7 @@ def lq_and_lm(noisy_batch):
     lm = gaussfit.fit_spots(
         gaussfit.ELLIPTIC,
         noisy_batch,
-        localize._initial_parameters_gauss(noisy_batch, BOX).astype(
-            np.float64
-        ),
+        seeds.initial_parameters_gauss(noisy_batch, BOX).astype(np.float64),
         mle=False,
         tolerance=1e-10,
         max_iterations=400,
@@ -303,7 +302,7 @@ class TestThreading:
     def test_threaded_matches_serial_bitwise(self, noisy_batch):
         """One thread per spot with no shared state, so the answer cannot
         depend on the scheduling."""
-        seed = localize._initial_parameters_gauss(noisy_batch, BOX).astype(
+        seed = seeds.initial_parameters_gauss(noisy_batch, BOX).astype(
             np.float64
         )
         serial = gaussfit.fit_spots(
@@ -319,7 +318,7 @@ class TestThreading:
             np.testing.assert_array_equal(a, b)
 
     def test_async_can_be_stopped(self, noisy_batch):
-        seed = localize._initial_parameters_gauss(noisy_batch, BOX).astype(
+        seed = seeds.initial_parameters_gauss(noisy_batch, BOX).astype(
             np.float64
         )
         fit = gaussfit.fit_spots_async(
@@ -346,7 +345,7 @@ class TestSchedule:
         assert gaussfit_cuda.n_parameters is gaussfit.n_parameters
 
     def test_iteration_cap_bites(self, noisy_batch):
-        seed = localize._initial_parameters_gauss(noisy_batch, BOX).astype(
+        seed = seeds.initial_parameters_gauss(noisy_batch, BOX).astype(
             np.float64
         )
         capped = gaussfit.fit_spots(
@@ -359,7 +358,7 @@ class TestSchedule:
         assert free.max() > 2
 
     def test_looser_tolerance_stops_earlier(self, noisy_batch):
-        seed = localize._initial_parameters_gauss(noisy_batch, BOX).astype(
+        seed = seeds.initial_parameters_gauss(noisy_batch, BOX).astype(
             np.float64
         )
         loose = gaussfit.fit_spots(
@@ -466,7 +465,7 @@ class TestWideSigmaSeedDoesNotAbortTheFit:
         first, undamped step to overshoot the background below zero.
         """
         spots = _poisson_spots(31, n=40)
-        seed = localize._initial_parameters_gauss(spots, 31).astype(np.float64)
+        seed = seeds.initial_parameters_gauss(spots, 31).astype(np.float64)
         seed[:, 3] = seed[:, 4] = width_seed
         fitted, _, states, iterations = gaussfit.fit_spots(
             gaussfit.ELLIPTIC,
@@ -494,11 +493,11 @@ class TestWideSigmaSeedDoesNotAbortTheFit:
         still *arrives*, which is the point: the old driver called this
         situation fatal on iteration 1 and returned the seed. This is also why
         the width seed itself is worth getting right
-        (``localize._initial_widths_gauss``) - correctness here is bought with
+        (``picasso.fitting.seeds._initial_widths_gauss``) - correctness here is bought with
         an iteration budget no production run would grant.
         """
         spots = _poisson_spots(31, n=40)
-        seed = localize._initial_parameters_gauss(spots, 31).astype(np.float64)
+        seed = seeds.initial_parameters_gauss(spots, 31).astype(np.float64)
         seed[:, 3] = seed[:, 4] = 8.0
         fitted, _, states, _ = gaussfit.fit_spots(
             gaussfit.ELLIPTIC,
@@ -523,7 +522,7 @@ class TestWideSigmaSeedDoesNotAbortTheFit:
             gaussfit.ELLIPTIC: {},
             gaussfit.ROTATED: dict(rotated=True),
         }[model]
-        seed = localize._initial_parameters_gauss(spots, box, **kwargs).astype(
+        seed = seeds.initial_parameters_gauss(spots, box, **kwargs).astype(
             np.float64
         )
         _, _, states, _ = gaussfit.fit_spots(
@@ -542,9 +541,7 @@ class TestWideSigmaSeedDoesNotAbortTheFit:
         coordinate is a whole pixel.
         """
         spots = _poisson_spots(box)
-        seed = localize._initial_parameters_gauss(spots, box).astype(
-            np.float64
-        )
+        seed = seeds.initial_parameters_gauss(spots, box).astype(np.float64)
         fitted, _, _, iterations = gaussfit.fit_spots(
             gaussfit.ELLIPTIC,
             spots,
@@ -566,7 +563,7 @@ class TestWideSigmaSeedDoesNotAbortTheFit:
         never take a valid step, if a rejected attempt were free.
         """
         spots = _poisson_spots(23, n=20)
-        seed = localize._initial_parameters_gauss(spots, 23).astype(np.float64)
+        seed = seeds.initial_parameters_gauss(spots, 23).astype(np.float64)
         seed[:, 3] = seed[:, 4] = 8.0
         for budget in (1, 2, 5):
             _, _, _, iterations = gaussfit.fit_spots(
@@ -600,7 +597,7 @@ class TestNonPositiveModelIsAbandoned:
     def test_every_converged_mle_fit_beats_ground_truth(self, noisy_batch):
         """An MLE that converges must explain the data at least as well as
         the truth does; a floored fit would not."""
-        seed = localize._initial_parameters_gauss(noisy_batch, BOX).astype(
+        seed = seeds.initial_parameters_gauss(noisy_batch, BOX).astype(
             np.float64
         )
         fitted, chi, states, _ = gaussfit.fit_spots(
@@ -715,7 +712,7 @@ class TestMultichannelReducesToSingleChannel:
                     rng.uniform(5, 20),
                 )
             )
-        seed = localize._initial_parameters_gauss(
+        seed = seeds.initial_parameters_gauss(
             spots, BOX, spherical=True
         ).astype(np.float64)
 

@@ -27,7 +27,7 @@ from PyQt6 import QtWidgets
 
 from picasso import gaussmle, gausslq, io, lib, localize, spline, transforms
 from picasso import transforms as transforms_mod
-from picasso.fitting import gaussfit_cuda, precision, splinefit
+from picasso.fitting import gaussfit_cuda, precision, seeds, splinefit
 from picasso.gui import localize as localize_gui
 
 from tests.conftest import (
@@ -1773,7 +1773,7 @@ def _gpufit_gauss_with_states(spots, rotated=False, mle=False):
     returning ``(theta, states, n_iterations)``."""
     data = np.maximum(spots, 0) if mle else spots
     size = data.shape[1]
-    init = localize._initial_parameters_gauss(data, size, rotated=rotated)
+    init = seeds.initial_parameters_gauss(data, size, rotated=rotated)
     model = gaussfit_cuda.ROTATED if rotated else gaussfit_cuda.ELLIPTIC
     params, _chi_squares, states, n_iter = gaussfit_cuda.fit_spots(
         model, data, init.astype(np.float64), mle=mle
@@ -1841,7 +1841,7 @@ class TestGpufit:
         applies to the model's peak-height parameter."""
         spots, _ = synthetic_spots
         size = spots.shape[1]
-        init = localize._initial_parameters_gauss(spots, size)
+        init = seeds.initial_parameters_gauss(spots, size)
         raw, _, _, _ = gaussfit_cuda.fit_spots(
             gaussfit_cuda.ELLIPTIC,
             spots,
@@ -2051,7 +2051,7 @@ class TestGpufit:
 
 
 class TestInitialParametersGpufit:
-    """``localize._initial_parameters_gauss`` seeds the Levenberg-Marquardt
+    """``seeds.initial_parameters_gauss`` seeds the Levenberg-Marquardt
     fit; it is pure NumPy and needs no GPU."""
 
     def test_elliptic_layout_and_values(self):
@@ -2063,7 +2063,7 @@ class TestInitialParametersGpufit:
         spots[0, 3, 3] = 103.0  # peak
         spots[1] = 7.0
         spots[1, 2, 4] = 57.0
-        init = localize._initial_parameters_gauss(spots, box)
+        init = seeds.initial_parameters_gauss(spots, box)
 
         assert init.shape == (2, 6)
         assert init.dtype == np.float32
@@ -2087,7 +2087,7 @@ class TestInitialParametersGpufit:
         # falls back to max(box / 5, 1.0) and is then capped by it.
         box = 4
         spots = np.ones((1, box, box), dtype=np.float32)
-        init = localize._initial_parameters_gauss(spots, box)
+        init = seeds.initial_parameters_gauss(spots, box)
         np.testing.assert_allclose(init[:, 3], 1.0)
         np.testing.assert_allclose(init[:, 4], 1.0)
 
@@ -2096,7 +2096,7 @@ class TestInitialParametersGpufit:
         blob several times too fat - see
         ``test_gaussfit.TestWideSigmaSeedDoesNotAbortTheFit``."""
         truth = 1.4
-        seeds = {}
+        widths = {}
         for box in (13, 23, 31):
             centre = (box - 1) / 2.0
             yy, xx = np.mgrid[0:box, 0:box].astype(np.float64)
@@ -2108,15 +2108,15 @@ class TestInitialParametersGpufit:
                 )
                 + 10.0
             )
-            init = localize._initial_parameters_gauss(
+            init = seeds.initial_parameters_gauss(
                 mu[None].astype(np.float32), box
             )
-            seeds[box] = init[0, 3]
+            widths[box] = init[0, 3]
             # Never wider than the old fixed seed, and close to the truth.
-            assert seeds[box] <= max(box / 5.0, 1.0)
-            assert abs(seeds[box] - truth) < 0.5
+            assert widths[box] <= max(box / 5.0, 1.0)
+            assert abs(widths[box] - truth) < 0.5
         # The old seed tripled from box 13 to 31; this one barely moves.
-        assert abs(seeds[31] - seeds[13]) < 0.3
+        assert abs(widths[31] - widths[13]) < 0.3
 
     def test_rotated_breaks_width_symmetry(self):
         # The rotated model gets a 7th (angle) parameter, and the two widths
@@ -2125,7 +2125,7 @@ class TestInitialParametersGpufit:
         box = 7
         spots = np.zeros((3, box, box), dtype=np.float32)
         spots[:, 3, 3] = 100.0
-        init = localize._initial_parameters_gauss(spots, box, rotated=True)
+        init = seeds.initial_parameters_gauss(spots, box, rotated=True)
         assert init.shape == (3, 7)
         # A single bright pixel gives a zero second moment, so the widths sit
         # on the floor before the asymmetry nudge is applied.
@@ -2144,7 +2144,7 @@ class TestInitialParametersGpufit:
         spots[0, 3, 3] = 103.0
         spots[1] = 7.0
         spots[1, 2, 4] = 57.0
-        init = localize._initial_parameters_gauss(spots, box, spherical=True)
+        init = seeds.initial_parameters_gauss(spots, box, spherical=True)
         assert init.shape == (2, 5)
         assert init.dtype == np.float32
         center = box / 2.0 - 0.5
@@ -2692,17 +2692,17 @@ class TestSplineHelpers:
     def test_initial_parameters_shape(self, synthetic_spots):
         spots, _ = synthetic_spots
         calib_3d = _fake_spline_calibration(model="spline-3d")
-        init_3d = localize._initial_parameters_spline(spots, calib_3d)
+        init_3d = seeds.initial_parameters_spline(spots, calib_3d)
         assert init_3d.shape == (len(spots), 5)
         assert init_3d.dtype == np.float32
         # z_shift is initialised to -z_init (the in-focus slice), so that the
         # Gpufit model's native z = -z_shift starts at the focus (see
-        # _initial_parameters_spline / spline.calibrate_spline). z_init defaults
+        # seeds.initial_parameters_spline / spline.calibrate_spline). z_init defaults
         # to z_center for this calibration.
         np.testing.assert_allclose(init_3d[:, 3], -calib_3d["z_center"])
 
         calib_2d = _fake_spline_calibration(model="spline-2d")
-        init_2d = localize._initial_parameters_spline(spots, calib_2d)
+        init_2d = seeds.initial_parameters_spline(spots, calib_2d)
         assert init_2d.shape == (len(spots), 4)
 
     def test_locs_from_fits_spline_3d(self):
@@ -3396,7 +3396,7 @@ class TestSplineHelpers:
         # scale the channels apart so a transposed or channel-major/minor
         # mix-up cannot pass
         spots = spots * (1.0 + np.arange(n_channels, dtype=np.float32))
-        init = localize._initial_parameters_spline(spots, calib)
+        init = seeds.initial_parameters_spline(spots, calib)
         # [x, y, z, N_0..N_{c-1}, bg_0..bg_{c-1}]
         assert init.shape == (4, 3 + 2 * n_channels)
         np.testing.assert_allclose(init[:, :2], 0.0)
@@ -3420,7 +3420,7 @@ class TestSplineHelpers:
             .random((4, BOX, BOX, 2), dtype=np.float64)
             .astype(np.float32)
         )
-        init = localize._initial_parameters_spline(spots, calib)
+        init = seeds.initial_parameters_spline(spots, calib)
         assert init.shape == (4, 5)
         # z_shift initialised to -z_init (= -z_center here); see the
         # single-channel test above.

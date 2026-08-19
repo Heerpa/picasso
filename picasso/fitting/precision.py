@@ -504,7 +504,7 @@ def _gauss_crlb(
         Fitted parameters in the fit's order ``[photons (total N), x, y,
         sx, sy, bg]`` (elliptic) or ``[..., bg, angle (radians)]`` (rotated).
         Positions are box-local (pixel = parameter, matching
-        :func:`_initial_parameters_gauss`).
+        :func:`picasso.fitting.seeds.initial_parameters_gauss`).
     box : int
         Fit box side length (pixels).
     em : bool

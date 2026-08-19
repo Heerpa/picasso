@@ -66,7 +66,7 @@ from . import io, lib, localize, __version__
 # aliased: `transforms` is used as a local name for lists of channel
 # transforms throughout this module
 from . import transforms as tform
-from .fitting import gaussfit, precision, splinefit
+from .fitting import gaussfit, precision, seeds, splinefit
 from .registration import (
     fit_registration,
     flip_affine,
@@ -471,7 +471,7 @@ def _fit_gauss_spots(spots: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     thetas, _, states, _ = gaussfit.fit_spots(
         gaussfit.ELLIPTIC,
         spots,
-        localize._initial_parameters_gauss(spots, box),
+        seeds.initial_parameters_gauss(spots, box),
         tolerance=gaussfit.TOLERANCE_LSQ_CPU,
         max_iterations=gaussfit.MAX_ITERATIONS_LSQ_CPU,
     )
@@ -638,10 +638,11 @@ def _focus_center_offset(
     box = focus.shape[0]
     thetas, states = _fit_gauss_spots(focus[None])
     # theta is [photons, x, y, sx, sy, bg] in box-local pixels, x the column
-    # and y the row (see localize._initial_parameters_gauss). A slice no
-    # Gaussian can describe either aborts the fit or "converges" to one with
-    # no photons or a width beyond the box - neither is a centre estimate, and
-    # both are a reason to fall back rather than to fail the calibration.
+    # and y the row (see picasso.fitting.seeds.initial_parameters_gauss). A
+    # slice no Gaussian can describe either aborts the fit or "converges" to
+    # one with no photons or a width beyond the box - neither is a centre
+    # estimate, and both are a reason to fall back rather than to fail the
+    # calibration.
     photons, x, y, sx, sy = (float(_) for _ in thetas[0, :5])
     aborted = states[0] in (
         splinefit.FIT_STATE_SINGULAR_HESSIAN,
@@ -1308,8 +1309,9 @@ def calibrate_spline(
     )
     template = built["template"]  # (box, box, n_steps)
     z_center = built["z_center"]
-    # Two distinct z references (see also ``localize._initial_parameters_spline``
-    # / ``locs_from_fits_spline``):
+    # Two distinct z references (see also
+    # ``picasso.fitting.seeds.initial_parameters_spline`` /
+    # ``locs_from_fits_spline``):
     #  - z_init: the sharpest (in-focus) slice. The fit's z_shift is initialized
     #    to -z_init. This is the numerically sound, convention-INDEPENDENT start
     #    and must NOT depend on ``correct_z_bias`` - otherwise the two

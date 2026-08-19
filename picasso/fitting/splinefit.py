@@ -30,9 +30,11 @@ per-spot progress - the same arrangement as ``picasso.gaussmle``.
 
 This module deliberately knows nothing about calibration dicts: it takes
 plain arrays only, so that ``picasso.localize`` can import it without a
-circular dependency. ``localize`` owns the dict handling
-(``_spline_coeff_reshaped``, ``_spline_channel_jacobians``,
-``_initial_parameters_spline``, ``crop_spline_calibration``).
+circular dependency. The dict handling lives elsewhere:
+``picasso.fitting.precision`` (``_spline_coeff_reshaped``,
+``_spline_channel_jacobians``), ``picasso.fitting.seeds``
+(``initial_parameters_spline``) and ``picasso.localize``
+(``crop_spline_calibration``).
 
 References
 ----------
@@ -560,7 +562,8 @@ def _accumulate_3d(
     """Chi-square, gradient and Hessian of the shared-amplitude 3D model.
 
     Parameters are ``[amplitude, x_shift, y_shift, z_shift, offset]``, the
-    order the Gpufit models and ``localize._initial_parameters_spline`` use.
+    order the Gpufit models and
+    ``picasso.fitting.seeds.initial_parameters_spline`` use.
     The single-channel ``spline-3d`` model is the ``n_channels == 1``, identity
     Jacobian, zero residual case of the multichannel one.
 
@@ -1496,7 +1499,7 @@ def fit_spots(
         (``precision._spline_crlb_residuals``); zeros for a single-channel fit.
     initial_parameters : np.ndarray
         ``(n_spots, n_params)`` seeds, from
-        ``localize._initial_parameters_spline``.
+        ``picasso.fitting.seeds.initial_parameters_spline``.
     z_seeds : np.ndarray
         Axial seeds for the multi-start, in z-shift units.
     apply_seeds : bool

@@ -325,9 +325,10 @@ def _make_accumulate_elliptic(ftype):
 def _make_accumulate_rotated(ftype):
     """Rotated elliptic Gaussian, ``[photons, x, y, sx, sy, bg, angle]``.
 
-    The angle derivative vanishes identically when ``sx == sy``, which makes the
-    first Hessian singular; ``localize._initial_parameters_gauss`` breaks that
-    symmetry in its seed on purpose, and this model relies on it."""
+    The angle derivative vanishes identically when ``sx == sy``, which makes
+    the first Hessian singular;
+    ``picasso.fitting.seeds.initial_parameters_gauss`` breaks that symmetry in
+    its seed on purpose, and this model relies on it."""
     half = ftype(0.5)
 
     @cuda.jit(device=True)
@@ -543,7 +544,7 @@ def fit_spots(
         ``(n_spots, box, box)`` photon counts, indexed ``[spot, y, x]``.
     initial_parameters : np.ndarray
         ``(n_spots, n_params)`` seeds, from
-        ``localize._initial_parameters_gauss``.
+        ``picasso.fitting.seeds.initial_parameters_gauss``.
     mle : bool, optional
         Use the Poisson maximum-likelihood estimator instead of least squares.
     tolerance, max_iterations : float and int, optional
@@ -1061,7 +1062,7 @@ def fit_spots_multichannel(
         Channel 0 is zero.
     initial_parameters : np.ndarray
         ``(n_spots, n_params)`` seeds, from
-        ``localize._initial_parameters_gauss_multichannel``.
+        ``picasso.fitting.seeds.initial_parameters_gauss_multichannel``.
     mle : bool, optional
         Use the Poisson maximum-likelihood estimator instead of least squares.
     tolerance, max_iterations : optional

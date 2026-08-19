@@ -21,8 +21,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from picasso import localize
-from picasso.fitting import gaussfit, gaussfit_cuda, lmfit_cuda, splinefit
+from picasso.fitting import (
+    gaussfit,
+    gaussfit_cuda,
+    lmfit_cuda,
+    seeds,
+    splinefit,
+)
 
 pytestmark = pytest.mark.skipif(
     not lmfit_cuda.CUDA_AVAILABLE, reason="no CUDA device"
@@ -80,7 +85,7 @@ def _seed(model, spots):
         gaussfit_cuda.ELLIPTIC: {},
         gaussfit_cuda.ROTATED: dict(rotated=True),
     }[model]
-    return localize._initial_parameters_gauss(spots, BOX, **kwargs).astype(
+    return seeds.initial_parameters_gauss(spots, BOX, **kwargs).astype(
         np.float64
     )
 
@@ -253,7 +258,7 @@ class TestWidthAndAngleDegeneracies:
         """With ``sx == sy`` the angle derivative is identically zero.
 
         The first Hessian is then singular and the fit cannot start, which is
-        why ``_initial_parameters_gauss`` perturbs the two widths apart. Pinned
+        why ``picasso.fitting.seeds.initial_parameters_gauss`` perturbs the two widths apart. Pinned
         here because it looks like an arbitrary fudge at the call site."""
         spots = np.zeros((1, BOX, BOX), dtype=np.float32)
         seed = _seed(gaussfit_cuda.ROTATED, spots)

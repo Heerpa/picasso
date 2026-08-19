@@ -390,8 +390,9 @@ def _accumulate_rotated(
     """Rotated elliptic Gaussian, ``[amplitude, x, y, sx, sy, bg, angle]``.
 
     The angle derivative vanishes identically when ``sx == sy``, which makes
-    the first Hessian singular; ``localize._initial_parameters_gauss`` breaks
-    that symmetry in its seed on purpose, and this model relies on it."""
+    the first Hessian singular;
+    ``picasso.fitting.seeds.initial_parameters_gauss`` breaks that symmetry in
+    its seed on purpose, and this model relies on it."""
     box = spots.shape[1]
     amp = theta[0]
     cx = theta[1]
@@ -840,7 +841,7 @@ def fit_spots(
         ``(n_spots, box, box)`` photon counts, indexed ``[spot, y, x]``.
     initial_parameters : np.ndarray
         ``(n_spots, n_params)`` seeds, from
-        ``localize._initial_parameters_gauss``.
+        ``picasso.fitting.seeds.initial_parameters_gauss``.
     mle : bool, optional
         Use the Poisson maximum-likelihood estimator instead of least squares.
     tolerance, max_iterations : float and int, optional
@@ -1634,7 +1635,7 @@ def fit_spots_multichannel(
         zero.
     initial_parameters : np.ndarray
         ``(n_spots, n_params)`` seeds, from
-        ``localize._initial_parameters_gauss_multichannel``.
+        ``picasso.fitting.seeds.initial_parameters_gauss_multichannel``.
     mle : bool, optional
         Use the Poisson maximum-likelihood estimator instead of least squares.
     tolerance, max_iterations : optional

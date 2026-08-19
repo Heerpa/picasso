@@ -482,7 +482,7 @@ class TestSingleChannelFits:
         resetting it every iteration makes badly-seeded fits stall.
 
         Amplitude and background are seeded from the data, as
-        ``localize._initial_parameters_spline`` does, so the test isolates the
+        ``seeds.initial_parameters_spline`` does, so the test isolates the
         position parameters. Seeding those badly *as well* drives the
         maximum-likelihood estimator into a negative model value and it bails
         out - see :meth:`test_mle_reports_negative_curvature`."""
@@ -525,7 +525,7 @@ class TestSingleChannelFits:
         spots = _spots_from_terms(
             terms, BOX, amplitude, offset, DX, DY, z_native
         )
-        # The standard seed of localize._initial_parameters_spline. It puts the
+        # The standard seed of seeds.initial_parameters_spline. It puts the
         # corner model value below zero for this calibration.
         initial = np.zeros((1, 5))
         initial[0, 0] = spots.max() - spots.min()

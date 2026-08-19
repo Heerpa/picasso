@@ -27,6 +27,11 @@ module               contents
                      rotated), over the same LM driver.
 :mod:`gaussfit_cuda`   GPU 2D Gaussian PSF fitting (spherical, elliptical and
                      rotated).
+:mod:`seeds`         The initial parameters the fitters above start from,
+                     one closed-form estimator per model family. Plain NumPy,
+                     and the one module that has to change in step with a
+                     model's parameter layout. Not part of the Gpufit port,
+                     which leaves the seed to its caller.
 :mod:`precision`     Uncertainties of the fitted parameters: the closed-form
                      precisions and the numerically inverted Fisher matrices
                      (Cramer-Rao bounds), on the CPU and on CUDA GPUs. Not
