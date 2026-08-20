@@ -10,13 +10,31 @@ not just shapes.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from picasso import gausslq
+from picasso import gausslq, localize
+from picasso.fitting import precision
 
-from tests.conftest import BOX
+from tests.conftest import BOX, make_rotated_gaussian_spot
+
+
+def _precision_matrix(sx, sy, angle):
+    """Precision (inverse-covariance) matrix of a rotated Gaussian.
+
+    ``(sx, sy, angle)`` and ``(sy, sx, angle +/- pi/2)`` describe the *same*
+    ellipse — the rotated fit is free to return either. The precision
+    matrix is invariant under that relabeling, so comparing it (rather than
+    the raw angle/widths) tests recovery without tripping on the
+    degeneracy.
+    """
+    c, s = np.cos(angle), np.sin(angle)
+    R = np.array([[c, -s], [s, c]])
+    D = np.diag([1.0 / sx**2, 1.0 / sy**2])
+    return R.T @ D @ R
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +133,62 @@ class TestFitSpots:
         assert len(calls) == len(spots)
         # callback receives the running index, monotonically increasing
         assert calls == list(range(len(spots)))
+
+
+class TestConvergenceSchedule:
+    """``tolerance``/``max_iterations`` are exposed so the GUI and the CLI can
+    offer them for every fitting method, this one included."""
+
+    def test_defaults_reproduce_minpacks_own(self):
+        """MAX_ITERATIONS must map to exactly ``leastsq``'s default
+        ``maxfev``, so passing the default explicitly is a no-op and the
+        historical behavior of ``gausslq`` is unchanged."""
+        for n_parameters in (5, 6, 7):
+            assert gausslq._max_function_evaluations(
+                gausslq.MAX_ITERATIONS, n_parameters
+            ) == 200 * (n_parameters + 1)
+
+    def test_defaults_match_passing_none(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        np.testing.assert_array_equal(
+            gausslq.fit_spots(spots),
+            gausslq.fit_spots(
+                spots,
+                tolerance=gausslq.TOLERANCE,
+                max_iterations=gausslq.MAX_ITERATIONS,
+            ),
+        )
+
+    def test_iteration_cap_bites(self, synthetic_spots):
+        """One iteration cannot reach the optimum a full fit finds."""
+        spots, gt = synthetic_spots
+        converged = gausslq.fit_spots(spots)
+        starved = gausslq.fit_spots(spots, max_iterations=1)
+        assert not np.allclose(converged, starved)
+        # ...and it is the starved fit that is wrong, not merely different
+        assert np.max(np.abs(starved[:, 0] - gt.x.values)) > np.max(
+            np.abs(converged[:, 0] - gt.x.values)
+        )
+
+    def test_tighter_tolerance_does_not_move_a_converged_fit(
+        self, synthetic_spots
+    ):
+        """The default stop is already at the optimum for clean spots, so
+        tightening it changes the position by far less than a pixel."""
+        spots, _ = synthetic_spots
+        loose = gausslq.fit_spots(spots)
+        tight = gausslq.fit_spots(spots, tolerance=1e-8, max_iterations=400)
+        assert np.max(np.abs(loose[:, :2] - tight[:, :2])) < 0.05
+
+    @pytest.mark.parametrize(
+        "kwargs", [{"spherical": True}, {"rotated": True}, {}]
+    )
+    def test_every_model_accepts_the_schedule(self, synthetic_spots, kwargs):
+        spots, _ = synthetic_spots
+        theta = gausslq.fit_spots(
+            spots[:3], tolerance=1e-3, max_iterations=50, **kwargs
+        )
+        assert np.all(np.isfinite(theta))
 
 
 # ---------------------------------------------------------------------------
@@ -381,18 +455,491 @@ class TestSigmaUncertainty:
 
 
 # ---------------------------------------------------------------------------
-# Optional GPU backend — skipped if pygpufit is not installed
+# Spherical (isotropic, single-width) least-squares fit
 # ---------------------------------------------------------------------------
 
 
-class TestGpufit:
-    """Tests for the optional GPU codepath. Skipped if pygpufit isn't
-    installed (which is true for the typical test environment)."""
+class TestFitSpotSpherical:
+    """``gausslq.fit_spot(spherical=True)`` fits one shared width."""
 
-    def test_fit_spots_gpufit(self, synthetic_spots):
-        pytest.importorskip("pygpufit")
-        spots, gt = synthetic_spots
-        theta = gausslq.fit_spots_gpufit(spots)
+    def test_returns_six_floats_with_equal_widths(
+        self, synthetic_spot_factory
+    ):
+        """The spherical fit still returns the standard 6-parameter layout
+        ``[x, y, photons, bg, sx, sy]`` with ``sx == sy`` so downstream
+        code is unchanged."""
+        spot = synthetic_spot_factory(sx=1.1, sy=1.1)
+        result = gausslq.fit_spot(spot, spherical=True)
+        assert result.shape == (6,)
+        assert np.all(np.isfinite(result))
+        assert result[4] == result[5]
+
+    def test_recovers_isotropic_ground_truth(self, synthetic_spot_factory):
+        """A noiseless isotropic spot is recovered to tight tolerance."""
+        spot = synthetic_spot_factory(
+            x0=0.2, y0=-0.15, sx=1.2, sy=1.2, photons=5000.0, bg=10.0
+        )
+        x, y, photons, bg, sx, sy = gausslq.fit_spot(spot, spherical=True)
+        assert x == pytest.approx(0.2, abs=5e-3)
+        assert y == pytest.approx(-0.15, abs=5e-3)
+        assert sx == pytest.approx(1.2, abs=5e-3)
+        assert sy == pytest.approx(1.2, abs=5e-3)
+        assert photons == pytest.approx(5000.0, rel=5e-3)
+        assert bg == pytest.approx(10.0, rel=5e-2)
+
+    def test_single_width_averages_anisotropic_spot(
+        self, synthetic_spot_factory
+    ):
+        """Given an anisotropic spot, the single-width fit lands between
+        the two true widths (it cannot represent sx != sy)."""
+        spot = synthetic_spot_factory(sx=1.4, sy=0.9)
+        _, _, _, _, sx, sy = gausslq.fit_spot(spot, spherical=True)
+        assert sx == sy
+        assert 0.9 < sx < 1.4
+
+
+class TestFitSpotsSpherical:
+    """Batch spherical fitting via ``gausslq.fit_spots``."""
+
+    def test_shape_and_equal_widths(self, synthetic_spots_isotropic):
+        spots, _ = synthetic_spots_isotropic
+        theta = gausslq.fit_spots(spots, spherical=True)
         assert theta.shape == (len(spots), 6)
-        # GPU returns parameters as [photons, x, y, sx, sy, bg]
-        np.testing.assert_allclose(theta[:, 0], gt.photons.values, rtol=0.05)
+        assert theta.dtype == np.float32
+        assert np.all(np.isfinite(theta))
+        np.testing.assert_array_equal(theta[:, 4], theta[:, 5])
+
+    def test_recovers_ground_truth(self, synthetic_spots_isotropic):
+        spots, gt = synthetic_spots_isotropic
+        theta = gausslq.fit_spots(spots, spherical=True)
+        # theta cols: x, y, photons, bg, sx, sy
+        np.testing.assert_allclose(theta[:, 0], gt.x.values, atol=0.02)
+        np.testing.assert_allclose(theta[:, 1], gt.y.values, atol=0.02)
+        np.testing.assert_allclose(theta[:, 2], gt.photons.values, rtol=0.02)
+        np.testing.assert_allclose(theta[:, 4], gt.sx.values, atol=0.02)
+
+    def test_per_spot_matches_scalar(self, synthetic_spots_isotropic):
+        spots, _ = synthetic_spots_isotropic
+        batch = gausslq.fit_spots(spots, spherical=True)
+        for i in [0, 5, len(spots) - 1]:
+            single = gausslq.fit_spot(spots[i], spherical=True)
+            np.testing.assert_allclose(batch[i], single, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Rotated elliptical least-squares fit
+# ---------------------------------------------------------------------------
+
+
+class TestFitSpotRotated:
+    """``gausslq.fit_spot(rotated=True)`` recovers the orientation."""
+
+    def test_returns_seven_floats(self):
+        spot = make_rotated_gaussian_spot(
+            9, 0.1, -0.1, 1.6, 0.9, 6000.0, 10.0, 0.4
+        )
+        result = gausslq.fit_spot(spot, rotated=True)
+        assert result.shape == (7,)
+        assert np.all(np.isfinite(result))
+
+    def test_recovers_ellipse_precision_matrix(self):
+        """The recovered ellipse (precision matrix) matches ground truth,
+        independent of the sx<->sy / angle+-pi/2 relabeling."""
+        box = 9
+        for angle in [-1.2, -0.6, -0.2, 0.3, 0.7, 1.1]:
+            spot = make_rotated_gaussian_spot(
+                box, 0.15, -0.1, 1.7, 0.9, 6000.0, 10.0, angle
+            )
+            _, _, _, _, sx, sy, ang = gausslq.fit_spot(spot, rotated=True)
+            np.testing.assert_allclose(
+                _precision_matrix(sx, sy, ang),
+                _precision_matrix(1.7, 0.9, angle),
+                atol=5e-3,
+            )
+            # sorted widths recovered regardless of axis labeling
+            np.testing.assert_allclose(sorted([sx, sy]), [0.9, 1.7], atol=1e-2)
+
+    def test_recovers_position_and_photons(self):
+        spot = make_rotated_gaussian_spot(
+            9, 0.25, -0.2, 1.6, 0.95, 7000.0, 12.0, 0.5
+        )
+        x, y, photons, bg, _, _, _ = gausslq.fit_spot(spot, rotated=True)
+        assert x == pytest.approx(0.25, abs=1e-2)
+        assert y == pytest.approx(-0.2, abs=1e-2)
+        assert photons == pytest.approx(7000.0, rel=1e-2)
+        assert bg == pytest.approx(12.0, rel=5e-2)
+
+
+class TestFitSpotsRotated:
+    """Batch rotated fitting via ``gausslq.fit_spots``."""
+
+    def test_shape_is_seven_columns(self, synthetic_spots_rotated):
+        spots, _ = synthetic_spots_rotated
+        theta = gausslq.fit_spots(spots, rotated=True)
+        assert theta.shape == (len(spots), 7)
+        assert np.all(np.isfinite(theta))
+
+    def test_recovers_each_ellipse(self, synthetic_spots_rotated):
+        spots, gt = synthetic_spots_rotated
+        theta = gausslq.fit_spots(spots, rotated=True)
+        for i in range(len(spots)):
+            np.testing.assert_allclose(
+                _precision_matrix(theta[i, 4], theta[i, 5], theta[i, 6]),
+                _precision_matrix(gt.sx[i], gt.sy[i], gt.angle[i]),
+                atol=1e-2,
+            )
+
+
+# ---------------------------------------------------------------------------
+# locs_from_fits — spherical (no ellipticity) and rotated (angle column)
+# ---------------------------------------------------------------------------
+
+
+class TestLocsFromFitsSphericalRotated:
+    """The ``spherical`` flag drops the (always-zero) ellipticity column;
+    a 7-column theta adds the ``angle`` column."""
+
+    def _ids(self, n):
+        return pd.DataFrame(
+            {
+                "frame": np.arange(n, dtype=np.uint32),
+                "x": np.full(n, 16, dtype=np.int64),
+                "y": np.full(n, 16, dtype=np.int64),
+                "net_gradient": np.full(n, 5000.0, dtype=np.float32),
+            }
+        )
+
+    def test_spherical_omits_ellipticity(self, synthetic_spots_isotropic):
+        spots, _ = synthetic_spots_isotropic
+        theta = gausslq.fit_spots(spots, spherical=True)
+        ids = self._ids(len(spots))
+        locs = gausslq.locs_from_fits(
+            ids, theta, BOX, em=False, spherical=True
+        )
+        assert "ellipticity" not in locs.columns
+        # everything else is still present
+        for col in [
+            "frame",
+            "x",
+            "y",
+            "photons",
+            "sx",
+            "sy",
+            "bg",
+            "lpx",
+            "lpy",
+            "net_gradient",
+        ]:
+            assert col in locs.columns
+
+    def test_non_spherical_keeps_ellipticity(self, synthetic_spots_isotropic):
+        """Default (spherical=False) still emits the ellipticity column,
+        so only the spherical path drops it."""
+        spots, _ = synthetic_spots_isotropic
+        theta = gausslq.fit_spots(spots, spherical=True)
+        ids = self._ids(len(spots))
+        locs = gausslq.locs_from_fits(
+            ids, theta, BOX, em=False, spherical=False
+        )
+        assert "ellipticity" in locs.columns
+        # sx == sy -> ellipticity is (numerically) zero
+        np.testing.assert_allclose(locs["ellipticity"], 0.0, atol=1e-6)
+
+    def test_spherical_flag_only_changes_ellipticity(
+        self, synthetic_spots_isotropic
+    ):
+        """Dropping ellipticity must not perturb any other column."""
+        spots, _ = synthetic_spots_isotropic
+        theta = gausslq.fit_spots(spots, spherical=True)
+        ids = self._ids(len(spots))
+        sph = gausslq.locs_from_fits(ids, theta, BOX, em=False, spherical=True)
+        ell = gausslq.locs_from_fits(
+            ids, theta, BOX, em=False, spherical=False
+        )
+        for col in sph.columns:
+            np.testing.assert_array_equal(
+                sph[col].to_numpy(), ell[col].to_numpy()
+            )
+        assert set(ell.columns) - set(sph.columns) == {"ellipticity"}
+
+    def test_rotated_adds_normalized_angle_column(
+        self, synthetic_spots_rotated
+    ):
+        spots, _ = synthetic_spots_rotated
+        theta = gausslq.fit_spots(spots, rotated=True)
+        ids = self._ids(len(spots))
+        locs = gausslq.locs_from_fits(ids, theta, BOX, em=False)
+        assert "angle" in locs.columns
+        # angle stored in degrees, wrapped to [-90, 90)
+        assert ((locs["angle"] >= -90.0) & (locs["angle"] < 90.0)).all()
+        # ellipticity is present for the (anisotropic) rotated model
+        assert "ellipticity" in locs.columns
+
+
+# ---------------------------------------------------------------------------
+# chi-square — the least-squares goodness-of-fit metric
+# ---------------------------------------------------------------------------
+
+
+class TestChiSquare:
+    """``return_chi_square`` appends the residual sum of squares at the fit
+    optimum. It is the least-squares counterpart of the MLE fits'
+    ``log_likelihood``: least squares assumes no noise model, so it has no
+    likelihood, but it does have the objective value it minimized."""
+
+    @staticmethod
+    def _ids(n):
+        return pd.DataFrame(
+            {
+                "frame": np.arange(n, dtype=np.uint32),
+                "x": np.full(n, 40, dtype=np.int64),
+                "y": np.full(n, 60, dtype=np.int64),
+                "net_gradient": np.full(n, 5000.0, dtype=np.float32),
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "kwargs, n_params",
+        [({}, 6), ({"spherical": True}, 6), ({"rotated": True}, 7)],
+    )
+    def test_fit_spot_appends_one_column(
+        self, synthetic_spot_factory, kwargs, n_params
+    ):
+        """One extra trailing element, and the parameters themselves are
+        untouched by asking for it."""
+        spot = synthetic_spot_factory()
+        plain = gausslq.fit_spot(spot, **kwargs)
+        with_chi = gausslq.fit_spot(spot, return_chi_square=True, **kwargs)
+        assert plain.shape == (n_params,)
+        assert with_chi.shape == (n_params + 1,)
+        np.testing.assert_allclose(with_chi[:n_params], plain, rtol=1e-6)
+        assert with_chi[-1] >= 0
+
+    def test_matches_residual_sum_of_squares(self, synthetic_spot_factory):
+        """The reported value is the sum of squared residuals of the fitted
+        model against the spot — recomputed here from the model directly."""
+        spot = synthetic_spot_factory()
+        theta = gausslq.fit_spot(spot, return_chi_square=True)
+        x, y, photons, bg, sx, sy = theta[:6].astype(np.float64)
+        half = BOX // 2
+        grid = np.arange(-half, half + 1, dtype=np.float64)
+
+        # The fit model is a point-sampled Gaussian PDF, separable in x and y
+        # (mirrors gausslq._compute_model / _gaussian).
+        def pdf(mu, sigma):
+            norm = 1.0 / (np.sqrt(2.0 * np.pi) * sigma)
+            return norm * np.exp(-0.5 * ((grid - mu) / sigma) ** 2)
+
+        model = photons * np.outer(pdf(y, sy), pdf(x, sx)) + bg
+        expected = np.sum((np.asarray(spot, dtype=np.float64) - model) ** 2)
+        np.testing.assert_allclose(theta[-1], expected, rtol=1e-3)
+
+    def test_fit_spots_batch_column(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        theta = gausslq.fit_spots(spots, return_chi_square=True)
+        assert theta.shape == (len(spots), 7)
+        assert np.all(theta[:, -1] >= 0)
+        assert np.all(np.isfinite(theta[:, -1]))
+        plain = gausslq.fit_spots(spots)
+        np.testing.assert_allclose(theta[:, :6], plain, rtol=1e-5, atol=1e-5)
+
+    def test_scales_with_noise(self, synthetic_spots, synthetic_spots_noisy):
+        """A noisier spot stack leaves larger residuals, so the chi-square
+        must be able to tell the two apart (that is the point of saving it)."""
+        clean, _ = synthetic_spots
+        noisy, _ = synthetic_spots_noisy
+        chi_clean = gausslq.fit_spots(clean, return_chi_square=True)[:, -1]
+        chi_noisy = gausslq.fit_spots(noisy, return_chi_square=True)[:, -1]
+        assert np.median(chi_noisy) > np.median(chi_clean)
+
+    def test_locs_from_fits_adds_column(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        theta = gausslq.fit_spots(spots, return_chi_square=True)
+        theta, chi_square = theta[:, :-1], theta[:, -1]
+        ids = self._ids(len(spots))
+        locs = gausslq.locs_from_fits(
+            ids, theta, BOX, em=False, chi_square=chi_square
+        )
+        assert locs["chi_square"].dtype == np.float32
+        # locs_from_fits sorts by frame; ids are already frame-ordered here
+        np.testing.assert_allclose(
+            locs["chi_square"].to_numpy(), chi_square, rtol=1e-6
+        )
+
+    def test_locs_from_fits_omits_column_by_default(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        theta = gausslq.fit_spots(spots)
+        locs = gausslq.locs_from_fits(self._ids(len(spots)), theta, BOX, False)
+        assert "chi_square" not in locs.columns
+
+
+class TestDeprecation:
+    """``picasso.gausslq``'s fitters are deprecated in 0.11 and go in 1.0.
+
+    Two things have to hold: the public names warn, and Picasso's own code
+    does not trigger them - a library warning about its own internals is
+    noise, not a signal. The internal callers use the private
+    implementations (``_fit_spot`` and friends), which is what these tests
+    pin."""
+
+    ENTRY_POINTS = ["fit_spot", "fit_spots", "fit_spots_parallel"]
+
+    @pytest.mark.parametrize("name", ENTRY_POINTS + ["fit_spots_gauss_gpu"])
+    def test_documented_as_deprecated(self, name):
+        doc = getattr(gausslq, name).__doc__
+        assert ".. deprecated:: 0.11" in doc
+        assert "Picasso 1.0" in doc
+
+    def test_fit_spot_warns(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        with pytest.warns(DeprecationWarning, match="Picasso 1.0"):
+            gausslq.fit_spot(spots[0])
+
+    def test_fit_spots_warns_once_not_per_spot(self, synthetic_spots):
+        spots, _ = synthetic_spots
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            gausslq.fit_spots(spots)
+        deprecations = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert len(deprecations) == 1
+
+    @pytest.mark.parametrize("name", ["fit_spot", "fit_spots"])
+    def test_private_implementation_is_silent(self, name, synthetic_spots):
+        """What Picasso itself calls. If these warned, every ordinary fit
+        would emit a deprecation notice about Picasso's own code.
+
+        ``_fit_spots_parallel`` is left out only because it needs
+        subprocesses; ``localize`` calling it is covered end to end by
+        ``test_localize.TestNoSelfDeprecation``."""
+        spots, _ = synthetic_spots
+        private = getattr(gausslq, "_" + name)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            private(spots[0] if name == "fit_spot" else spots)
+        assert not [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+
+    @pytest.mark.parametrize("name", ENTRY_POINTS)
+    def test_public_and_private_agree(self, name, synthetic_spots):
+        """The wrapper must add a warning and nothing else."""
+        spots, _ = synthetic_spots
+        public = getattr(gausslq, name)
+        private = getattr(gausslq, "_" + name)
+        if name == "fit_spot":
+            args = (spots[0],)
+        elif name == "fit_spots":
+            args = (spots,)
+        else:
+            pytest.skip("fit_spots_parallel needs subprocesses")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            np.testing.assert_array_equal(public(*args), private(*args))
+
+    def test_private_locs_from_fits_is_silent(self, synthetic_spots):
+        """``_locs_from_fits`` computes ``lpx``/``lpy``, so it must reach the
+        *new* home of ``localization_precision`` rather than the shim beside
+        it. It did not, once - and every least-squares fit warned about
+        Picasso's own code as a result."""
+        spots, _ = synthetic_spots
+        theta = gausslq._fit_spots(spots)
+        identifications = pd.DataFrame(
+            {
+                "frame": np.zeros(len(spots), np.uint32),
+                "x": np.full(len(spots), 10.0),
+                "y": np.full(len(spots), 10.0),
+                "net_gradient": np.full(len(spots), 5000.0),
+            }
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            gausslq._locs_from_fits(identifications, theta, BOX, em=False)
+        assert not [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+
+    def test_replacement_is_named(self):
+        """A deprecation without a migration path is just an annoyance."""
+        assert "picasso.fitting.gaussfit" in gausslq._DEPRECATION_MESSAGE
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "fit_spot",
+            "fit_spots",
+            "fit_spots_parallel",
+            "fit_spots_gauss_gpu",
+            "fits_from_futures",
+            "locs_from_fits",
+            "locs_from_fits_gauss_gpu",
+            "localization_precision",
+            "sigma_uncertainty",
+        ],
+    )
+    def test_every_public_name_is_deprecated(self, name):
+        """The *whole module* goes in 1.0, not just the fitters - so nothing
+        may be left here without a documented replacement."""
+        doc = getattr(gausslq, name).__doc__ or ""
+        assert ".. deprecated:: 0.11" in doc, name
+        assert "Picasso 1.0" in doc, name
+
+    def test_no_undeprecated_public_names_remain(self):
+        """Catches a *new* public function being added to a module that is
+        on its way out."""
+        undeprecated = [
+            name
+            for name in dir(gausslq)
+            if not name.startswith("_")
+            and callable(getattr(gausslq, name))
+            and getattr(getattr(gausslq, name), "__module__", "")
+            == "picasso.gausslq"
+            and ".. deprecated::" not in (getattr(gausslq, name).__doc__ or "")
+        ]
+        assert undeprecated == []
+
+    def test_precision_formulas_moved_verbatim(self):
+        """``localization_precision`` and ``sigma_uncertainty`` now live in
+        ``picasso.fitting.precision``. The numbers must not have moved with
+        them - these are published formulas, and ``lpx`` is in every saved
+        localization file."""
+        photons = np.array([500.0, 1200.0, 8000.0])
+        s = np.array([1.2, 1.4, 0.9])
+        s_orth = np.array([1.1, 1.5, 1.3])
+        bg = np.array([5.0, 12.0, 2.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            for em in (False, True):
+                np.testing.assert_array_equal(
+                    gausslq.localization_precision(photons, s, s_orth, bg, em),
+                    precision.localization_precision(
+                        photons, s, s_orth, bg, em
+                    ),
+                )
+            np.testing.assert_array_equal(
+                gausslq.sigma_uncertainty(s, s_orth, photons, bg),
+                precision.sigma_uncertainty_lsq(s, s_orth, photons, bg),
+            )
+
+    def test_new_home_does_not_warn(self):
+        """The replacement must be usable without tripping the warning the
+        old name raises."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            precision.localization_precision(
+                np.array([500.0]),
+                np.array([1.2]),
+                np.array([1.1]),
+                np.array([5.0]),
+                False,
+            )
+            precision.sigma_uncertainty_lsq(
+                np.array([1.2]),
+                np.array([1.1]),
+                np.array([500.0]),
+                np.array([5.0]),
+            )
+        assert not [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]

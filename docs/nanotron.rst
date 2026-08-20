@@ -19,7 +19,7 @@ Train a MLP model for nanopattern prediction using nanoTRON.
 
 1. In ``Picasso: nanoTRON``, select ``Tools`` > ``Train Model`` to open the training user interface.
 2. Set the number of different classes of the model via ``Number of Classes`` and press ``Generate Data Set``.
-3. Load all the training files via the various buttons ``Load File``. Greyed out buttons indicate that the data set slot is loaded.
+3. Load all the training files via the various buttons ``Load File``. Grayed out buttons indicate that the data set slot is loaded.
 4. Name every data set (class) with a unique name.
 5. Set up the image parameters in the box ``Image Parameter``. Set the oversampling factor via ``Oversampling``. This factor determines the sub-pixel resolution of the training images. We recommend lower resolution as the data would provide for better generalization. Augment the training data sets via the check button ``Expand Training Set``. Here every data set point is rotated eleven times. Exemplary images training data images can be exported via ``Export Image Subset``.
 6. If the data is loaded and the image parameters are set, press ``Prepare Data`` to convert the localization (molecule) tables into images.
@@ -35,7 +35,7 @@ nanoTRON Predict
 Use a trained nanoTRON model to classify nanopatterns on new data.
 
 1. Load the model via ``Tools`` > ``Train Model``. The different classes should now be listed on the right side.
-2. Drag and drop the Picasso localization table file (HDF5) that should be used for prediction into the large grey box. If the file was loaded correctly, the box displays the image.
+2. Drag and drop the Picasso localization table file (HDF5) that should be used for prediction into the large gray box. If the file was loaded correctly, the box displays the image.
 3. Start the classification via the button ``Predict``.
 4. Choose the classes that should be exported in the box ``Export Structures``. By default, each class is exported.
 5. Set the export parameters in the box ``Export``. The distribution of the prediction probability can be plotted via the button ``Show Probabilities``. Optional, set a probability filter via the check button ``Filter Probabilities``. Optional, enable the additional export of the pick regions via the check button ``Export Pick Regions``. Choose if the new localization files, segmented by the classified nanopatterns, should be regrouped via the check button ``Regroup Export Files``. Note, the group id in every exported file start with 0 then. Identification of picks in the original file will be lost.

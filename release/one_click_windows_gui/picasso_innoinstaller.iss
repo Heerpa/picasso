@@ -1,15 +1,29 @@
+; VARIANT is an optional suffix used to build alternative editions (e.g.
+; the GPU build passes /DVARIANT=-GPU). When left undefined it defaults to
+; an empty string, reproducing the standard CPU installer names exactly.
+#ifndef VARIANT
+  #define VARIANT ""
+#endif
+
+; DISTDIR is the PyInstaller output folder to package. The GPU build writes to
+; a separate "dist_gpu" tree (passed via /DDISTDIR=dist_gpu) so it does not
+; clash with the CPU build's "dist". Defaults to "dist" for the CPU installer.
+#ifndef DISTDIR
+  #define DISTDIR "dist"
+#endif
+
 [Setup]
-AppName=Picasso
+AppName=Picasso{#VARIANT}
 AppPublisher=Jungmann Lab, Max Planck Institute of Biochemistry
 AppVersion={#APP_VERSION}
-DefaultDirName="C:\Picasso"
-DefaultGroupName=Picasso
-OutputBaseFilename="Picasso-Windows-64bit-{#APP_VERSION}"
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+DefaultDirName="C:\Picasso{#VARIANT}"
+DefaultGroupName=Picasso{#VARIANT}
+OutputBaseFilename="Picasso-Windows-64bit{#VARIANT}-{#APP_VERSION}"
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 
 [Files]
-Source: "dist\picasso\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
+Source: "{#DISTDIR}\picasso\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
 
 [Types]
 Name: "full"; Description: "Full installation"
@@ -25,7 +39,6 @@ Name: "average"; Description: "Average"; Types: full custom
 Name: "spinna"; Description: "SPINNA"; Types: full custom
 Name: "server"; Description: "Server"; Types: full custom
 Name: "nanotron"; Description: "Nanotron"; Types: full custom
-Name: "toraw"; Description: "ToRaw"; Types: full custom
 
 [Icons]
 Name: "{group}\Design"; Filename: "{app}\picassow.exe"; Parameters: "design"; IconFilename: "{app}\_internal\picasso\gui\icons\design.ico"; Components: design
@@ -37,7 +50,6 @@ Name: "{group}\Average"; Filename: "{app}\picassow.exe"; Parameters: "average"; 
 Name: "{group}\SPINNA"; Filename: "{app}\picassow.exe"; Parameters: "spinna"; IconFilename: "{app}\_internal\picasso\gui\icons\spinna.ico"; Components: spinna
 Name: "{group}\Server"; Filename: "{app}\picasso.exe"; Parameters: "server"; IconFilename: "{app}\_internal\picasso\gui\icons\server.ico"; Components: server
 Name: "{group}\Nanotron"; Filename: "{app}\picassow.exe"; Parameters: "nanotron"; IconFilename: "{app}\_internal\picasso\gui\icons\nanotron.ico"; Components: nanotron
-Name: "{group}\ToRaw"; Filename: "{app}\picassow.exe"; Parameters: "toraw"; IconFilename: "{app}\_internal\picasso\gui\icons\toraw.ico"; Components: toraw
 
 
 Name: "{autodesktop}\Design"; Filename: "{app}\picassow.exe"; Parameters: "design"; IconFilename: "{app}\_internal\picasso\gui\icons\design.ico"; Components: design
@@ -49,7 +61,6 @@ Name: "{autodesktop}\Average"; Filename: "{app}\picassow.exe"; Parameters: "aver
 Name: "{autodesktop}\SPINNA"; Filename: "{app}\picassow.exe"; Parameters: "spinna"; IconFilename: "{app}\_internal\picasso\gui\icons\spinna.ico"; Components: spinna
 Name: "{autodesktop}\Server"; Filename: "{app}\picasso.exe"; Parameters: "server"; IconFilename: "{app}\_internal\picasso\gui\icons\server.ico"; Components: server
 Name: "{autodesktop}\Nanotron"; Filename: "{app}\picassow.exe"; Parameters: "nanotron"; IconFilename: "{app}\_internal\picasso\gui\icons\nanotron.ico"; Components: nanotron
-Name: "{autodesktop}\ToRaw"; Filename: "{app}\picassow.exe"; Parameters: "toraw"; IconFilename: "{app}\_internal\picasso\gui\icons\toraw.ico"; Components: toraw
 
 [Registry]
 Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; \

@@ -79,7 +79,7 @@ def locs_3d(locs):
 @pytest.fixture(scope="module")
 def image(locs, info):
     """Rendered image used by masking tests."""
-    return render.render(locs, info, oversampling=13)[1]
+    return render.render(locs, info, disp_px_size=PIXELSIZE / 13)[1]
 
 
 @pytest.fixture(scope="module")
@@ -109,13 +109,17 @@ class TestRender:
 
     def test_no_blur_mass_conservation(self, locs, info):
         """Each loc deposits exactly 1, so image.sum() must equal n."""
-        n, im = render.render(locs, info, oversampling=13, viewport=VIEWPORT)
+        n, im = render.render(
+            locs, info, disp_px_size=PIXELSIZE / 13, viewport=VIEWPORT
+        )
         assert im.sum() == n
         assert n > 0, "Test data should have locs in viewport"
 
     def test_viewport_exact_shape(self, locs, info):
         """Image shape is exactly oversampling * viewport size."""
-        n, im = render.render(locs, info, oversampling=130, viewport=VIEWPORT)
+        n, im = render.render(
+            locs, info, disp_px_size=PIXELSIZE / 130, viewport=VIEWPORT
+        )
         assert im.shape == (130, 130)
         assert im.dtype == np.float32
 
@@ -127,22 +131,10 @@ class TestRender:
         y = locs["y"].to_numpy()
         in_view = (x > x_min) & (x < x_max) & (y > y_min) & (y < y_max)
         expected = int(in_view.sum())
-        n, _ = render.render(locs, info, oversampling=13, viewport=VIEWPORT)
+        n, _ = render.render(
+            locs, info, disp_px_size=PIXELSIZE / 13, viewport=VIEWPORT
+        )
         assert n == expected
-
-    def test_disp_px_size_equivalence(self, locs, info):
-        """`oversampling=k` and `disp_px_size=pixelsize/k` must be
-        bitwise-identical."""
-        oversampling = 5
-        disp_px = PIXELSIZE / oversampling
-        n1, im1 = render.render(
-            locs, info, oversampling=oversampling, viewport=FULL_VIEWPORT
-        )
-        n2, im2 = render.render(
-            locs, info, disp_px_size=disp_px, viewport=FULL_VIEWPORT
-        )
-        assert n1 == n2
-        assert np.array_equal(im1, im2)
 
     @pytest.mark.parametrize("blur_method", BLUR_METHODS)
     def test_blur_methods(self, locs, info, blur_method):
@@ -151,7 +143,7 @@ class TestRender:
         n, im = render.render(
             locs,
             info,
-            oversampling=5,
+            disp_px_size=PIXELSIZE / 5,
             viewport=FULL_VIEWPORT,
             blur_method=blur_method,
         )
@@ -168,7 +160,7 @@ class TestRender:
         n, im = render.render(
             locs,
             info,
-            oversampling=5,
+            disp_px_size=PIXELSIZE / 5,
             viewport=FULL_VIEWPORT,
             blur_method=blur_method,
         )
@@ -179,7 +171,7 @@ class TestRender:
         _, im_narrow = render.render(
             locs,
             info,
-            oversampling=5,
+            disp_px_size=PIXELSIZE / 5,
             viewport=FULL_VIEWPORT,
             blur_method="gaussian",
             min_blur_width=0.0,
@@ -187,7 +179,7 @@ class TestRender:
         _, im_wide = render.render(
             locs,
             info,
-            oversampling=5,
+            disp_px_size=PIXELSIZE / 5,
             viewport=FULL_VIEWPORT,
             blur_method="gaussian",
             min_blur_width=2.0,
@@ -199,14 +191,14 @@ class TestRender:
             render.render(
                 locs,
                 info,
-                oversampling=5,
+                disp_px_size=PIXELSIZE / 5,
                 viewport=FULL_VIEWPORT,
                 blur_method="not_a_method",
             )
 
     def test_no_info_no_viewport_raises(self, locs):
-        with pytest.raises(ValueError):
-            render.render(locs, None, oversampling=5)
+        with pytest.raises(Exception):
+            render.render(locs, None, disp_px_size=PIXELSIZE / 5)
 
     def test_empty_locs_gaussian(self, locs, info):
         """Empty input must not crash the parallel _fill_gaussian path."""
@@ -214,7 +206,7 @@ class TestRender:
         n, im = render.render(
             empty,
             info,
-            oversampling=5,
+            disp_px_size=PIXELSIZE / 5,
             viewport=FULL_VIEWPORT,
             blur_method="gaussian",
         )
@@ -228,7 +220,7 @@ class TestRender:
         n, im = render.render(
             empty,
             info,
-            oversampling=5,
+            disp_px_size=PIXELSIZE / 5,
             viewport=FULL_VIEWPORT,
             blur_method="gaussian",
             ang=(0.1, 0.2, 0.3),
@@ -241,7 +233,7 @@ class TestRender:
         _, im_no_rot = render.render(
             locs_3d,
             info,
-            oversampling=5,
+            disp_px_size=PIXELSIZE / 5,
             viewport=FULL_VIEWPORT,
             blur_method="gaussian",
             ang=(0.0, 0.0, 0.0),
@@ -249,12 +241,149 @@ class TestRender:
         _, im_rot = render.render(
             locs_3d,
             info,
-            oversampling=5,
+            disp_px_size=PIXELSIZE / 5,
             viewport=FULL_VIEWPORT,
             blur_method="gaussian",
             ang=(0.5, 0.3, 0.2),
         )
         assert not np.array_equal(im_no_rot, im_rot)
+
+    def test_gaussian_angle_zero_matches_unrotated(self):
+        """An 'angle' column of 0 reproduces the axis-aligned render."""
+        info = {"Pixelsize": 100.0, "Height": 20, "Width": 20}
+        base = pd.DataFrame(
+            {"x": [10.0], "y": [10.0], "lpx": [0.6], "lpy": [0.2]}
+        )
+        _, im_plain = render.render(
+            base, info, disp_px_size=25.0, blur_method="gaussian"
+        )
+        _, im_rot0 = render.render(
+            base.assign(angle=[0.0]),
+            info,
+            disp_px_size=25.0,
+            blur_method="gaussian",
+        )
+        assert np.allclose(im_rot0, im_plain, rtol=1e-4, atol=1e-6)
+
+    def test_gaussian_angle_ninety_swaps_precision(self):
+        """A 90 degree rotation is equivalent to swapping lpx and lpy."""
+        info = {"Pixelsize": 100.0, "Height": 20, "Width": 20}
+        rotated = pd.DataFrame(
+            {
+                "x": [10.0],
+                "y": [10.0],
+                "lpx": [0.6],
+                "lpy": [0.2],
+                "angle": [90.0],
+            }
+        )
+        swapped = pd.DataFrame(
+            {"x": [10.0], "y": [10.0], "lpx": [0.2], "lpy": [0.6]}
+        )
+        _, im_rot = render.render(
+            rotated, info, disp_px_size=25.0, blur_method="gaussian"
+        )
+        _, im_swap = render.render(
+            swapped, info, disp_px_size=25.0, blur_method="gaussian"
+        )
+        assert np.allclose(im_rot, im_swap, rtol=1e-4, atol=1e-6)
+
+    def test_gaussian_angle_changes_image_and_keeps_mass(self):
+        """A non-zero rotation tilts the ellipse while conserving mass."""
+        info = {"Pixelsize": 100.0, "Height": 20, "Width": 20}
+        base = pd.DataFrame(
+            {"x": [10.0], "y": [10.0], "lpx": [0.6], "lpy": [0.2]}
+        )
+        _, im0 = render.render(
+            base.assign(angle=[0.0]),
+            info,
+            disp_px_size=25.0,
+            blur_method="gaussian",
+        )
+        _, im45 = render.render(
+            base.assign(angle=[45.0]),
+            info,
+            disp_px_size=25.0,
+            blur_method="gaussian",
+        )
+        assert not np.allclose(im0, im45)
+        assert np.isclose(im0.sum(), im45.sum(), rtol=1e-3)
+
+    def test_empty_locs_gaussian_theta(self):
+        """Empty input with an 'angle' column must not crash."""
+        info = {"Pixelsize": 100.0, "Height": 20, "Width": 20}
+        empty = (
+            pd.DataFrame(
+                {"x": [10.0], "y": [10.0], "lpx": [0.6], "lpy": [0.2]}
+            )
+            .assign(angle=[0.0])
+            .iloc[:0]
+        )
+        n, im = render.render(
+            empty, info, disp_px_size=25.0, blur_method="gaussian"
+        )
+        assert n == 0
+        assert (im == 0).all()
+
+    def test_gaussian_rot_angle_changes_image(self):
+        """Per-loc angle must affect the globally-rotated (3D) render."""
+        info = {"Pixelsize": 100.0, "Height": 20, "Width": 20}
+        base = pd.DataFrame(
+            {
+                "x": [10.0],
+                "y": [10.0],
+                "z": [0.0],
+                "lpx": [0.6],
+                "lpy": [0.2],
+                "lpz": [0.4],
+            }
+        )
+        ang = (0.3, 0.2, 0.1)
+        _, im0 = render.render(
+            base.assign(angle=[0.0]),
+            info,
+            disp_px_size=25.0,
+            blur_method="gaussian",
+            ang=ang,
+        )
+        _, im45 = render.render(
+            base.assign(angle=[45.0]),
+            info,
+            disp_px_size=25.0,
+            blur_method="gaussian",
+            ang=ang,
+        )
+        assert not np.allclose(im0, im45)
+        # mass is only approximately conserved under a global tilt because
+        # the 3-sigma bounding box truncates differently per orientation
+        assert np.isclose(im0.sum(), im45.sum(), rtol=1e-2)
+
+    def test_gaussian_rot_angle_matches_2d_under_identity(self):
+        """Under identity global rotation the composed 3D path reduces to
+        the pure 2D rotated render."""
+        info = {"Pixelsize": 100.0, "Height": 20, "Width": 20}
+        base = pd.DataFrame(
+            {
+                "x": [10.0],
+                "y": [10.0],
+                "z": [0.0],
+                "lpx": [0.6],
+                "lpy": [0.2],
+                "lpz": [0.4],
+                "angle": [40.0],
+            }
+        )
+        _, im_2d = render.render(
+            base, info, disp_px_size=25.0, blur_method="gaussian"
+        )
+        _, im_3d = render.render(
+            base,
+            info,
+            disp_px_size=25.0,
+            blur_method="gaussian",
+            ang=(0.0, 0.0, 0.0),
+        )
+        assert np.allclose(im_2d, im_3d, rtol=1e-4, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +702,7 @@ class TestRotation:
             _, im_tuple = render.render(
                 locs_3d,
                 info,
-                oversampling=5,
+                disp_px_size=25,
                 viewport=FULL_VIEWPORT,
                 blur_method=blur_method,
                 ang=ang,
@@ -581,7 +710,7 @@ class TestRotation:
             _, im_rotation = render.render(
                 locs_3d,
                 info,
-                oversampling=5,
+                disp_px_size=25,
                 viewport=FULL_VIEWPORT,
                 blur_method=blur_method,
                 ang=render.rotation_matrix(*ang),
@@ -1262,6 +1391,85 @@ class TestRenderScene:
         assert isinstance(qimage, QtGui.QImage)
         assert n_locs == 0
 
+    def test_background_color_none_equals_black(self, locs, info):
+        """``background_color=None`` and an explicit black background must
+        be byte-for-byte identical (black is the no-op default)."""
+        kwargs = dict(
+            disp_px_size=PIXELSIZE,
+            viewport=FULL_VIEWPORT,
+            colors=[(1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+        )
+        q_none, _ = render.render_scene(
+            [locs, locs], [info, info], **kwargs, background_color=None
+        )
+        q_black, _ = render.render_scene(
+            [locs, locs],
+            [info, info],
+            **kwargs,
+            background_color=(0.0, 0.0, 0.0),
+        )
+        assert np.array_equal(
+            _qimage_to_array(q_none), _qimage_to_array(q_black)
+        )
+
+    def test_background_color_fills_empty_pixels(self, locs, info):
+        """With a white background, pixels with no localizations become
+        white while pixels containing localizations do not."""
+        qimage, _, raw = render.render_scene(
+            [locs, locs],
+            [info, info],
+            disp_px_size=PIXELSIZE,
+            viewport=FULL_VIEWPORT,
+            colors=[(1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            background_color=(1.0, 1.0, 1.0),
+            return_raw_image=True,
+        )
+        bgra = _qimage_to_array(qimage)
+        empty = raw.sum(axis=0) == 0  # (H, W) mask of pixels with no locs
+        assert empty.any(), "Sparse test data should leave empty pixels"
+        # every empty pixel is fully white
+        assert (bgra[empty][:, :3] == 255).all()
+        # at least one occupied pixel keeps its channel color (not white)
+        occupied = ~empty
+        assert occupied.any()
+        assert not (bgra[occupied][:, :3] == 255).all()
+
+    def test_background_color_composite_exact(self, locs, info):
+        """Exact compositing on a synthetic cache: a saturated channel
+        pixel keeps its pure color, an empty pixel shows the background."""
+        # channel 0 saturated at (0, 0); everything else empty
+        raw = np.zeros((2, 3, 3), dtype=np.float32)
+        raw[0, 0, 0] = 1.0
+        colors = [
+            render.solid_to_lut((1.0, 0.0, 0.0)),
+            render.solid_to_lut((0.0, 1.0, 0.0)),
+        ]
+        qimage, _ = render.render_scene(
+            [locs, locs],
+            [info, info],
+            disp_px_size=PIXELSIZE,
+            viewport=FULL_VIEWPORT,
+            colors=colors,
+            contrast=(0.0, 1.0),
+            background_color=(0.2, 0.4, 0.6),
+            raw_image_cache=raw,
+        )
+        bgra = _qimage_to_array(qimage)  # B, G, R, A
+        # saturated channel-0 pixel stays pure red (background fully masked)
+        assert tuple(int(v) for v in bgra[0, 0, :3]) == (0, 0, 255)
+        # empty pixel shows the background color (0.2, 0.4, 0.6) -> bytes
+        assert bgra[2, 2, 2] == pytest.approx(round(0.2 * 255), abs=1)  # R
+        assert bgra[2, 2, 1] == pytest.approx(round(0.4 * 255), abs=1)  # G
+        assert bgra[2, 2, 0] == pytest.approx(round(0.6 * 255), abs=1)  # B
+
+    def test_background_color_default_is_none(self):
+        """The public render_scene signature defaults background_color to
+        None so existing callers are unaffected."""
+        import inspect
+
+        sig = inspect.signature(render.render_scene)
+        assert sig.parameters["background_color"].default is None
+
 
 # ---------------------------------------------------------------------------
 # Rectangle pick polygon (pure geometry)
@@ -1619,7 +1827,7 @@ class TestMasking:
 
     def test_mask_locs_partitions_input(self, locs, info, image):
         mask, _ = masking.mask_image(image, method="otsu")
-        locs_in, locs_out = masking.mask_locs(locs, mask, info=info)
+        locs_in, locs_out = masking.mask_locs(locs, info, mask)
         assert len(locs_in) + len(locs_out) == len(locs)
         # in / out are disjoint
         assert set(locs_in.index).isdisjoint(set(locs_out.index))

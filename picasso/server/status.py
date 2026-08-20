@@ -7,6 +7,18 @@ import os
 
 
 def check_file(file):
+    """Whether a movie has been localized, i.e. has a ``_locs.hdf5`` next to
+    it.
+
+    Parameters
+    ----------
+    file : str
+        Path to the movie.
+
+    Returns
+    -------
+    exists : bool
+    """
     base, ext = os.path.splitext(file)
     file_hdf = base + "_locs.hdf5"
 
@@ -14,11 +26,17 @@ def check_file(file):
 
 
 def escape_markdown(text: str) -> str:
-    """Helper function to escape markdown in text.
-    Args:
-        text (str): Input text.
-    Returns:
-        str: Converted text to be used in markdown.
+    """Escape the markdown special characters in a text.
+
+    Parameters
+    ----------
+    text : str
+        Input text.
+
+    Returns
+    -------
+    text : str
+        Converted text, safe to embed in markdown.
     """
     MD_SPECIAL_CHARS = r"\`*_{}[]()#+-.!"
     for char in MD_SPECIAL_CHARS:
@@ -38,7 +56,7 @@ def status():  # noqa: C901
             "superresolution runs. By selecting `Estimate and add to database`"
             " in localize, summary statistics of a run will be stored in a "
             "local database in the picasso user folder ("
-            f"{escape_markdown(localize._db_filename())})."
+            f"{escape_markdown(localize.db_filename())})."
         )
         st.write(
             "- Status: Displays the current database status and documentation."
@@ -110,7 +128,7 @@ def status():  # noqa: C901
                     st.write(summary)
                     if st.button("Add to database"):
                         engine = create_engine(
-                            "sqlite:///" + localize._db_filename(), echo=False
+                            "sqlite:///" + localize.db_filename(), echo=False
                         )
                         pd.DataFrame(
                             summary.values(), summary.keys()
@@ -164,7 +182,7 @@ def status():  # noqa: C901
                     st.write(stack)
 
                     engine = create_engine(
-                        "sqlite:///" + localize._db_filename(), echo=False
+                        "sqlite:///" + localize.db_filename(), echo=False
                     )
                     stack.to_sql(
                         "files",

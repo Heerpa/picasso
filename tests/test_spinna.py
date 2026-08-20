@@ -178,14 +178,14 @@ def test_rref_does_not_mutate_input():
 
 
 def test_find_target_counts_shape_and_values(monomer_dimer_structures):
-    counts = spinna.find_target_counts(["target"], monomer_dimer_structures)
+    counts = spinna._find_target_counts(["target"], monomer_dimer_structures)
     assert counts.shape == (1, 2)
     # monomer has 1 target, dimer has 2
     assert np.array_equal(counts, np.array([[1.0, 2.0]]))
 
 
 def test_find_target_counts_missing_target_zero(monomer_dimer_structures):
-    counts = spinna.find_target_counts(
+    counts = spinna._find_target_counts(
         ["target", "missing"], monomer_dimer_structures
     )
     assert counts.shape == (2, 2)
@@ -196,13 +196,13 @@ def test_find_target_counts_missing_target_zero(monomer_dimer_structures):
 def test_targets_from_structures_is_unique_and_order_preserving(
     het_structures,
 ):
-    targets = spinna.targets_from_structures(het_structures)
+    targets = spinna._targets_from_structures(het_structures)
     assert targets == ["A", "B"]
 
 
 def test_get_structures_permutation_homo_dimer(monomer_dimer_structures):
-    t_counts = spinna.find_target_counts(["target"], monomer_dimer_structures)
-    perm = spinna.get_structures_permutation(t_counts.copy())
+    t_counts = spinna._find_target_counts(["target"], monomer_dimer_structures)
+    perm = spinna._get_structures_permutation(t_counts.copy())
     # 2 structures, 1 target → exactly one free param goes last
     assert perm.shape == (2,)
     assert sorted(perm.tolist()) == [0, 1]
@@ -1201,6 +1201,178 @@ def test_spinna_fit_save_csv_creates_file(
     assert "Kolmogorov-Smirnov statistic" in df.columns
 
 
+def test_convert_counts_to_props_squeezes_single_row(mixer_2d_csr):
+    """Single-row input returns 1D, not (1, n_structures).
+
+    Every caller that np.hstack's the result with a 2D counts array
+    must therefore re-expand it (see the save= paths of the three
+    fitting modes).
+    """
+    props = mixer_2d_csr.convert_counts_to_props(
+        np.array([[100, 50]], dtype=np.int32)
+    )
+    assert props.ndim == 1
+    assert props.shape == (2,)
+
+
+def _single_row_fit_setup(het_structures):
+    """2 targets / 2 structures → search space with exactly one row."""
+    structures = [het_structures[0], het_structures[2]]  # MonA + HetAB
+    mixer = StructureMixer(
+        structures=structures,
+        label_unc={"A": LABEL_UNC, "B": LABEL_UNC},
+        le={"A": LE, "B": LE},
+        width=ROI,
+        height=ROI,
+    )
+    ss = spinna.generate_N_structures(
+        structures, {"A": 200, "B": 200}, granularity=5
+    )
+    return structures, mixer, ss
+
+
+@pytest.mark.parametrize(
+    "fitting_mode", ["brute-force", "coarse-to-fine", "bayesian"]
+)
+def test_spinna_fit_save_csv_single_row_search_space(
+    het_structures, tmp_path, fitting_mode
+):
+    """Saving must work when the search space collapses to one row.
+
+    convert_counts_to_props squeezes such a result to 1D, which used to
+    break the np.hstack in every save= branch.
+    """
+    structures, mixer, ss = _single_row_fit_setup(het_structures)
+    assert len(ss["MonA"]) == 1, "fixture no longer yields a 1-row space"
+
+    gt_mixer = StructureMixer(
+        structures=structures,
+        label_unc={"A": LABEL_UNC, "B": LABEL_UNC},
+        le={"A": LE, "B": LE},
+        width=ROI,
+        height=ROI,
+    )
+    np.random.seed(0)
+    gt = gt_mixer.run_simulation([100, 100])
+
+    spinner = SPINNA(mixer=mixer, gt_coords=gt, N_sim=1)
+    np.random.seed(0)
+    out_csv = tmp_path / f"fits_{fitting_mode}.csv"
+    spinner.fit_stoichiometry(
+        N_structures=ss,
+        fitting_mode=fitting_mode,
+        asynch=False,
+        save=str(out_csv),
+    )
+    df = pd.read_csv(out_csv)
+    assert len(df) == 1
+    assert {"N_MonA", "N_HetAB", "Prop_MonA", "Prop_HetAB"}.issubset(
+        df.columns
+    )
+    assert np.allclose(df["Prop_MonA"] + df["Prop_HetAB"], 100.0)
+
+
+@pytest.mark.parametrize("fitting_mode", ["coarse-to-fine", "bayesian"])
+def test_spinna_fit_save_csv_non_brute_force_modes(
+    mixer_2d_csr, monomer_dimer_structures, tmp_path, fitting_mode
+):
+    """coarse-to-fine and bayesian have their own save= code paths."""
+    np.random.seed(0)
+    gt = mixer_2d_csr.run_simulation([100, 50])
+    mixer = StructureMixer(
+        structures=monomer_dimer_structures,
+        label_unc={"target": LABEL_UNC},
+        le={"target": LE},
+        width=ROI,
+        height=ROI,
+    )
+    ss = spinna.generate_N_structures(
+        monomer_dimer_structures, {"target": 200}, granularity=10
+    )
+    spinner = SPINNA(mixer=mixer, gt_coords=gt, N_sim=1)
+    np.random.seed(0)
+    out_csv = tmp_path / f"fits_{fitting_mode}.csv"
+    spinner.fit_stoichiometry(
+        N_structures=ss,
+        fitting_mode=fitting_mode,
+        asynch=False,
+        save=str(out_csv),
+    )
+    if fitting_mode == "coarse-to-fine":
+        # two files are written: coarse and fine pass
+        paths = sorted(tmp_path.glob("*.csv"))
+        assert paths, "no csv written"
+    else:
+        paths = [out_csv]
+    for path in paths:
+        df = pd.read_csv(path)
+        assert len(df) >= 1
+        prop_cols = [c for c in df.columns if c.startswith("Prop_")]
+        assert len(prop_cols) == 2
+        assert np.allclose(df[prop_cols].sum(axis=1), 100.0)
+
+
+def test_coarse_to_fine_save_with_single_candidate_fine_pass(
+    mixer_2d_csr, monomer_dimer_structures, tmp_path
+):
+    """A radius small enough to keep only the coarse winner makes the
+    fine pass a single row — its own save= branch must survive that.
+
+    fit_coarse_to_fine is called directly because fit_stoichiometry
+    exposes no radius argument.
+    """
+    np.random.seed(0)
+    gt = mixer_2d_csr.run_simulation([100, 50])
+    mixer = StructureMixer(
+        structures=monomer_dimer_structures,
+        label_unc={"target": LABEL_UNC},
+        le={"target": LE},
+        width=ROI,
+        height=ROI,
+    )
+    ss = spinna.generate_N_structures(
+        monomer_dimer_structures, {"target": 200}, granularity=10
+    )
+    spinner = SPINNA(mixer=mixer, gt_coords=gt, N_sim=1)
+    np.random.seed(0)
+    out_csv = tmp_path / "c2f.csv"
+    spinner.fit_coarse_to_fine(
+        ss, radius=1e-6, save=str(out_csv), asynch=False
+    )
+    written = sorted(tmp_path.glob("*.csv"))
+    assert written, "no csv written"
+    for path in written:
+        df = pd.read_csv(path)
+        prop_cols = [c for c in df.columns if c.startswith("Prop_")]
+        assert len(prop_cols) == 2
+        assert np.allclose(df[prop_cols].sum(axis=1), 100.0)
+
+
+def test_bayesian_save_with_single_evaluated_candidate(
+    mixer_2d_csr, monomer_dimer_structures, tmp_path
+):
+    """Only one evaluated candidate → 1-row props in _save_bayesian_csv."""
+    np.random.seed(0)
+    gt = mixer_2d_csr.run_simulation([100, 50])
+    mixer = StructureMixer(
+        structures=monomer_dimer_structures,
+        label_unc={"target": LABEL_UNC},
+        le={"target": LE},
+        width=ROI,
+        height=ROI,
+    )
+    ss = spinna.generate_N_structures(
+        monomer_dimer_structures, {"target": 200}, granularity=10
+    )
+    spinner = SPINNA(mixer=mixer, gt_coords=gt, N_sim=1)
+    np.random.seed(0)
+    out_csv = tmp_path / "bayes.csv"
+    spinner.fit_bayesian(ss, n_initial=1, n_iterations=0, save=str(out_csv))
+    df = pd.read_csv(out_csv)
+    assert len(df) == 1
+    assert np.allclose(df["Prop_Monomer"] + df["Prop_Dimer"], 100.0)
+
+
 def test_spinna_evaluate_single_returns_finite_float(
     mixer_2d_csr, monomer_dimer_structures
 ):
@@ -1609,3 +1781,119 @@ def test_fit_le_smoke(mols_real):
     assert len(best_props) == 3
     assert isinstance(best_mixer, StructureMixer)
     assert len(best_mixer.structures) == 3
+
+
+# ---------------------------------------------------------------------
+# Section H — Progress reporting
+#
+# Progress is driven through a uniform duck-typed interface (see
+# lib.normalize_progress), so every fitting mode must work with None,
+# "console" and any object implementing that interface.
+# ---------------------------------------------------------------------
+
+
+class _RecordingProgress:
+    """Duck-typed progress tracker recording the calls it receives."""
+
+    def __init__(self):
+        self.values = []
+        self.maxima = []
+        self.titles = []
+        self.description_base = ""
+        self.closed = False
+
+    def set_value(self, value):
+        self.values.append(value)
+
+    def setMaximum(self, maximum):
+        self.maxima.append(maximum)
+
+    def maximum(self):
+        return self.maxima[-1] if self.maxima else 0
+
+    def zero_progress(self, description=None, *args, **kwargs):
+        self.titles.append(description)
+
+    def close(self, *args, **kwargs):
+        self.closed = True
+
+
+@pytest.fixture
+def small_spinner(mols_real, monomer_dimer_structures):
+    """A SPINNA instance plus a small search space, cheap to fit."""
+    coords = mols_real[["x", "y"]].to_numpy()
+    n = int(len(coords) / LE)
+    mixer = StructureMixer(
+        structures=monomer_dimer_structures,
+        label_unc={"target": LABEL_UNC},
+        le={"target": LE},
+        width=ROI,
+        height=ROI,
+    )
+    ss = spinna.generate_N_structures(
+        monomer_dimer_structures, {"target": n}, granularity=3
+    )
+    spinner = SPINNA(mixer=mixer, gt_coords={"target": coords}, N_sim=1)
+    return spinner, ss
+
+
+@pytest.mark.parametrize(
+    "fitting_mode", ["brute-force", "coarse-to-fine", "bayesian"]
+)
+@pytest.mark.parametrize("callback", [None, "console"])
+def test_fit_progress_modes(small_spinner, fitting_mode, callback):
+    spinner, ss = small_spinner
+    np.random.seed(0)
+    props, score = spinner.fit_stoichiometry(
+        N_structures=ss,
+        fitting_mode=fitting_mode,
+        asynch=False,
+        callback=callback,
+    )
+    assert np.isfinite(score)
+    assert props.shape == (2,)
+
+
+@pytest.mark.parametrize(
+    "fitting_mode", ["brute-force", "coarse-to-fine", "bayesian"]
+)
+def test_fit_reports_progress_to_duck_typed_tracker(
+    small_spinner, fitting_mode
+):
+    spinner, ss = small_spinner
+    tracker = _RecordingProgress()
+    np.random.seed(0)
+    spinner.fit_stoichiometry(
+        N_structures=ss,
+        fitting_mode=fitting_mode,
+        asynch=False,
+        callback=tracker,
+    )
+    assert tracker.values, "no progress was reported"
+    assert tracker.maxima, "progress range was never set"
+    assert all(m > 0 for m in tracker.maxima)
+    # progress never exceeds the range declared at the time
+    assert max(tracker.values) <= max(tracker.maxima)
+
+
+def test_invalid_callback_raises(small_spinner):
+    spinner, ss = small_spinner
+    with pytest.raises((TypeError, ValueError)):
+        spinner.fit_stoichiometry(
+            N_structures=ss, fitting_mode="brute-force", callback="bogus"
+        )
+
+
+def test_coarse_to_fine_labels_both_passes(small_spinner):
+    spinner, ss = small_spinner
+    tracker = _RecordingProgress()
+    np.random.seed(0)
+    spinner.fit_stoichiometry(
+        N_structures=ss,
+        fitting_mode="coarse-to-fine",
+        asynch=False,
+        callback=tracker,
+    )
+    titles = " | ".join(t for t in tracker.titles if t)
+    assert "Coarse pass" in titles
+    assert "Fine pass" in titles

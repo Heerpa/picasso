@@ -25,10 +25,8 @@ from . import lib, render
 
 def mask_locs(
     locs: pd.DataFrame,
+    info: list[dict],
     mask: lib.BoolArray2D,
-    width: float = None,
-    height: float = None,
-    info: list[dict] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Mask localizations given a binary mask.
 
@@ -36,16 +34,10 @@ def mask_locs(
     ----------
     locs : pd.DataFrame
         Localizations to be masked.
-    mask : lib.BoolArray2D
-        Binary mask where True indicates the area to keep.
-    width : float
-        Maximum x coordinate of the localizations. Deprecated, will be
-        removed in v0.11.0.
-    height : float
-        Maximum y coordinate of the localizations. Deprecated, will be
-        removed in v0.11.0.
     info : list of dict
         Localization metadata containing 'Width' and 'Height' keys.
+    mask : lib.BoolArray2D
+        Binary mask where True indicates the area to keep.
 
     Returns
     -------
@@ -54,19 +46,8 @@ def mask_locs(
     locs_out : pd.DataFrame
         Localizations outside the mask.
     """
-    # deprecation of width and height (use info instead) TODO: remove in v0.11.0
-    if width is not None or height is not None:
-        lib.deprecation_warning(
-            "Deprecation warning: 'width' and 'height' are deprecated "
-            "parameters in 'mask_locs'. Please provide 'info' see "
-            "``io.load_locs``. The arguments 'width' and 'height' will "
-            "be removed in v0.11.0.",
-        )
-    elif info is not None:
-        width = lib.get_from_metadata(info, "Width")
-        height = lib.get_from_metadata(info, "Height")
-    else:
-        raise ValueError("`mask_locs` requires `info` parameter.")
+    width = lib.get_from_metadata(info, "Width", raise_error=True)
+    height = lib.get_from_metadata(info, "Height", raise_error=True)
     x_ind = np.int32(np.floor(locs["x"] / width * mask.shape[1]))
     y_ind = np.int32(np.floor(locs["y"] / height * mask.shape[0]))
 
@@ -94,6 +75,11 @@ def generate_image(
     blur : float
         Standard deviation of the Gaussian blur in nm applied to the
         histogrammed image.
+
+    Returns
+    -------
+    image_blur : lib.FloatArray2D
+        The blurred image, scaled so that its maximum is 1.
     """
     _, image = render.render(
         locs=locs,
@@ -678,6 +664,9 @@ def loess_smooth(arr: lib.FloatArray1D, span: int = 5) -> lib.FloatArray1D:
     ----------
     arr : lib.FloatArray1D
         Input array to be smoothed (1D).
+    span : int, optional
+        Width of the smoothing window in samples; rounded up to the next odd
+        number. Default 5.
 
     Returns
     -------

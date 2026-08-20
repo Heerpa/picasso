@@ -4,8 +4,11 @@ Every write goes to a ``tmp_path`` so nothing pollutes ``tests/data/``.
 The bundled ``locs`` and ``movie`` fixtures from ``tests/conftest.py``
 are reused for round-trip checks against real Picasso data.
 
+TIFF loading (``load_tif`` / ``TiffMap`` / ``TiffMultiMap``) is covered
+with synthetic ``tifffile``-written stacks generated per test.
+
 Skipped functions (need fixtures we don't have bundled): ``load_ims*``,
-``load_nd2``, ``load_stk``, ``load_tif``, ``to_raw``, ``to_raw_combined``.
+``load_nd2``, ``load_stk``.
 
 :author: Rafal Kowalewski, 2026
 :copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry
@@ -14,16 +17,29 @@ Skipped functions (need fixtures we don't have bundled): ``load_ims*``,
 from __future__ import annotations
 
 import os
+import json
+import types
 
 import h5py
 import numpy as np
 import pandas as pd
 import pytest
+import tifffile
 import yaml
 
 from picasso import io, lib
 
 from tests.conftest import PIXELSIZE
+
+
+@pytest.fixture(autouse=True)
+def _yaml_sidecar_on(monkeypatch):
+    """Write the sidecar .yaml, whatever the developer's user settings
+    say. ``io._save_metadata_in_yaml`` reads ``~/.picasso/settings.yaml``,
+    so without this the outcome of every save test would depend on the
+    machine it runs on. Tests that need the sidecar off patch it again.
+    """
+    monkeypatch.setattr(io, "_save_metadata_in_yaml", lambda: True)
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +193,256 @@ class TestSaveLoadLocs:
             loaded["x"].to_numpy(), locs["x"].to_numpy()
         )
 
+    def test_combine_channels_inner_join_preserves_all_rows(
+        self, tmp_path, locs, info
+    ):
+        # Regression test for "Combine all channels" only saving the first
+        # channel. The GUI combines channels with
+        # ``pd.concat(..., join="inner")``. If an outer join were used,
+        # columns missing from some channels would become NaN and
+        # io.save_locs -> lib.ensure_sanity (dropna how="any") would drop
+        # every row from those channels, silently discarding all but one.
+        ch0 = locs.copy()
+        # Second channel lacks a column present in the first (e.g. "z").
+        extra_col = "z" if "z" in ch0.columns else ch0.columns[-1]
+        ch1 = locs.copy().drop(columns=[extra_col])
+
+        combined = pd.concat([ch0, ch1], ignore_index=True, join="inner")
+        # No NaN-introducing columns survive, so no rows are dropped.
+        assert extra_col not in combined.columns
+        assert len(combined) == len(ch0) + len(ch1)
+
+        path = tmp_path / "combined.hdf5"
+        io.save_locs(str(path), combined, info)
+        loaded, _ = io.load_locs(str(path))
+        # Both channels' localizations are preserved after the round-trip.
+        assert len(loaded) == len(ch0) + len(ch1)
+
     def test_csv_extension_raises(self, tmp_path):
         # ThunderSTORM .csv files must go through import_ts, not load_locs
         path = tmp_path / "locs.csv"
         path.write_text("dummy")
         with pytest.raises(ValueError, match="ThunderSTORM"):
             io.load_locs(str(path))
+
+    def test_metadata_embedded_in_hdf5(self, tmp_path, locs, info):
+        # save_locs always embeds metadata as a JSON string at /metadata
+        path = tmp_path / "locs.hdf5"
+        io.save_locs(str(path), locs, info)
+        with h5py.File(path, "r") as f:
+            assert "metadata" in f
+            raw = f["metadata"][()]
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        assert json.loads(raw) == list(info)
+
+    def test_loads_from_embedded_metadata_when_yaml_missing(
+        self, tmp_path, locs, info
+    ):
+        # Deleting the sidecar .yaml must not break loading: the embedded
+        # /metadata dataset is used as a fallback.
+        path = tmp_path / "locs.hdf5"
+        io.save_locs(str(path), locs, info)
+        os.remove(tmp_path / "locs.yaml")
+
+        loaded, loaded_info = io.load_locs(str(path))
+        assert loaded_info == list(info)
+        assert len(loaded) == len(locs)
+
+    def test_no_metadata_anywhere_raises(self, tmp_path, locs):
+        # An HDF5 with neither a .yaml nor an embedded /metadata dataset
+        # still raises NoMetadataFileError.
+        path = tmp_path / "locs.hdf5"
+        with h5py.File(path, "w") as f:
+            f.create_dataset("locs", data=locs.to_records(index=False))
+        with pytest.raises(io.NoMetadataFileError):
+            io.load_locs(str(path))
+
+    def test_embeds_metadata_json_cannot_represent(
+        self, tmp_path, locs, info, monkeypatch
+    ):
+        # YAML (yaml.Dumper) writes numpy scalars, arrays and dates, but
+        # json.dumps rejects them. Such a value must not abort the
+        # embedding: with the .yaml sidecar off, that would leave a file
+        # with no metadata at all (e.g. a G5M molecule map that can only
+        # be opened if a .yaml happens to sit next to it).
+        import datetime
+
+        monkeypatch.setattr(io, "_save_metadata_in_yaml", lambda: False)
+        info = list(info) + [
+            {
+                "Generated by": "Test",
+                "Int": np.int64(7),
+                "Bool": np.bool_(True),
+                "Array": np.arange(3),
+                "Date": datetime.date(2026, 8, 7),
+            }
+        ]
+        path = tmp_path / "locs.hdf5"
+        io.save_locs(str(path), locs, info)
+
+        assert not (tmp_path / "locs.yaml").exists()
+        _, loaded_info = io.load_locs(str(path))
+        assert loaded_info[-1]["Int"] == 7
+        assert loaded_info[-1]["Bool"] is True
+        assert loaded_info[-1]["Array"] == [0, 1, 2]
+        assert loaded_info[-1]["Date"] == "2026-08-07"
+
+    def test_yaml_written_when_metadata_cannot_be_embedded(
+        self, tmp_path, locs, info, monkeypatch
+    ):
+        # Last resort: a value that not even _json_default can coerce
+        # falls back to the .yaml sidecar even if the user disabled it,
+        # so the file never ends up unreadable.
+        monkeypatch.setattr(io, "_save_metadata_in_yaml", lambda: False)
+        info = list(info) + [{"Generated by": "Test", "Odd": object()}]
+        path = tmp_path / "locs.hdf5"
+        with pytest.warns(UserWarning, match="embed the metadata"):
+            io.save_locs(str(path), locs, info)
+
+        assert (tmp_path / "locs.yaml").exists()
+        with h5py.File(path, "r") as f:
+            assert "metadata" not in f
+        loaded, loaded_info = io.load_locs(str(path))
+        assert loaded_info[-1]["Generated by"] == "Test"
+
+    def test_setting_disables_yaml_sidecar(
+        self, tmp_path, locs, info, monkeypatch
+    ):
+        # With "Save metadata in .yaml" off, only the embedded /metadata
+        # dataset is written — no .yaml file. (monkeypatched to avoid
+        # touching the real user settings file.)
+        monkeypatch.setattr(io, "_save_metadata_in_yaml", lambda: False)
+        path = tmp_path / "locs.hdf5"
+        io.save_locs(str(path), locs, info)
+
+        assert not (tmp_path / "locs.yaml").exists()
+        with h5py.File(path, "r") as f:
+            assert "metadata" in f
+        # The file is still loadable via the embedded metadata.
+        loaded, loaded_info = io.load_locs(str(path))
+        assert loaded_info == list(info)
+
+
+class TestSavePicksInMetadataSetting:
+    @pytest.fixture(autouse=True)
+    def _settings_file(self, tmp_path, monkeypatch):
+        # Never touch the developer's ~/.picasso/settings.yaml.
+        path = tmp_path / "settings.yaml"
+        monkeypatch.setattr(io, "_user_settings_filename", lambda: str(path))
+        return path
+
+    def test_defaults_to_false_and_is_persisted(self, _settings_file):
+        # Nothing is defined yet: the default must not crash and must be
+        # written out, so the setting is visible and editable.
+        assert io._save_picks_in_metadata() is False
+        assert (
+            yaml.safe_load(_settings_file.read_text())[
+                "Save picks in metadata"
+            ]
+            is False
+        )
+
+    def test_respects_the_setting(self, _settings_file):
+        io.save_user_settings({"Save picks in metadata": True})
+        assert io._save_picks_in_metadata() is True
+        io.save_user_settings({"Save picks in metadata": False})
+        assert io._save_picks_in_metadata() is False
+
+    def test_other_settings_are_kept(self, _settings_file):
+        # Persisting the default must not wipe unrelated settings.
+        io.save_user_settings({"Colors": {"Render": "hot"}})
+        io._save_picks_in_metadata()
+        settings = io.load_user_settings()
+        assert settings["Colors"]["Render"] == "hot"
+        assert settings["Save picks in metadata"] is False
+
+
+class TestSaveMMMetadataSetting:
+    @pytest.fixture(autouse=True)
+    def _settings_file(self, tmp_path, monkeypatch):
+        # Never touch the developer's ~/.picasso/settings.yaml.
+        path = tmp_path / "settings.yaml"
+        monkeypatch.setattr(io, "_user_settings_filename", lambda: str(path))
+        return path
+
+    def test_defaults_to_true_and_is_persisted(self, _settings_file):
+        # Nothing is defined yet: the MicroManager block is saved as
+        # before and the default is written out so it can be edited.
+        assert io._save_mm_metadata() is True
+        assert (
+            yaml.safe_load(_settings_file.read_text())[
+                "Save Micro-Manager metadata"
+            ]
+            is True
+        )
+
+    def test_respects_the_setting(self, _settings_file):
+        io.save_user_settings({"Save Micro-Manager metadata": False})
+        assert io._save_mm_metadata() is False
+        io.save_user_settings({"Save Micro-Manager metadata": True})
+        assert io._save_mm_metadata() is True
+
+    def test_strip_keeps_input_untouched(self, _settings_file):
+        # The movie metadata kept in memory (used to read the camera
+        # settings while localizing) must survive stripping the copy
+        # that is carried over into the localizations.
+        io.save_user_settings({"Save Micro-Manager metadata": False})
+        info = [{"Frames": 10, "Micro-Manager Metadata": {"Camera": "Zyla"}}]
+        stripped = io.strip_mm_metadata(info)
+        assert stripped == [{"Frames": 10}]
+        assert "Micro-Manager Metadata" in info[0]
+
+    def test_strip_is_a_noop_when_enabled(self, _settings_file):
+        info = [{"Frames": 10, "Micro-Manager Metadata": {"Camera": "Zyla"}}]
+        assert io.strip_mm_metadata(info) is info
+
+
+class TestMMMetadataInSavedFiles:
+    @pytest.fixture
+    def mm_info(self, info):
+        return list(info) + [
+            {
+                "Generated by": "Test",
+                "Micro-Manager Metadata": {"Camera": "Zyla", "Exposure": 100},
+            }
+        ]
+
+    def test_saved_by_default(self, tmp_path, locs, mm_info):
+        path = tmp_path / "locs.hdf5"
+        io.save_locs(str(path), locs, mm_info)
+        _, loaded_info = io.load_locs(str(path))
+        assert loaded_info[-1]["Micro-Manager Metadata"]["Camera"] == "Zyla"
+
+    def test_never_stripped_when_saving_existing_metadata(
+        self, tmp_path, locs, mm_info, monkeypatch
+    ):
+        # The setting applies when localizing only: a file that already
+        # holds the block must keep it, no matter the setting, so that
+        # loading and saving it again (e.g. in Render) never loses it.
+        monkeypatch.setattr(io, "_save_mm_metadata", lambda: False)
+        path = tmp_path / "locs.hdf5"
+        io.save_locs(str(path), locs, mm_info)
+        _, loaded_info = io.load_locs(str(path))
+        assert loaded_info[-1]["Micro-Manager Metadata"]["Camera"] == "Zyla"
+
+        # ... and the same for identifications and pick properties
+        ids_path = tmp_path / "ids.hdf5"
+        ids = pd.DataFrame(
+            {
+                "frame": np.array([0, 1], dtype=np.int32),
+                "x": np.array([1.0, 2.0], dtype=np.float32),
+                "y": np.array([3.0, 4.0], dtype=np.float32),
+                "net_gradient": np.array([10.0, 20.0], dtype=np.float32),
+            }
+        )
+        io.save_identifications(str(ids_path), ids, mm_info)
+        assert "Micro-Manager Metadata" in io.load_info(str(ids_path))[-1]
+
+        groups_path = tmp_path / "groups.hdf5"
+        groups = pd.DataFrame({"group": [0, 1], "n": [10, 20]})
+        io.save_datasets(str(groups_path), mm_info, groups=groups)
+        assert "Micro-Manager Metadata" in io.load_info(str(groups_path))[-1]
 
 
 class TestSaveDatasets:
@@ -215,6 +475,92 @@ class TestLoadCalibration:
         out = io.load_calibration(str(path))
         assert "X Coefficients" in out
         assert out["Step size in nm"] == 5.0
+
+
+# ---------------------------------------------------------------------------
+# save/load_camera_calibration — the per-pixel sCMOS maps
+# ---------------------------------------------------------------------------
+
+
+class TestCameraCalibrationRoundtrip:
+    @staticmethod
+    def _calibration(with_gain=True):
+        rng = np.random.default_rng(0)
+        calibration = {
+            "offset": rng.normal(100.0, 2.0, (6, 5)).astype(np.float32),
+            "variance": rng.gamma(4.0, 0.5, (6, 5)).astype(np.float32),
+            "model": "scmos-noise",
+            "Height": 6,
+            "Width": 5,
+            "Frames": 20000,
+            "Light movies": ["a.raw", "b.raw"],
+            "Variance median (ADU^2)": 2.0,
+        }
+        if with_gain:
+            calibration["gain"] = rng.normal(2.13, 0.1, (6, 5)).astype(
+                np.float32
+            )
+        return calibration
+
+    @pytest.mark.parametrize("with_gain", [True, False])
+    def test_arrays_survive_bit_exactly(self, tmp_path, with_gain):
+        calibration = self._calibration(with_gain)
+        path = str(tmp_path / "cam_scmos_calib.hdf5")
+        io.save_camera_calibration(path, calibration)
+        out = io.load_camera_calibration(path)
+
+        for name in ("offset", "variance") + (("gain",) if with_gain else ()):
+            assert out[name].dtype == np.float32
+            np.testing.assert_array_equal(out[name], calibration[name])
+        assert ("gain" in out) is with_gain
+
+    def test_metadata_survives(self, tmp_path):
+        calibration = self._calibration()
+        path = str(tmp_path / "cam_scmos_calib.hdf5")
+        io.save_camera_calibration(path, calibration)
+        out = io.load_camera_calibration(path)
+        assert out["model"] == "scmos-noise"
+        assert out["Frames"] == 20000
+        assert out["Light movies"] == ["a.raw", "b.raw"]
+        assert out["Variance median (ADU^2)"] == 2.0
+
+    def test_load_records_where_it_came_from(self, tmp_path):
+        """``Path`` is set on load, so a moved file still reports its home."""
+        path = str(tmp_path / "cam_scmos_calib.hdf5")
+        io.save_camera_calibration(path, self._calibration())
+        assert io.load_camera_calibration(path)["Path"] == path
+
+    def test_save_rejects_a_calibration_without_maps(self, tmp_path):
+        with pytest.raises(ValueError, match="missing 'variance' map"):
+            io.save_camera_calibration(
+                str(tmp_path / "x.hdf5"), {"offset": np.zeros((2, 2))}
+            )
+
+    def test_load_rejects_a_spline_calibration(self, tmp_path):
+        """The two calibrations share a container format, not a schema."""
+        path = str(tmp_path / "spline_calib.hdf5")
+        io.save_spline_calibration(
+            path, {"coefficients": np.zeros((1, 1, 1, 4, 4)), "model": "2d"}
+        )
+        with pytest.raises(ValueError, match="sCMOS camera calibration"):
+            io.load_camera_calibration(path)
+
+    def test_roundtrips_a_real_calibration(
+        self, tmp_path, scmos_maps, dark_movie_factory
+    ):
+        """End to end from ``scmos.calibrate_scmos``, metadata included."""
+        from picasso import scmos
+
+        frames = dark_movie_factory(scmos_maps, 20_000, seed=8)
+        calibration = scmos.calibrate_scmos(frames, dark_path="dark.raw")
+        path = str(tmp_path / "real_scmos_calib.hdf5")
+        io.save_camera_calibration(path, calibration)
+        out = io.load_camera_calibration(path)
+
+        np.testing.assert_array_equal(out["offset"], calibration["offset"])
+        np.testing.assert_array_equal(out["variance"], calibration["variance"])
+        assert out["Dark movie"] == "dark.raw"
+        assert out["Hot pixels"] == calibration["Hot pixels"]
 
 
 # ---------------------------------------------------------------------------
@@ -409,3 +755,1270 @@ class TestThunderstormRoundtrip:
         )
         # Frame count is preserved (frames re-zeroed by import_ts)
         assert out_info[0]["Frames"] == 3
+
+    def test_extra_columns_kept(self, tmp_path):
+        # Columns that do not map onto predefined Picasso fields must
+        # survive the import (with names sanitized to identifiers).
+        data = pd.DataFrame(
+            {
+                "id": [1, 2, 3],
+                "frame": [1, 2, 3],
+                "x [nm]": [650.0, 1300.0, 1950.0],
+                "y [nm]": [650.0, 1300.0, 1950.0],
+                "intensity [photon]": [1000.0, 2000.0, 3000.0],
+                "offset [photon]": [10.0, 10.0, 10.0],
+                "uncertainty_xy [nm]": [6.5, 6.5, 6.5],
+                "sigma [nm]": [130.0, 130.0, 130.0],
+                "chi2": [1.1, 2.2, 3.3],
+                "uncertainty_z [nm]": [20.0, 30.0, 40.0],
+            }
+        )
+        path = tmp_path / "ts_extra.csv"
+        data.to_csv(path, index=False)
+
+        out_locs, _ = io.import_ts(str(path), pixelsize=PIXELSIZE)
+        assert "id" in out_locs.columns
+        np.testing.assert_allclose(
+            out_locs["chi2"].to_numpy(), [1.1, 2.2, 3.3], atol=1e-5
+        )
+        # Names with units/spaces are sanitized to valid identifiers.
+        assert "uncertainty_z_nm" in out_locs.columns
+
+
+# ---------------------------------------------------------------------------
+# SMAP round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestSMAPRoundtrip:
+    def _locs_2d(self):
+        return pd.DataFrame(
+            {
+                "frame": np.array([0, 1, 2], dtype=np.uint32),
+                "x": np.array([5.0, 10.0, 15.0], dtype=np.float32),
+                "y": np.array([6.0, 11.0, 16.0], dtype=np.float32),
+                "sx": np.array([1.1, 1.2, 1.3], dtype=np.float32),
+                "sy": np.array([1.4, 1.5, 1.6], dtype=np.float32),
+                "photons": np.array(
+                    [1000.0, 2000.0, 3000.0], dtype=np.float32
+                ),
+                "bg": np.array([10.0, 20.0, 30.0], dtype=np.float32),
+                "lpx": np.array([0.05, 0.06, 0.07], dtype=np.float32),
+                "lpy": np.array([0.07, 0.08, 0.09], dtype=np.float32),
+            }
+        )
+
+    def _info(self):
+        return [
+            {"Pixelsize": PIXELSIZE, "Width": 64, "Height": 64, "Frames": 3}
+        ]
+
+    def test_export_import_2d(self, tmp_path):
+        locs = self._locs_2d()
+        info = self._info()
+        path = tmp_path / "data_sml.mat"
+        io.export_smap(str(path), locs, info)
+        assert path.exists()
+
+        out_locs, out_info = io.import_smap(str(path), pixelsize=PIXELSIZE)
+        np.testing.assert_allclose(
+            out_locs["x"].to_numpy(), locs["x"].to_numpy(), atol=1e-3
+        )
+        np.testing.assert_allclose(
+            out_locs["y"].to_numpy(), locs["y"].to_numpy(), atol=1e-3
+        )
+        # SMAP frames are 1-based on disk; import re-zeroes them.
+        np.testing.assert_array_equal(
+            out_locs["frame"].to_numpy(), locs["frame"].to_numpy()
+        )
+        np.testing.assert_allclose(
+            out_locs["photons"].to_numpy(),
+            locs["photons"].to_numpy(),
+            atol=1e-3,
+        )
+        # lpx and lpy collapse to the combined locprecnm on export, so
+        # both come back as the average of the original lpx/lpy.
+        expected_lp = (locs["lpx"].to_numpy() + locs["lpy"].to_numpy()) / 2
+        np.testing.assert_allclose(
+            out_locs["lpx"].to_numpy(), expected_lp, atol=1e-3
+        )
+        np.testing.assert_allclose(
+            out_locs["lpy"].to_numpy(), expected_lp, atol=1e-3
+        )
+        assert out_info[0]["Frames"] == 3
+
+    def test_export_import_3d(self, tmp_path):
+        locs = self._locs_2d()
+        locs["z"] = np.array([-100.0, 0.0, 100.0], dtype=np.float32)
+        locs["lpz"] = np.array([3.0, 4.0, 5.0], dtype=np.float32)
+        info = self._info()
+        path = tmp_path / "data3d_sml.mat"
+        io.export_smap(str(path), locs, info)
+
+        out_locs, _ = io.import_smap(str(path), pixelsize=PIXELSIZE)
+        # z and lpz are kept in nm in both formats.
+        np.testing.assert_allclose(
+            out_locs["z"].to_numpy(), locs["z"].to_numpy(), atol=1e-3
+        )
+        np.testing.assert_allclose(
+            out_locs["lpz"].to_numpy(), locs["lpz"].to_numpy(), atol=1e-3
+        )
+
+    def test_extra_fields_kept(self, tmp_path):
+        # export_smap writes a 'channel' field, which is not a
+        # predefined Picasso column — import must keep it.
+        locs = self._locs_2d()
+        info = self._info()
+        path = tmp_path / "extra_sml.mat"
+        io.export_smap(str(path), locs, info)
+
+        out_locs, _ = io.import_smap(str(path), pixelsize=PIXELSIZE)
+        assert "channel" in out_locs.columns
+        np.testing.assert_array_equal(
+            out_locs["channel"].to_numpy(), np.zeros(len(locs))
+        )
+
+    def test_export_enforces_sml_suffix(self, tmp_path):
+        # SMAP recognizes localizations by the '_sml' suffix; export
+        # appends it when missing.
+        locs = self._locs_2d()
+        info = self._info()
+        io.export_smap(str(tmp_path / "plain.mat"), locs, info)
+        assert (tmp_path / "plain_sml.mat").exists()
+
+    def test_export_writes_smap_structure(self, tmp_path):
+        from scipy.io import loadmat
+
+        locs = self._locs_2d()
+        info = self._info()
+        path = tmp_path / "struct_sml.mat"
+        io.export_smap(str(path), locs, info)
+
+        mat = loadmat(str(path), struct_as_record=False, squeeze_me=True)
+        assert "saveloc" in mat
+        assert "fileformat" in mat
+        assert mat["fileformat"].name == "sml"
+        assert hasattr(mat["saveloc"].loc, "xnm")
+        assert hasattr(mat["saveloc"], "info")
+
+    def test_split_parts_raises(self, tmp_path):
+        # A SMAP split '_sml_p*.mat' file carries 'lds'/'partnames'
+        # variables; import should reject it with a clear message.
+        from scipy.io import savemat
+
+        path = tmp_path / "split_sml.mat"
+        savemat(
+            str(path),
+            {"lds": np.zeros((1, 1)), "partnames": np.zeros((1, 1))},
+        )
+        with pytest.raises(ValueError, match="split"):
+            io.import_smap(str(path), pixelsize=PIXELSIZE)
+
+    def test_import_v73_hdf5(self, tmp_path):
+        # MATLAB v7.3 files are HDF5-based and read via the h5py path.
+        # SMAP stores column vectors transposed, so each loc field is a
+        # (1, N) dataset under /saveloc/loc.
+        n = 10
+        path = tmp_path / "v73_sml.mat"
+        with h5py.File(str(path), "w") as f:
+            loc = f.create_group("saveloc").create_group("loc")
+            loc.create_dataset(
+                "xnm", data=np.linspace(130, 1300, n).reshape(1, n)
+            )
+            loc.create_dataset(
+                "ynm", data=np.linspace(260, 2600, n).reshape(1, n)
+            )
+            loc.create_dataset(
+                "frame", data=np.arange(1, n + 1, dtype=float).reshape(1, n)
+            )
+            loc.create_dataset("phot", data=np.full((1, n), 500.0))
+            loc.create_dataset("bg", data=np.full((1, n), 12.0))
+            loc.create_dataset("locprecnm", data=np.full((1, n), 13.0))
+            loc.create_dataset("numberInGroup", data=np.full((1, n), 2.0))
+
+        locs, info = io.import_smap(str(path), pixelsize=PIXELSIZE)
+        assert len(locs) == n
+        # Non-predefined SMAP fields are kept as extra columns.
+        assert "numberInGroup" in locs.columns
+        # SMAP frames are 1-based; import re-zeroes them.
+        assert int(locs["frame"].min()) == 0
+        np.testing.assert_allclose(
+            locs["x"].to_numpy(),
+            np.linspace(130, 1300, n) / PIXELSIZE,
+            atol=1e-3,
+        )
+        np.testing.assert_allclose(
+            locs["lpx"].to_numpy(), 13.0 / PIXELSIZE, atol=1e-3
+        )
+
+
+# ---------------------------------------------------------------------------
+# TIFF loading — TiffMap / TiffMultiMap / load_tif
+#
+# Picasso reads TIFFs via ``tifffile`` (see picasso.io.TiffMap). Real
+# microscopy movies store one IFD per frame, so the fixtures here are
+# written frame-by-frame (a single 3-D array would be collapsed into one
+# volumetric page by tifffile and would not represent a real movie).
+# ---------------------------------------------------------------------------
+
+
+def _write_tif_stack(
+    path,
+    data,
+    byteorder=None,
+    bigtiff=False,
+    compression=None,
+    mm_metadata=None,
+):
+    """Write ``data`` (frames, H, W) as a multi-page TIFF, one IFD per
+    frame. Optionally big-endian, BigTIFF, compressed, or with a
+    MicroManager metadata tag (51123) on the first page."""
+    with tifffile.TiffWriter(
+        str(path), byteorder=byteorder, bigtiff=bigtiff, ome=False
+    ) as tw:
+        for i, frame in enumerate(data):
+            kw = {}
+            if i == 0 and mm_metadata is not None:
+                kw["extratags"] = [
+                    (51123, "s", 0, json.dumps(mm_metadata), True)
+                ]
+            tw.write(
+                frame,
+                photometric="minisblack",
+                compression=compression,
+                contiguous=(compression is None),
+                **kw,
+            )
+
+
+def _write_imagej_contiguous_stack(path, data):
+    """Write ``data`` (frames, H, W) in ImageJ's *contiguous stack*
+    layout: a single IFD whose ``ImageDescription`` declares the full
+    plane count, followed by every other plane's pixel data laid out
+    back-to-back. This mirrors ImageJ's own "Save As > Tiff" for large
+    stacks (as opposed to one-IFD-per-plane), which tifffile reports as
+    a single page plus an N-plane series."""
+    tifffile.imwrite(str(path), data[0], imagej=True)
+    with tifffile.TiffFile(str(path)) as t:
+        tag = t.pages[0].tags.get(270)  # ImageDescription
+        offset, count = tag.valueoffset, tag.count
+    n = len(data)
+    desc = f"ImageJ=1.54f\nimages={n}\nslices={n}\n".encode()
+    assert len(desc) <= count, "test description longer than reserved tag"
+    desc = desc + b" " * (count - len(desc))
+    with open(path, "r+b") as fh:
+        fh.seek(offset)
+        fh.write(desc)
+    with open(path, "ab") as fh:
+        fh.write(np.ascontiguousarray(data[1:]).tobytes())
+
+
+class TestTiffLoading:
+    def test_load_tif_basic_shape_dtype_frames(self, tmp_path):
+        rng = np.random.default_rng(0)
+        data = rng.integers(0, 60000, size=(7, 32, 48), dtype="<u2")
+        path = tmp_path / "plain.tif"
+        _write_tif_stack(path, data)
+
+        movie, info = io.load_tif(str(path))
+        try:
+            assert movie.shape == (7, 32, 48)
+            assert movie.dtype == np.dtype("<u2")
+            assert movie.n_frames == 7
+            assert len(movie) == 7
+            assert info[0]["Height"] == 32
+            assert info[0]["Width"] == 48
+            assert info[0]["Frames"] == 7
+            assert info[0]["Data Type"] == "uint16"
+        finally:
+            movie.close()
+
+    def test_frame_slice_and_iter_access(self, tmp_path):
+        rng = np.random.default_rng(1)
+        data = rng.integers(0, 60000, size=(6, 16, 20), dtype="<u2")
+        path = tmp_path / "access.tif"
+        _write_tif_stack(path, data)
+
+        movie, _ = io.load_tif(str(path))
+        try:
+            np.testing.assert_array_equal(movie[3], data[3])
+            np.testing.assert_array_equal(np.array(movie[2:5]), data[2:5])
+            np.testing.assert_array_equal(movie[...], data)
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+            # Region indexing
+            np.testing.assert_array_equal(
+                movie[4, 5:10, 3:7], data[4, 5:10, 3:7]
+            )
+            # Single frames are little-endian 2-D arrays
+            assert movie[0].dtype == np.dtype("<u2")
+            assert movie[0].shape == (16, 20)
+        finally:
+            movie.close()
+
+    def test_big_endian_normalized_to_little_endian(self, tmp_path):
+        rng = np.random.default_rng(2)
+        data = rng.integers(0, 60000, size=(4, 16, 20), dtype="<u2")
+        path = tmp_path / "be.tif"
+        _write_tif_stack(path, data.astype(">u2"), byteorder=">")
+
+        movie, info = io.load_tif(str(path))
+        try:
+            # Values must be preserved despite byte-order conversion
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+            assert movie.dtype == np.dtype("<u2")
+            assert movie[1].dtype.byteorder in ("<", "=")
+            # info preserves the file's native byte order
+            assert info[0]["Byte Order"] == ">"
+        finally:
+            movie.close()
+
+    def test_bigtiff(self, tmp_path):
+        rng = np.random.default_rng(3)
+        data = rng.integers(0, 255, size=(3, 10, 12), dtype="<u2")
+        path = tmp_path / "big.tif"
+        _write_tif_stack(path, data, bigtiff=True)
+
+        movie, _ = io.load_tif(str(path))
+        try:
+            assert movie.n_frames == 3
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+        finally:
+            movie.close()
+
+    def test_compressed_falls_back_to_decoder(self, tmp_path):
+        rng = np.random.default_rng(4)
+        data = rng.integers(0, 1000, size=(5, 16, 16), dtype="<u2")
+        path = tmp_path / "zip.tif"
+        _write_tif_stack(path, data, compression="zlib")
+
+        movie, _ = io.load_tif(str(path))
+        try:
+            # Compressed pages are not contiguous → fast path disabled
+            assert movie.maps[0]._uncompressed is False
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+            np.testing.assert_array_equal(movie[2], data[2])
+        finally:
+            movie.close()
+
+    def test_multifile_ome_concatenation(self, tmp_path):
+        rng = np.random.default_rng(5)
+        parts = [
+            rng.integers(0, 500, size=(3, 8, 8), dtype="<u2") for _ in range(3)
+        ]
+        base = tmp_path / "mov"
+        _write_tif_stack(str(base) + ".ome.tif", parts[0])
+        _write_tif_stack(str(base) + "_1.ome.tif", parts[1])
+        _write_tif_stack(str(base) + "_2.ome.tif", parts[2])
+
+        movie, info = io.load_tif(str(base) + ".ome.tif")
+        try:
+            expected = np.concatenate(parts, axis=0)
+            assert movie.n_frames == 9
+            assert info[0]["Frames"] == 9
+            np.testing.assert_array_equal(np.array(list(movie)), expected)
+            # Frame routing across files
+            np.testing.assert_array_equal(movie[7], expected[7])
+        finally:
+            movie.close()
+
+    def test_imagej_contiguous_stack_all_frames_detected(self, tmp_path):
+        # ImageJ stores a large stack as one IFD + contiguous plane data,
+        # recording the count in its metadata. Picasso must read every
+        # plane, not just the single page tifffile reports.
+        rng = np.random.default_rng(30)
+        data = rng.integers(0, 60000, size=(50, 24, 32), dtype="<u2")
+        path = tmp_path / "ij_contiguous.tif"
+        _write_imagej_contiguous_stack(path, data)
+
+        movie, info = io.load_tif(str(path))
+        try:
+            assert movie.n_frames == 50
+            assert movie.shape == (50, 24, 32)
+            assert info[0]["Frames"] == 50
+            # Fast offset path is used (uncompressed contiguous planes).
+            assert movie.maps[0]._imagej_planes == 50
+            assert movie.maps[0]._offsets is not None
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+            np.testing.assert_array_equal(movie[37], data[37])
+            np.testing.assert_array_equal(movie[49], data[49])
+        finally:
+            movie.close()
+
+    def test_imagej_contiguous_big_endian(self, tmp_path):
+        # Real-world ImageJ stacks are often big-endian; values must be
+        # normalized to little-endian like every other TIFF path.
+        rng = np.random.default_rng(31)
+        data = rng.integers(0, 60000, size=(20, 16, 16), dtype="<u2")
+        path = tmp_path / "ij_be.tif"
+        _write_imagej_contiguous_stack(path, data.astype(">u2"))
+
+        movie, _ = io.load_tif(str(path))
+        try:
+            assert movie.n_frames == 20
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+        finally:
+            movie.close()
+
+    def test_imagej_single_plane_not_expanded(self, tmp_path):
+        # A genuine single-plane ImageJ image must stay one frame.
+        rng = np.random.default_rng(32)
+        frame = rng.integers(0, 60000, size=(16, 16), dtype="<u2")
+        path = tmp_path / "ij_single.tif"
+        tifffile.imwrite(str(path), frame, imagej=True)
+
+        movie, _ = io.load_tif(str(path))
+        try:
+            assert movie.n_frames == 1
+            assert movie.maps[0]._imagej_planes is None
+            np.testing.assert_array_equal(movie[0], frame)
+        finally:
+            movie.close()
+
+    def test_micromanager_metadata_flattened(self, tmp_path):
+        rng = np.random.default_rng(6)
+        data = rng.integers(0, 500, size=(2, 8, 8), dtype="<u2")
+        path = tmp_path / "mm.tif"
+        mm = {
+            "Camera": "TestCam",
+            # MM 2.0 nests values under PropVal — must be flattened
+            "TestCam-Gain": {"PropName": "Gain", "PropVal": "300"},
+            "scopeDataKeys": {"ignored": 1},
+        }
+        _write_tif_stack(path, data, mm_metadata=mm)
+
+        movie, info = io.load_tif(str(path))
+        try:
+            meta = info[0]
+            assert meta["Camera"] == "TestCam"
+            mm_meta = meta["Micro-Manager Metadata"]
+            assert mm_meta["TestCam-Gain"] == "300"
+            assert mm_meta["Camera"] == "TestCam"
+            assert "scopeDataKeys" not in mm_meta
+            # This acquisition has no comment, so the key is left out
+            # rather than saved empty with every file.
+            assert "Micro-Manager Acquisition Comments" not in meta
+        finally:
+            movie.close()
+
+    def test_non_mm_tiff_has_no_camera_key(self, tmp_path):
+        rng = np.random.default_rng(7)
+        data = rng.integers(0, 500, size=(2, 8, 8), dtype="<u2")
+        path = tmp_path / "plain2.tif"
+        _write_tif_stack(path, data)
+
+        movie, info = io.load_tif(str(path))
+        try:
+            assert "Camera" not in info[0]
+            assert "Micro-Manager Metadata" not in info[0]
+        finally:
+            movie.close()
+
+    def test_load_movie_dispatches_tif(self, tmp_path):
+        rng = np.random.default_rng(8)
+        data = rng.integers(0, 60000, size=(4, 12, 10), dtype="<u2")
+        path = tmp_path / "dispatch.tif"
+        _write_tif_stack(path, data)
+
+        movie, _ = io.load_movie(str(path))
+        try:
+            assert isinstance(movie, io.AbstractPicassoMovie)
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+        finally:
+            movie.close()
+
+    @pytest.mark.parametrize("ext", [".btf", ".tf8", ".tf2"])
+    def test_bigtiff_extensions_load_via_load_movie(self, tmp_path, ext):
+        rng = np.random.default_rng(10)
+        data = rng.integers(0, 60000, size=(4, 12, 10), dtype="<u2")
+        path = tmp_path / ("movie" + ext)
+        _write_tif_stack(path, data, bigtiff=True)
+
+        movie, info = io.load_movie(str(path))
+        try:
+            assert isinstance(movie, io.AbstractPicassoMovie)
+            assert movie.shape == (4, 12, 10)
+            assert movie.n_frames == 4
+            assert info[0]["Frames"] == 4
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+        finally:
+            movie.close()
+
+
+class _FakeTif:
+    """Just enough of a ``tifffile.TiffFile`` for
+    ``_mm_metadata_from_tifffile``: no pages (so the per-image tag is
+    skipped) and a file-level MicroManager block."""
+
+    def __init__(self, micromanager_metadata):
+        self.pages = []
+        self.micromanager_metadata = micromanager_metadata
+
+
+class TestMMAcquisitionComments:
+    @pytest.mark.parametrize("summary", ["", "   ", "\n", None, 42], ids=repr)
+    def test_left_out_when_empty(self, summary):
+        # An empty comment is not worth a key in the metadata of every
+        # file of the acquisition.
+        tif = _FakeTif({"Comments": {"Summary": summary}})
+        out = io._mm_metadata_from_tifffile(tif)
+        assert "Micro-Manager Acquisition Comments" not in out
+
+    def test_left_out_when_no_comments_block(self):
+        assert (
+            "Micro-Manager Acquisition Comments"
+            not in io._mm_metadata_from_tifffile(_FakeTif({}))
+        )
+        assert (
+            "Micro-Manager Acquisition Comments"
+            not in io._mm_metadata_from_tifffile(_FakeTif(None))
+        )
+
+    def test_kept_when_present(self):
+        tif = _FakeTif({"Comments": {"Summary": "line one\nline two"}})
+        out = io._mm_metadata_from_tifffile(tif)
+        assert out["Micro-Manager Acquisition Comments"] == [
+            "line one",
+            "line two",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# MicroManager "separate image files" acquisitions (one TIFF per frame).
+# ---------------------------------------------------------------------------
+
+
+def _write_single_frame(path, frame):
+    """Write one 2-D frame as a single-page TIFF (mimics one file of a
+    MicroManager separate-files acquisition)."""
+    with tifffile.TiffWriter(str(path), ome=False) as tw:
+        tw.write(frame, photometric="minisblack", contiguous=True)
+
+
+class TestMMSeparateFiles:
+    def _mm2_name(self, t, c=0, p=0, z=0):
+        return (
+            f"img_channel{c:03d}_position{p:03d}" f"_time{t:09d}_z{z:03d}.tif"
+        )
+
+    def _mm14_name(self, frame, channel="Default", z=0):
+        return f"img_{frame:09d}_{channel}_{z:03d}.tif"
+
+    def test_mm2_folder_loads_as_single_movie(self, tmp_path):
+        rng = np.random.default_rng(20)
+        data = rng.integers(0, 60000, size=(6, 16, 20), dtype="<u2")
+        for t, frame in enumerate(data):
+            _write_single_frame(tmp_path / self._mm2_name(t), frame)
+
+        # Opening any single frame assembles the whole sequence.
+        movie, info = io.load_tif(str(tmp_path / self._mm2_name(2)))
+        try:
+            assert isinstance(movie, io.MMSeparateTiffMovie)
+            assert movie.n_frames == 6
+            assert movie.shape == (6, 16, 20)
+            assert info[0]["Frames"] == 6
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+            np.testing.assert_array_equal(movie[4], data[4])
+            np.testing.assert_array_equal(movie[-1], data[-1])
+        finally:
+            movie.close()
+
+    def test_mm14_folder_loads_and_orders_frames(self, tmp_path):
+        rng = np.random.default_rng(21)
+        data = rng.integers(0, 60000, size=(5, 12, 8), dtype="<u2")
+        # Write out of order to prove sorting is by frame index.
+        for t in [3, 0, 4, 1, 2]:
+            _write_single_frame(tmp_path / self._mm14_name(t), data[t])
+
+        movie, info = io.load_movie(str(tmp_path / self._mm14_name(0)))
+        try:
+            assert isinstance(movie, io.MMSeparateTiffMovie)
+            assert movie.n_frames == 5
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+        finally:
+            movie.close()
+
+    def test_other_channels_not_interleaved(self, tmp_path):
+        rng = np.random.default_rng(22)
+        ch0 = rng.integers(0, 60000, size=(4, 10, 10), dtype="<u2")
+        ch1 = rng.integers(0, 60000, size=(4, 10, 10), dtype="<u2")
+        for t in range(4):
+            _write_single_frame(tmp_path / self._mm2_name(t, c=0), ch0[t])
+            _write_single_frame(tmp_path / self._mm2_name(t, c=1), ch1[t])
+
+        # Selecting a channel-0 frame yields only channel-0 frames.
+        movie, _ = io.load_tif(str(tmp_path / self._mm2_name(0, c=0)))
+        try:
+            assert movie.n_frames == 4
+            np.testing.assert_array_equal(np.array(list(movie)), ch0)
+        finally:
+            movie.close()
+
+    def test_lone_file_is_not_treated_as_series(self, tmp_path):
+        rng = np.random.default_rng(23)
+        frame = rng.integers(0, 60000, size=(8, 8), dtype="<u2")
+        path = tmp_path / self._mm2_name(0)
+        _write_single_frame(path, frame)
+
+        # A single matching file must not become a separate-files movie;
+        # it opens as an ordinary one-frame TIFF.
+        assert io._mm_separate_files(str(path)) is None
+        movie, _ = io.load_tif(str(path))
+        try:
+            assert not isinstance(movie, io.MMSeparateTiffMovie)
+            assert movie.n_frames == 1
+        finally:
+            movie.close()
+
+    def test_plain_tiff_name_not_detected(self, tmp_path):
+        rng = np.random.default_rng(24)
+        data = rng.integers(0, 60000, size=(3, 8, 8), dtype="<u2")
+        path = tmp_path / "acquisition.tif"
+        _write_tif_stack(path, data)
+        assert io._mm_separate_files(str(path)) is None
+
+    def test_find_mm_separate_first(self, tmp_path):
+        rng = np.random.default_rng(25)
+        data = rng.integers(0, 60000, size=(3, 8, 8), dtype="<u2")
+        for t in range(3):
+            _write_single_frame(tmp_path / self._mm2_name(t), data[t])
+        # A stray metadata.txt and unrelated file must be ignored.
+        (tmp_path / "metadata.txt").write_text("{}")
+
+        first = io.find_mm_separate_first(str(tmp_path))
+        assert first is not None
+        movie, _ = io.load_tif(first)
+        try:
+            assert movie.n_frames == 3
+            np.testing.assert_array_equal(np.array(list(movie)), data)
+        finally:
+            movie.close()
+
+        # A folder without a sequence returns None.
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        assert io.find_mm_separate_first(str(empty)) is None
+
+
+# ---------------------------------------------------------------------------
+# Concatenating TIFF movies found across folders
+# (find_tif_movies / ConcatenatedTiffMovie / load_tif_concatenated)
+# ---------------------------------------------------------------------------
+
+
+class TestConcatenatedTiffMovies:
+    def _write_movie(self, directory, name, data):
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        _write_tif_stack(path, data)
+        return str(path)
+
+    def test_concatenates_in_given_order(self, tmp_path):
+        rng = np.random.default_rng(30)
+        parts = [
+            rng.integers(0, 60000, size=(n, 12, 16), dtype="<u2")
+            for n in (3, 5, 2)
+        ]
+        paths = [
+            self._write_movie(tmp_path / f"run_{i}", "movie.tif", part)
+            for i, part in enumerate(parts)
+        ]
+        expected = np.concatenate(parts)
+
+        movie, info = io.load_tif_concatenated(paths)
+        try:
+            assert movie.n_frames == 10
+            assert movie.shape == (10, 12, 16)
+            assert len(movie) == 10
+            np.testing.assert_array_equal(np.array(list(movie)), expected)
+            np.testing.assert_array_equal(movie[...], expected)
+            # A frame from each component, including across a boundary.
+            np.testing.assert_array_equal(movie[0], expected[0])
+            np.testing.assert_array_equal(movie[3], expected[3])
+            np.testing.assert_array_equal(movie[9], expected[9])
+            np.testing.assert_array_equal(movie[2:6], expected[2:6])
+            # Metadata records the total and the provenance.
+            assert info[0]["Frames"] == 10
+            assert info[0]["Concatenated Files"] == paths
+            assert info[0]["Frames per File"] == [3, 5, 2]
+        finally:
+            movie.close()
+
+    def test_order_follows_the_given_list(self, tmp_path):
+        rng = np.random.default_rng(31)
+        parts = [
+            rng.integers(0, 60000, size=(2, 8, 8), dtype="<u2")
+            for _ in range(2)
+        ]
+        paths = [
+            self._write_movie(tmp_path / f"run_{i}", "movie.tif", part)
+            for i, part in enumerate(parts)
+        ]
+
+        movie, _ = io.load_tif_concatenated(paths[::-1])
+        try:
+            np.testing.assert_array_equal(
+                np.array(list(movie)), np.concatenate(parts[::-1])
+            )
+        finally:
+            movie.close()
+
+    def test_mismatched_geometry_raises(self, tmp_path):
+        rng = np.random.default_rng(32)
+        good = self._write_movie(
+            tmp_path / "a",
+            "movie.tif",
+            rng.integers(0, 60000, size=(2, 8, 8), dtype="<u2"),
+        )
+        wide = self._write_movie(
+            tmp_path / "b",
+            "movie.tif",
+            rng.integers(0, 60000, size=(2, 8, 12), dtype="<u2"),
+        )
+        with pytest.raises(ValueError, match="Cannot concatenate"):
+            io.load_tif_concatenated([good, wide])
+
+    def test_no_paths_raises(self):
+        with pytest.raises(ValueError, match="No TIFF files"):
+            io.ConcatenatedTiffMovie([])
+
+    def test_find_tif_movies_sorts_numerically(self, tmp_path):
+        rng = np.random.default_rng(33)
+        for name in ("run_10", "run_2", "run_1"):
+            self._write_movie(
+                tmp_path / name,
+                "movie.tif",
+                rng.integers(0, 60000, size=(1, 8, 8), dtype="<u2"),
+            )
+        found = io.find_tif_movies(str(tmp_path))
+        assert [os.path.basename(os.path.dirname(_)) for _ in found] == [
+            "run_1",
+            "run_2",
+            "run_10",
+        ]
+
+    def test_find_tif_movies_skips_ome_continuations(self, tmp_path):
+        rng = np.random.default_rng(34)
+        data = rng.integers(0, 60000, size=(2, 8, 8), dtype="<u2")
+        _write_tif_stack(tmp_path / "acq.ome.tif", data)
+        _write_tif_stack(tmp_path / "acq_1.ome.tif", data)
+        # The continuation file belongs to acq.ome.tif and is re-attached
+        # by TiffMultiMap; listing it as well would repeat its frames.
+        found = io.find_tif_movies(str(tmp_path))
+        assert [os.path.basename(_) for _ in found] == ["acq.ome.tif"]
+
+    def test_find_tif_movies_collapses_mm_separate_folder(self, tmp_path):
+        rng = np.random.default_rng(35)
+        separate = tmp_path / "separate"
+        separate.mkdir()
+        frames = rng.integers(0, 60000, size=(4, 8, 8), dtype="<u2")
+        for t, frame in enumerate(frames):
+            _write_single_frame(
+                separate / f"img_channel000_position000_time{t:09d}_z000.tif",
+                frame,
+            )
+        stack = rng.integers(0, 60000, size=(3, 8, 8), dtype="<u2")
+        self._write_movie(tmp_path / "plain", "movie.tif", stack)
+
+        found = io.find_tif_movies(str(tmp_path))
+        # One entry for the whole separate-files folder, one for the
+        # ordinary stack.
+        assert len(found) == 2
+        movie, info = io.load_tif_concatenated(found)
+        try:
+            assert movie.n_frames == 7
+            assert info[0]["Frames per File"] == [3, 4]
+            np.testing.assert_array_equal(
+                np.array(list(movie)), np.concatenate([stack, frames])
+            )
+        finally:
+            movie.close()
+
+    def test_non_recursive_ignores_subfolders(self, tmp_path):
+        rng = np.random.default_rng(36)
+        self._write_movie(
+            tmp_path,
+            "top.tif",
+            rng.integers(0, 60000, size=(1, 8, 8), dtype="<u2"),
+        )
+        self._write_movie(
+            tmp_path / "sub",
+            "nested.tif",
+            rng.integers(0, 60000, size=(1, 8, 8), dtype="<u2"),
+        )
+        assert [
+            os.path.basename(_)
+            for _ in io.find_tif_movies(str(tmp_path), recursive=False)
+        ] == ["top.tif"]
+        assert len(io.find_tif_movies(str(tmp_path))) == 2
+
+    def test_cli_collects_folder_recursively(self, tmp_path):
+        from picasso.__main__ import _localize_collect_concat_paths
+
+        rng = np.random.default_rng(37)
+        for name in ("run_10", "run_2"):
+            self._write_movie(
+                tmp_path / name,
+                "movie.tif",
+                rng.integers(0, 60000, size=(1, 8, 8), dtype="<u2"),
+            )
+        found = _localize_collect_concat_paths(str(tmp_path))
+        assert [os.path.basename(os.path.dirname(_)) for _ in found] == [
+            "run_2",
+            "run_10",
+        ]
+
+    def test_cli_collects_pattern_and_skips_continuations(self, tmp_path):
+        from picasso.__main__ import _localize_collect_concat_paths
+
+        rng = np.random.default_rng(38)
+        data = rng.integers(0, 60000, size=(1, 8, 8), dtype="<u2")
+        _write_tif_stack(tmp_path / "acq.ome.tif", data)
+        _write_tif_stack(tmp_path / "acq_1.ome.tif", data)
+        _write_tif_stack(tmp_path / "other.tif", data)
+
+        found = _localize_collect_concat_paths(str(tmp_path / "*.tif"))
+        assert [os.path.basename(_) for _ in found] == [
+            "acq.ome.tif",
+            "other.tif",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Manual-metadata fallback for movie files whose metadata cannot be read
+# (load_tif / load_nd2 / load_stk via _movie_info_or_prompt).
+# ---------------------------------------------------------------------------
+
+
+class TestMovieMetadataFallback:
+    def test_prompt_used_when_info_unreadable(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(7)
+        data = rng.integers(0, 60000, size=(5, 16, 24), dtype="<u2")
+        path = tmp_path / "broken.tif"
+        _write_tif_stack(path, data)
+
+        # Simulate metadata extraction failing.
+        monkeypatch.setattr(
+            io.TiffMultiMap,
+            "info",
+            lambda self: (_ for _ in ()).throw(RuntimeError("bad meta")),
+        )
+
+        captured = {}
+
+        def prompt(partial):
+            captured["partial"] = partial
+            return {**partial, "Pixelsize": 130}, False
+
+        movie, info = io.load_tif(str(path), prompt_info=prompt)
+        try:
+            # The dialog is pre-filled with the dimensions read from the
+            # file structure.
+            assert captured["partial"]["Frames"] == 5
+            assert captured["partial"]["Height"] == 16
+            assert captured["partial"]["Width"] == 24
+            assert info[0]["Pixelsize"] == 130
+        finally:
+            movie.close()
+
+    def test_canceled_prompt_returns_none(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(8)
+        data = rng.integers(0, 60000, size=(3, 16, 16), dtype="<u2")
+        path = tmp_path / "broken2.tif"
+        _write_tif_stack(path, data)
+
+        monkeypatch.setattr(
+            io.TiffMultiMap,
+            "info",
+            lambda self: (_ for _ in ()).throw(RuntimeError("bad meta")),
+        )
+
+        assert io.load_tif(str(path), prompt_info=lambda partial: None) is None
+
+    def test_no_prompt_raises_instead_of_returning_none(
+        self, tmp_path, monkeypatch
+    ):
+        # Programmatic use (no GUI callback) must raise an informative
+        # error rather than silently returning None.
+        rng = np.random.default_rng(11)
+        data = rng.integers(0, 60000, size=(3, 16, 16), dtype="<u2")
+        path = tmp_path / "broken_noprompt.tif"
+        _write_tif_stack(path, data)
+
+        monkeypatch.setattr(
+            io.TiffMultiMap,
+            "info",
+            lambda self: (_ for _ in ()).throw(RuntimeError("bad meta")),
+        )
+
+        with pytest.raises(io.NoMetadataFileError):
+            io.load_tif(str(path))
+
+    def test_sidecar_yaml_preferred_over_prompt(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(9)
+        data = rng.integers(0, 60000, size=(4, 16, 16), dtype="<u2")
+        path = tmp_path / "broken3.tif"
+        _write_tif_stack(path, data)
+        io.save_info(
+            str(tmp_path / "broken3.yaml"),
+            [{"Frames": 4, "Height": 16, "Width": 16, "Pixelsize": 99}],
+        )
+
+        monkeypatch.setattr(
+            io.TiffMultiMap,
+            "info",
+            lambda self: (_ for _ in ()).throw(RuntimeError("bad meta")),
+        )
+
+        def prompt(partial):
+            raise AssertionError("prompt should not be called")
+
+        movie, info = io.load_tif(str(path), prompt_info=prompt)
+        try:
+            assert info[0]["Pixelsize"] == 99
+        finally:
+            movie.close()
+
+    def test_readable_info_does_not_prompt(self, tmp_path):
+        rng = np.random.default_rng(10)
+        data = rng.integers(0, 60000, size=(6, 16, 16), dtype="<u2")
+        path = tmp_path / "fine.tif"
+        _write_tif_stack(path, data)
+
+        def prompt(partial):
+            raise AssertionError("prompt should not be called")
+
+        movie, info = io.load_tif(str(path), prompt_info=prompt)
+        try:
+            assert info[0]["Frames"] == 6
+        finally:
+            movie.close()
+
+
+# ---------------------------------------------------------------------------
+# Movie extension dispatch — MOVIE_EXTENSIONS / TIFF_EXTENSIONS / load_movie
+#
+# Note: tifffile cannot WRITE .lsm, so LSM read-correctness cannot be
+# unit-tested without a real sample file. We only verify that a .lsm path is
+# dispatched to load_tif; reading a real .lsm should be validated manually.
+# ---------------------------------------------------------------------------
+
+
+class TestMovieExtensions:
+    def test_constants_contents(self):
+        # TIFF family routed to the tifffile-backed reader
+        for ext in (".tif", ".tiff", ".btf", ".tf8", ".tf2", ".lsm"):
+            assert ext in io.TIFF_EXTENSIONS
+        # MOVIE_EXTENSIONS is the full set incl. the dedicated-loader formats
+        assert set(io.TIFF_EXTENSIONS) <= set(io.MOVIE_EXTENSIONS)
+        for ext in (".raw", ".ims", ".nd2", ".stk"):
+            assert ext in io.MOVIE_EXTENSIONS
+
+    def test_unsupported_extension_raises(self, tmp_path):
+        path = tmp_path / "movie.foobar"
+        path.write_bytes(b"not a movie")
+        with pytest.raises(ValueError, match="Unsupported movie format"):
+            io.load_movie(str(path))
+
+    @pytest.mark.parametrize("ext", [".tif", ".tiff", ".btf", ".tf8", ".lsm"])
+    def test_tiff_family_dispatches_to_load_tif(
+        self, tmp_path, monkeypatch, ext
+    ):
+        # Route every TIFF-family extension through load_tif without needing
+        # a real file for each (esp. .lsm, which tifffile cannot write).
+        called = {}
+
+        def fake_load_tif(path, prompt_info=None, progress=None):
+            called["path"] = path
+            return "MOVIE", [{}]
+
+        monkeypatch.setattr(io, "load_tif", fake_load_tif)
+        path = tmp_path / ("movie" + ext)
+        movie, info = io.load_movie(str(path))
+        assert movie == "MOVIE"
+        assert called["path"] == str(path)
+
+
+# ---------------------------------------------------------------------------
+# Zeiss .czi / Leica .lif loading (CZIMovie / LIFMovie)
+#
+# czifile / liffile are read-only, so we cannot write synthetic sample
+# files. Instead we exercise the *adapter* logic (channel selection, plane
+# indexing, squeeze, shape/dtype/info) against lightweight fakes that mimic
+# the small slice of each library's API that the adapters use, plus the
+# availability / dispatch / graceful-degradation paths.
+# ---------------------------------------------------------------------------
+
+
+class _FakeCziImage:
+    """Mimics czifile.CziImage for a ``(T, C, [Z, ]Y, X)`` array."""
+
+    def __init__(self, data, dims, mpp=(0.13, 0.13), channels=None, sel=None):
+        self._data = data
+        self.dims = dims
+        self.sizes = dict(zip(dims, data.shape))
+        self.dtype = data.dtype
+        self.mpp = mpp
+        self.attrs = {"meta": "value"}
+        self._channels = channels
+        self._sel = sel or {}
+
+    @property
+    def channels(self):
+        # czifile exposes a dict keyed by channel name; empty when unknown.
+        return self._channels if self._channels is not None else {}
+
+    def __call__(self, **selection):
+        return _FakeCziImage(
+            self._data,
+            self.dims,
+            self.mpp,
+            self._channels,
+            {**self._sel, **selection},
+        )
+
+    def asarray(self):
+        idx = tuple(
+            slice(None) if d in ("Y", "X") else self._sel.get(d, 0)
+            for d in self.dims
+        )
+        return self._data[idx]
+
+
+class _FakeCziFile:
+    def __init__(self, image):
+        self.scenes = {0: image}
+        self.subblock_directory = ()
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _install_fake_czifile(monkeypatch, data, dims, **kwargs):
+    image = _FakeCziImage(data, dims, **kwargs)
+    fake = types.SimpleNamespace(
+        CziFile=lambda path, *a, **k: _FakeCziFile(image),
+        CziImage=lambda parent, entries, *a, **k: image,
+    )
+    monkeypatch.setattr(io, "czifile", fake)
+    return image
+
+
+class TestCZIMovie:
+    def test_shape_dtype_frames_and_access(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(0)
+        data = rng.integers(0, 60000, size=(5, 1, 8, 6), dtype="<u2")
+        _install_fake_czifile(monkeypatch, data, ("T", "C", "Y", "X"))
+
+        movie, info = io.load_czi(str(tmp_path / "m.czi"))
+        try:
+            assert isinstance(movie, io.AbstractPicassoMovie)
+            assert movie.shape == (5, 8, 6)
+            assert movie.n_frames == 5
+            assert len(movie) == 5
+            assert movie.dtype == np.dtype("uint16")
+            np.testing.assert_array_equal(movie[2], data[2, 0])
+            np.testing.assert_array_equal(np.array(movie[1:3]), data[1:3, 0])
+            np.testing.assert_array_equal(np.array(list(movie)), data[:, 0])
+            assert movie[0].shape == (8, 6)
+            assert info[0]["Height"] == 8
+            assert info[0]["Width"] == 6
+            assert info[0]["Frames"] == 5
+            assert info[0]["Pixelsize"] == 130.0  # 0.13 um -> nm
+        finally:
+            movie.close()
+
+    def test_channel_prompt_selects_channel(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(1)
+        data = rng.integers(0, 60000, size=(3, 2, 4, 4), dtype="<u2")
+        _install_fake_czifile(
+            monkeypatch,
+            data,
+            ("T", "C", "Y", "X"),
+            channels={"DAPI": {}, "GFP": {}},
+        )
+
+        picked = {}
+
+        def prompt(channels):
+            picked["channels"] = list(channels)
+            return "GFP"
+
+        movie, info = io.load_czi(str(tmp_path / "m.czi"), prompt_info=prompt)
+        try:
+            assert picked["channels"] == ["DAPI", "GFP"]
+            assert info[0]["Channel"] == "GFP"
+            np.testing.assert_array_equal(movie[0], data[0, 1])
+        finally:
+            movie.close()
+
+    def test_defaults_to_first_channel_without_prompt(
+        self, tmp_path, monkeypatch
+    ):
+        rng = np.random.default_rng(2)
+        data = rng.integers(0, 60000, size=(2, 3, 4, 4), dtype="<u2")
+        _install_fake_czifile(monkeypatch, data, ("T", "C", "Y", "X"))
+
+        movie, _ = io.load_czi(str(tmp_path / "m.czi"))  # prompt_info=None
+        try:
+            np.testing.assert_array_equal(movie[1], data[1, 0])
+        finally:
+            movie.close()
+
+    def test_extra_z_dimension_pinned(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(3)
+        data = rng.integers(0, 1000, size=(4, 1, 2, 5, 5), dtype="<u2")
+        _install_fake_czifile(monkeypatch, data, ("T", "C", "Z", "Y", "X"))
+
+        movie, _ = io.load_czi(str(tmp_path / "m.czi"))
+        try:
+            assert movie.shape == (4, 5, 5)
+            # Z is pinned to 0 -> the first z-plane is returned.
+            np.testing.assert_array_equal(movie[3], data[3, 0, 0])
+        finally:
+            movie.close()
+
+
+class _FakeLifImage:
+    def __init__(self, data, name="Image0", coords=None, outer=("T", "C")):
+        self._data = data
+        self.dims = ("T", "C", "Y", "X")
+        self.sizes = dict(zip(self.dims, data.shape))
+        self.dtype = data.dtype
+        self.size = int(data.size)
+        self.name = name
+        self.coords = coords or {}
+        self.attrs = {"meta": "value"}
+        self.frames = types.SimpleNamespace(dims=outer)
+
+    def frame(self, **indices):
+        return self._data[indices.get("T", 0), indices.get("C", 0)]
+
+
+class _FakeLifFile:
+    def __init__(self, images):
+        self.images = images
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _install_fake_liffile(monkeypatch, images):
+    fake = types.SimpleNamespace(
+        LifFile=lambda path, *a, **k: _FakeLifFile(images),
+    )
+    monkeypatch.setattr(io, "liffile", fake)
+
+
+class TestLIFMovie:
+    def test_shape_dtype_frames_and_access(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(4)
+        data = rng.integers(0, 60000, size=(6, 1, 7, 9), dtype="<u2")
+        # X coords spaced 1e-7 m = 100 nm
+        coords = {"X": np.arange(9) * 1e-7}
+        _install_fake_liffile(
+            monkeypatch, [_FakeLifImage(data, coords=coords)]
+        )
+
+        movie, info = io.load_lif(str(tmp_path / "m.lif"))
+        try:
+            assert movie.shape == (6, 7, 9)
+            assert movie.n_frames == 6
+            assert movie.dtype == np.dtype("uint16")
+            np.testing.assert_array_equal(movie[4], data[4, 0])
+            np.testing.assert_array_equal(np.array(list(movie)), data[:, 0])
+            assert info[0]["Frames"] == 6
+            assert info[0]["Image"] == "Image0"
+            assert info[0]["Pixelsize"] == 100.0
+        finally:
+            movie.close()
+
+    def test_picks_image_series_with_most_frames(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(5)
+        small = _FakeLifImage(
+            rng.integers(0, 100, size=(2, 1, 4, 4), dtype="<u2"),
+            name="snap",
+        )
+        big = _FakeLifImage(
+            rng.integers(0, 100, size=(20, 1, 4, 4), dtype="<u2"),
+            name="movie",
+        )
+        _install_fake_liffile(monkeypatch, [small, big])
+
+        movie, info = io.load_lif(str(tmp_path / "m.lif"))
+        try:
+            assert info[0]["Image"] == "movie"
+            assert movie.n_frames == 20
+        finally:
+            movie.close()
+
+    def test_channel_prompt_selects_channel(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(6)
+        data = rng.integers(0, 60000, size=(3, 2, 4, 4), dtype="<u2")
+        coords = {"C": ["red", "green"]}
+        _install_fake_liffile(
+            monkeypatch, [_FakeLifImage(data, coords=coords)]
+        )
+
+        movie, info = io.load_lif(
+            str(tmp_path / "m.lif"), prompt_info=lambda ch: "green"
+        )
+        try:
+            assert info[0]["Channel"] == "green"
+            np.testing.assert_array_equal(movie[2], data[2, 1])
+        finally:
+            movie.close()
+
+    def test_implausible_pixelsize_is_dropped(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(7)
+        data = rng.integers(0, 100, size=(2, 1, 4, 4), dtype="<u2")
+        # 1 m spacing -> 1e9 nm, far outside the plausible range
+        coords = {"X": np.arange(4) * 1.0}
+        _install_fake_liffile(
+            monkeypatch, [_FakeLifImage(data, coords=coords)]
+        )
+
+        movie, info = io.load_lif(str(tmp_path / "m.lif"))
+        try:
+            assert "Pixelsize" not in info[0]
+        finally:
+            movie.close()
+
+
+class TestCZILIFAvailabilityAndDispatch:
+    def test_extensions_advertised_when_library_present(self):
+        if io.czifile is not None:
+            assert ".czi" in io.MOVIE_EXTENSIONS
+        if io.liffile is not None:
+            assert ".lif" in io.MOVIE_EXTENSIONS
+
+    def test_load_czi_without_library_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(io, "czifile", None)
+        with pytest.raises(ImportError, match=r"picassosr\[czi\]"):
+            io.load_czi(str(tmp_path / "m.czi"))
+
+    def test_load_lif_without_library_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(io, "liffile", None)
+        with pytest.raises(ImportError, match=r"picassosr\[lif\]"):
+            io.load_lif(str(tmp_path / "m.lif"))
+
+    def test_load_movie_dispatches_czi(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(8)
+        data = rng.integers(0, 60000, size=(3, 1, 4, 4), dtype="<u2")
+        _install_fake_czifile(monkeypatch, data, ("T", "C", "Y", "X"))
+        movie, _ = io.load_movie(str(tmp_path / "m.czi"))
+        try:
+            assert isinstance(movie, io.CZIMovie)
+        finally:
+            movie.close()
+
+    def test_load_movie_dispatches_lif(self, tmp_path, monkeypatch):
+        rng = np.random.default_rng(9)
+        data = rng.integers(0, 60000, size=(3, 1, 4, 4), dtype="<u2")
+        _install_fake_liffile(monkeypatch, [_FakeLifImage(data)])
+        movie, _ = io.load_movie(str(tmp_path / "m.lif"))
+        try:
+            assert isinstance(movie, io.LIFMovie)
+        finally:
+            movie.close()

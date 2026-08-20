@@ -9,6 +9,8 @@ Provides:
 - ``locs_data`` / ``locs`` / ``info`` / ``movie_data`` / ``movie`` /
   ``movie_info``: shared loaders for the bundled test data, so individual
   test files don't reload the same files.
+- ``qapp`` / ``qt_offscreen``: the single ``QApplication`` every GUI test
+  shares, and a per-test wrapper that closes the widgets a test opened.
 
 :author: Rafal Kowalewski, 2026
 :copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry
@@ -16,11 +18,130 @@ Provides:
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from picasso import io
+from picasso import io, transforms
+
+# Qt must be told to run without a display before the first QApplication is
+# built, and the environment is read once at that point - hence a module-level
+# default rather than a fixture. ``setdefault`` keeps an explicit
+# ``QT_QPA_PLATFORM=xcb pytest`` (to watch the widgets) working.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+# ---------------------------------------------------------------------------
+# Qt
+# ---------------------------------------------------------------------------
+
+
+def pytest_collection_modifyitems(items):
+    """Mark every test that builds Qt widgets as ``gui``.
+
+    Deriving the marker from the fixtures a test requests keeps it from
+    drifting out of date, and lets a headless run skip the lot with
+    ``pytest -m "not gui"``.
+
+    Only fixtures named in the test's own signature count. A module that
+    keeps a ``QApplication`` alive with an autouse fixture (test_localize
+    does) would otherwise mark its every test as a GUI test, including the
+    numerical ones that never build a widget.
+    """
+    for item in items:
+        info = getattr(item, "_fixtureinfo", None)
+        argnames = getattr(info, "argnames", None)
+        if argnames is None:  # pragma: no cover - non-Function items
+            argnames = getattr(item, "fixturenames", ())
+        if {"qapp", "qt_offscreen"} & set(argnames):
+            item.add_marker(pytest.mark.gui)
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    """The one ``QApplication`` for the whole session.
+
+    Qt allows a single application object per process and it must outlive
+    every widget built from it, so this is session scoped and never torn
+    down. Skips rather than errors where Qt cannot start, so the suite stays
+    usable on machines without a working Qt platform plugin.
+    """
+    pytest.importorskip("PyQt6.QtWidgets")
+    from PyQt6 import QtWidgets
+
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        try:
+            app = QtWidgets.QApplication([])
+        except Exception as exc:  # pragma: no cover - environment issue
+            pytest.skip(f"Qt could not be initialized: {exc}")
+    return app
+
+
+@pytest.fixture
+def qt_offscreen(qapp):
+    """``qapp``, plus cleanup of the widgets the test opened.
+
+    A widget that outlives its test keeps receiving events and can crash the
+    interpreter during interpreter shutdown, so anything top level the test
+    left behind is closed and scheduled for deletion here.
+    """
+    before = set(qapp.topLevelWidgets())
+    yield qapp
+    for widget in qapp.topLevelWidgets():
+        if widget not in before:
+            widget.close()
+            widget.deleteLater()
+    qapp.processEvents()
+
+
+# ---------------------------------------------------------------------------
+# Geometric transforms
+# ---------------------------------------------------------------------------
+
+
+def affine(matrix) -> transforms.AffineTransform:
+    """An ``AffineTransform`` from a ``(2, 3)`` or ``(3, 3)`` matrix.
+
+    Most tests write channel registrations as the bare ``(2, 3)`` they used to
+    be stored as; this lifts them into the transform objects the code now
+    passes around.
+    """
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.shape == (2, 3):
+        matrix = np.vstack([matrix, [0.0, 0.0, 1.0]])
+    return transforms.AffineTransform(matrix=matrix)
+
+
+def apply_transform(xy, transform):
+    """Map ``(n, 2)`` points through a transform, its serialized dict, or a
+    bare matrix."""
+    if not isinstance(transform, (transforms.Transform, dict)):
+        transform = affine(transform)
+    return transforms.from_dict(transform).apply(xy)
+
+
+def affine_matrix(transform) -> np.ndarray:
+    """The ``(2, 3)`` matrix of an affine transform (or its serialized dict) -
+    what a channel registration used to be stored as."""
+    return transforms.from_dict(transform).matrix[:2]
+
+
+def affine_matrix_3x3(transform) -> np.ndarray:
+    """The ``(3, 3)`` homogeneous matrix of an affine or projective transform
+    (or its serialized dict)."""
+    return transforms.from_dict(transform).matrix
+
+
+def linear_part(transform) -> np.ndarray:
+    """The ``(2, 2)`` local linear part of a transform at its domain center -
+    what the old ``transform[:, :2]`` slice used to be."""
+    return transforms.from_dict(transform).jacobian([[0.0, 0.0]])[0]
+
+
+IDENTITY = transforms.identity().to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +309,123 @@ def synthetic_spots_noisy():
     return spots, gt
 
 
+@pytest.fixture(scope="module")
+def synthetic_spots_isotropic():
+    """Return ``(spots, ground_truth_df)`` for a batch of *isotropic*
+    Gaussian spots (``sx == sy``).
+
+    Used to test the spherical (single-width) fitters — least squares and
+    MLE, CPU and GPU. Because the ground truth already has ``sx == sy``,
+    a correct spherical fit must recover the shared width and the
+    ellipticity of the resulting localizations is exactly 0 (which is why
+    the spherical output drops the ``ellipticity`` column altogether).
+    """
+    box = 7
+    n = 48
+    rng = np.random.default_rng(7)
+    s = rng.uniform(0.9, 1.4, n)
+    gt = pd.DataFrame(
+        {
+            "x": rng.uniform(-0.5, 0.5, n),
+            "y": rng.uniform(-0.5, 0.5, n),
+            "sx": s,
+            "sy": s.copy(),
+            "photons": rng.uniform(2000.0, 8000.0, n),
+            "bg": rng.uniform(5.0, 30.0, n),
+        }
+    )
+    spots = np.empty((n, box, box), dtype=np.float32)
+    for i in range(n):
+        spots[i] = _make_gaussian_spot(
+            box,
+            gt.x[i],
+            gt.y[i],
+            gt.sx[i],
+            gt.sy[i],
+            gt.photons[i],
+            gt.bg[i],
+        )
+    return spots, gt
+
+
+def make_rotated_gaussian_spot(
+    box: int,
+    x0: float,
+    y0: float,
+    sx: float,
+    sy: float,
+    photons: float,
+    bg: float,
+    angle: float,
+) -> np.ndarray:
+    """Point-sampled rotated elliptical Gaussian spot.
+
+    Matches the model both ``gausslq._compute_model_rotated`` (CPU) and
+    Gpufit's ``GAUSS_2D_ROTATED`` (GPU) optimize::
+
+        mu = photons / (2 pi sx sy) * exp(-0.5 (u^2/sx^2 + w^2/sy^2)) + bg
+        u = dx cos(a) - dy sin(a),  w = dx sin(a) + dy cos(a)
+
+    where ``dx``/``dy`` are pixel offsets from the spot center (``x0``/``y0``
+    are offsets from the box center) and ``x`` varies along columns.
+    """
+    half = box // 2
+    g = np.arange(-half, half + 1, dtype=np.float64)
+    X, Y = np.meshgrid(g, g)  # X varies along columns (x), Y along rows (y)
+    dx, dy = X - x0, Y - y0
+    ct, st = np.cos(angle), np.sin(angle)
+    u = dx * ct - dy * st
+    w = dx * st + dy * ct
+    e = np.exp(-0.5 * (u**2 / sx**2 + w**2 / sy**2))
+    return (photons / (2 * np.pi * sx * sy) * e + bg).astype(np.float32)
+
+
+@pytest.fixture(scope="module")
+def synthetic_spots_rotated():
+    """Return ``(spots, ground_truth_df)`` for a batch of *rotated*
+    elliptical Gaussian spots.
+
+    ``ground_truth_df`` has the usual ``x, y, sx, sy, photons, bg`` columns
+    plus ``angle`` (radians). The widths are deliberately anisotropic so
+    the rotation angle is well-defined, and the angles span roughly
+    ``(-pi/2, pi/2)`` (the range over which the ellipse orientation is
+    unique). Used to test the rotated fitters — LQ (CPU/GPU) and MLE (GPU).
+    """
+    box = 9
+    rng = np.random.default_rng(2026)
+    angles = np.array(
+        [-1.3, -0.9, -0.45, -0.1, 0.15, 0.5, 0.85, 1.2], dtype=np.float64
+    )
+    n = len(angles)
+    gt = pd.DataFrame(
+        {
+            "x": rng.uniform(-0.3, 0.3, n),
+            "y": rng.uniform(-0.3, 0.3, n),
+            # Keep the widths well separated so the ellipse orientation is
+            # well conditioned — a near-circular spot has an ill-defined
+            # angle and is not a meaningful recovery target.
+            "sx": rng.uniform(1.6, 1.9, n),
+            "sy": rng.uniform(0.8, 1.0, n),
+            "photons": rng.uniform(5000.0, 9000.0, n),
+            "bg": rng.uniform(5.0, 20.0, n),
+            "angle": angles,
+        }
+    )
+    spots = np.empty((n, box, box), dtype=np.float32)
+    for i in range(n):
+        spots[i] = make_rotated_gaussian_spot(
+            box,
+            gt.x[i],
+            gt.y[i],
+            gt.sx[i],
+            gt.sy[i],
+            gt.photons[i],
+            gt.bg[i],
+            gt.angle[i],
+        )
+    return spots, gt
+
+
 # ---------------------------------------------------------------------------
 # Convenience: identifications + spots extracted from the bundled movie
 # (used by both test_localize and test_gausslq / test_gaussmle).
@@ -317,3 +555,83 @@ def picasso_movie(movie, movie_info):
     ``localize.localize_3D`` tests — those functions assert their movie
     argument ``isinstance`` of ``AbstractPicassoMovie``."""
     return _MemmapPicassoMovie(movie, movie_info)
+
+
+@pytest.fixture(scope="session")
+def picasso_movie_factory():
+    """Wrap an arbitrary ndarray as an ``AbstractPicassoMovie``.
+
+    As ``picasso_movie``, but for tests that build their own synthetic movie
+    (with known ground truth) rather than using the bundled .raw."""
+    return _MemmapPicassoMovie
+
+
+# ---------------------------------------------------------------------------
+# sCMOS camera calibration (per-pixel offset / variance / gain)
+# ---------------------------------------------------------------------------
+
+
+def _make_scmos_maps(
+    height=16, width=16, n_hot=3, gain=2.13, seed=0
+) -> dict[str, np.ndarray]:
+    """Ground-truth per-pixel maps resembling a real sCMOS sensor.
+
+    Values follow Huang et al. (2013), Supplementary Fig. 1, measured on a
+    Hamamatsu ORCA Flash 4.0: an offset around 100 ADU, a readout variance of
+    a couple of ADU squared with a sparse tail of very noisy pixels, and a
+    gain of roughly 2 ADU per photoelectron with column-wise structure.
+    """
+    rng = np.random.default_rng(seed)
+    offset = 100.0 + rng.normal(0.0, 1.5, (height, width))
+    variance = rng.gamma(shape=4.0, scale=0.5, size=(height, width)) + 0.5
+    # The hot tail is what the whole noise model exists for, so it is placed
+    # deterministically rather than left to chance at this map size.
+    flat = rng.choice(height * width, size=n_hot, replace=False)
+    variance.flat[flat] = np.array([40.0, 220.0, 900.0])[:n_hot]
+    # Column-wise amplifiers: gain varies mostly along x, weakly along y.
+    columns = gain + rng.normal(0.0, 0.12, (1, width))
+    gains = np.repeat(columns, height, axis=0) + rng.normal(
+        0.0, 0.02, (height, width)
+    )
+    return {
+        "offset": offset,
+        "variance": variance,
+        "gain": np.abs(gains),
+        "hot_pixels": flat[:n_hot],
+    }
+
+
+@pytest.fixture(scope="session")
+def scmos_maps():
+    """Ground-truth per-pixel offset / variance / gain maps."""
+    return _make_scmos_maps()
+
+
+@pytest.fixture(scope="session")
+def scmos_maps_factory():
+    """Build ground-truth per-pixel maps at an arbitrary size."""
+    return _make_scmos_maps
+
+
+@pytest.fixture(scope="session")
+def dark_movie_factory():
+    """Build a dark movie consistent with a set of ground-truth maps.
+
+    ``camera_output`` also serves the bright case: pass a photon level and it
+    adds Poisson shot noise amplified by the gain, which is exactly the
+    photon-transfer-curve model the gain calibration inverts.
+    """
+
+    def camera_output(maps, n_frames, photons=0.0, seed=0, dtype=np.float64):
+        rng = np.random.default_rng(seed)
+        shape = maps["offset"].shape
+        frames = maps["offset"] + rng.normal(
+            0.0, np.sqrt(maps["variance"]), (n_frames, *shape)
+        )
+        if photons:
+            frames = frames + maps["gain"] * rng.poisson(
+                photons, (n_frames, *shape)
+            )
+        return frames.astype(dtype)
+
+    return camera_output

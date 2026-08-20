@@ -14,7 +14,7 @@ scale bar and picks.
 from __future__ import annotations
 
 import os
-from typing import Literal, Callable
+from typing import Literal, Callable, TYPE_CHECKING
 
 import numba
 import numpy as np
@@ -24,9 +24,17 @@ import imageio.v2 as imageio
 from scipy import signal, ndimage
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
-from PyQt6 import QtGui, QtCore, QtSvg
 
 from . import io, lib, __version__
+
+if TYPE_CHECKING:
+    from PyQt6 import QtGui, QtCore, QtSvg
+else:
+    # PyQt6 is imported on first attribute access so that importing
+    # picasso.render does not require PyQt6.
+    QtGui = lib._LazyQtModule("PyQt6.QtGui")
+    QtCore = lib._LazyQtModule("PyQt6.QtCore")
+    QtSvg = lib._LazyQtModule("PyQt6.QtSvg")
 
 
 _DRAW_MAX_SIGMA = 3  # max. sigma from mean to render (mu +/- 3 sigma)
@@ -36,15 +44,15 @@ POLYGON_POINTER_SIZE = 16  # must be even
 
 def render(
     locs: pd.DataFrame,
-    info: dict | None,
-    oversampling: float = 1.0,
+    info: dict,
+    *,
+    disp_px_size: float,
     viewport: tuple[tuple[float, float], tuple[float, float]] | None = None,
     blur_method: (
         Literal["gaussian", "gaussian_iso", "smooth", "convolve"] | None
     ) = None,
     min_blur_width: float = 0.0,
     ang: tuple | Rotation | None = None,
-    disp_px_size: float | None = None,
 ) -> tuple[int, lib.FloatArray2D]:
     """Render localizations given FOV and blur method.
 
@@ -52,12 +60,10 @@ def render(
     ----------
     locs : pd.DataFrame
         Localizations to be rendered.
-    info : dict, optional
+    info : dict
         Contains localizations metadata.
-    oversampling : float, optional
-        Number of super-resolution pixels per camera pixel. Default is
-        1. Deprecated, use disp_px_size instead. Will be removed in
-        v0.11.0. Ignored if disp_px_size is specified.
+    disp_px_size : float
+        Display pixel size in nm.
     viewport : tuple, optional
         Field of view to be rendered (in camera pixels). The input is
         ``((y_min, x_min), (y_max, x_max))``. If None, all localizations
@@ -79,8 +85,6 @@ def render(
         quaternion) or a tuple of 3 rotation angles around the x, y
         and z axes in radians (legacy Euler convention, see
         ``rotation_matrix``). If None, locs are not rotated.
-    disp_px_size : float, optional
-        Display pixel size in nm. Will replace oversampling in v0.11.0.
 
     Raises
     ------
@@ -96,21 +100,13 @@ def render(
         Rendered image.
     """
     pixelsize = lib.get_from_metadata(info, "Pixelsize", raise_error=True)
-    if disp_px_size is None:
-        lib.deprecation_warning(
-            "Deprecation warning: the 'oversampling' parameter is "
-            "deprecated and will be removed in v0.11.0. Use "
-            "'disp_px_size' instead."
-        )
-        disp_px_size = pixelsize / oversampling
     oversampling = pixelsize / disp_px_size
 
     if viewport is None:
-        try:
-            # all locs
-            viewport = [(0, 0), (info[0]["Height"], info[0]["Width"])]
-        except TypeError:
-            raise ValueError("Need info if no viewport is provided.")
+        height = lib.get_from_metadata(info, "Height", raise_error=True)
+        width = lib.get_from_metadata(info, "Width", raise_error=True)
+        viewport = [(0, 0), (height, width)]
+
     (y_min, x_min), (y_max, x_max) = viewport
     if blur_method is None:
         # no blur
@@ -486,7 +482,6 @@ def _fill3d(
     x = x.astype(np.int32)
     y = y.astype(np.int32)
     z = z.astype(np.int32)
-    z += np.min(z)  # because z takes also negative values
     for i, j, k in zip(x, y, z):
         image[j, i, k] += 1
 
@@ -502,6 +497,11 @@ def _draw_gaussian_loc(
     n_pixel_y: int,
 ) -> None:
     """Render a single separable 2D Gaussian into ``image``."""
+    if not (sx_ > 0.0 and sy_ > 0.0):
+        # Degenerate localization (e.g. lpx/lpy of exactly 0 from a
+        # singular CRLB fit); also catches NaN. Skip instead of
+        # dividing by zero.
+        return
     max_y_off = _DRAW_MAX_SIGMA * sy_
     i_min = np.int32(y_ - max_y_off)
     if i_min < 0:
@@ -576,24 +576,116 @@ def _fill_gaussian(
 
 
 @numba.njit(cache=True)
-def _draw_gaussian_rot_loc(
+def _draw_gaussian_theta_loc(
     image: lib.FloatArray2D,
     x_: float,
     y_: float,
     sx_: float,
     sy_: float,
-    sz_: float,
+    angle_: float,
+    n_pixel_x: int,
+    n_pixel_y: int,
+) -> None:
+    """Render a single in-plane rotated 2D Gaussian into ``image``.
+
+    The elliptical Gaussian with standard deviations (``sx_``, ``sy_``)
+    is rotated in the image plane by ``angle_`` (radians) via its 2x2
+    covariance matrix. Unlike ``_draw_gaussian_loc`` the rotated kernel
+    is not separable (it has a cross term), so pixels are evaluated with
+    the full bivariate quadratic form, as in ``_draw_gaussian_rot_loc``.
+    """
+    c = np.cos(angle_)
+    s = np.sin(angle_)
+    vx = sx_ * sx_
+    vy = sy_ * sy_
+    cxx = vx * c * c + vy * s * s
+    cyy = vx * s * s + vy * c * c
+    cxy = (vx - vy) * s * c
+    det2d = cxx * cyy - cxy * cxy
+    if det2d < 1e-10:
+        return
+    inv_xx = cyy / det2d
+    inv_yy = cxx / det2d
+    inv_xy = -cxy / det2d
+    norm = 1.0 / (2.0 * np.pi * np.sqrt(det2d))
+    max_x_off = _DRAW_MAX_SIGMA * np.sqrt(cxx)
+    max_y_off = _DRAW_MAX_SIGMA * np.sqrt(cyy)
+    j_min = int(x_ - max_x_off)
+    if j_min < 0:
+        j_min = 0
+    j_max = int(x_ + max_x_off + 1)
+    if j_max > n_pixel_x:
+        j_max = n_pixel_x
+    i_min = int(y_ - max_y_off)
+    if i_min < 0:
+        i_min = 0
+    i_max = int(y_ + max_y_off + 1)
+    if i_max > n_pixel_y:
+        i_max = n_pixel_y
+    for i in range(i_min, i_max):
+        b = np.float32(i + 0.5 - y_)
+        for j in range(j_min, j_max):
+            a = np.float32(j + 0.5 - x_)
+            exponent = a * a * inv_xx + 2.0 * a * b * inv_xy + b * b * inv_yy
+            image[i, j] += norm * np.exp(-0.5 * exponent)
+
+
+@numba.njit(cache=True)
+def _fill_gaussian_theta(
+    image: lib.FloatArray2D,
+    x: lib.FloatArray1D,
+    y: lib.FloatArray1D,
+    sx: lib.FloatArray1D,
+    sy: lib.FloatArray1D,
+    angle: lib.FloatArray1D,
+    n_pixel_x: int,
+    n_pixel_y: int,
+) -> None:
+    """Fill image with in-plane rotated gaussian-blurred localizations.
+
+    Each localization is rendered as a 2D Gaussian centered at (x, y)
+    with standard deviations (sx, sy) rotated in the image plane by its
+    own ``angle`` (radians).
+
+    Parameters
+    ----------
+    image : lib.FloatArray2D
+        Empty image array.
+    x, y : lib.FloatArray1D
+        x and y coordinates to be rendered.
+    sx, sy : lib.FloatArray1D
+        Localization precision in x and y for each localization.
+    angle : lib.FloatArray1D
+        In-plane rotation angle (radians) for each localization.
+    n_pixel_x, n_pixel_y : int
+        Number of pixels in x and y.
+    """
+    n_locs = len(x)
+    if n_locs == 0:
+        return
+
+    for i in range(n_locs):
+        _draw_gaussian_theta_loc(
+            image, x[i], y[i], sx[i], sy[i], angle[i], n_pixel_x, n_pixel_y
+        )
+
+
+@numba.njit(cache=True)
+def _draw_gaussian_cov3d_loc(
+    image: lib.FloatArray2D,
+    x_: float,
+    y_: float,
+    cov: lib.Array3x3,
     n_pixel_x: int,
     n_pixel_y: int,
     rot_matrix: lib.Array3x3,
     rot_matrixT: lib.Array3x3,
 ) -> None:
-    """Render a single rotated 2D Gaussian (projected from 3D) into
-    ``image``."""
-    cov = np.zeros((3, 3), dtype=np.float32)
-    cov[0, 0] = sx_ * sx_
-    cov[1, 1] = sy_ * sy_
-    cov[2, 2] = sz_ * sz_
+    """Render a single 3D Gaussian with local covariance ``cov`` into
+    ``image``: ``cov`` is rotated by the global ``rot_matrix`` and the
+    top-left 2x2 block is projected, inverted and drawn as a bivariate
+    Gaussian. Shared by ``_draw_gaussian_rot_loc`` (diagonal ``cov``) and
+    ``_draw_gaussian_rot_theta_loc`` (in-plane rotated ``cov``)."""
     cov_rot = rot_matrix @ cov @ rot_matrixT
     s00 = cov_rot[0, 0]
     s01 = cov_rot[0, 1]
@@ -627,6 +719,63 @@ def _draw_gaussian_rot_loc(
             a = np.float32(j + 0.5 - x_)
             exponent = a * a * inv00 + a * b * (inv01 + inv10) + b * b * inv11
             image[i, j] += norm * np.exp(-0.5 * exponent)
+
+
+@numba.njit(cache=True)
+def _draw_gaussian_rot_loc(
+    image: lib.FloatArray2D,
+    x_: float,
+    y_: float,
+    sx_: float,
+    sy_: float,
+    sz_: float,
+    n_pixel_x: int,
+    n_pixel_y: int,
+    rot_matrix: lib.Array3x3,
+    rot_matrixT: lib.Array3x3,
+) -> None:
+    """Render a single rotated 2D Gaussian (projected from 3D) into
+    ``image``."""
+    cov = np.zeros((3, 3), dtype=np.float32)
+    cov[0, 0] = sx_ * sx_
+    cov[1, 1] = sy_ * sy_
+    cov[2, 2] = sz_ * sz_
+    _draw_gaussian_cov3d_loc(
+        image, x_, y_, cov, n_pixel_x, n_pixel_y, rot_matrix, rot_matrixT
+    )
+
+
+@numba.njit(cache=True)
+def _draw_gaussian_rot_theta_loc(
+    image: lib.FloatArray2D,
+    x_: float,
+    y_: float,
+    sx_: float,
+    sy_: float,
+    sz_: float,
+    angle_: float,
+    n_pixel_x: int,
+    n_pixel_y: int,
+    rot_matrix: lib.Array3x3,
+    rot_matrixT: lib.Array3x3,
+) -> None:
+    """Render a single rotated 2D Gaussian (projected from 3D) into
+    ``image``. The in-plane precision ellipse (``sx_``, ``sy_``) is
+    first rotated by ``angle_`` (radians) about the z-axis, then the
+    full 3D covariance is rotated by the global ``rot_matrix``."""
+    c = np.cos(angle_)
+    s = np.sin(angle_)
+    vx = sx_ * sx_
+    vy = sy_ * sy_
+    cov = np.zeros((3, 3), dtype=np.float32)
+    cov[0, 0] = vx * c * c + vy * s * s
+    cov[1, 1] = vx * s * s + vy * c * c
+    cov[0, 1] = (vx - vy) * c * s
+    cov[1, 0] = cov[0, 1]
+    cov[2, 2] = sz_ * sz_
+    _draw_gaussian_cov3d_loc(
+        image, x_, y_, cov, n_pixel_x, n_pixel_y, rot_matrix, rot_matrixT
+    )
 
 
 @numba.njit(cache=True)
@@ -672,6 +821,63 @@ def _fill_gaussian_rot(
             sx[i],
             sy[i],
             sz[i],
+            n_pixel_x,
+            n_pixel_y,
+            rot_matrix,
+            rot_matrixT,
+        )
+
+
+@numba.njit(cache=True)
+def _fill_gaussian_rot_theta(
+    image: lib.FloatArray2D,
+    x: lib.FloatArray1D,
+    y: lib.FloatArray1D,
+    sx: lib.FloatArray1D,
+    sy: lib.FloatArray1D,
+    sz: lib.FloatArray1D,
+    angle: lib.FloatArray1D,
+    n_pixel_x: int,
+    n_pixel_y: int,
+    rot_matrix: lib.Array3x3,
+) -> None:
+    """Fill image with rotated gaussian-blurred localizations, each with
+    its own in-plane rotation.
+
+    Same as ``_fill_gaussian_rot`` but the precision ellipse (sx, sy) of
+    every localization is first rotated in the image plane by its own
+    ``angle`` (radians) about the z-axis, before the global rotation.
+
+    Parameters
+    ----------
+    image : lib.FloatArray2D
+        Empty image array.
+    x, y, z : lib.FloatArray1D
+        3D coordinates to be rendered.
+    sx, sy, sz : lib.FloatArray1D
+        Localization precision in x, y and z for each localization.
+    angle : lib.FloatArray1D
+        In-plane rotation angle (radians) for each localization,
+        applied about the z-axis before the global ``rot_matrix``.
+    n_pixel_x, n_pixel_y : int
+        Number of pixels in x and y.
+    rot_matrix : lib.Array3x3
+        Rotation matrix (float32) applied to the localizations.
+    """
+    n_locs = len(x)
+    if n_locs == 0:
+        return
+    rot_matrixT = np.ascontiguousarray(rot_matrix.T)
+
+    for i in range(n_locs):
+        _draw_gaussian_rot_theta_loc(
+            image,
+            x[i],
+            y[i],
+            sx[i],
+            sy[i],
+            sz[i],
+            angle[i],
             n_pixel_x,
             n_pixel_y,
             rot_matrix,
@@ -744,7 +950,7 @@ def render_hist_numba(
     t_max: float,
 ) -> tuple[int, lib.FloatArray2D]:
     """Calculate 2D histogram of xy coordinates. Similar to
-    ``render_hist`` but modified to work with numba.
+    ``_render_hist`` but modified to work with numba.
 
     Parameters
     ----------
@@ -771,28 +977,6 @@ def render_hist_numba(
     image = np.zeros((n_pixel, n_pixel), dtype=np.float32)
     _fill(image, x, y)
     return len(x), image
-
-
-def render_hist(
-    locs: pd.DataFrame,
-    oversampling: float,
-    y_min: float,
-    x_min: float,
-    y_max: float,
-    x_max: float,
-    ang: tuple[float, float, float] | Rotation | None = None,
-) -> tuple[int, lib.FloatArray2D]:
-    """Alias for _render_hist which will be a private function in
-    v0.11.0. Kept for backward compatibility but will be removed in
-    v0.11.0. Use _render_hist instead if necessary."""
-    lib.deprecation_warning(
-        "Deprecation warning: the 'render_hist' function is deprecated "
-        "and will be removed in v0.11.0. Use _render_hist instead if "
-        "necessary."
-    )
-    return _render_hist(
-        locs, oversampling, y_min, x_min, y_max, x_max, ang=ang
-    )
 
 
 def _render_hist(
@@ -872,8 +1056,10 @@ def render_hist3d(
 
     Parameters
     ----------
-    locs : pd.DataFrame
-        Localizations to be rendered.
+    x, y : lib.FloatArray1D
+        Lateral coordinates of the localizations (camera pixels).
+    z : lib.FloatArray1D
+        Axial coordinates of the localizations (nm).
     oversampling : float (default=1)
         Number of super-resolution pixels per camera pixel.
     y_min, x_min : float
@@ -938,8 +1124,10 @@ def render_hist3d_anisotropic(
 
     Parameters
     ----------
-    locs : pd.DataFrame
-        Localizations to be rendered.
+    x, y : lib.FloatArray1D
+        Lateral coordinates of the localizations (camera pixels).
+    z : lib.FloatArray1D
+        Axial coordinates of the localizations (nm).
     oversampling_x, oversampling_y, oversampling_z : float (default=1)
         Number of super-resolution pixels per camera pixel in x, y, and
         z directions.
@@ -985,36 +1173,6 @@ def render_hist3d_anisotropic(
     n = len(x)
     z *= pixelsize  # convert back to nm
     return n, image
-
-
-def render_gaussian(
-    locs: pd.DataFrame,
-    oversampling: float,
-    y_min: float,
-    x_min: float,
-    y_max: float,
-    x_max: float,
-    min_blur_width: float,
-    ang: tuple[float, float, float] | Rotation | None = None,
-) -> tuple[int, lib.FloatArray2D]:
-    """Alias for _render_gaussian which will be a private function in
-    v0.11.0. Kept for backward compatibility but will be removed in v0.11.0. Use
-    _render_gaussian instead if necessary."""
-    lib.deprecation_warning(
-        "Deprecation warning: the 'render_gaussian' function is deprecated "
-        "and will be removed in v0.11.0. Use _render_gaussian instead if "
-        "necessary."
-    )
-    return _render_gaussian(
-        locs,
-        oversampling,
-        y_min,
-        x_min,
-        y_max,
-        x_max,
-        min_blur_width,
-        ang=ang,
-    )
 
 
 def _render_gaussian(
@@ -1075,7 +1233,15 @@ def _render_gaussian(
         sy = blur_height[in_view]
         sx = blur_width[in_view]
 
-        _fill_gaussian(image, x, y, sx, sy, n_pixel_x, n_pixel_y)
+        if "angle" in locs:
+            # per-localization in-plane rotation of the precision ellipse;
+            # the stored column is in degrees, the kernel expects radians
+            angle = np.deg2rad(locs["angle"].to_numpy()[in_view])
+            _fill_gaussian_theta(
+                image, x, y, sx, sy, angle, n_pixel_x, n_pixel_y
+            )
+        else:
+            _fill_gaussian(image, x, y, sx, sy, n_pixel_x, n_pixel_y)
 
     else:  # rotated
         x, y, in_view, z = locs_rotation(
@@ -1107,42 +1273,29 @@ def _render_gaussian(
         rot_matrix = np.ascontiguousarray(
             to_rotation(ang).as_matrix(), dtype=np.float32
         )
-        _fill_gaussian_rot(
-            image, x, y, sx, sy, sz, n_pixel_x, n_pixel_y, rot_matrix
-        )
+        if "angle" in locs:
+            # per-localization in-plane rotation (degrees in the stored
+            # column), composed with the global rotation
+            angle = np.deg2rad(locs["angle"].to_numpy())[in_view]
+            _fill_gaussian_rot_theta(
+                image,
+                x,
+                y,
+                sx,
+                sy,
+                sz,
+                angle,
+                n_pixel_x,
+                n_pixel_y,
+                rot_matrix,
+            )
+        else:
+            _fill_gaussian_rot(
+                image, x, y, sx, sy, sz, n_pixel_x, n_pixel_y, rot_matrix
+            )
 
     n = len(x)
     return n, image
-
-
-def render_gaussian_iso(
-    locs: pd.DataFrame,
-    oversampling: float,
-    y_min: float,
-    x_min: float,
-    y_max: float,
-    x_max: float,
-    min_blur_width: float,
-    ang: tuple[float, float, float] | Rotation | None = None,
-) -> tuple[int, lib.FloatArray2D]:
-    """Alias for _render_gaussian_iso which will be a private function in
-    v0.11.0. Kept for backward compatibility but will be removed in v0.11.0. Use
-    _render_gaussian_iso instead if necessary."""
-    lib.deprecation_warning(
-        "Deprecation warning: the 'render_gaussian_iso' function is "
-        "deprecated and will be removed in v0.11.0. Use "
-        "_render_gaussian_iso instead if necessary."
-    )
-    return _render_gaussian_iso(
-        locs,
-        oversampling,
-        y_min,
-        x_min,
-        y_max,
-        x_max,
-        min_blur_width,
-        ang=ang,
-    )
 
 
 def _render_gaussian_iso(
@@ -1206,6 +1359,7 @@ def _render_gaussian_iso(
         sx = sy
         sz = blur_depth[in_view]
 
+        # isotropic in-plane blur: per-loc rotation about z has no effect
         rot_matrix = np.ascontiguousarray(
             to_rotation(ang).as_matrix(), dtype=np.float32
         )
@@ -1214,36 +1368,6 @@ def _render_gaussian_iso(
         )
 
     return len(x), image
-
-
-def render_convolve(
-    locs: pd.DataFrame,
-    oversampling: float,
-    y_min: float,
-    x_min: float,
-    y_max: float,
-    x_max: float,
-    min_blur_width: float,
-    ang: tuple[float, float, float] | Rotation | None = None,
-) -> tuple[int, lib.FloatArray2D]:
-    """Alias for _render_convolve which will be a private function in v0.11.0.
-    Kept for backward compatibility but will be removed in v0.11.0. Use
-    _render_convolve instead if necessary."""
-    lib.deprecation_warning(
-        "Deprecation warning: the 'render_convolve' function is "
-        "deprecated and will be removed in v0.11.0. Use "
-        "_render_convolve instead if necessary."
-    )
-    return _render_convolve(
-        locs,
-        oversampling,
-        y_min,
-        x_min,
-        y_max,
-        x_max,
-        min_blur_width,
-        ang=ang,
-    )
 
 
 def _render_convolve(
@@ -1317,33 +1441,6 @@ def _render_convolve(
             np.median(locs["lpy"].to_numpy()[in_view]), min_blur_width
         )
         return n, _fftconvolve(image, blur_width, blur_height)
-
-
-def render_smooth(
-    locs: pd.DataFrame,
-    oversampling: float,
-    y_min: float,
-    x_min: float,
-    y_max: float,
-    x_max: float,
-    ang: tuple[float, float, float] | Rotation | None = None,
-) -> tuple[int, lib.FloatArray2D]:
-    """Alias for _render_smooth which will be a private function in v0.11.0. Kept for
-    backward compatibility but will be removed in v0.11.0. Use _render_smooth
-    instead if necessary."""
-    lib.deprecation_warning(
-        "Deprecation warning: the 'render_smooth' function is deprecated and "
-        "will be removed in v0.11.0. Use _render_smooth instead if necessary."
-    )
-    return _render_smooth(
-        locs,
-        oversampling,
-        y_min,
-        x_min,
-        y_max,
-        x_max,
-        ang=ang,
-    )
 
 
 def _render_smooth(
@@ -1640,6 +1737,20 @@ def locs_rotation(
 def export_qimage_to_pdf(
     image: QtGui.QImage, path: str, dpi: int = 96
 ) -> None:
+    """Write a rendered image to a PDF at its original physical size.
+
+    The page is sized so that one image pixel is 1/96 inch regardless of
+    ``dpi``, which only sets the resolution the image is rasterized at.
+
+    Parameters
+    ----------
+    image : QtGui.QImage
+        The rendered image.
+    path : str
+        Where to write the PDF.
+    dpi : int, optional
+        Resolution of the PDF writer. Default 96.
+    """
     writer = QtGui.QPdfWriter(path)
 
     # Fixed physical page size (1 image pixel = 1/96 inch, regardless of dpi)
@@ -1664,6 +1775,15 @@ def export_qimage_to_pdf(
 
 
 def export_qimage_to_svg(image: QtGui.QImage, path: str):
+    """Write a rendered image to an SVG, embedded at its pixel size.
+
+    Parameters
+    ----------
+    image : QtGui.QImage
+        The rendered image.
+    path : str
+        Where to write the SVG.
+    """
     generator = QtSvg.QSvgGenerator()
     generator.setFileName(path)
     generator.setSize(image.size())
@@ -2042,7 +2162,22 @@ def map_to_view(
     image_size: QtCore.QSize,
     viewport: tuple[tuple[float, float], tuple[float, float]],
 ) -> tuple[int, int]:
-    """Convert (x, y) from camera pixels to display pixels."""
+    """Convert (x, y) from camera pixels to display pixels.
+
+    Parameters
+    ----------
+    x, y : float
+        Coordinates in camera pixels.
+    image_size : QtCore.QSize
+        Size of the displayed image in display pixels.
+    viewport : tuple
+        ``((y_min, x_min), (y_max, x_max))`` in camera pixels.
+
+    Returns
+    -------
+    cx, cy : int
+        Coordinates in display pixels.
+    """
     image_width = image_size.width()
     image_height = image_size.height()
     cx = image_width * (x - viewport[0][1]) / viewport_width(viewport)
@@ -2061,10 +2196,24 @@ def get_rectangle_pick_polygon(
     """Find QtGui.QPolygonF object used for drawing a rectangular
     pick.
 
+    Parameters
+    ----------
+    start_x, start_y : float
+        One end of the rectangle's center line.
+    end_x, end_y : float
+        The other end of the center line.
+    width : float
+        Width of the rectangle, perpendicular to the center line.
+    return_most_right : bool, optional
+        Also return the rightmost corner, where the GUI anchors the pick
+        label. Default False.
+
     Returns
     -------
     p : QtGui.QPolygonF
         The polygon.
+    most_right : tuple
+        Only if ``return_most_right``: the ``(x, y)`` of the rightmost corner.
     """
     X, Y = lib.get_pick_rectangle_corners(
         start_x, start_y, end_x, end_y, width
@@ -2087,10 +2236,12 @@ def _draw_picks_circle(
     pick_size: float,  # diameter in camera pixels
     point_picks: bool = False,
     annotate_picks: bool = False,
-    color: QtGui.QColor = QtGui.QColor("yellow"),
+    color: QtGui.QColor | None = None,  # default: yellow
 ) -> QtGui.QImage:
     """Draw circular picks onto the image of rendered localizations.
     See ``draw_picks`` for more details."""
+    if color is None:
+        color = QtGui.QColor("yellow")
     if point_picks:  # draw circular picks as points
         painter = QtGui.QPainter(image)
         painter.setBrush(QtGui.QBrush(color))
@@ -2131,10 +2282,12 @@ def _draw_picks_rectangle(
     picks: list[tuple],  # picks in camera pixels
     pick_size: float,  # width in camera pixels
     annotate_picks: bool = False,
-    color: QtGui.QColor = QtGui.QColor("yellow"),
+    color: QtGui.QColor | None = None,  # default: yellow
 ) -> QtGui.QImage:
     """Draw rectangular picks onto the image of rendered
     localizations. See ``draw_picks`` for more details."""
+    if color is None:
+        color = QtGui.QColor("yellow")
     w = pick_size * image.width() / viewport_width(viewport)
     painter = QtGui.QPainter(image)
     painter.setPen(color)
@@ -2160,10 +2313,12 @@ def _draw_picks_polygon(
     viewport: tuple[tuple[float, float], tuple[float, float]],  # cam. px
     picks: list[tuple],  # picks in camera pixels
     annotate_picks: bool = False,
-    color: QtGui.QColor = QtGui.QColor("yellow"),
+    color: QtGui.QColor | None = None,  # default: yellow
 ) -> QtGui.QImage:
     """Draw polygon picks onto the image of rendered localizations. See
     ``draw_picks`` for more details."""
+    if color is None:
+        color = QtGui.QColor("yellow")
     painter = QtGui.QPainter(image)
     painter.setPen(color)
     for i, pick in enumerate(picks):
@@ -2197,9 +2352,11 @@ def _draw_picks_square(
     picks: list[tuple],  # picks in camera pixels
     pick_size: float,  # side length in camera pixels
     annotate_picks: bool = False,
-    color: QtGui.QColor = QtGui.QColor("yellow"),
+    color: QtGui.QColor | None = None,  # default: yellow
 ) -> QtGui.QImage:
     """Draw square picks onto the image of rendered localizations."""
+    if color is None:
+        color = QtGui.QColor("yellow")
     w = int(pick_size * image.width() / viewport_width(viewport))
     painter = QtGui.QPainter(image)
     painter.setPen(color)
@@ -2235,7 +2392,7 @@ def draw_picks(
     pick_size: float | None,  # diameter in camera pixels
     point_picks: bool = False,
     annotate_picks: bool = False,
-    color: QtGui.QColor = QtGui.QColor("yellow"),
+    color: QtGui.QColor | None = None,  # default: yellow
 ) -> QtGui.QImage:
     """Draw all selected picks onto the image (QImage) of rendered
     localizations.
@@ -2247,9 +2404,9 @@ def draw_picks(
     viewport : tuple
         Current field of view in camera pixels, ((y_min, y_max), (x_min,
         x_max)).
-    pick_shape: {"Circle", "Rectangle", "Polygon", "Square"}
+    pick_shape : {"Circle", "Rectangle", "Polygon", "Square"}
         Shape of the picks to be drawn.
-    picks: list of tuples
+    picks : list of tuples
         List of picks, where each pick is a tuple specifying the pick
         coordinates. Note: this must match the format of the given pick
         shape.
@@ -2317,8 +2474,9 @@ def draw_points(
     viewport: tuple[tuple[float, float], tuple[float, float]],  # cam. px
     points: list[tuple],  # points in camera pixels,
     pixelsize: int | float,  # camera pixel size in nm
-    color: QtGui.QColor = QtGui.QColor("yellow"),
+    color: QtGui.QColor | None = None,  # default: yellow
     mark_width: int = 20,  # width of the drawn crosses in display pixels
+    cursor: tuple | None = None,  # live cursor position in camera pixels
 ) -> QtGui.QImage:
     """Draw points, lines and distances between them onto image.
 
@@ -2338,14 +2496,51 @@ def draw_points(
         Color of the points, lines and text. Default is yellow.
     mark_width : int, optional
         Width of the drawn crosses in display pixels. Default is 20.
+    cursor : tuple or None, optional
+        Current cursor position in camera pixels. If given, it is drawn
+        as a cross and, when at least one point exists, a line with the
+        live distance to the last point is shown. Default is None.
 
     Returns
     -------
     image : QImage
         Image with the drawn points.
     """
+    if color is None:
+        color = QtGui.QColor("yellow")
     painter = QtGui.QPainter(image)
     painter.setPen(color)
+
+    def draw_cross(x, y):
+        """Draw a cross marker centered at display coordinates."""
+        painter.drawPoint(x, y)
+        painter.drawLine(x, y, int(x + mark_width / 2), y)
+        painter.drawLine(x, y, x, int(y + mark_width / 2))
+        painter.drawLine(x, y, int(x - mark_width / 2), y)
+        painter.drawLine(x, y, x, int(y - mark_width / 2))
+
+    def draw_distance(x1, y1, x2, y2, p1, p2):
+        """Draw a line and the distance label between two points."""
+        painter.drawLine(x1, y1, x2, y2)
+        font = painter.font()
+        font.setPixelSize(20)
+        painter.setFont(font)
+        # get distance with 2 decimal places
+        distance = (
+            float(
+                int(
+                    np.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+                    * pixelsize
+                    * 100
+                )
+            )
+            / 100
+        )
+        painter.drawText(
+            int((x1 + x2) / 2 + mark_width),
+            int((y1 + y2) / 2 + mark_width),
+            str(distance) + " nm",
+        )
 
     cx = []
     cy = []
@@ -2359,41 +2554,22 @@ def draw_points(
         cx, cy = map_to_view(*point, image.size(), viewport=viewport)
 
         # draw a cross
-        painter.drawPoint(cx, cy)
-        painter.drawLine(cx, cy, int(cx + mark_width / 2), cy)
-        painter.drawLine(cx, cy, cx, int(cy + mark_width / 2))
-        painter.drawLine(cx, cy, int(cx - mark_width / 2), cy)
-        painter.drawLine(cx, cy, cx, int(cy - mark_width / 2))
+        draw_cross(cx, cy)
 
         # draw a line between points and show distance
         if oldpoint != []:
-            painter.drawLine(cx, cy, ox, oy)
-            font = painter.font()
-            font.setPixelSize(20)
-            painter.setFont(font)
-
-            # get distance with 2 decimal places
-            distance = (
-                float(
-                    int(
-                        np.sqrt(
-                            (
-                                (oldpoint[0] - point[0]) ** 2
-                                + (oldpoint[1] - point[1]) ** 2
-                            )
-                        )
-                        * pixelsize
-                        * 100
-                    )
-                )
-                / 100
-            )
-            painter.drawText(
-                int((cx + ox) / 2 + mark_width),
-                int((cy + oy) / 2 + mark_width),
-                str(distance) + " nm",
-            )
+            draw_distance(cx, cy, ox, oy, oldpoint, point)
         oldpoint = point
+
+    # draw the live cursor as a cross and the running distance to the
+    # last placed point
+    if cursor is not None:
+        ccx, ccy = map_to_view(*cursor, image.size(), viewport=viewport)
+        draw_cross(ccx, ccy)
+        if points:
+            lx, ly = map_to_view(*points[-1], image.size(), viewport=viewport)
+            draw_distance(ccx, ccy, lx, ly, points[-1], cursor)
+
     painter.end()
     return image
 
@@ -2405,7 +2581,7 @@ def draw_scalebar(
     scalebar_length_nm: int | float,
     pixelsize: int | float,
     display_length: bool = True,
-    color: QtGui.QColor = QtGui.QColor("white"),
+    color: QtGui.QColor | None = None,  # default: white
     display_height: int = 10,
     margin: tuple[int, int] = (35, 20),
     text_spacer: int = 40,
@@ -2428,6 +2604,8 @@ def draw_scalebar(
         Color of the scalebar and text. Default is white.
     display_length : bool, optional
         Whether to display scalebar length in nm. Default is True.
+    display_height : int, optional
+        Thickness of the scalebar in display pixels. Default is 10.
     margin : tuple of int, optional
         Margins from the right and bottom edges in display pixels.
         Default is (35, 20).
@@ -2444,6 +2622,8 @@ def draw_scalebar(
     image : QImage
         Image with the drawn scalebar.
     """
+    if color is None:
+        color = QtGui.QColor("white")
     painter = QtGui.QPainter(image)
     painter.setPen(QtGui.QPen(QtCore.Qt.PenStyle.NoPen))
     painter.setBrush(QtGui.QBrush(color))
@@ -2551,8 +2731,8 @@ def draw_minimap(
     image: QtGui.QImage,
     viewport: tuple[tuple[float, float], tuple[float, float]],  # cam. px
     max_viewport_size: tuple[float, float],  # in camera pixels,
-    color_main: QtGui.QColor = QtGui.QColor("yellow"),
-    color_frame: QtGui.QColor = QtGui.QColor("white"),
+    color_main: QtGui.QColor | None = None,  # default: yellow
+    color_frame: QtGui.QColor | None = None,  # default: white
     length_minimap: int = 100,
     margin: tuple[int, int] = (20, 20),
 ) -> QtGui.QImage:
@@ -2582,6 +2762,10 @@ def draw_minimap(
     image : QImage
         Image with the drawn minimap.
     """
+    if color_main is None:
+        color_main = QtGui.QColor("yellow")
+    if color_frame is None:
+        color_frame = QtGui.QColor("white")
     movie_height, movie_width = max_viewport_size
     height_minimap = int(movie_height / movie_width * length_minimap)
     # draw in the upper right corner, overview rectangle
@@ -2693,7 +2877,7 @@ def draw_rotation(
 def draw_rotation_angles(
     image: QtGui.QImage,
     ang: tuple[float, float, float],
-    color: QtGui.QColor = QtGui.QColor("white"),
+    color: QtGui.QColor | None = None,  # default: white
 ) -> QtGui.QImage:
     """Draw rotation angles (numbers in degrees) on the image.
 
@@ -2712,6 +2896,8 @@ def draw_rotation_angles(
     image : QImage
         Image with the drawn rotation angles.
     """
+    if color is None:
+        color = QtGui.QColor("white")
     angx, angy, angz = [int(np.round(_ * 180 / np.pi, 0)) for _ in ang]
     text = f"{angx} {angy} {angz}"
     x = image.width() - len(text) * 8 - 10
@@ -2741,6 +2927,7 @@ def render_scene(
     single_channel_colormap: str | lib.FloatArray2D = "magma",
     colors: list | None = None,
     relative_intensities: list[float] | None = None,
+    background_color: tuple[float, float, float] | None = None,
     raw_image_cache: lib.FloatArray2D | lib.FloatArray3D | None = None,
     return_contrast_limits: bool = False,
     return_raw_image: bool = False,
@@ -2777,7 +2964,7 @@ def render_scene(
 
     Parameters
     ----------
-    locs: pd.DataFrame or list of pd.DataFrame
+    locs : pd.DataFrame or list of pd.DataFrame
         Localizations to be rendered. Can be either one localization
         file or a list thereof. If a single DataFrame is provided,
         localizations will be rendered in a single channel, i.e., using
@@ -2785,7 +2972,7 @@ def render_scene(
         DataFrames is provided, localizations will be rendered in
         multiple channels, and the color of each channel can be
         specified by `colors`.
-    info: list of dict or list of list of dict
+    info : list of dict or list of list of dict
         List of info dictionaries corresponding to the localization
         file(s).
     disp_px_size : float, optional
@@ -2836,7 +3023,14 @@ def render_scene(
         List of relative intensities for each channel. Only needs to be
         specified for multi-channel data. Default is None, in which
         case all channels are rendered with the same intensity.
-    raw_image_cache: lib.FloatArray2D or lib.FloatArray3D, optional
+    background_color : tuple of float, optional
+        ``(r, g, b)`` background color with values between 0 and 1 that
+        the additively-blended channels are composited over (multi-channel
+        data only). The background shows through where there are few/no
+        localizations, while bright regions keep their true channel
+        colors. Default is None (equivalent to a black background, i.e.
+        the image is left unchanged).
+    raw_image_cache : lib.FloatArray2D or lib.FloatArray3D, optional
         If provided, this raw grayscale image of localizations, i.e.,
         obtained with ``render.render`` (2D array for single-channel
         data, 3D array for multi-channel data) is used instead of
@@ -2907,6 +3101,7 @@ def render_scene(
             contrast=contrast,
             relative_intensities=relative_intensities,
             invert_colors=invert_colors,
+            background_color=background_color,
             raw_image_cache=raw_image_cache,
         )
     qimage = rgb_to_qimage(rgb)
@@ -2935,17 +3130,17 @@ def _render_multi_channel(
     contrast: tuple[float, float] | None = None,
     relative_intensities: list[float] | None = None,
     invert_colors: bool = False,
+    background_color: tuple[float, float, float] | None = None,
     raw_image_cache: lib.FloatArray3D | None = None,
 ) -> tuple[int, lib.IntArray3D, tuple[float, float], lib.FloatArray3D]:
     """Render multi-channel localizations into an RGB 8bit image
     (numpy array). See ``render_scene`` for more details.
 
     ``colors`` may be either a list of ``(r, g, b)`` triplets (legacy
-    behaviour: each channel rendered as ``intensity × rgb``, additive
+    behavior: each channel rendered as ``intensity × rgb``, additive
     blend) or a list of ``(256, 3)`` LUTs (each channel indexed into
     its LUT before additive blending — supports per-channel
-    matplotlib colormaps and user-defined colormaps from the GUI).
-    """
+    matplotlib colormaps and user-defined colormaps from the GUI)."""
     if raw_image_cache is not None:
         assert raw_image_cache.ndim == 3, "raw_image_cache must be a 3D array."
         raw_image = raw_image_cache
@@ -2994,6 +3189,15 @@ def _render_multi_channel(
             rgb += colors_arr[c][idx[c]]
     # clip to max value of 1 (preserves relative brightness)
     np.minimum(rgb, 1.0, out=rgb)
+    # composite over a background color (default black = no change). The
+    # background shows through where there are few/no localizations,
+    # while bright regions keep their true channel colors. Alpha is the
+    # total per-pixel coverage summed across channels.
+    if background_color is not None and any(c > 0 for c in background_color):
+        bg = np.asarray(background_color, dtype=np.float32)
+        alpha = np.clip(images_f32.sum(axis=0), 0.0, 1.0)[..., None]
+        rgb = rgb + bg * (1.0 - alpha)
+        np.minimum(rgb, 1.0, out=rgb)
     rgb = to_8bit(rgb)
     if invert_colors:
         rgb = 255 - rgb
@@ -3147,8 +3351,8 @@ def scale_intensities(
 
     Parameters
     ----------
-    image : FloatArray3D
-        Image(s) to be intensity scaled.
+    images : FloatArray3D
+        Images to be intensity scaled, one per channel. Scaled in place.
     relative_intensities : list of float, optional
         List of relative intensities for each channel. If None, all
         channels are rendered with the same intensity. Default is None.
@@ -3172,7 +3376,19 @@ def to_8bit(
     image: lib.FloatArray2D | lib.FloatArray3D,
 ) -> lib.IntArray2D | lib.IntArray3D:
     """Convert a float image with values between 0 and 1 to an 8-bit image
-    with values between 0 and 255."""
+    with values between 0 and 255.
+
+    Parameters
+    ----------
+    image : FloatArray2D or FloatArray3D
+        Image(s) with values between 0 and 1. Normalized in place so that the
+        maximum is 1 before the conversion.
+
+    Returns
+    -------
+    image : IntArray2D or IntArray3D
+        The image as ``uint8``.
+    """
     # normalize to max value of 1 and convert to 8-bit
     image /= image.max() if image.max() > 0 else 1.0
     return np.round(image * 255).astype(np.uint8)
@@ -3194,6 +3410,11 @@ def apply_colormap(
         array, a 256x4 or 256x3 array is expected with values between 0
         and 1. Note: the alpha channel (if present) is ignored and the
         colormap is applied as if all values were fully opaque.
+
+    Returns
+    -------
+    image : IntArray3D
+        RGB image of shape ``(height, width, 3)``, ``uint8``.
     """
     if isinstance(colormap, str):
         cmap = np.uint8(np.round(255 * plt.get_cmap(colormap)(np.arange(256))))
@@ -3275,6 +3496,12 @@ def split_locs_by_group(
     group_color : IntArray1D or None, optional
         If provided, specifies the group color ids (up to `n_colors`)
         for each localization.
+
+    Returns
+    -------
+    locs_groups : list of pd.DataFrame
+        One data frame per group; a single-element list when there is no
+        grouping to apply.
     """
     if group_color is not None:
         assert len(group_color) == len(

@@ -17,21 +17,44 @@ FILETYPES = (".raw", ".ome.tif", ".ims")
 
 
 class aclass:
+    """Namespace object whose attributes are the keyword arguments given.
+
+    Used to hand the localize settings to code that expects an argparse
+    namespace.
+    """
+
     def __init__(self, **entries):
+        """Set one attribute per keyword argument.
+
+        Parameters
+        ----------
+        **entries
+            The attributes to set.
+        """
         self.__dict__.update(entries)
 
 
 def check_new(path: str, processed: dict, logfile: str):
-    """Check if files in a folder are not processed yet.
-    Files are considered processed if they have a _locs.hdf5 file.
+    """Check which files in a folder are not processed yet.
 
-    Args:
-        path (str): Folder to check.
-        processed (dict): Dict of files that are already processed.
-        logfile (str): Path to logfile.
+    Files are considered processed if they have a ``_locs.hdf5`` file.
 
-    Returns:
-        _type_: _description_
+    Parameters
+    ----------
+    path : str
+        Folder to check.
+    processed : dict
+        Files that are already processed, keyed by normalized path.
+    logfile : str
+        Path to the logfile new findings are reported to.
+
+    Returns
+    -------
+    new : list of str
+        Movie files that still need processing.
+    processed : dict
+        ``processed``, with the files that turned out to be done already
+        added to it.
     """
 
     all_ = os.listdir(path)
@@ -68,10 +91,12 @@ def check_new(path: str, processed: dict, logfile: str):
 
 
 def wait_for_change(file: str):
-    """Helper function that checks if a file is changing the size.
+    """Block until a file stops growing.
 
-    Args:
-        file (str): Path to file.
+    Parameters
+    ----------
+    file : str
+        Path to the file being written.
     """
     print(f"Waiting for {file}")
     filesize = os.path.getsize(file)
@@ -88,11 +113,20 @@ def wait_for_change(file: str):
 
 
 def get_children_files(file: str, checked: list):
-    """Helper function that extracts files with the same start and same ending.
+    """List the files sitting next to ``file`` in its folder.
 
-    Args:
-        file (str): Path to check.
-        checked (list): List with files that are already checked.
+    Parameters
+    ----------
+    file : str
+        Path whose folder is listed.
+    checked : list
+        Files that were already checked; accepted for the caller's
+        bookkeeping.
+
+    Returns
+    -------
+    files_in_folder : list of str
+        Absolute paths of every file in that folder.
     """
     dir_ = os.path.dirname(file)
     files_in_folder = [
@@ -117,10 +151,19 @@ def get_children_files(file: str, checked: list):
 
 
 def wait_for_completion(file: str):
-    """Helper function that waits until a file is completely written.
+    """Wait until a file - and, for OME-TIFFs, its continuation files - is
+    completely written.
 
-    Args:
-        file (str): Filepath.
+    Parameters
+    ----------
+    file : str
+        Path to the movie being acquired.
+
+    Returns
+    -------
+    checked : list of str
+        The file and the continuation files waited for; empty for a
+        single-file movie.
     """
 
     wait_for_change(file)
@@ -144,6 +187,15 @@ def wait_for_completion(file: str):
 
 
 def print_to_file(path, text):
+    """Append a line to the watcher's logfile.
+
+    Parameters
+    ----------
+    path : str
+        Path to the logfile.
+    text : str
+        The line to append.
+    """
     with open(path, "a") as f:
         f.write(text)
         f.write("\n")
@@ -157,15 +209,24 @@ def check_new_and_process(  # noqa: C901
     existing: list,
     update_time: int,
 ):
-    """
-    Checks a folder for new files and processes them with defined settigns.
-    Args:
-        settings_list (list): List of dictionaries with settings.
-        path (str): Path to folder.
-        command (str): Command to execute after processing.
-        logfile (str): Path to logfile.
-        existing (list): existing files
-        update_time (int): Refresh every x minutes
+    """Watch a folder for new movies and localize them as they appear.
+
+    Runs until interrupted.
+
+    Parameters
+    ----------
+    settings_list : dict
+        Localize settings, one entry per processing step.
+    path : str
+        Folder to watch.
+    command : str
+        Command to execute after processing a file.
+    logfile : str
+        Path to the logfile.
+    existing : list
+        Files already present that should not be processed.
+    update_time : int
+        How long to wait between scans of the folder, in minutes.
     """
 
     print_to_file(logfile, f"{datetime.now()} Started watcher for {path}.")
@@ -268,7 +329,7 @@ def watcher():  # noqa: C901
             if st.button("Remove non-running watchers."):
                 df = df[df["running"]]
                 engine = create_engine(
-                    "sqlite:///" + localize._db_filename(), echo=False
+                    "sqlite:///" + localize.db_filename(), echo=False
                 )
                 df.to_sql(
                     "watcher",
@@ -406,7 +467,7 @@ def watcher():  # noqa: C901
                 "Update time (scan every x-th minute):", DEFAULT_UPDATE_TIME
             )
 
-            logfile_dir = os.path.dirname(localize._db_filename())
+            logfile_dir = os.path.dirname(localize.db_filename())
             now_str = datetime.now().strftime("%Y-%m-%d %H_%M_%S")
             logfile = os.path.join(logfile_dir, f"{now_str}_watcher.log")
             logfile = st.text_input("Logfile", logfile)
@@ -480,7 +541,7 @@ def watcher():  # noqa: C901
                 )
 
                 engine = create_engine(
-                    "sqlite:///" + localize._db_filename(), echo=False
+                    "sqlite:///" + localize.db_filename(), echo=False
                 )
                 df.to_sql(
                     "watcher",

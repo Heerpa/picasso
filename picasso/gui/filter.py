@@ -13,19 +13,20 @@ from __future__ import annotations
 
 import os.path
 import sys
-import importlib
-import pkgutil
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+# must come after the PyQt6 import so that matplotlib's qt_compat
+# selects the PyQt6 binding (picasso core no longer imports PyQt6)
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg,
     NavigationToolbar2QT,
 )
 from matplotlib.widgets import SpanSelector, RectangleSelector
 from matplotlib.colors import LogNorm
-from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .. import io, lib, clusterer, __version__
 
@@ -615,19 +616,19 @@ class Window(QtWidgets.QMainWindow):
         self.user_settings_dialog = lib.UserSettingsDialog(self)
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("File")
-        open_action = file_menu.addAction("Open")
+        open_action = file_menu.addAction("Open...")
         open_action.setShortcut(QtGui.QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.open_file_dialog)
         file_menu.addAction(open_action)
-        save_action = file_menu.addAction("Save")
+        save_action = file_menu.addAction("Save...")
         save_action.setShortcut(QtGui.QKeySequence.StandardKey.Save)
         save_action.triggered.connect(self.save_file_dialog)
-        export_csv_action = file_menu.addAction("Export as CSV")
+        export_csv_action = file_menu.addAction("Export as CSV...")
         export_csv_action.triggered.connect(self.export_csv_dialog)
-        metadata_action = file_menu.addAction("Show metadata")
+        metadata_action = file_menu.addAction("Show metadata...")
         metadata_action.setShortcut("Ctrl+M")
         metadata_action.triggered.connect(self.show_metadata)
-        picasso_settings_action = file_menu.addAction("Picasso settings")
+        picasso_settings_action = file_menu.addAction("Picasso settings...")
         picasso_settings_action.triggered.connect(
             self.user_settings_dialog.show
         )
@@ -642,20 +643,20 @@ class Window(QtWidgets.QMainWindow):
         scatter_action = plot_menu.addAction("2D Histogram")
         scatter_action.setShortcut("Ctrl+D")
         scatter_action.triggered.connect(self.plot_hist2d)
-        test_subcluster_action = plot_menu.addAction("Test subclustering")
+        test_subcluster_action = plot_menu.addAction("Test subclustering...")
         test_subcluster_action.triggered.connect(self.plot_subclustering)
 
         filter_menu = menu_bar.addMenu("Filter")
-        filter_action = filter_menu.addAction("Filter numerically")
+        filter_action = filter_menu.addAction("Filter numerically...")
         filter_action.setShortcut("Ctrl+F")
         filter_action.triggered.connect(self.filter_num.show)
         apply_from_metadata_action = filter_menu.addAction(
-            "Apply filters from metadata"
+            "Apply filters from metadata..."
         )
         apply_from_metadata_action.triggered.connect(
             self.apply_filters_from_metadata
         )
-        remove_columns_action = filter_menu.addAction("Remove columns")
+        remove_columns_action = filter_menu.addAction("Remove columns...")
         remove_columns_action.triggered.connect(self.remove_columns)
         main_widget = QtWidgets.QWidget()
         hbox = QtWidgets.QHBoxLayout(main_widget)
@@ -1072,20 +1073,11 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     window = Window()
 
-    from . import plugins
+    # load plugins from ~/.picasso/plugins
+    from .plugins_loader import load_plugins, add_plugins_menu_actions
 
-    def iter_namespace(pkg):
-        return pkgutil.iter_modules(pkg.__path__, pkg.__name__ + ".")
-
-    plugins = [
-        importlib.import_module(name)
-        for finder, name, ispkg in iter_namespace(plugins)
-    ]
-
-    for plugin in plugins:
-        p = plugin.Plugin(window)
-        if p.name == "filter":
-            p.execute()
+    load_plugins(window, "filter")
+    add_plugins_menu_actions(window, "filter")
 
     window.show()
 

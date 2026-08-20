@@ -32,7 +32,7 @@ c1, c2, c3, c4 = st.sidebar.columns((1, 1, 1, 1))
 c1.image(logo)
 c2.write("# Picasso Server")
 
-engine = create_engine("sqlite:///" + localize._db_filename(), echo=False)
+engine = create_engine("sqlite:///" + localize.db_filename(), echo=False)
 
 st.sidebar.code(f"{socket.gethostname()}\nVersion {VERSION_NO}")
 

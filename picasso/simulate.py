@@ -84,7 +84,16 @@ def test_calculate_zpsf() -> lib.FloatArray1D:
 
 
 def saveInfo(filename: str, info: dict) -> None:
-    """Save metadata to a YAML file."""
+    """Save metadata to a YAML file.
+
+    Parameters
+    ----------
+    filename : str
+        Path of the file the metadata belongs to; the YAML is written next to
+        it (see ``io.save_info``).
+    info : dict
+        The metadata to save.
+    """
     io.save_info(filename, [info], default_flow_style=True)
 
 
@@ -491,7 +500,17 @@ def convertMovie(
 
 
 def saveMovie(filename: str, movie: lib.IntArray3D, info: dict) -> None:
-    """Save the simulated movie to a file."""
+    """Save the simulated movie to a file.
+
+    Parameters
+    ----------
+    filename : str
+        Where to write the raw movie; the metadata YAML is written next to it.
+    movie : lib.IntArray3D
+        ``(n_frames, height, width)`` simulated movie.
+    info : dict
+        Metadata to save alongside it.
+    """
     io.save_raw(filename, movie, [info])
 
 

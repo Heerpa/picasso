@@ -25,26 +25,35 @@ The reconstruction parameters can be specified by adding respective arguments. I
 ::
 
    '-b', '--box-side-length', type=int, default=7, help='box side length'
-   '-a', '--fit-method', choices=["mle", "lq", "lq-gpu", "lq-3d", "lq-gpu-3d", "mle-3d", "avg"], default='mle', help='fitting method'
+   '-a', '--fit-method', choices=["mle", "mle-gpu", "mle-spherical", "mle-spherical-gpu", "mle-rotated", "mle-rotated-gpu", "lq", "lq-spherical", "lq-spherical-gpu", "lq-rotated", "lq-rotated-gpu", "lq-gpu", "lq-3d", "lq-gpu-3d", "mle-3d", "spline", "spline-mle", "spline-gpu", "spline-mle-gpu", "avg"], default='mle', help='fitting method'
    '-g', '--gradient', type=int, default=5000, help='minimum net gradient'
+   '-tm', '--temporal-median', type=int, default=0, help='window length (frames) of the temporal median filter applied before identification, 0 to deactivate'
+   '-gf', '--gaussian-filter', type=float, default=0.0, help='sigma (camera pixels) of the spatial Gaussian filter applied before identification, 0 to deactivate'
    '-d', '--drift', type=int, default=1000, help='segmentation size for subsequent RCC, 0 to deactivate'
    '-r', '--roi', type=int, nargs=4, default=None, help='ROI (y_min, x_min, y_max, x_max) in camera pixels'
    '-fb', '--frame-bounds', type=int, nargs=2, default=None, help='frame bounds (start_frame, end_frame), 0-indexed'
    '-bl', '--baseline', type=int, default=0, help='camera baseline'
    '-s', '--sensitivity', type=float, default=1, help='camera sensitivity'
    '-ga', '--gain', type=int, default=1, help='camera gain'
-   '-qe', '--qe', type=float, default=1, help='camera quantum efficiency'
    '-px', '--pixelsize', type=int, default=130, help='pixel size in nm'
+   '-sc', '--spline-calibration', type=str, default='', help='path to a cubic-spline PSF calibration (.hdf5), required by the spline fit methods'
    '-mf', '--mf', type=float, default=0, help='magnification factor (3D only)'
    '-zc', '--zc', type=str, default='', help='path to 3D calibration file (3D only)'
    '-sf', '--suffix', type=str, default='', help='suffix to add to output files'
    '-db', '--database', action='store_true', help='add the run to the local database'
+   '--concat', action='store_true', help='treat all TIFF movies found as one movie, with their frames concatenated in order'
 
-Note 1: Localize will automatically try to perform an RCC drift correction on the dataset. As this will not always work with the default settings after an unsuccessful attempt, the program will continue with the next file. If the drift correction succeeds, another hdf5 file with the drift corrected locs will be created.
+Localize will automatically try to perform an RCC drift correction on the dataset. As this will not always work with the default settings after an unsuccessful attempt, the program will continue with the next file. If the drift correction succeeds, another hdf5 file with the drift corrected locs will be created.
 
-Note 2: Make sure to set the camera settings correctly; otherwise photon counts are wrong plus the MLE might have problems.
+Make sure to set the camera settings correctly; otherwise photon counts are wrong plus the MLE might have problems.
 
-Note 3: If you select one of the 3D algorithms (``lq-3d``, ``lq-gpu-3d`` or ``mle-3d``) you must supply both the magnification factor (``-mf``) and the path to the 3D calibration file (``-zc``). If either is omitted, the program will prompt you for it interactively.
+``--temporal-median`` subtracts a rolling per-pixel median background before spots are identified, which suppresses uneven background and static structures. It affects identification only. See Martens KJA, Turkowyd B, Endesfelder U, `Raw data to results: a hands-on introduction and overview of computational analysis for single-molecule localization microscopy <https://doi.org/10.3389/fbinf.2021.817254>`_, *Frontiers in Bioinformatics* 1, 817254 (2022).
+
+``--gaussian-filter`` smooths each frame with a Gaussian of the given standard deviation before spots are identified. Spot identification looks for a single local maximum per spot, so a PSF that is not Gaussian-shaped may break into several maxima and is detected several times; smoothing merges them into one. It affects identification only — fitting always uses the raw movie — and since smoothing lowers gradient magnitudes, ``-g`` needs re-tuning when it is changed. It can be combined with ``--temporal-median``, which is applied first.
+
+``--concat`` accumulates movies found in the folder specified as on concatenated movie. Given a folder, Picasso searches it and all of its sub-folders; given a pattern (e.g. ``"experiment_folder/*/*.tif"``), it uses the matching files. In both cases the files are ordered by folder and file name with numbers compared numerically, so ``run_2`` comes before ``run_10``, and the full order is printed before the analysis starts — check it, since a wrong order is only noticeable afterwards. Each entry is one whole movie: the continuation files of a split OME-TIFF stack (``*_1.ome.tif``, ...) and the individual frames of a MicroManager "separate image files" folder are read together with the movie they belong to, so no frames are repeated.
+
+If you select one of the 3D algorithms (``lq-3d``, ``lq-gpu-3d`` or ``mle-3d``) you must supply both the magnification factor (``-mf``) and the path to the 3D calibration file (``-zc``). If either is omitted, the program will prompt you for it interactively.
 
 Example
 ^^^^^^^
@@ -58,7 +67,7 @@ Start the render module (GUI) or render from command line. With no arguments the
 
 ::
 
-   '-o', '--oversampling', type=float, default=1.0, help='the number of super-resolution pixels per camera pixel'
+   '-px', '--disp-px-size', type=float, default=1.0, help='the size of the rendered pixel in nm'
    '-b', '--blur-method', choices=['none', 'convolve', 'gaussian'], default='convolve'
    '-w', '--min-blur-width', type=float, default=0.0, help='minimum blur width if blur is applied'
    '--vmin', type=float, default=0.0, help='minimum colormap level in range 0-100 or absolute value'
@@ -131,6 +140,14 @@ Convert hdf5 files to Chimera ``.xyz`` files.
 hdf2visp
 --------
 Convert hdf5 files to ViSP ``.3d`` files.
+
+smap2hdf
+--------
+Convert SMAP (`https://github.com/jries/SMAP <https://github.com/jries/SMAP>`_) ``_sml.mat`` files to ``.hdf5``. Type ``picasso smap2hdf filepath -p pixelsize`` (``-p/--pixelsize`` in nm is required, since SMAP stores coordinates in nm while Picasso uses camera pixels). Reads single-file MATLAB ``-v7`` and ``-v7.3`` saves; split ``_sml_p*.mat`` parts files are not supported (re-save them in SMAP as a single file).
+
+hdf2smap
+--------
+Convert hdf5 files to SMAP ``_sml.mat`` files. The output is named ``<file>_sml.mat`` (the ``_sml`` suffix is required for SMAP to recognize the file) and can be loaded directly in SMAP via File > Load.
 
 join
 ----
@@ -238,6 +255,7 @@ The positional ``files`` argument is a unix-style path to one or more clustered 
    '--max-rounds', type=int, default=3, help='max. rounds without BIC improvement to terminate'
    '--bootstrap-sem', action='store_true', help='bootstrap to estimate SEM of molecule positions'
    '-c', '--calibration', type=str, default='', help='path to calibration file (3D only)'
+   '--covariance-type', type=str, choices=['auto', 'spherical', 'diagonal', 'rotated'], default='auto', help="shape of the fitted molecules; 'auto' picks 'rotated' for 3D astigmatism locs carrying an 'angle' column, 'diagonal' for 3D localizations without the 'angle' column and spherical for 2D data"
    '-p', '--postprocess', action='store_false', help='do not postprocess results to remove sticking events and low-quality fits'
    '--max-locs', type=int, default=100000, help='maximum number of localizations to process per cluster; useful for excluding fiducials'
    '-a', '--asynch', action='store_false', help='do not perform fitting asynchronously (multiprocessing)'

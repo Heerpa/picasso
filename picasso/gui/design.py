@@ -11,8 +11,6 @@ GUI for designing rectangular rothemund origami.
 import glob
 import os
 import sys
-import importlib
-import pkgutil
 from math import sqrt
 from copy import deepcopy
 
@@ -245,7 +243,7 @@ if colorscheme:
     rgbcolors[6] = [227, 26, 28]
     rgbcolors[7] = [255, 255, 255]
     rgbcolors[8] = [205, 205, 205]
-    allcolors[0] = QtGui.QColor(205, 205, 205, 255)  # DEFAULT,  GREY
+    allcolors[0] = QtGui.QColor(205, 205, 205, 255)  # DEFAULT,  GRAY
     allcolors[1] = QtGui.QColor(166, 206, 227, 255)
     allcolors[2] = QtGui.QColor(31, 120, 180, 255)
     allcolors[3] = QtGui.QColor(178, 223, 138, 255)
@@ -265,7 +263,7 @@ else:
     rgbcolors[6] = [227, 26, 28]
     rgbcolors[7] = [253, 191, 111]
     rgbcolors[8] = [205, 205, 205]
-    allcolors[0] = QtGui.QColor(205, 205, 205, 255)  # DEFAULT,  GREY
+    allcolors[0] = QtGui.QColor(205, 205, 205, 255)  # DEFAULT,  GRAY
     allcolors[1] = QtGui.QColor(166, 206, 227, 255)
     allcolors[2] = QtGui.QColor(31, 120, 180, 255)
     allcolors[3] = QtGui.QColor(178, 223, 138, 255)
@@ -842,7 +840,7 @@ class BindingSiteItem(QtWidgets.QGraphicsPolygonItem):
         hexagonPointsF = QtGui.QPolygonF(points)
         super().__init__(hexagonPointsF)
         self.setPen(HEX_PEN)
-        self.setBrush(defaultcolor)  # initialize all as grey
+        self.setBrush(defaultcolor)  # initialize all as gray
 
 
 class Scene(QtWidgets.QGraphicsScene):
@@ -1056,7 +1054,7 @@ class Scene(QtWidgets.QGraphicsScene):
                     allitems[paletteindex + i]: allcolors[i]
                     for i in range(1, maxcolor + 1)
                 }
-                # index 8 (last) resets to default grey
+                # index 8 (last) resets to default gray
                 palette_map[allitems[paletteindex + maxcolor]] = defaultcolor
 
                 if clicked_item == allitems[paletteindex]:
@@ -1787,7 +1785,7 @@ class MainWindow(QtWidgets.QWidget):
 
         menu_bar = QtWidgets.QMenuBar(self)
         file_menu = menu_bar.addMenu("File")
-        picasso_settings_action = file_menu.addAction("Picasso settings")
+        picasso_settings_action = file_menu.addAction("Picasso settings...")
         picasso_settings_action.triggered.connect(
             self.window.user_settings_dialog.show
         )
@@ -1798,20 +1796,11 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     window = MainWindow()
 
-    from . import plugins
+    # load plugins from ~/.picasso/plugins
+    from .plugins_loader import load_plugins, add_plugins_menu_actions
 
-    def iter_namespace(pkg):
-        return pkgutil.iter_modules(pkg.__path__, pkg.__name__ + ".")
-
-    plugins = [
-        importlib.import_module(name)
-        for finder, name, ispkg in iter_namespace(plugins)
-    ]
-
-    for plugin in plugins:
-        p = plugin.Plugin(window)
-        if p.name == "design":
-            p.execute()
+    load_plugins(window, "design")
+    add_plugins_menu_actions(window, "design")
 
     window.show()
 

@@ -15,18 +15,19 @@ import glob as _glob
 import os
 import sys
 import time
-import importlib
-import pkgutil
 import yaml
 from typing import Literal
 
 import numpy as np
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+# must come after the PyQt6 import so that matplotlib's qt_compat
+# selects the PyQt6 binding (picasso core no longer imports PyQt6)
 from matplotlib.backends.backend_qt5agg import FigureCanvas
 from scipy.optimize import curve_fit
 from scipy.stats import norm
-from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .. import io, lib, simulate, __version__
 
@@ -266,7 +267,7 @@ class Window(QtWidgets.QMainWindow):
 
         self.user_settings_dialog = lib.UserSettingsDialog(self)
         file_menu = self.menuBar().addMenu("File")
-        picasso_settings_action = file_menu.addAction("Picasso settings")
+        picasso_settings_action = file_menu.addAction("Picasso settings...")
         picasso_settings_action.triggered.connect(
             self.user_settings_dialog.show
         )
@@ -2619,20 +2620,11 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     window = Window()
 
-    from . import plugins
+    # load plugins from ~/.picasso/plugins
+    from .plugins_loader import load_plugins, add_plugins_menu_actions
 
-    def iter_namespace(pkg):
-        return pkgutil.iter_modules(pkg.__path__, pkg.__name__ + ".")
-
-    plugins = [
-        importlib.import_module(name)
-        for finder, name, ispkg in iter_namespace(plugins)
-    ]
-
-    for plugin in plugins:
-        p = plugin.Plugin(window)
-        if p.name == "simulate":
-            p.execute()
+    load_plugins(window, "simulate")
+    add_plugins_menu_actions(window, "simulate")
 
     window.show()
 

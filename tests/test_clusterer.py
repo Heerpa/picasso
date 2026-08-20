@@ -46,7 +46,9 @@ def info(locs_data):
 @pytest.fixture(scope="module")
 def db_locs(locs):
     """DBSCAN-clustered real locs, for downstream area/center tests."""
-    return clusterer.dbscan(locs, DBSCAN_EPS, DBSCAN_MIN_SAMPLES, min_locs=0)
+    return clusterer.dbscan(locs, DBSCAN_EPS, DBSCAN_MIN_SAMPLES, min_locs=0)[
+        0
+    ]
 
 
 # ---------------------------------------------------------------------
@@ -129,7 +131,9 @@ def synth_info():
 
 
 def _run_dbscan_2d(locs):
-    return clusterer.dbscan(locs, DBSCAN_EPS, DBSCAN_MIN_SAMPLES, min_locs=0)
+    return clusterer.dbscan(locs, DBSCAN_EPS, DBSCAN_MIN_SAMPLES, min_locs=0)[
+        0
+    ]
 
 
 def _run_hdbscan_2d(locs):
@@ -138,7 +142,7 @@ def _run_hdbscan_2d(locs):
         min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
         min_samples=HDBSCAN_MIN_SAMPLES,
         cluster_eps=HDBSCAN_CLUSTER_EPS,
-    )
+    )[0]
 
 
 def _run_smlm_2d(locs):
@@ -147,7 +151,7 @@ def _run_smlm_2d(locs):
         radius_xy=GA_RADIUS,
         min_locs=GA_MIN_LOCS,
         frame_analysis=False,
-    )
+    )[0]
 
 
 def _run_dbscan_3d(locs):
@@ -158,7 +162,7 @@ def _run_dbscan_3d(locs):
         min_locs=0,
         pixelsize=PIXELSIZE,
         radius_z=DBSCAN_EPS * 2.5,
-    )
+    )[0]
 
 
 def _run_hdbscan_3d(locs):
@@ -168,7 +172,7 @@ def _run_hdbscan_3d(locs):
         min_samples=HDBSCAN_MIN_SAMPLES,
         cluster_eps=HDBSCAN_CLUSTER_EPS,
         pixelsize=PIXELSIZE,
-    )
+    )[0]
 
 
 def _run_smlm_3d(locs):
@@ -179,7 +183,7 @@ def _run_smlm_3d(locs):
         frame_analysis=False,
         radius_z=GA_RADIUS_Z,
         pixelsize=PIXELSIZE,
-    )
+    )[0]
 
 
 # sklearn>=1.8 raises TypeError inside cluster_selection_epsilon on this real
@@ -394,6 +398,106 @@ def test_find_cluster_centers_3d(synth_locs_3d):
     assert len(centers) == len(BLOB_CENTERS_3D)
 
 
+# Columns that localizations are not required to have; each maps to the
+# center columns that can only be computed when it is present.
+OPTIONAL_COLUMN_OUTPUTS = {
+    "photons": {"photons"},
+    "sx": {"sx", "ellipticity"},
+    "sy": {"sy", "ellipticity"},
+    "bg": {"bg"},
+    "net_gradient": {"net_gradient"},
+    "lpx": set(),
+    "lpy": set(),
+}
+ESSENTIAL_CENTER_COLS = {
+    "frame",
+    "std_frame",
+    "x",
+    "y",
+    "std_x",
+    "std_y",
+    "lpx",
+    "lpy",
+    "n_locs",
+    "n_events",
+    "convexhull",
+    "group",
+}
+
+
+def test_find_cluster_centers_2d_minimal_columns(synth_locs_2d):
+    """Only frame/x/y present: centers are still computed, and columns
+    derived from missing non-essential columns are dropped."""
+    minimal = synth_locs_2d[["frame", "x", "y"]]
+    centers = clusterer.find_cluster_centers(_run_dbscan_2d(minimal))
+
+    assert (ESSENTIAL_CENTER_COLS | {"area"}).issubset(centers.columns)
+    for col in ("photons", "sx", "sy", "bg", "net_gradient", "ellipticity"):
+        assert col not in centers.columns
+    assert len(centers) == len(BLOB_CENTERS_2D)
+    _match_truth_to_recovered(
+        centers[["x", "y"]].to_numpy(), BLOB_CENTERS_2D, tol=0.5
+    )
+
+
+def test_find_cluster_centers_3d_minimal_columns(synth_locs_3d):
+    """3D without lpx/lpy: z falls back to the unweighted cluster mean."""
+    minimal = synth_locs_3d[["frame", "x", "y", "z"]]
+    db_locs = _run_dbscan_3d(minimal)
+    centers = clusterer.find_cluster_centers(db_locs, pixelsize=PIXELSIZE)
+
+    assert (ESSENTIAL_CENTER_COLS | {"z", "lpz", "std_z", "volume"}).issubset(
+        centers.columns
+    )
+    assert "ellipticity" not in centers.columns
+    assert len(centers) == len(BLOB_CENTERS_3D)
+    expected_z = db_locs.groupby("group", sort=True)["z"].mean().to_numpy()
+    np.testing.assert_allclose(centers["z"].to_numpy(), expected_z, rtol=1e-5)
+
+
+@pytest.mark.parametrize("dropped", sorted(OPTIONAL_COLUMN_OUTPUTS))
+def test_find_cluster_centers_single_column_missing(synth_locs_2d, dropped):
+    """Dropping any one non-essential column must not raise, and only
+    the columns derived from it disappear."""
+    full = clusterer.find_cluster_centers(_run_dbscan_2d(synth_locs_2d))
+    reduced = clusterer.find_cluster_centers(
+        _run_dbscan_2d(synth_locs_2d.drop(columns=dropped))
+    )
+
+    lost = set(full.columns) - set(reduced.columns)
+    assert lost == OPTIONAL_COLUMN_OUTPUTS[dropped]
+    assert len(reduced) == len(full)
+
+
+def test_find_cluster_centers_averages_custom_columns(synth_locs_2d):
+    """Any extra numeric column is carried over as its cluster mean;
+    non-numeric columns are ignored rather than raising."""
+    locs = synth_locs_2d.copy()
+    locs["my_metric"] = np.arange(len(locs), dtype=np.float32)
+    locs["my_label"] = "channel_a"
+    db_locs = _run_dbscan_2d(locs)
+    centers = clusterer.find_cluster_centers(db_locs)
+
+    assert "my_label" not in centers.columns
+    expected = db_locs.groupby("group", sort=True)["my_metric"].mean()
+    np.testing.assert_allclose(
+        centers["my_metric"].to_numpy(), expected.to_numpy(), rtol=1e-5
+    )
+
+
+def test_find_cluster_centers_recomputes_derived_columns(synth_locs_2d):
+    """Re-running on centers recomputes derived columns (e.g. n_locs)
+    instead of averaging the input values of the same name."""
+    centers = clusterer.find_cluster_centers(_run_dbscan_2d(synth_locs_2d))
+    centers["group"] = 0  # merge all centers into one cluster
+    recentered = clusterer.find_cluster_centers(centers)
+
+    assert len(recentered) == 1
+    assert recentered["n_locs"].iloc[0] == len(centers)
+    assert not any(c.endswith("_mean") for c in recentered.columns)
+    assert list(recentered.columns).count("n_locs") == 1
+
+
 # ---------------------------------------------------------------------
 # cluster_areas
 # ---------------------------------------------------------------------
@@ -429,3 +533,52 @@ def test_find_cluster_centers_real_data(db_locs):
     centers = clusterer.find_cluster_centers(db_locs)
     assert len(centers) > 0
     assert {"x", "y", "group"}.issubset(centers.columns)
+
+
+# ---------------------------------------------------------------------
+# Progress reporting (uniform duck-typed interface, see
+# lib.normalize_progress)
+# ---------------------------------------------------------------------
+
+
+class _RecordingProgress:
+    """Minimal duck-typed tracker implementing the ProgressDialog
+    interface."""
+
+    def __init__(self):
+        self.maximum_set = None
+        self.values = []
+
+    def set_value(self, value):
+        self.values.append(value)
+
+    def setMaximum(self, maximum):
+        self.maximum_set = maximum
+
+
+@pytest.mark.parametrize("progress", [None, "console"])
+def test_cluster_progress_modes(synth_locs_2d, progress):
+    out = clusterer.cluster(
+        synth_locs_2d,
+        radius_xy=GA_RADIUS,
+        min_locs=GA_MIN_LOCS,
+        frame_analysis=False,
+        return_info=False,
+        progress=progress,
+    )
+    assert len(np.unique(out["group"])) == len(BLOB_CENTERS_2D)
+
+
+def test_cluster_accepts_duck_typed_progress(synth_locs_2d):
+    tracker = _RecordingProgress()
+    clusterer.cluster(
+        synth_locs_2d,
+        radius_xy=GA_RADIUS,
+        min_locs=GA_MIN_LOCS,
+        frame_analysis=False,
+        return_info=False,
+        progress=tracker,
+    )
+    assert tracker.maximum_set is not None and tracker.maximum_set > 0
+    assert tracker.values, "progress was never reported"
+    assert max(tracker.values) <= tracker.maximum_set

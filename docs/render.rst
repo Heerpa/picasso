@@ -9,7 +9,7 @@ render
 Opening Files
 -------------
 1. Rendering of the super-resolution image: In ``Picasso: Render``, open a movie file by dragging a localization file (ending with '.hdf5') into the window or by selecting ``File > Open``. The super-resolution image will be rendered automatically. A region of choice can be zoomed into by a rectangular selection using the left mouse button. The 'View' menu contains more options for zooming and panning.
-2. (Optional) Adjust rendering options by selecting ``View > Display Settings``. The field 'Oversampling' defines the number of super-resolution pixels per camera pixel. The contrast settings ``Min. Density`` and ``Max. Density`` define at which number of localizations per super-resolution pixel the minimum and maximum color of the colormap should be applied.
+2. (Optional) Adjust rendering options by selecting ``View > Display Settings``. The field 'Display pixel size (nm)' defines the size of the rendered pixels of the super-resolution image. The contrast settings ``Min. Density`` and ``Max. Density`` define at which number of localizations per super-resolution pixel the minimum and maximum color of the colormap should be applied.
 3. (Optional) For multiplexed image acquisition, open HDF5 localization files from other channels subsequently. Alternatively, drag and drop all HDF5 files to be displayed simultaneously.
 
 Drift Correction
@@ -49,7 +49,7 @@ Picking of regions of interest
 2. Switch the active tool by selecting ``Tools > Pick``. The mouse cursor will now change to a circle. Alternatively, open ``Tools > Tools Settings`` to change the shape into a rectangle. Lastly, choosing ``Polygon`` allows for drawing polygons of any shape.
 3. Set the size of the pick circle by adjusting the ``Diameter`` field in the tool settings dialog (``Tools > Tools Settings``). Alternatively, choose ``Width`` for a rectangular shape.
 4. Pick regions of interest using the circular mouse cursor by clicking the left mouse button. All localizations within the circle will be selected for further processing.
-5. (Optional) Automated region of interest selection. Select ``Tools > Pick similar`` to automatically detect and pick structures that have similar numbers of localizations and RMS deviation (RMSD) from their center of mass than already-picked structures. The upper and lower thresholds for these similarity measures are the respective standard deviations of already-picked regions, scaled by a tunable factor. This factor can be adjusted using the field ``Tools > Tools Settings > Pick similar ± range``. To display the mean and standard deviation of localization number and RMSD for currently picked regions, select ``View > Show info`` and click ``Calculate info below``.
+5. (Optional) Automated region of interest selection. Select ``Tools > Pick similar`` to automatically detect and pick structures that have similar numbers of localizations and RMS deviation (RMSD) from their center of mass than already-picked structures. The upper and lower thresholds for these similarity measures are the respective standard deviations of already-picked regions, scaled by a tunable factor. This factor can be adjusted using the field ``Tools > Tools Settings > Pick similar ± range``. To display the mean and standard deviation of localization number and RMSD for currently picked regions, select ``View > Show info`` and click ``Calculate info below``. ``Pick similar`` works with circular, square and rectangular picks (not with polygons). Rectangular picks all take the median length of the already-picked regions and are automatically rotated onto the principal axis of the localizations they contain, so elongated structures are found at any orientation; for them the RMSD along and across that axis are used as two separate similarity measures.
 6. (Optional) Exporting of pick information. All localizations in picked regions can be saved by selecting ``File > Save picked localizations``. The resulting HDF5 file will contain a new integer column ``group`` indicating to which pick each localization is assigned.
 7. (Optional) Statistics about each pick region can be saved by selecting ``File > Save pick properties``. The resulting HDF5 file is not a localization file. Instead, it holds a data set called ``groups`` in which the rows show statistical values for each pick region.
 8. (Optional) The picked positions and diameter itself can be saved by selecting ``File > Save pick regions``. Such saved pick information can also be loaded into ``Picasso: Render`` by selecting ``File > Load pick regions``.
@@ -63,9 +63,11 @@ The 3D rotation window allows the user to render 3D localization data. To use it
 
 The user may perform multiple actions in the rotation window, including: saving rotated localizations, building animations (.mp4 format), rotating by a specified angle, etc.
 
-Note that to build animations, the user must have ``ffmpeg`` installed on their system. 
+Note that to build animations, the user must have ``ffmpeg`` installed on their system.
 
-Rotation around z-axis is available by pressing Ctrl/Command. Rotation axis can be frozen by pressing x/y/z to freeze around the corresponding axes (to freeze around the z-axis, Ctrl/Command must be pressed as well).
+When rotating by a specified angle, the dialog offers a ``Rotate around`` choice between **Localizations** (the default) and **World**. ``Localizations`` rotates around the data's own axes - the axes shown by the axes icon, which rotate together with the data - so each entered angle changes the corresponding displayed angle by exactly that amount. ``World`` rotates around the fixed screen/camera axes instead.
+
+Rotation around the z-axis is available by pressing Ctrl/Command. Rotation axis can be frozen by pressing x/y/z to freeze around the corresponding axis. By default the frozen rotation is around the data's own axes (Localizations frame); holding Ctrl/Command together with x/y/z instead rotates around the fixed screen/World axes. The z-axis can now be frozen by pressing z alone (vertical dragging spins around it); Ctrl/Command is only needed for the z-axis if you want to rotate it in the World frame, or to spin around the screen z-axis when no axis is frozen.
 
 RESI
 ----
@@ -89,7 +91,11 @@ In Picasso 0.9.5, a new algorithm for molecular mapping (i.e., finding the posit
 
 G5M requires some preprocessing of localizations to filter out the badly fitted ones, especially the ones arising from crosstalk (overlapping blinking). These can be excluded from 2D data where the ellipticity and size of the image of an emitter in x and y can be filtered (in Picasso these are found under names “ellipticity”, “sx” and “sy”, respectively). Moreover, the photon count can be cut-off as crosstalk is likely to result in a higher-intensity signal. In 3D data these filters are less reliable due to astigmatism, however, “d_zcalib” could be used. We strongly encourage avoiding dense blinking, where emission signals from neighboring molecules overlap, especially during 3D image acquisition.
 
+Note that G5M assumes that the localization precision values (``lpx``, ``lpy`` and ``lpz`` columns) correspond to the real spread of the localization clouds. For example, drift correction needs to done precisely. In astigmatic imaging, great care needs to be taken if fiducials are used for drift correction, especially if they lie at a different plane from the target localizations. In fact, we recommend using the new fiducial-free algorithms such as `COMET <https://www.biorxiv.org/content/10.64898/2026.03.27.714864v1>`_ and `AIM <https://www.science.org/doi/10.1126/sciadv.adm7765>`_. This prevenents overfitting of too many molecules.
+
 Prior to molecular mapping, clustering of localizations is required to split the data into smaller chunks. For many datasets, DBSCAN works well. While in some cases some adjustments may be needed, we recommend the following DBSCAN parameters: In 2D, DBSCAN radius (epsilon) of 2*LP, in 3D - 3*LP (LP - average localization precision of the dataset, for example, NeNA or median localization precision). Default min. samples is set to 4. Clustering in Picasso adds the ``group`` column to the localization file, which is required for G5M. **Note: G5M relies on the information in the ``group`` column, therefore, if it is overwritten (for example, by picking localizations after DBSCAN clustering), G5M will not work.**
+
+Localizations obtained with the rotated elliptical Gaussian model will automatically take the mean value of the xy-plane rotation and apply it to the fitted molecule.
 
 To account for fluorophore non-specific sticking, frame analysis is normally recommended (especially the filtering of st. dev. of frame per molecule). However, if localizations from neighboring localization clouds overlap, this is not sufficient due to ambigous assignment of localizations to molecules. Therefore, we recommend filtering of molecules that express too few binding events (saved in the column ``n_events``). In the publication, we recommend a threshold of at least 3 binding events per molecule.
 
@@ -99,8 +105,9 @@ As a final check for overfitting (i.e., too many assigned molecules), G5M automa
 
 If the outcome of G5M seems unsatisfactory, please check the following:
 
-- Make sure that ``group`` column is present in the localization file and contains the correct information (i.e., from DBSCAN clustering, not from picking localizations);
+- Make sure that ``group`` column is present in the localization file and contains the correct information (i.e., from DBSCAN clustering, not from picking localizations). ``group_input`` can also be used;
 - Make sure that the loc. precision values (columns ``lpx``, ``lpy``, ``lpz``) are correct, comparing NeNA and median loc. precision is a reasonable proxy (without fiducial markers); the most common issue is a miscalibrated camera, leading to incorrect photon counts and thus incorrect loc. precisions;
+- Consider using a more accurate fitting model, such as spline fitting; we found that switching to it with optional increase in max. sigma can be very beneficial
 - Another reason why the loc. precision values can be off is due to the small box size in the localization step; especially in 3D astigmatic imaging, single-emitter images can be quite large, potentially exceeding the user-defined box size; in such cases, we recommend increasing the box size in the localization step and rerunning the analysis;
 - Inspect if the localizations were preprocessed as described above;
 - Rerun the analysis without postprocessing (filtering) and redo it manually, since some steps may be too stringent, such as ``p_val`` or ``n_events`` (latter especially for short acquisition times);
@@ -123,9 +130,9 @@ Zoom
 +++++
 Set the magnification factor.
 
-Oversampling
-++++++++++++
-Set the oversampling. Choose ``dynamic`` to automatically adjust to current window size when zooming.
+Display pixel size (nm)
++++++++++++++++++++++++
+Set the size of the pixel in the rendered image. Choose ``dynamic`` to automatically adjust to current window size when zooming.
 
 Minimap
 +++++++
@@ -188,7 +195,7 @@ File
 
 Open [Ctrl+O]
 ^^^^^^^^^^^^^
-Open an .hdf5 file to open in render.
+Open a localization file in render. Picasso ``.hdf5`` files are loaded directly; ThunderSTORM ``.csv`` and SMAP ``_sml.mat`` files are imported (you will be asked for the camera pixel size in nm). Localization files can also be imported by dragging and dropping them onto the render window.
 
 Open rotated localizations [Ctrl+Shift+O]
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -203,6 +210,8 @@ Save picked localizations [Ctrl+Shift+S]
 Save the localizations that are within a picked region (yellow circle, rectangle or polygon). Each pick will get a different group number. To display the group number in Render, select ``Annotate picks`` in Tools/Tools Settings.
 In case of rectangular picks, the saved localizations file will contain new columns `x_pick_rot` and `y_pick_rot`, which are localization coordinates into the coordinate system of the pick rectangle (coordinate (0,0) is where the rectangle was started to be drawn, and `y_pick_rot` is in the direction of the drawn line.)
 These columns can be used to plot density profiles of localizations along the rectangle dimensions easily (e.g., with "Filter").
+
+The picked regions themselves (shape, size and positions, in the same format as a pick regions ``.yaml`` file, see "Save pick regions" below) can additionally be stored in the metadata of the saved file, under the key ``Picks``. This is switched off by default, since it can add a substantial amount of data to the metadata. To switch it on, set ``Save picks in metadata`` to ``True`` in ``~/.picasso/settings.yaml`` (also available under File > Picasso settings in any module).
 
 Save pick properties
 ^^^^^^^^^^^^^^^^^^^^
@@ -219,7 +228,7 @@ Resets the current picked regions and loads regions from a .yaml file that conta
 Export ROI for Imaris
 ^^^^^^^^^^^^^^^^^^^^^
 This function allows to export the current ROI for Imaris. Note that this is currently only implemented for Windows.
-Click on File / Export ROI for imaris and enter a filename for export. Picasso will export the current region of interest with the current oversampling settings. If multiple channels are loaded it will export the channels with the same colors as set in Picasso (Shortcut CTRL+F or View / Files to change.)
+Click on File / Export ROI for imaris and enter a filename for export. Picasso will export the current region of interest with the current display pixel size settings. If multiple channels are loaded it will export the channels with the same colors as set in Picasso (Shortcut CTRL+F or View / Files to change.)
 Depending on the size of the ROI, the export will take a couple of seconds. Once exporting is finished, the file will be saved at the set location.
 The resulting file can be opened e.g. with ImarisViewer or Imaris. Note that the orientation is the same as in Picasso.
 
@@ -257,6 +266,12 @@ Export as .3d for ViSP
 ++++++++++++++++++++++
 Export as .3d file to be used ViSP.
 
+Export as .mat for SMAP
++++++++++++++++++++++++
+Export the dataset as a SMAP (`https://github.com/jries/SMAP <https://github.com/jries/SMAP>`_) ``_sml.mat`` file that can be loaded in SMAP via File > Load. The output is named ``<file>_sml.mat`` (the ``_sml`` suffix is required for SMAP to recognize the file).
+
+Coordinates and localization precision are converted from camera pixels to nm using the pixel size set in Display Settings; z and its precision (``lpz``) are written in nm; frames are made 1-based (SMAP convention). ``lpx`` and ``lpy`` are combined into SMAP's single ``locprecnm`` field as their mean.
+
 Remove all localizations
 ^^^^^^^^^^^^^^^^^^^^^^^^
 Removes all .hdf5 files loaded, restarts the render window.
@@ -275,12 +290,17 @@ control its title, visibility, color (or colormap), and relative intensity.
 A small horizontal gradient next to each channel previews what that channel
 will look like at intensity 0 → intensity 1.
 
-Each channel's *Color* dropdown is organised into three sections:
+**Left click** on a channel's checkbox ticks/unticks it, i.e., shows or
+hides that channel. **Right click** on a checkbox displays that channel
+only - it is ticked and all other channels are unticked at once, which is
+convenient for quickly inspecting individual channels in multiplexed data.
+
+Each channel's *Color* dropdown is organized into three sections:
 
 * **Solid colors** — the 14 default named colors (``red``, ``cyan``,
   ``green``, …). You can also type a hexadecimal code such as ``#FF5733``
   directly into the dropdown. Solid colors are rendered as a black →
-  color ramp, exactly matching the previous "intensity × RGB" behaviour.
+  color ramp, exactly matching the previous "intensity × RGB" behavior.
 * **Built-in colormaps** — one 3-stop *black → color → white* gradient
   per default solid color, named ``<color>_gradient`` (e.g.
   ``blue_gradient``, ``red_gradient``).
@@ -366,15 +386,24 @@ Selects the pick tool. The mouse can now be used for picking localizations. The 
 
 Measure (CTRL + M)
 ^^^^^^^^^^^^^^^^^^
-Selects the measure tool. The mouse can now be used for measuring distances. Left click adds a crosshair for measuring; right-click deletes the last crosshair.
+Selects the measure tool, which is used to measure distances on the rendered image.
+
+While the tool is active, the cursor is shown as a crosshair that follows the mouse. **Left click** drops a measurement point: each new point is connected to the previous one by a line, and the running total distance (in nm) is displayed live next to the line as you move the mouse, before the next point is even placed. Chaining several left clicks measures a multi-segment path.
+
+**Right click** has two functions:
+
+* The **first** right click *freezes* the current measurement set: the crosshair stops following the mouse and the measured path stays drawn on the image. A new, independent set of measurements can then be started simply by left-clicking again.
+* While in this frozen state, a **further** right click *deletes* the most recently finalized set. Repeating it removes the previous sets one by one.
+
+Distances and lines are only drawn within a set, never across sets, so multiple independent measurements can be displayed at the same time.
 
 Tools settings (CTRL + T)
 ^^^^^^^^^^^^^^^^^^^^^^^^^
-Define the settings of the tools, i.e., the radius of the pick and an option to annotate each pick. For the circular picks the range of pick similar can be set.
+Define the settings of the tools, i.e., the radius of the pick and an option to annotate each pick. The range of pick similar can be set here as well.
 
 Pick similar (CTRL + Shift + P)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Automatically identifies picks that are similar to the current picks.
+Automatically identifies picks that are similar to the current picks. Available for circular, square and rectangular picks. For rectangular picks, the new picks take the median length of the current picks and are oriented along the localizations they contain.
 
 Remove localizations in picks
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -487,7 +516,13 @@ Arranges an average in a square so that each structure is displayed individually
 
 Link localizations
 ^^^^^^^^^^^^^^^^^^
-Links consecutive localizations
+Links localizations originating from individual binding events. If the localizations were already grouped the binding events are never linked across two input groups.
+
+Select central frames localizations
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Groups localizations into binding events, exactly like *Link localizations* (same dialog: maximum distance and maximum number of transient dark frames), but instead of merging each binding event into a single localization, it keeps the localizations that are not at the borders of the event, i.e., those in the first and the last frame of each event are discarded, see `Steen et al., Nature Methods 21, 1755-1762 (2024) <https://doi.org/10.1038/s41592-024-02374-8>`_, Extended Data Fig. 1f.
+
+The retained localizations of each binding event are assigned a unique value in the *group* column. If the localizations were already grouped (e.g., by picking or clustering), the previous grouping is preserved in the *group_input* column, and binding events are never linked across two input groups.
 
 Align channels (RCC or from picked)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

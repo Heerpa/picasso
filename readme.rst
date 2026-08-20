@@ -39,14 +39,16 @@ A comprehensive documentation can be found here: `Read the Docs <https://picasso
 
 To see all changes introduced across releases, see `the changelog <https://github.com/jungmannlab/picasso/blob/master/changelog.md>`_.
 
-Picasso 0.10
+Picasso 0.11
 ------------
-In this version, a lot of new architectural (behind the scenes) changes were introduced to make Picasso more modular, maintainable and accessible to both developers and end-users. The adaptations include flexible dependencies and Python versions, integration of GPUfit, faster SPINNA and **many** more. You can explore these improvements in the `changelog <https://github.com/jungmannlab/picasso/blob/master/changelog.md>`_.
+This release substantially expands Picasso: Localize. Localization can now be performed with an experimentally measured PSF (cubic-spline model), jointly across several channels (e.g. biplane 3D), and with a pixel-dependent sCMOS noise model; rotated and spherical 2D Gaussian models were added as well. All GPU fitting was reimplemented in Numba CUDA, removing the dependency on Gpufit. Localize also reads a much wider range of data directly - ``.tif`` and OME-TIFF stacks (including movies split across several folders), MicroManager single-image acquisitions, Zeiss ``.czi`` and Leica ``.lif`` - so Picasso: ToRaw is no longer required and has been removed. Further additions include a temporal median filter for spot identification, affine calibrations for astigmatism and chromatic aberration correction, localization metadata embedded in the ``.hdf5`` files, a revised plugin system with an online plugin browser, and various performance and usability improvements throughout Localize, Render and SPINNA. We encourage all users to acquaint themselves with the new features in the `Localize documentation <https://picassosr.readthedocs.io/en/latest/localize.html>`_. See the `changelog <https://github.com/jungmannlab/picasso/blob/master/changelog.md>`_ for the complete list.
 
 Installation
 ------------
 
 Check out the `Picasso release page <https://github.com/jungmannlab/picasso/releases/>`__ to download and run the latest compiled one-click installer for Windows or MacOS (the latter is experimental and feedback is welcome). Here you will also find the Nature Protocols legacy version (v0.1.0).
+
+For Windows, two one-click installers are provided: a default (CPU) build and a **GPU** build. The GPU build additionally bundles the CUDA runtime so that GPU-accelerated (numba.cuda) code can run. It is larger and requires an NVIDIA (CUDA-capable) GPU; on machines without one, GPU-only options are simply hidden. Choose the GPU installer only if you have a compatible NVIDIA GPU and want to use the accelerated tools, for example localization fitting. Picasso uses Cuda12 in the one-click-installer.
 
 Python is also distributed as a PyPI package that is platform-independent (``pip install picassosr``) which grants not only GUI but also access to Picasso’s internal routines in custom Python programs. For more details, see the `Via PyPI <https://github.com/jungmannlab/picasso#via-pypi>`__ section below. For examples of how to use Picasso in Python scripts, see the section `Example Usage <https://github.com/jungmannlab/picasso#example-usage>`__ below.
 
@@ -60,6 +62,8 @@ Via PyPI
 3. Install Picasso package using: ``pip install picassosr``.
 4. You can now run any Picasso function directly from the console/terminal by running: ``picasso render``, ``picasso localize``, etc, or import Picasso functions in your own Python scripts.
 5. To update Picasso (you should get a notification about available updates since v0.10.0) run ``pip install --upgrade picassosr``.
+6. You can optionally install dependencies for .czi and .lif formats by passing ``pip install picassosr[czi]`` or ``pip install picassosr[lif]``.
+7. To enable GPU-accelerated (numba.cuda) code, install the CUDA dependencies with ``pip install picassosr[gpu]``. This requires an NVIDIA (CUDA-capable) GPU. The ``gpu`` extra targets CUDA toolkit 12.x; for other toolkits use ``pip install picassosr[cuda11]`` or ``pip install picassosr[cuda13]`` instead. Without these extras, Picasso runs fine on the CPU and GPU-only options are hidden.
 
 For Developers (local, editable installation)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -73,12 +77,13 @@ If you wish to use your local version of Picasso with your own modifications:
 5. Open the Picasso directory: ``cd picasso``.
 6. You can modify Picasso code in this directory.
 7. To create a *local* Picasso package to use it in other Python scripts, run ``pip install -e ".[dev]"``. When you change the code in the ``picasso`` directory, the changes will be reflected in the package.
-8. You can now run any Picasso module directly from the console/terminal by running: ``picasso render``, ``picasso localize``, etc, or import Picasso functions in your own Python scripts.
+8. You can install other extensions, such as ``".[gpu]"``, etc. The whole list of optional dependencies can be found in ``pyproject.toml``.
+9. You can now run any Picasso module directly from the console/terminal by running: ``picasso render``, ``picasso localize``, etc, or import Picasso functions in your own Python scripts.
 
 Creating shortcuts on Windows (*optional*)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Run the PowerShell script “createShortcuts.ps1” in the gui directory. This should be doable by right-clicking on the script and choosing “Run with PowerShell”. Alternatively, run the command
+This applies only to the users who installed Picasso via PyPI or through the editable, developer version and want to use desktop shortcuts. If you installed Picasso from the one-click installer on the `Release page <https://github.com/jungmannlab/picasso/releases/>`__, you can ignore this section. Run the PowerShell script “createShortcuts.ps1” in the ``gui`` directory. This should be doable by right-clicking on the script and choosing “Run with PowerShell”. Alternatively, run the command
 ``powershell ./createShortcuts.ps1`` in the command line. Use the generated shortcuts in the top level directory to start GUI components. Users can drag these shortcuts to their Desktop, Start Menu or Task Bar.
 
 Example Usage
@@ -103,7 +108,7 @@ For more examples, visit the `sample notebooks <https://github.com/jungmannlab/p
 Contributing
 ------------
 
-If you have a feature request or a bug report, please post it as an issue on the GitHub issue tracker. If you want to contribute, put a PR for it. You can find more guidelines for contributing `here <https://github.com/jungmannlab/picasso/blob/master/CONTRIBUTING.rst>`__. We will gladly guide you through the codebase and credit you accordingly. Additionally, you can check out the ``Projects``-page on GitHub.  You can also contact us via picasso@jungmannlab.org.
+If you have a feature request or a bug report, please post it as an issue on the GitHub issue tracker. If you want to contribute, put a pull request (PR) for it. You can find more guidelines for contributing `here <https://github.com/jungmannlab/picasso/blob/master/CONTRIBUTING.rst>`__. We will gladly guide you through the codebase and credit you accordingly.  You can also contact us via picasso@jungmannlab.org.
 
 .. SYNC-START: contributions
 
@@ -128,13 +133,15 @@ If you use Picasso in your research, please cite our Nature Protocols publicatio
 |
 | If you use some of the functionalities provided by Picasso, please also cite the respective publications:
 
+- All fitting methods are ports of Gpufit. DOI: `10.1038/s41598-017-15313-9 <https://doi.org/10.1038/s41598-017-15313-9>`__. License can be found `here <https://github.com/jungmannlab/picasso/blob/master/LICENSES/Gpufit-LICENSE.txt>`__.
+- Experimental PSF (cubic-spline) fitting. DOIs: `10.1038/nmeth.4661 <https://doi.org/10.1038/nmeth.4661>`__ (Li et al., experimental-PSF localization and bead alignment) and `10.1038/s41598-017-00622-w <https://doi.org/10.1038/s41598-017-00622-w>`__ (Babcock & Zhuang, cubic-spline PSF model). The spline calibration follows the coefficient scheme of Gpuspline; license can be found `here <https://github.com/jungmannlab/picasso/blob/master/LICENSES/Gpuspline-LICENSE.txt>`__.
+- Multichannel (global) experimental-PSF fitting. DOI: `10.1038/s41467-022-30719-4 <https://doi.org/10.1038/s41467-022-30719-4>`__ (Li et al., globLoc).
+- 3D fitting via astigmatism. DOI: `10.1126/science.1153529 <https://www.science.org/doi/10.1126/science.1153529>`__.
+- sCMOS pixel-dependent noise modeling. DOI: `10.1038/nmeth.2488 <https://doi.org/10.1038/nmeth.2488>`__.
 - NeNA. DOI: `10.1007/s00418-014-1192-3 <https://doi.org/10.1007/s00418-014-1192-3>`__
 - FRC. DOI: `10.1038/nmeth.2448 <https://doi.org/10.1038/nmeth.2448>`__
-- Theoretical lateral localization precision (Gauss LQ). DOI: `10.1038/nmeth.1447 <https://doi.org/10.1038/nmeth.1447>`__
-- Theoretical axial localization precision (Gauss LQ and MLE). DOI: `10.1038/s41467-026-70198-5 <https://doi.org/10.1038/s41467-026-70198-5>`__
-- MLE fitting. DOI: `10.1038/nmeth.1449 <https://doi.org/10.1038/nmeth.1449>`__
-- GPU fitting (LQ). DOI: `10.1038/s41598-017-15313-9 <https://doi.org/10.1038/s41598-017-15313-9>`__. License can be found `here <https://github.com/jungmannlab/picasso/tree/master/picasso/ext/pygpufit>`__.
-- 3D fitting via astigmatism. DOI: `10.1126/science.1153529 <https://www.science.org/doi/10.1126/science.1153529>`__.
+- Theoretical lateral localization precision (``lpx`` / ``lpy``, Gaussian least-squares). DOI: `10.1038/nmeth.1447 <https://doi.org/10.1038/nmeth.1447>`__
+- Theoretical axial localization precision (``lpz`` values, Gaussian). DOI: `10.1038/s41467-026-70198-5 <https://doi.org/10.1038/s41467-026-70198-5>`__
 - RCC undrifting: DOI: `10.1364/OE.22.015982 <https://doi.org/10.1364/OE.22.015982>`__
 - AIM undrifting. DOI: `10.1126/sciadv.adm776 <https://www.science.org/doi/10.1126/sciadv.adm7765>`__
 - SMLM clusterer. DOIs: `10.1038/s41467-021-22606-1 <https://doi.org/10.1038/s41467-021-22606-1>`__ and `10.1038/s41586-023-05925-9 <https://doi.org/10.1038/s41586-023-05925-9>`__

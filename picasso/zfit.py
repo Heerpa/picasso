@@ -4,31 +4,41 @@ picasso.zfit
 
 Fitting z coordinates using astigmatism.
 
-:authors: Joerg Schnitzbauer, Rafal Kowalewski
+:authors: Joerg Schnitzbauer, Rafal Kowalewski, Thomas Kellerer
 :copyright: Copyright (c) 2016-2026 Jungmann Lab, MPI of Biochemistry
 """
 
 from __future__ import annotations
 
 import os
+import math
 import multiprocessing
 import time
+import warnings
 from concurrent import futures
 from concurrent.futures import ProcessPoolExecutor
 from typing import Callable, Literal
 
 import numba
-import yaml
+from numba import cuda
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.optimize import minimize_scalar
 
-from . import lib, gausslq, gaussmle, __version__
-
+from . import io, lib, __version__
+from .fitting import precision
 
 plt.style.use("ggplot")
+
+
+try:
+    # Probing the CUDA driver can fail on machines without a runtime; treat
+    # any error as "no GPU available" so the CPU path stays the default.
+    CUDA_AVAILABLE = bool(cuda.is_available())
+except Exception:
+    CUDA_AVAILABLE = False
 
 
 def _nan_index(y: lib.FloatArray1D) -> tuple[lib.BoolArray1D, Callable]:
@@ -50,11 +60,17 @@ def calibrate_z(
     magnification_factor: float,
     path: str | None = None,
     frame_bounds: tuple[int, int] | None = None,
+    frames_per_step: int = 1,
+    frame_order: Literal["fov", "z"] = "fov",
 ) -> dict:
     """Given localizations of a calibration sample (e.g., gold beads at
     different z positions), calibrate the z-axis by fitting a polynomial
-    to the mean spot width/height of each frame. See Huang et al.
-    Science, 2008. DOI: 10.1126/science.1153529.
+    to the mean spot width/height of each z (stage) position. See Huang
+    et al. Science, 2008. DOI: 10.1126/science.1153529.
+
+    Several frames may be acquired at each z (stage) position to
+    increase the number of localizations per position and thus the
+    confidence of the calibration fit (see ``frames_per_step``).
 
     Parameters
     ----------
@@ -73,12 +89,28 @@ def calibrate_z(
     path : str, optional
         Path to save the calibration data as a YAML file. If None, the
         calibration data will not be saved. Default is None.
-    frame_bounds : tuple, optional
-        Minimum and maximum frame numbers to consider for the
-        calibration. If None, all frames are used. If only min or max
-        is to be specified, the other is to be set to None, for example,
+    frame_bounds : tuple, list of tuples, optional
+        Frame numbers to consider for the calibration. A single
+        ``(min, max)`` tuple restricts the calibration to one contiguous,
+        inclusive range; a list of such tuples restricts it to several
+        (disjoint) segments, where a frame is used if it falls in any
+        segment. If None, all frames are used. If only min or max is to be
+        specified, the other is to be set to None, for example,
         ``(5, None)`` sets minimum frame to 5 without maximum frame.
         Default is None.
+    frames_per_step : int, optional
+        Number of frames acquired at each z (stage) position. With the
+        default of 1, every frame corresponds to a distinct z position
+        (the classic behavior). Default is 1.
+    frame_order : {"fov", "z"}, optional
+        Acquisition order of the frames when ``frames_per_step`` > 1.
+        ``"fov"`` means the z position is held constant while several
+        fields of view are imaged, i.e., consecutive frames share the
+        same z position (``[z0, z0, ..., z1, z1, ...]``). ``"z"`` means
+        the full z stack is scanned sequentially and then repeated,
+        i.e., frames cycle through all z positions
+        (``[z0, z1, ..., z0, z1, ...]``). Ignored when
+        ``frames_per_step`` is 1. Default is "fov".
 
     Returns
     -------
@@ -88,49 +120,69 @@ def calibrate_z(
         magnification factor.
     """
     n_frames = info[0]["Frames"]
-    range = (n_frames - 1) * d
-    frame_range = np.arange(n_frames)
-    z_range = -(frame_range * d - range / 2)  # negative so that the
-    # first frames of a bottom-to-up scan are positive z coordinates.
+    frames_per_step = max(1, int(frames_per_step))
+    # number of distinct z (stage) positions; any trailing frames that do
+    # not complete a step are ignored
+    n_steps = n_frames // frames_per_step
+    if n_steps < 1:
+        raise ValueError(
+            "Number of frames per step is larger than the number of "
+            "frames in the movie."
+        )
+
+    # map each frame to the index of its z (stage) position
+    all_frames = np.arange(n_frames)
+    valid = all_frames < n_steps * frames_per_step
+    if frame_order == "z":
+        # full z stack scanned sequentially, then repeated
+        step_of_frame = all_frames % n_steps
+    else:  # "fov": consecutive frames share the same z position
+        step_of_frame = all_frames // frames_per_step
+    step_of_frame = np.where(valid, step_of_frame, -1)
+
+    # z position of each step; negative so that the first frames of a
+    # bottom-to-up scan are positive z coordinates
+    z_span = (n_steps - 1) * d
+    z_of_step = -(np.arange(n_steps) * d - z_span / 2)
+
     if frame_bounds is not None:
-        frame_min, frame_max = frame_bounds
-        frame_min = frame_min or 0
-        frame_max = frame_max or (n_frames - 1)
-        # frame bounds are inclusive, like in picasso.localize
-        frame_range = frame_range[frame_min : frame_max + 1]
-        z_range = z_range[frame_min : frame_max + 1]
-        locs = locs[
-            (locs["frame"] >= frame_min) & (locs["frame"] <= frame_max)
-        ]
+        # normalize to a list of inclusive (lo, hi) segments; a frame is
+        # kept if it falls in any segment (frame bounds are inclusive,
+        # like in picasso.localize)
+        segments = lib.normalize_frame_bounds(frame_bounds, n_frames - 1)
+        in_bounds = np.zeros(n_frames, dtype=bool)
+        for frame_min, frame_max in segments:
+            in_bounds |= (all_frames >= frame_min) & (all_frames <= frame_max)
+        step_of_frame = np.where(in_bounds, step_of_frame, -1)
 
-    mean_sx = np.array(
-        [locs["sx"][locs["frame"] == _].mean() for _ in frame_range]
-    )
-    mean_sy = np.array(
-        [locs["sy"][locs["frame"] == _].mean() for _ in frame_range]
-    )
-    var_sx = np.array(
-        [locs["sx"][locs["frame"] == _].var() for _ in frame_range]
-    )
-    var_sy = np.array(
-        [locs["sy"][locs["frame"] == _].var() for _ in frame_range]
-    )
+    # steps that still have at least one frame contributing to them
+    step_range = np.unique(step_of_frame[step_of_frame >= 0])
+    z_range = z_of_step[step_range]
+    # position of each step within the (bounded) step_range
+    step_to_pos = {int(s): i for i, s in enumerate(step_range)}
 
-    # index of each localization's frame in the (possibly bounded)
-    # frame_range
-    frame_idx = locs["frame"] - frame_range[0]
-    keep_x = (locs["sx"] - mean_sx[frame_idx]) ** 2 < var_sx[frame_idx]
-    keep_y = (locs["sy"] - mean_sy[frame_idx]) ** 2 < var_sy[frame_idx]
+    # assign each localization to its z (stage) position
+    locs = locs.copy()
+    locs_step = step_of_frame[locs["frame"].to_numpy()]
+    locs = locs[np.isin(locs_step, step_range)]
+    locs_step = step_of_frame[locs["frame"].to_numpy()]
+
+    mean_sx = np.array([locs["sx"][locs_step == _].mean() for _ in step_range])
+    mean_sy = np.array([locs["sy"][locs_step == _].mean() for _ in step_range])
+    var_sx = np.array([locs["sx"][locs_step == _].var() for _ in step_range])
+    var_sy = np.array([locs["sy"][locs_step == _].var() for _ in step_range])
+
+    # position of each localization's z (stage) position within step_range
+    pos = np.array([step_to_pos[int(s)] for s in locs_step], dtype=int)
+    keep_x = (locs["sx"] - mean_sx[pos]) ** 2 < var_sx[pos]
+    keep_y = (locs["sy"] - mean_sy[pos]) ** 2 < var_sy[pos]
     keep = keep_x & keep_y
     locs = locs[keep]
+    locs_step = step_of_frame[locs["frame"].to_numpy()]
 
-    # Fits calibration curve to the mean of each frame
-    mean_sx = np.array(
-        [locs["sx"][locs["frame"] == _].mean() for _ in frame_range]
-    )
-    mean_sy = np.array(
-        [locs["sy"][locs["frame"] == _].mean() for _ in frame_range]
-    )
+    # Fits calibration curve to the mean of each z (stage) position
+    mean_sx = np.array([locs["sx"][locs_step == _].mean() for _ in step_range])
+    mean_sy = np.array([locs["sy"][locs_step == _].mean() for _ in step_range])
 
     # Fix nan
     mean_sx = _interpolate_nan(mean_sx)
@@ -155,15 +207,18 @@ def calibrate_z(
         "Magnification factor": float(magnification_factor),
         "Path": path if path is not None else "N/A",
         "Frame bounds": frame_bounds,
+        "Frames per step": int(frames_per_step),
+        "Frame order": frame_order,
     }
     if path is not None:
-        with open(path, "w") as f:
-            yaml.dump(calibration, f, default_flow_style=False)
+        io.save_calibration(path, calibration)
 
     # pixelsize does not matter here anyway
     locs = _fit_z(locs, info, calibration, magnification_factor, pixelsize=130)
     locs["z"] /= magnification_factor
-    frame_idx = locs["frame"] - frame_range[0]
+    # position of each localization's z (stage) position within step_range
+    locs_step = step_of_frame[locs["frame"].to_numpy()]
+    pos = np.array([step_to_pos[int(s)] for s in locs_step], dtype=int)
 
     plt.figure(figsize=(18, 10))
 
@@ -208,7 +263,7 @@ def calibrate_z(
     plt.legend(loc="best")
 
     ax = plt.subplot(234)
-    plt.plot(z_range[frame_idx], locs["z"], ".k", alpha=0.1)
+    plt.plot(z_range[pos], locs["z"], ".k", alpha=0.1)
     plt.plot(
         [z_range.min(), z_range.max()],
         [z_range.min(), z_range.max()],
@@ -223,19 +278,19 @@ def calibrate_z(
     plt.legend(loc="best")
 
     ax = plt.subplot(235)
-    deviation = locs["z"] - z_range[frame_idx]
+    deviation = locs["z"] - z_range[pos]
     bins = lib.calculate_optimal_bins(deviation, max_n_bins=1000)
     plt.hist(deviation, bins)
     plt.xlabel("Deviation to true position")
     plt.ylabel("Occurence")
 
     ax = plt.subplot(236)
-    square_deviation = deviation**2
-    mean_square_deviation_frame = [
-        np.mean(square_deviation[locs["frame"] == _]) for _ in frame_range
+    square_deviation = deviation.to_numpy() ** 2
+    mean_square_deviation_step = [
+        np.mean(square_deviation[locs_step == _]) for _ in step_range
     ]
-    rmsd_frame = np.sqrt(mean_square_deviation_frame)
-    plt.plot(z_range, rmsd_frame, ".-", color="0.3")
+    rmsd_step = np.sqrt(mean_square_deviation_step)
+    plt.plot(z_range, rmsd_step, ".-", color="0.3")
     plt.xlim(z_range.min(), z_range.max())
     plt.gca().set_ylim(bottom=0)
     plt.xlabel("Stage position")
@@ -289,39 +344,6 @@ def _fit_z_target(
         + cy[6]
     )
     return (sx**0.5 - wx**0.5) ** 2 + (sy**0.5 - wy**0.5) ** 2
-
-
-def fit_z(  # TODO: remove in v0.11.0
-    locs: pd.DataFrame,
-    info: list[dict],
-    calibration: dict,
-    magnification_factor: float,
-    pixelsize: float,
-    fitting_method: Literal["gausslq", "gaussmle"] = "gausslq",
-    filter: int = 2,
-    progress_callback: (
-        Callable[[int], None] | Literal["console"] | None
-    ) = None,
-) -> pd.DataFrame:
-    """Fit z coordinates to the localizations based on the calibration
-    curve coefficients and the single-emitter image width and height.
-    See `zfit` for more details.
-
-    Will be deprecated in v0.11.0 in favor of `zfit`."""
-    lib.deprecation_warning(
-        "Deprecation warning: `fit_z` will become a private function in "
-        "v0.11.0. Please use `zfit` instead."
-    )
-    return _fit_z(
-        locs,
-        info,
-        calibration,
-        magnification_factor,
-        pixelsize,
-        fitting_method,
-        filter,
-        progress_callback,
-    )
 
 
 def _fit_z(
@@ -382,37 +404,6 @@ def _fit_z(
     return filter_z_fits(locs, filter)
 
 
-def fit_z_parallel(  # TODO: remove in v0.11.0
-    locs: pd.DataFrame,
-    info: list[dict],
-    calibration: dict,
-    magnification_factor: float,
-    pixelsize: float,
-    fitting_method: Literal["gausslq", "gaussmle"] = "gausslq",
-    filter: int = 2,
-    asynch: bool = False,
-) -> pd.DataFrame | list[futures.Future]:
-    """Fit z coordinates to the localizations based on the calibration
-    curve coefficients and the single-emitter image width and height,
-    optionally using multiprocessing. See `zfit` for more details.
-
-    Will be deprecated in v0.11.0 in favor of `zfit`."""
-    lib.deprecation_warning(
-        "Deprecation warning: `fit_z_parallel` will become a private "
-        "function in v0.11.0. Please use `zfit` instead."
-    )
-    return _fit_z_parallel(
-        locs,
-        info,
-        calibration,
-        magnification_factor,
-        pixelsize,
-        fitting_method,
-        filter,
-        asynch,
-    )
-
-
 def _fit_z_parallel(
     locs: pd.DataFrame,
     info: list[dict],
@@ -462,6 +453,242 @@ def _fit_z_parallel(
     return locs_from_futures(fs, filter=filter)
 
 
+@cuda.jit(device=True, inline=True)
+def _poly6_device(c: lib.FloatArray1D, z: float) -> float:
+    """Evaluate the degree-6 z calibration polynomial (highest power
+    first, as returned by ``np.polyfit``) via Horner's scheme."""
+    return (
+        (((((c[0] * z + c[1]) * z + c[2]) * z + c[3]) * z + c[4]) * z + c[5])
+    ) * z + c[6]
+
+
+@cuda.jit(device=True, inline=True)
+def _fit_z_target_device(
+    z: float,
+    sx: float,
+    sy: float,
+    cx: lib.FloatArray1D,
+    cy: lib.FloatArray1D,
+) -> float:
+    """Device version of ``_fit_z_target`` (the objective minimized when
+    fitting a single z coordinate). See ``_fit_z_target`` for details."""
+    wx = _poly6_device(cx, z)
+    wy = _poly6_device(cy, z)
+    return (math.sqrt(sx) - math.sqrt(wx)) ** 2 + (
+        math.sqrt(sy) - math.sqrt(wy)
+    ) ** 2
+
+
+@cuda.jit(device=True)
+def _minimize_z_device(
+    sx: float,
+    sy: float,
+    cx: lib.FloatArray1D,
+    cy: lib.FloatArray1D,
+    x1: float,
+    x2: float,
+) -> tuple[float, float]:
+    """Bounded scalar minimization of ``_fit_z_target_device`` over
+    ``[x1, x2]`` for a single localization.
+
+    This is a faithful port of SciPy's ``_minimize_scalar_bounded``
+    (Brent's method with golden-section fallback, the algorithm used by
+    ``scipy.optimize.minimize_scalar`` when ``bounds`` are given), so the
+    GPU fit reproduces the CPU (``_fit_z``) result. Returns the minimizer
+    ``xf`` and the objective value ``fx`` at that point."""
+    xatol = 1e-5
+    maxfun = 500
+    sqrt_eps = 1.4901161193847656e-08  # sqrt(2.2e-16)
+    golden_mean = 0.3819660112501051  # 0.5 * (3 - sqrt(5))
+
+    a = x1
+    b = x2
+    fulc = a + golden_mean * (b - a)
+    nfc = fulc
+    xf = fulc
+    rat = 0.0
+    e = 0.0
+    x = xf
+    fx = _fit_z_target_device(x, sx, sy, cx, cy)
+    num = 1
+    ffulc = fx
+    fnfc = fx
+    xm = 0.5 * (a + b)
+    tol1 = sqrt_eps * abs(xf) + xatol / 3.0
+    tol2 = 2.0 * tol1
+
+    while abs(xf - xm) > (tol2 - 0.5 * (b - a)):
+        golden = True
+        # Try a parabolic (Brent) step
+        if abs(e) > tol1:
+            golden = False
+            r = (xf - nfc) * (fx - ffulc)
+            q = (xf - fulc) * (fx - fnfc)
+            p = (xf - fulc) * q - (xf - nfc) * r
+            q = 2.0 * (q - r)
+            if q > 0.0:
+                p = -p
+            q = abs(q)
+            r = e
+            e = rat
+            # Is the parabola acceptable?
+            if (
+                (abs(p) < abs(0.5 * q * r))
+                and (p > q * (a - xf))
+                and (p < q * (b - xf))
+            ):
+                rat = p / q
+                x = xf + rat
+                if ((x - a) < tol2) or ((b - x) < tol2):
+                    si = 1.0 if (xm - xf) >= 0 else -1.0
+                    rat = tol1 * si
+            else:  # fall back to golden section
+                golden = True
+
+        if golden:  # golden-section step
+            if xf >= xm:
+                e = a - xf
+            else:
+                e = b - xf
+            rat = golden_mean * e
+
+        si = 1.0 if rat >= 0 else -1.0
+        x = xf + si * max(abs(rat), tol1)
+        fu = _fit_z_target_device(x, sx, sy, cx, cy)
+        num += 1
+
+        if fu <= fx:
+            if x >= xf:
+                a = xf
+            else:
+                b = xf
+            fulc = nfc
+            ffulc = fnfc
+            nfc = xf
+            fnfc = fx
+            xf = x
+            fx = fu
+        else:
+            if x < xf:
+                a = x
+            else:
+                b = x
+            if (fu <= fnfc) or (nfc == xf):
+                fulc = nfc
+                ffulc = fnfc
+                nfc = x
+                fnfc = fu
+            elif (fu <= ffulc) or (fulc == xf) or (fulc == nfc):
+                fulc = x
+                ffulc = fu
+
+        xm = 0.5 * (a + b)
+        tol1 = sqrt_eps * abs(xf) + xatol / 3.0
+        tol2 = 2.0 * tol1
+
+        if num >= maxfun:
+            break
+
+    return xf, fx
+
+
+@cuda.jit
+def _fit_z_kernel(
+    sx: lib.FloatArray1D,
+    sy: lib.FloatArray1D,
+    cx: lib.FloatArray1D,
+    cy: lib.FloatArray1D,
+    z_out: lib.FloatArray1D,
+    fun_out: lib.FloatArray1D,
+) -> None:
+    """One thread per localization: fit its z coordinate and store the
+    minimizer and objective value (residual^2) in the output arrays."""
+    i = cuda.grid(1)
+    if i < sx.shape[0]:
+        # Bounds match the CPU path (``_fit_z``); they avoid potential
+        # gaps in the calibration curve.
+        xf, fx = _minimize_z_device(sx[i], sy[i], cx, cy, -1000.0, 1000.0)
+        z_out[i] = xf
+        fun_out[i] = fx
+
+
+def _fit_z_gpu(
+    locs: pd.DataFrame,
+    info: list[dict],
+    calibration: dict,
+    magnification_factor: float,
+    pixelsize: float,
+    fitting_method: Literal["gausslq", "gaussmle"] = "gausslq",
+    filter: int = 2,
+    progress_callback: (
+        Callable[[int], None] | Literal["console"] | None
+    ) = None,
+) -> pd.DataFrame:
+    """GPU (numba.cuda) equivalent of ``_fit_z``. Fits the z coordinate
+    of every localization in parallel on the GPU, reproducing the CPU
+    result. See ``_fit_z`` for details."""
+    if not CUDA_AVAILABLE:
+        raise RuntimeError(
+            "GPU z fitting requested but no CUDA-capable GPU is available."
+        )
+    locs = locs.copy()
+    cx = np.ascontiguousarray(calibration["X Coefficients"], dtype=np.float64)
+    cy = np.ascontiguousarray(calibration["Y Coefficients"], dtype=np.float64)
+    # float64 throughout: the 1e-5 convergence tolerance is unreachable in
+    # float32 for |z| up to 1000, and it keeps the fit faithful to the CPU.
+    sx = np.ascontiguousarray(locs["sx"].to_numpy(), dtype=np.float64)
+    sy = np.ascontiguousarray(locs["sy"].to_numpy(), dtype=np.float64)
+    N = sx.shape[0]
+    z = np.zeros(N, dtype=np.float64)
+    square_d_zcalib = np.zeros(N, dtype=np.float64)
+
+    if N:
+        d_cx = cuda.to_device(cx)
+        d_cy = cuda.to_device(cy)
+        threads_per_block = 128
+        # Process in chunks to bound device memory and report progress.
+        chunk = 1_000_000
+        use_tqdm = progress_callback == "console"
+        pbar = (
+            tqdm(total=N, desc="Fitting z...", unit="locs")
+            if use_tqdm
+            else None
+        )
+        for start in range(0, N, chunk):
+            end = min(start + chunk, N)
+            n = end - start
+            d_sx = cuda.to_device(sx[start:end])
+            d_sy = cuda.to_device(sy[start:end])
+            d_z = cuda.device_array(n, dtype=np.float64)
+            d_fun = cuda.device_array(n, dtype=np.float64)
+            blocks = (n + threads_per_block - 1) // threads_per_block
+            _fit_z_kernel[blocks, threads_per_block](
+                d_sx, d_sy, d_cx, d_cy, d_z, d_fun
+            )
+            z[start:end] = d_z.copy_to_host()
+            square_d_zcalib[start:end] = d_fun.copy_to_host()
+            if use_tqdm:
+                pbar.update(n)
+            elif callable(progress_callback):
+                progress_callback(end)
+        if use_tqdm:
+            pbar.close()
+
+    locs["z"] = (z * magnification_factor).astype(np.float32)
+    locs["d_zcalib"] = np.sqrt(square_d_zcalib).astype(np.float32)
+    lpz = _axial_localization_precision_astig(
+        locs,
+        cx,
+        cy,
+        magnification_factor,
+        pixelsize,
+        fitting_method,
+    )
+    locs["lpz"] = lpz
+    locs = lib.ensure_sanity(locs, info)
+    return filter_z_fits(locs, filter)
+
+
 def zfit(
     locs: pd.DataFrame,
     info: list[dict],
@@ -472,6 +699,7 @@ def zfit(
     fitting_method: Literal["gausslq", "gaussmle"] = "gausslq",
     filter: int = 2,
     multiprocess: bool = False,
+    gpu: bool = False,
     progress_callback: (
         Callable[[int], None] | Literal["console"] | None
     ) = None,
@@ -479,8 +707,8 @@ def zfit(
 ) -> tuple[pd.DataFrame, list[dict]] | tuple[None, None]:
     """Main function for fitting z coordinates to the localizations.
 
-    Replaces `fit_z` (which will become a private function) and
-    `fit_z_parallel` in v0.11.0.
+    Introduced in v0.10.0. Note that `fit_z` and `fit_z_parallel` were
+    completely replaced in v0.11.0.
 
     Parameters
     ----------
@@ -522,7 +750,12 @@ def zfit(
         square deviation (RMSD) of the z calibration. Default is 2.
     multiprocess : bool, optional
         Whether to use multiprocessing for fitting the z coordinates.
-        Default is False.
+        Ignored when ``gpu`` is True. Default is False.
+    gpu : bool, optional
+        Whether to fit the z coordinates on a CUDA-capable GPU
+        (numba.cuda). Reproduces the CPU result. Requires
+        ``zfit.CUDA_AVAILABLE`` to be True. Takes precedence over
+        ``multiprocess``. Default is False.
     progress_callback : callable, "console", or None, optional
         If a callable is provided, it will be called with the current
         progress (number of localizations processed) as an argument. If
@@ -544,6 +777,10 @@ def zfit(
     """
     assert fitting_method in ["gausslq", "gaussmle"], "Invalid fitting method."
     assert filter >= 0, "Filter must be non-negative."
+    if gpu and not CUDA_AVAILABLE:
+        raise RuntimeError(
+            "GPU z fitting requested but no CUDA-capable GPU is available."
+        )
     assert isinstance(
         calibration,
         dict,
@@ -576,6 +813,7 @@ def zfit(
         fitting_method,
         filter,
         multiprocess,
+        gpu,
         progress_callback,
         abort_callback,
     )
@@ -588,6 +826,7 @@ def _zfit(
     fitting_method: Literal["gausslq", "gaussmle"],
     filter: int,
     multiprocess: bool,
+    gpu: bool,
     progress_callback: Callable[[int], None] | Literal["console"] | None,
     abort_callback: Callable[[], bool] | None,
 ) -> tuple[pd.DataFrame, list[dict]] | tuple[None, None]:
@@ -595,7 +834,18 @@ def _zfit(
     See `zfit` for details."""
     pixelsize = lib.get_from_metadata(info, "Pixelsize", raise_error=True)
     N = len(locs)
-    if multiprocess:
+    if gpu:
+        locs = _fit_z_gpu(
+            locs=locs,
+            info=info,
+            calibration=calibration,
+            magnification_factor=calibration["Magnification factor"],
+            pixelsize=pixelsize,
+            fitting_method=fitting_method,
+            filter=filter,
+            progress_callback=progress_callback,
+        )
+    elif multiprocess:
         use_tqdm = progress_callback == "console"
         if use_tqdm:
             iter_range = tqdm(range(N), desc="Fitting z...", unit="locs")
@@ -636,11 +886,15 @@ def _zfit(
             filter=filter,
             progress_callback=progress_callback,
         )
+    affine = lib.describe_lateral_transforms(calibration)
+    locs = lib.apply_lateral_transforms(locs, calibration)
     new_info = {
         "Generated by": f"Picasso v{__version__} Fit 3D",
         "Calibration path": calibration.get("Path", "N/A"),
         "Filter range": filter,
     }
+    if affine:
+        new_info["Lateral corrections applied"] = affine
     new_info = info + [new_info | calibration]
     return locs, new_info
 
@@ -838,13 +1092,13 @@ def _axial_localization_precision_astig(
     """
     if fitting_method == "gausslq":
         se_sx = (
-            gausslq.sigma_uncertainty(
+            precision.sigma_uncertainty_lsq(
                 locs["sx"], locs["sy"], locs["photons"], locs["bg"]
             )
             * pixelsize
         )
         se_sy = (
-            gausslq.sigma_uncertainty(
+            precision.sigma_uncertainty_lsq(
                 locs["sy"], locs["sx"], locs["photons"], locs["bg"]
             )
             * pixelsize
@@ -852,13 +1106,13 @@ def _axial_localization_precision_astig(
     elif fitting_method == "gaussmle":
         if "sx_unc" not in locs.columns or "sy_unc" not in locs.columns:
             se_sx = (
-                gaussmle.sigma_uncertainty(
+                precision.sigma_uncertainty_mle(
                     locs["sx"], locs["sy"], locs["photons"], locs["bg"]
                 )
                 * pixelsize
             )
             se_sy = (
-                gaussmle.sigma_uncertainty(
+                precision.sigma_uncertainty_mle(
                     locs["sy"], locs["sx"], locs["photons"], locs["bg"]
                 )
                 * pixelsize
