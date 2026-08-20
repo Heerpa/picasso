@@ -237,6 +237,42 @@ class TestSignalRegistration:
             _matrix(calibration["channel_transforms"][1]), truth, atol=0.35
         )
 
+    def test_the_bootstrap_survives_a_tied_vote(self):
+        """A dense cloud saturates the RANSAC inlier count - hundreds of wrong
+        candidates map *every* point within the tolerance and tie at the
+        maximum - so the winner may not be left to the sampling order: which
+        spots are detected varies with the machine (the identification's thread
+        count, a spot sitting on the net-gradient threshold), and a tie broken
+        by order then registers a different transform on a different machine.
+        Thinning the point sets stands in for that here; the detections are
+        whole pixels, as identified ones are."""
+        rng = np.random.RandomState(0)
+        truth = np.array([[1.0, 0.0, 5.4], [0.0, 1.0, -3.7]])
+        ref_by_frame, chan_by_frame = {}, {}
+        for f in range(25):
+            xy = rng.uniform(14, 34, size=(rng.randint(5, 8), 2))
+            ref_by_frame[f] = np.rint(xy)
+            chan_by_frame[f] = np.rint(_apply(xy, truth))
+
+        for trial in range(4):
+            drop = np.random.RandomState(trial)
+
+            def thinned(by_frame):
+                out = {}
+                for f, xy in by_frame.items():
+                    kept = xy[drop.rand(len(xy)) > 0.06]
+                    if len(kept):
+                        out[f] = kept
+                return out
+
+            info = registration.register_from_point_sets(
+                thinned(ref_by_frame), thinned(chan_by_frame), "affine", BOX
+            )
+
+            np.testing.assert_allclose(
+                info["transform"].matrix[:2], truth, atol=0.8
+            )
+
     def test_rejects_an_empty_frame_range(self):
         movies = _blinking_movies([_rotation(0.0, 2.0, 0.0)], n_frames=10)
         with pytest.raises(ValueError, match="No frames"):

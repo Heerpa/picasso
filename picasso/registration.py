@@ -235,13 +235,21 @@ def ransac_match(
     overlaid onto the reference frame - a flip orientation plus an approximate
     shift), but the transform is fit on the original **absolute** ``ref_xy`` /
     ``c_xy``. Two candidate pairs are sampled, the similarity transforms they
-    imply (see :func:`_similarity_from_two`) are formed, and the beads each maps
-    within ``inlier_tol`` are counted; the largest consensus wins and its
-    inliers (unique nearest-neighbor assignment) are returned. Because only the
-    *candidate proposal* uses the coarse overlay - not the fit - an inaccurate
-    overlay (e.g. an imperfectly placed split-FOV ROI) cannot mis-pair beads
-    and corrupt the transform, which otherwise makes the calibration
-    hypersensitive to ROI placement.
+    imply (see :func:`_similarity_from_two`) are formed, and each is scored by
+    how well it maps the reference cloud onto the other one - every bead
+    contributing its squared distance to the nearest partner, capped at
+    ``inlier_tol`` for the ones with no partner at all (the MSAC cost). The
+    cheapest wins and its inliers (unique nearest-neighbor assignment) are
+    returned. Capped-square rather than plain inlier counting because a dense
+    cloud, such as the blinking signal registration pairs, maps *every* bead
+    within ``inlier_tol`` under hundreds of different candidates, which all tie
+    at the maximum count and leave the winner to the sampling order; the
+    residuals still separate the true transform from the coincidental ones.
+
+    Because only the *candidate proposal* uses the coarse overlay - not the fit
+    - an inaccurate overlay (e.g. an imperfectly placed split-FOV ROI) cannot
+    mis-pair beads and corrupt the transform, which otherwise makes the
+    calibration hypersensitive to ROI placement.
 
     Parameters
     ----------
@@ -255,7 +263,8 @@ def ransac_match(
         propose candidate pairs. Pass ``c_xy`` itself for an identity overlay.
     inlier_tol : float
         Distance (camera pixels) within which a mapped point counts as an
-        inlier, both for the consensus vote and the final assignment.
+        inlier: the cap on the scoring cost, and the pairing radius of the
+        final assignment.
     radius : float
         Radius (camera pixels) around each reference point in which the
         overlay proposes candidate partners. It only has to be generous enough
@@ -317,22 +326,25 @@ def ransac_match(
         return empty
     pairs = np.asarray(pairs, dtype=int)
 
+    # Candidates are scored by the M-estimator (MSAC) cost
+    tol_sq = float(inlier_tol) ** 2
+
     if groups is None:
         c_tree = KDTree(c_xy)
 
-        def consensus(pred: np.ndarray) -> int:
+        def msac_cost(pred: np.ndarray) -> float:
             dist, _ = c_tree.query(pred, k=1)
-            return int(np.count_nonzero(dist <= inlier_tol))
+            return float(np.sum(np.minimum(dist**2, tol_sq)))
 
     else:
         # one tree per field, so a bead can only find partners in its own
         group_trees = [(ri, KDTree(c_xy[ci])) for ri, ci in groups]
 
-        def consensus(pred: np.ndarray) -> int:
-            total = 0
+        def msac_cost(pred: np.ndarray) -> float:
+            total = 0.0
             for ri, tree in group_trees:
                 dist, _ = tree.query(pred[ri], k=1)
-                total += int(np.count_nonzero(dist <= inlier_tol))
+                total += float(np.sum(np.minimum(dist**2, tol_sq)))
             return total
 
     n_samples = len(pairs) * (len(pairs) - 1) // 2
@@ -344,7 +356,7 @@ def ransac_match(
             list(combinations(range(len(pairs)), 2)), dtype=int
         )
 
-    best_M, best_count = None, 0
+    best_M, best_cost = None, np.inf
     for a, b in samples:
         (i0, j0), (i1, j1) = pairs[a], pairs[b]
         if i0 == i1 or j0 == j1:  # need two distinct ref and channel beads
@@ -355,9 +367,9 @@ def ransac_match(
         for M in _similarity_from_two(
             ref_xy[i0], ref_xy[i1], c_xy[j0], c_xy[j1]
         ):
-            count = consensus(M.apply(ref_xy))
-            if count > best_count:
-                best_count, best_M = count, M
+            cost = msac_cost(M.apply(ref_xy))
+            if cost < best_cost:
+                best_cost, best_M = cost, M
 
     if best_M is None:
         return empty
