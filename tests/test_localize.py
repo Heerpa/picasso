@@ -23,7 +23,7 @@ import pandas as pd
 import pytest
 from scipy import ndimage
 from scipy.interpolate import CubicSpline
-from PyQt6 import QtWidgets
+from PyQt6 import QtCore, QtWidgets
 
 from picasso import gaussmle, gausslq, io, lib, localize, spline, transforms
 from picasso import transforms as transforms_mod
@@ -12544,3 +12544,48 @@ class TestSplitFovGaussianThroughTheWindow:
             assert window.locs["x"].max() < 64
         finally:
             window.close()
+
+
+class _InterruptibleWorker(QtCore.QThread):
+    """A worker that runs until it is asked to stop, like the real ones."""
+
+    def run(self) -> None:
+        while not self.isInterruptionRequested():
+            self.msleep(10)
+
+
+@pytest.mark.gui
+class TestClosingStopsTheWorkers:
+    """Qt aborts the process when a running QThread is destroyed, so a window
+    must not be closed out from under its identification or fit."""
+
+    def test_a_running_worker_is_interrupted_and_waited_for(self):
+        window = localize_gui.Window()
+        worker = _InterruptibleWorker()
+        worker.start()
+        while not worker.isRunning():  # started asynchronously
+            pass
+        window._active_worker = worker
+        try:
+            window.close()
+            assert not worker.isRunning()
+            assert window._worker_still_running() is False
+        finally:
+            worker.requestInterruption()
+            worker.wait()
+
+    def test_the_fit_worker_is_stopped_too(self):
+        """Not only the one the abort button points at: the window is
+        destroyed with every thread it started."""
+        window = localize_gui.Window()
+        worker = _InterruptibleWorker()
+        worker.start()
+        while not worker.isRunning():
+            pass
+        window.fit_worker = worker
+        try:
+            window.close()
+            assert not worker.isRunning()
+        finally:
+            worker.requestInterruption()
+            worker.wait()

@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 19-AUG-2026 CEST
+Last change: 20-AUG-2026 CEST
 
 ## 0.11.0
 
@@ -121,6 +121,7 @@ This release substantially expands Picasso: Localize. Localization can now be pe
 - `Micro-Manager Acquisition Comments` is only saved in the metadata if the acquisition actually has a comment; an empty one is no longer written.
 - All API docstrings have been updated to match the [Numpy docstrings style](https://numpydoc.readthedocs.io/en/latest/format.html).
 - Menu entries that open a dialog end with an ellipsis (e.g. `File > Open...`), following the standard GUI convention.
+- Closing the Localize window while an identification or a fit is running now stops that worker first.
 
 ### **Backward incompatible changes:**
 - All the functions deprecated in v0.10 were removed, see section **0.10.0** below.
