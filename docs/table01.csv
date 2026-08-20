@@ -5,15 +5,18 @@
 "photons ","The total number of detected photons from this event, not including background or camera offset.","float "
 "sx ",The Point Spread Function width in camera pixels.,"float "
 "sy ",The Point Spread Function height in camera pixels.,"float "
+"angle ","(Optional) The in-plane rotation angle of the elliptical Gaussian PSF, in degrees. Only available when fitting a rotated elliptical Gaussian. Used by the ""gaussian"" render blur to orient each localization's precision ellipse.","float "
 "bg ","The number of background photons per pixel, not including the camera offset.","float "
-"lpx ","The localization precision in x direction, in camera pixels, as estimated by the Cramer-Rao Lower Bound (Mortensen et al., Nat Meth, 2010 and Smith et al., Nat Meth, 2010). ","float "
-"lpy ","The localization precision in y direction, in camera pixels, as estimated by the Cramer-Rao Lower Bound (Mortensen et al., Nat Meth, 2010 and Smith et al., Nat Meth, 2010). ","float "
+"lpx ","The localization precision in x direction, in camera pixels. ","float "
+"lpy ","The localization precision in y direction, in camera pixels. ","float "
+ellipticity,"The ellipticity of the fitted PSF, defined as (a - b) / a, where a and b are the larger and the smaller of ""sx"" and ""sy"". Not saved for the spherical (isotropic) Gaussian, where it is always zero.","float "
 "net_gradient ","The net gradient of this spot which is defined by the sum of gradient vector magnitudes within the fitting box, projected to the spot center. ","float "
 z,(Optional) The z coordinate fitted in 3D in nm. Please note the units are different for x and y coordinates.,"float "
 lpz,(Optional) The localization precision in z direction in nm.,float
 d_zcalib,"(Optional) The value of the D function used for z fitting with astigmatism, see the supplement to Huang et al. 2008.","float "
-"likelihood ",(Optional) The log-likelihood of the fit. Only available for MLE fitting.,"float "
+log_likelihood,"(Optional) The log-likelihood of the fit. Only available for MLE fitting. Before v0.11.0, this column might be “likelihood”.","float "
 "iterations ",(Optional) The number of iterations of the fit procedure. Only available for MLE fitting.,"long "
+chi_square,"(Optional) The chi-square of the fit, i.e. the sum of squared residuals between the spot and the fitted model at the fit optimum, in photons squared. Only available for least-squares fitting, where it is the counterpart of the “log_likelihood” column of MLE fits.","float "
 "group ","(Optional) An identifier to assign multiple localizations to groups, for example by picking regions of interest or clustering. ","long "
 group_input," ""(Optional) Assigned after clustering if the input localizations had a “group” column. This allows to trace back which input group a clustered group originated from.""",long
 "len ","(Optional) The length of the event in frames, if localizations from consecutive frames have been linked.","long "
@@ -25,3 +28,8 @@ group_input," ""(Optional) Assigned after clustering if the input localizations 
 "bg_unc ","(Optional) The uncertainty of the background estimation as estimated by the Cramer-Rao Lower Bound of the Maximum Likelihood fit. ",float
 "sx_unc ","(Optional) The uncertainty of the sx estimation (camera pixels) as estimated by the Cramer-Rao Lower Bound of the Maximum Likelihood fit. ",float
 "sy_unc ","(Optional) The uncertainty of the sy estimation (camera pixels) as estimated by the Cramer-Rao Lower Bound of the Maximum Likelihood fit. ",float
+angle_unc,"(Optional) The uncertainty of the angle estimation (degrees) as estimated by the Cramer-Rao Lower Bound of the Maximum Likelihood fit. Only available when fitting a rotated elliptical Gaussian with MLE. ",float
+n_id,"(Optional) The index of the pick or of the input localization that this spot was extracted from, when fitting picked spots (identifications generated from picks or from a localization file). ",unsigned long
+photons_ch<c>,"(Optional) The number of detected photons in channel c (c = 0, 1, ...), for a multichannel spline fit with photon counts not linked across channels. The “photons” column holds their sum.",float
+bg_ch<c>,"(Optional) The number of background photons per pixel in channel c (c = 0, 1, ...), for a multichannel spline fit with photon counts not linked across channels. The “bg” column holds their sum.",float
+rel_photons_ch<c>,"(Optional) The share of the total photons emitted in channel c (c = 0, 1, ...), for a multichannel spline fit with photon counts not linked across channels. The values sum to 1 per localization and provide the continuous ratiometric readout used for color assignment.",float

@@ -25,7 +25,14 @@ URL_GITHUB_REPO = "https://github.com/jungmannlab/picasso"
 
 
 def get_latest_version() -> str | None:
-    """Fetch the latest release tag from GitHub."""
+    """Fetch the latest release tag from GitHub.
+
+    Returns
+    -------
+    version : str or None
+        The tag with its leading ``v`` stripped, or None if the request
+        failed - an update check must never crash the app.
+    """
     try:
         response = requests.get(URL_LATEST_RELEASE_API, timeout=5)
         response.raise_for_status()
@@ -36,7 +43,15 @@ def get_latest_version() -> str | None:
 
 
 def is_update_available() -> tuple[bool, str | None]:
-    """Returns (update_available, latest_version)."""
+    """Compare the installed version against the latest release.
+
+    Returns
+    -------
+    update_available : bool
+        True if the latest release is newer than the running version.
+    latest_version : str or None
+        The latest release, or None if it could not be determined.
+    """
     latest = get_latest_version()
     if latest is None:
         return False, None
@@ -47,7 +62,16 @@ def is_update_available() -> tuple[bool, str | None]:
 
 
 def get_update_url() -> str:
-    """Return the appropriate update URL based on how the app is running."""
+    """Return the appropriate update instructions for how the app is
+    running.
+
+    Returns
+    -------
+    message : str
+        The releases page URL for a bundled ``.exe``, the ``pip install
+        --upgrade`` command for a PyPI install, or the repository URL when
+        running from source.
+    """
 
     # PyInstaller sets this attribute when running as a bundled .exe
     if getattr(sys, "frozen", False):
@@ -76,7 +100,14 @@ def get_update_url() -> str:
 
 
 def should_check_today() -> bool:
-    """Only check once per day."""
+    """Whether the daily update check is due.
+
+    Returns
+    -------
+    should_check : bool
+        True if the last check was more than 24 hours ago, or if no check
+        has been recorded (including when the settings cannot be read).
+    """
     try:
         settings = io.load_user_settings()
         if settings["Updates"].get("Last update check", False):
@@ -89,15 +120,27 @@ def should_check_today() -> bool:
 
 
 def skip_version(version: str) -> None:
-    """Mark the current latest version as "skipped" so the user won't be
-    notified about it again."""
+    """Mark a version as "skipped" so the user won't be notified about it
+    again.
+
+    Parameters
+    ----------
+    version : str
+        The version to skip.
+    """
     settings = io.load_user_settings()
     settings["Updates"]["Skipped version"] = version
     io.save_user_settings(settings)
 
 
 def snooze_until(days: int) -> None:
-    """User chose 'remind me later' — suppress for N days."""
+    """User chose 'remind me later' — suppress notifications for a while.
+
+    Parameters
+    ----------
+    days : int
+        How many days from now to stay quiet for.
+    """
     settings = io.load_user_settings()
     settings["Updates"]["Snoozed until"] = (
         datetime.now() + timedelta(days=days)
@@ -113,8 +156,19 @@ def disable_updates() -> None:
 
 
 def should_notify(latest_version: str) -> bool:
-    """Check user settings to decide whether to show update notification
-    for the given version."""
+    """Check user settings to decide whether to show an update notification.
+
+    Parameters
+    ----------
+    latest_version : str
+        The version that is available.
+
+    Returns
+    -------
+    should_notify : bool
+        False if update checks are disabled, this version was skipped, the
+        snooze window is still open, or a check already ran today.
+    """
     settings = io.load_user_settings()
     if settings["Updates"].get("Disabled", False):
         return False
@@ -130,14 +184,26 @@ def should_notify(latest_version: str) -> bool:
 
 
 def mark_checked():
+    """Record that an update check ran now, so the next one waits a day."""
     settings = io.load_user_settings()
     settings["Updates"]["Last update check"] = datetime.now().isoformat()
     io.save_user_settings(settings)
 
 
 def check_and_notify(notify_callback):
-    """Run update check in background thread, call notify_callback if
-    update found. Returns the thread so callers can join it."""
+    """Run an update check in a background thread.
+
+    Parameters
+    ----------
+    notify_callback : callable
+        Invoked with the latest version string if an update is available and
+        the user's settings allow notifying.
+
+    Returns
+    -------
+    thread : threading.Thread
+        The running daemon thread, so callers can join it.
+    """
 
     def _check():
         available, latest = is_update_available()
@@ -153,6 +219,14 @@ def check_and_notify(notify_callback):
 
 
 def cli_notify_update(latest_version):
+    """Tell the user about an update on stderr and offer to silence future
+    notifications.
+
+    Parameters
+    ----------
+    latest_version : str
+        The version that is available.
+    """
     url = get_update_url()
     print(
         f"\n⚡ Picasso update available: v{latest_version}\n\n{url}",
@@ -182,6 +256,11 @@ def setup_gui_update_check(parent=None):  # noqa: C901
     Must be called after QApplication is created (e.g. after
     ``window.show()``). The HTTP request runs in a background thread;
     the dialog is delivered to the main thread via a Qt signal.
+
+    Parameters
+    ----------
+    parent : QtWidgets.QWidget, optional
+        Parent of the message box. Default None.
     """
     if not should_check_today():
         return

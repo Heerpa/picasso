@@ -8,9 +8,16 @@ call cd %~dp0\..\..
 call conda create -n picasso_installer python=3.14.4 -y
 call conda activate picasso_installer
 call pip install build
-call python -m build
 
 for /f %%i in ('python -c "exec(open('picasso/version.py').read()); print(__version__)"') do set PICASSO_VERSION=%%i
+REM The CPU and GPU installers share the repo-level dist/ folder. If both are
+REM created at the same time, the second "python -m build" run fails because the
+REM sdist/wheel already exist, so only build when they are missing.
+if exist "dist\picassosr-%PICASSO_VERSION%-py3-none-any.whl" (
+    echo Reusing existing dist/picassosr-%PICASSO_VERSION%-py3-none-any.whl
+) else (
+    call python -m build
+)
 call pip install "dist/picassosr-%PICASSO_VERSION%-py3-none-any.whl[installer]"
 call cd release/one_click_windows_gui
 

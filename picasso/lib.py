@@ -13,28 +13,27 @@ from __future__ import annotations
 import glob
 import collections
 import colorsys
+import importlib
 import os
-import sys
-import time
-import traceback
 import warnings
 from copy import deepcopy
-from typing import Any, TypeAlias, Literal
+from typing import Any, TypeAlias, Literal, TYPE_CHECKING
 from collections.abc import Callable
 from asyncio import Future
 
-import yaml
 import numba
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from numpy.lib.recfunctions import append_fields, drop_fields
 from scipy import stats, optimize
-from PyQt6 import QtCore, QtWidgets, QtGui
 from playsound3 import playsound
 from tqdm import tqdm
 
 from picasso import io
+
+if TYPE_CHECKING:
+    from PyQt6 import QtGui
 
 # A global variable where we store all open progress and status dialogs.
 # In case of an exception, we close them all,
@@ -61,6 +60,9 @@ FloatArray2D: TypeAlias = np.ndarray[
 FloatArray3D: TypeAlias = np.ndarray[
     tuple[int, int, int], np.dtype[np.floating[Any]]
 ]
+FloatArray4D: TypeAlias = np.ndarray[
+    tuple[int, int, int, int], np.dtype[np.floating[Any]]
+]
 SeriesOrFloatArray1D: TypeAlias = pd.Series | FloatArray1D
 SeriesOrIntArray1D: TypeAlias = pd.Series | IntArray1D
 BoolArray1D: TypeAlias = np.ndarray[tuple[int], np.dtype[np.bool_]]
@@ -70,437 +72,324 @@ Array3x3: TypeAlias = np.ndarray[
 ]
 
 
-class Dialog(QtWidgets.QDialog):
-    """Base class for dialogs without 'What's this?' help."""
+class _LazyQtModule:
+    """Placeholder for a PyQt6 submodule that is imported on first
+    attribute access, so that importing the surrounding module does not
+    require PyQt6."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._focus_buttons = ["OK"]
-        self.setWindowFlag(
-            QtCore.Qt.WindowType.WindowContextHelpButtonHint, False
-        )
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._module = None
 
-    def showEvent(self, event):
-        """Remove focus from any QPushButton when the dialog is shown,
-        so that pressing Enter does not trigger any button by default
-        (unless it's called "OK")."""
-        super().showEvent(event)
-        for button in self.findChildren(QtWidgets.QPushButton):
-            if button.text() in self._focus_buttons:
-                continue
-            button.setDefault(False)
-            button.setAutoDefault(False)
+    def __getattr__(self, attr: str) -> Any:
+        if self._module is None:
+            self._module = importlib.import_module(self._name)
+        return getattr(self._module, attr)
 
 
-class UserSettingsDialog(Dialog):
-    """Dialog for inspecting and editing the user settings YAML file."""
-
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("User Settings")
-        self.setModal(False)
-        self.resize(600, 500)
-
-        layout = QtWidgets.QVBoxLayout(self)
-
-        path_label = QtWidgets.QLabel(
-            f"Settings file: {io._user_settings_filename()}\n"
-            "Warning: editing this file can affect the behavior of Picasso.\n"
-            "Clearing the file will reset all settings to their default "
-            "values."
-        )
-        path_label.setTextInteractionFlags(
-            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        layout.addWidget(path_label)
-
-        self.editor = QtWidgets.QPlainTextEdit()
-        self.editor.setFont(QtGui.QFont("Helvetica", 12))
-        layout.addWidget(self.editor)
-
-        button_layout = QtWidgets.QHBoxLayout()
-        reload_button = QtWidgets.QPushButton("Reload")
-        reload_button.clicked.connect(self.load_settings)
-        button_layout.addWidget(reload_button)
-        button_layout.addStretch()
-        save_button = QtWidgets.QPushButton("Save")
-        save_button.clicked.connect(self.save_settings)
-        button_layout.addWidget(save_button)
-        layout.addLayout(button_layout)
-
-    def showEvent(self, event: QtGui.QShowEvent) -> None:
-        super().showEvent(event)
-        self.load_settings()
-
-    def load_settings(self) -> None:
-        """Read the settings file and display its contents."""
-        filename = io._user_settings_filename()
-        try:
-            with open(filename, "r") as f:
-                self.editor.setPlainText(f.read())
-        except FileNotFoundError:
-            self.editor.setPlainText(
-                "# No settings file found. Edit and save to create one."
-            )
-
-    def save_settings(self) -> None:
-        """Validate YAML and write back to the settings file."""
-        text = self.editor.toPlainText()
-        try:
-            parsed = yaml.safe_load(text)
-        except yaml.YAMLError as e:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Invalid YAML",
-                f"Cannot save — the YAML is invalid:\n\n{e}",
-            )
-            return
-        if parsed is None:
-            parsed = {}
-        if not isinstance(parsed, dict):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Invalid settings",
-                "Settings must be a YAML mapping (key: value pairs).",
-            )
-            return
-        io.save_user_settings(parsed)
-        QtWidgets.QMessageBox.information(
-            self, "Saved", "User settings saved successfully."
-        )
+# Qt-dependent classes and functions live in picasso.lib_qt (which
+# imports PyQt6) but stay accessible as lib.<name>; they are resolved
+# lazily below so that importing picasso.lib does not require PyQt6.
+_QT_NAMES = (
+    "Dialog",
+    "UserSettingsDialog",
+    "MetadataDialog",
+    "ProgressDialog",
+    "StatusDialog",
+    "ProgressType",
+    "ScrollableGroupBox",
+    "LogDoubleSpinBox",
+    "RangeSlider",
+    "GenericPlotWindow",
+    "RemoveColumnsDialog",
+    "HelpButton",
+    "cancel_dialogs",
+    "install_excepthook",
+    "adjust_widget_size",
+    "get_save_filename_ext_dialog",
+)
 
 
-class MetadataDialog(Dialog):
-    """Dialog for inspecting YAML metadata (list of lists of dicts).
+def __getattr__(name: str) -> Any:
+    if name in _QT_NAMES:
+        from picasso import lib_qt
 
-    Can be used standalone with any ``infos`` data, making it reusable
-    across Picasso modules.
+        value = getattr(lib_qt, name)
+        globals()[name] = value  # cache for subsequent lookups
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def normalize_frame_bounds(frame_bounds, n_frames):
+    """Normalize ``frame_bounds`` to a list of concrete, inclusive,
+    0-indexed ``(lo, hi)`` segments.
+
+    Accepts either the legacy flat form ``(min, max)`` (where either bound
+    may be None for an open end) or a list of such segments. ``None``
+    bounds are resolved to ``0`` / ``n_frames``. Returns None when
+    ``frame_bounds`` is None (i.e., all frames are used).
 
     Parameters
     ----------
-    parent : QWidget or None
-        Parent widget.
+    frame_bounds : tuple, list of tuples, or None
+        A single ``(min, max)`` tuple, a list of such tuples, or None.
+    n_frames : int
+        Number of frames in the movie, used to resolve open upper bounds.
+
+    Returns
+    -------
+    segments : list of tuple, or None
+        List of ``(lo, hi)`` inclusive 0-indexed segments, or None.
     """
-
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Metadata")
-        self.setModal(False)
-        self.resize(700, 500)
-
-        layout = QtWidgets.QVBoxLayout(self)
-
-        # channel selector
-        selector_layout = QtWidgets.QHBoxLayout()
-        selector_layout.addWidget(QtWidgets.QLabel("Channel:"))
-        self.channel_box = QtWidgets.QComboBox()
-        self.channel_box.currentIndexChanged.connect(self._on_channel_changed)
-        selector_layout.addWidget(self.channel_box)
-        selector_layout.addStretch(1)
-
-        # copy button
-        copy_button = QtWidgets.QPushButton("Copy to clipboard")
-        copy_button.clicked.connect(self._copy_to_clipboard)
-        selector_layout.addWidget(copy_button)
-
-        layout.addLayout(selector_layout)
-
-        # tree widget for structured metadata display
-        self.tree = QtWidgets.QTreeWidget()
-        self.tree.setHeaderLabels(["Key", "Value"])
-        self.tree.setAlternatingRowColors(True)
-        self.tree.header().setStretchLastSection(True)
-        self.tree.setColumnWidth(0, 250)
-        layout.addWidget(self.tree)
-
-        self._infos: list[list[dict]] = []
-        self._labels: list[str] = []
-
-    def set_infos(
-        self,
-        infos: list[list[dict]] | list[dict],
-        labels: list[str] | str | None = None,
-    ) -> None:
-        """Set metadata and refresh the display. The user can provide
-        the metadata and the label for a single channel as a list of
-        dicts and a single string, respectively, or for multiple
-        channels as a list of lists of dicts and a list of strings,
-        respectively.
-
-        Parameters
-        ----------
-        infos : list of list of dict or list of dict
-            Metadata for each channel. Each element is a list of dicts
-            as loaded from a YAML file.
-        labels : list of str, optional
-            Display labels for each channel (e.g., file paths).
-        """
-        if isinstance(infos, list) and all(isinstance(i, dict) for i in infos):
-            infos = [infos]  # wrap single list of dicts into a list
-        if isinstance(labels, str):
-            labels = [labels]  # wrap single label into a list
-        self._infos = infos
-        self._labels = labels or [f"Channel {i}" for i in range(len(infos))]
-        self.channel_box.blockSignals(True)
-        self.channel_box.clear()
-        self.channel_box.addItems(self._labels)
-        self.channel_box.blockSignals(False)
-        if infos:
-            self._on_channel_changed(0)
-
-    def _on_channel_changed(self, index: int) -> None:
-        """Populate tree with metadata from the selected channel."""
-        self.tree.clear()
-        if index < 0 or index >= len(self._infos):
-            return
-        info_list = self._infos[index]
-        for i, info_dict in enumerate(info_list):
-            section_label = info_dict.get("Generated by", f"Section {i}")
-            section_item = QtWidgets.QTreeWidgetItem(
-                [f"[{i}] {section_label}", ""]
-            )
-            section_item.setExpanded(True)
-            font = section_item.font(0)
-            font.setBold(True)
-            section_item.setFont(0, font)
-            self._add_dict_to_tree(section_item, info_dict)
-            self.tree.addTopLevelItem(section_item)
-        self.tree.expandAll()
-
-    def _add_dict_to_tree(
-        self,
-        parent: QtWidgets.QTreeWidgetItem,
-        data: dict | list | object,
-    ) -> None:
-        """Recursively add dict/list contents to a tree item."""
-        if isinstance(data, dict):
-            for key, value in data.items():
-                if isinstance(value, (dict, list)):
-                    child = QtWidgets.QTreeWidgetItem([str(key), ""])
-                    self._add_dict_to_tree(child, value)
-                    parent.addChild(child)
-                else:
-                    child = QtWidgets.QTreeWidgetItem([str(key), str(value)])
-                    parent.addChild(child)
-        elif isinstance(data, list):
-            for i, value in enumerate(data):
-                if isinstance(value, (dict, list)):
-                    child = QtWidgets.QTreeWidgetItem([f"[{i}]", ""])
-                    self._add_dict_to_tree(child, value)
-                    parent.addChild(child)
-                else:
-                    child = QtWidgets.QTreeWidgetItem([f"[{i}]", str(value)])
-                    parent.addChild(child)
-
-    def _copy_to_clipboard(self) -> None:
-        """Copy the current channel's metadata to clipboard as YAML."""
-
-        index = self.channel_box.currentIndex()
-        if index < 0 or index >= len(self._infos):
-            return
-        text = yaml.dump_all(
-            self._infos[index], default_flow_style=False, sort_keys=False
-        )
-        QtWidgets.QApplication.clipboard().setText(text)
+    if frame_bounds is None:
+        return None
+    # detect the legacy flat (min, max) form: the first element is a
+    # scalar or None rather than a (lo, hi) segment
+    first = frame_bounds[0]
+    if first is None or np.isscalar(first):
+        segments = [frame_bounds]
+    else:
+        segments = frame_bounds
+    normalized = []
+    for lo, hi in segments:
+        lo = 0 if lo is None else lo
+        hi = n_frames if hi is None else hi
+        normalized.append((lo, hi))
+    return normalized
 
 
-class ProgressDialog(QtWidgets.QProgressDialog):
-    """ProgressDialog displays a progress dialog with a progress bar."""
+def frame_in_bounds(frame_number, frame_bounds, n_frames):
+    """Whether a frame falls within any of the requested segments.
 
-    def __init__(self, description, minimum, maximum, parent):
-        # append time estimate to description
-        super().__init__(
-            description,
-            None,
-            minimum,
-            maximum,
-            parent,
-            QtCore.Qt.WindowType.CustomizeWindowHint,
-        )
-        self.description_base = description  # without time estimate
-        self.initalized = None
+    Parameters
+    ----------
+    frame_number : int
+        The frame to test.
+    frame_bounds : tuple, list of tuples or None
+        The requested frame ranges; None means all frames. Bounds are
+        inclusive. See ``normalize_frame_bounds``.
+    n_frames : int
+        Total number of frames, used to resolve open-ended bounds.
 
-    def init(self):
-        _dialogs.append(self)
-        self.setMinimumDuration(500)
-        self.setModal(True)
-        self.t0 = time.time()
-        self.app = QtCore.QCoreApplication.instance()
-        self.initalized = True
-        self.count_started = False
-        self.finished = False
-        # sound notification
-        self.sound_notification_path = get_sound_notification_path()
-
-    def set_value(self, value):
-        if not self.initalized:
-            self.init()
-        self.setValue(value)
-        if self.count_started:
-            # estimate time left
-            elapsed = time.time() - self.t0_est
-            remaining = int(
-                (self.maximum() - value) * elapsed / (value + 1e-6)
-            )
-            # convert to hh-mm-ss
-            hours, remainder = divmod(remaining, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            # format time estimate
-            if hours > 0:
-                hours = min(10, hours)  # limit hours to 10 for display
-                time_estimate = f"{hours:02d}h:{minutes:02d}m:{seconds:02d}s"
-            else:
-                time_estimate = f"{minutes:02d}m:{seconds:02d}s"
-            # set label text with time estimate
-            description = (
-                f"{self.description_base}"
-                f"\nEstimated time remaining: {time_estimate}"
-            )
-            self.setLabelText(description)
-        # sound notification
-        if value >= self.maximum() and self.finished is False:
-            self.finished = True
-            self.play_sound_notification()
-        # if value is above zero, count has started, enabling time estimate
-        if not self.count_started:
-            if value > 0:
-                self.count_started = True
-                self.t0_est = time.time()
-        self.app.processEvents()
-
-    def closeEvent(self, event):
-        _dialogs.remove(self)
-        if self.finished is False:
-            self.finished = True
-            self.play_sound_notification()
-
-    def zero_progress(self, description=None):
-        """Set progress dialog to zero and changes title if given."""
-        if description:
-            self.setLabelText(description)
-            self.description_base = description
-        if self.initalized:
-            # restart the time-estimate baseline so the next non-zero
-            # set_value re-arms the timer for the new phase
-            self.count_started = False
-        self.set_value(0)
-
-    def play_sound_notification(self):
-        """Play a sound notification if a sound file is specified and
-        at least a minute has passed since the dialog was opened."""
-        if self.sound_notification_path is not None:
-            if time.time() - self.t0 > SOUND_NOTIFICATION_DURATION:
-                playsound(self.sound_notification_path, block=False)
-
-    def get_iterator(self, start=None, end=None):
-        """Get an iterator for the progress dialog."""
-        start = self.value() if start is None else start
-        end = self.maximum() if end is None else end
-        return range(start, end)
-
-
-class StatusDialog(Dialog):
-    """StatusDialog displays the description string in a dialog."""
-
-    def __init__(self, description, parent):
-        super(StatusDialog, self).__init__(
-            parent,
-            QtCore.Qt.WindowType.CustomizeWindowHint,
-        )
-        _dialogs.append(self)
-        vbox = QtWidgets.QVBoxLayout(self)
-        label = QtWidgets.QLabel(description)
-        vbox.addWidget(label)
-        self.sound_notification_path = get_sound_notification_path()
-        self.t0 = time.time()
-        self.show()
-        QtCore.QCoreApplication.instance().processEvents()
-
-    def closeEvent(self, event):
-        _dialogs.remove(self)
-        if self.sound_notification_path is not None:
-            if time.time() - self.t0 > SOUND_NOTIFICATION_DURATION:
-                playsound(self.sound_notification_path, block=False)
+    Returns
+    -------
+    in_bounds : bool
+    """
+    segments = normalize_frame_bounds(frame_bounds, n_frames)
+    if segments is None:
+        return True
+    return any(lo <= frame_number <= hi for lo, hi in segments)
 
 
 class MockProgress:
     """Class to mock a progress bar or dialog, allowing for calling
-    the same methods but not displaying anything."""
+    the same methods but not displaying anything.
+
+    Every method accepts (and ignores) whatever the ``ProgressDialog``
+    interface passes, so a caller can drive progress unconditionally. See
+    :func:`normalize_progress`.
+    """
 
     def __init__(self, *args, **kwargs):
-        pass
+        """Accept and ignore any arguments a real progress dialog takes."""
+        self.description_base = ""
+        self._maximum = 0
 
     def init(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
     def set_value(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
-    def setMaximum(self, *args, **kwargs):
-        pass
+    def setMaximum(self, maximum, *args, **kwargs):
+        """Record the maximum, so :meth:`maximum` can report it back.
+
+        Parameters
+        ----------
+        maximum : int
+            The value progress runs up to.
+        """
+        self._maximum = maximum
+
+    def maximum(self):
+        """The maximum last set.
+
+        Returns
+        -------
+        maximum : int
+        """
+        return self._maximum
 
     def update(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
     def closeEvent(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
-    def zero_progress(self, description, *args, **kwargs):
+    def zero_progress(self, description=None, *args, **kwargs):
+        """Do nothing.
+
+        Parameters
+        ----------
+        description : str, optional
+            Ignored; a real dialog would show it as the new phase's label.
+        """
         pass
 
     def close(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
     def setLabelText(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
     def play_sound_notification(self, *args, **kwargs):
+        """Do nothing."""
         pass
 
     def get_iterator(self, start=0, end=100):
+        """A plain iterator, with no progress attached.
+
+        Parameters
+        ----------
+        start, end : int, optional
+            First and one-past-last value. Defaults 0 and 100.
+
+        Returns
+        -------
+        iterator : range
+        """
         return range(start, end)
 
 
 class TqdmProgress:
     """Class to absorb calls to ProgressDialog but is used to display
-    tqdm progress bar instead."""
+    tqdm progress bar instead.
 
-    def __init__(self, *args, **kwargs):
+    Implements the same interface as ``ProgressDialog`` (see
+    ``normalize_progress``): the bar is armed lazily on the first
+    ``set_value`` call, using the description and maximum declared so
+    far; ``zero_progress`` closes the current bar so that the next
+    ``set_value`` starts a fresh one (a new phase)."""
+
+    def __init__(self, *args, unit="it", **kwargs):
+        """Set up the (not yet armed) bar.
+
+        Parameters
+        ----------
+        unit : str, optional
+            Name of one iteration, shown by tqdm. Default "it".
+        **kwargs
+            ``description`` is used as the bar's label; anything else a real
+            progress dialog takes is accepted and ignored.
+        """
         self.description_base = (
             "" if "description" not in kwargs else kwargs["description"]
         )
         self.iterator = None
+        self.unit = unit
+        self._maximum = 0
 
     def init(self, *args, **kwargs):
+        """Do nothing; the bar is armed lazily on the first
+        :meth:`set_value`."""
         pass
 
     def set_value(self, value, *args, **kwargs):
-        if self.iterator is not None:
-            self.iterator.update(value - self.iterator.n)
+        """Advance the bar to ``value``, arming it on the first call.
 
-    def setMaximum(self, *args, **kwargs):
-        pass
+        Parameters
+        ----------
+        value : int
+            Cumulative progress so far.
+        """
+        if self.iterator is None:
+            self.iterator = tqdm(
+                total=self._maximum or None,
+                desc=self.description_base,
+                unit=self.unit,
+            )
+        self.iterator.update(value - self.iterator.n)
+
+    def setMaximum(self, maximum, *args, **kwargs):
+        """Set the value progress runs up to, updating a live bar.
+
+        Parameters
+        ----------
+        maximum : int
+            The total the bar counts towards.
+        """
+        self._maximum = maximum
+        if self.iterator is not None:
+            self.iterator.total = maximum
+            self.iterator.refresh()
+
+    def maximum(self):
+        """The maximum last set.
+
+        Returns
+        -------
+        maximum : int
+        """
+        return self._maximum
 
     def update(self, *args, **kwargs):
+        """Do nothing; tqdm redraws itself."""
         pass
 
     def closeEvent(self, *args, **kwargs):
+        """Do nothing; accepted for interface compatibility with Qt."""
         pass
 
-    def zero_progress(self, description, *args, **kwargs):
-        self.description_base = description
+    def zero_progress(self, description=None, *args, **kwargs):
+        """Close the current bar so the next :meth:`set_value` starts a fresh
+        one, i.e. a new phase.
+
+        Parameters
+        ----------
+        description : str, optional
+            Label of the new phase. None keeps the current one.
+        """
+        if description:
+            self.description_base = description
+        self.close()
 
     def close(self, *args, **kwargs):
-        pass
+        """Close the bar, if one is running."""
+        if self.iterator is not None:
+            self.iterator.close()
+            self.iterator = None
 
     def setLabelText(self, *args, **kwargs):
+        """Do nothing; the label is set through :meth:`zero_progress`."""
         pass
 
     def play_sound_notification(self, *args, **kwargs):
+        """Do nothing; there is no console equivalent."""
         pass
 
     def get_iterator(self, start=0, end=100, unit="segment"):
-        """Get an iterator for the progress bar."""
+        """Get an iterator that drives the progress bar.
+
+        Parameters
+        ----------
+        start, end : int, optional
+            First and one-past-last value of the iteration. Defaults 0 and
+            100.
+        unit : str, optional
+            Name of one iteration, shown by tqdm. Default "segment".
+
+        Returns
+        -------
+        iterator : tqdm.tqdm
+            Iterator over ``range(start, end)``, also stored on the instance.
+        """
+        self.close()
         iterator = tqdm(
             range(start, end),
             desc=self.description_base,
@@ -510,99 +399,54 @@ class TqdmProgress:
         return iterator
 
 
-# type alias for the progress dialogs
-ProgressType: TypeAlias = ProgressDialog | MockProgress | TqdmProgress
+def normalize_progress(
+    progress: Any,
+    description: str = "",
+    unit: str = "it",
+) -> Any:
+    """Normalize a public ``progress``/``callback`` argument to an
+    object with the ``ProgressDialog`` interface (``set_value``,
+    ``setMaximum``, ``zero_progress``, ...), so that callers can drive
+    progress with plain method calls instead of checking which kind of
+    tracker they hold (which would also pull in Qt in headless runs):
 
+    * ``None`` -> ``MockProgress`` (reports nothing),
+    * ``"console"`` -> ``TqdmProgress`` (tqdm bar in the console),
+    * anything else (e.g. a ``lib.ProgressDialog``) is returned
+      unchanged, as long as it exposes the interface.
 
-class ScrollableGroupBox(QtWidgets.QGroupBox):
-    """QGroupBox with QScrollArea as the top widget that enables
-    scrolling."""
+    Parameters
+    ----------
+    progress : None, "console", or ProgressType
+        The public progress argument.
+    description : str, optional
+        Initial description for a newly created ``TqdmProgress``.
+        Default is "".
+    unit : str, optional
+        tqdm unit label for a newly created ``TqdmProgress``. Default
+        is "it".
 
-    def __init__(self, title, parent=None, layout="grid"):
-        super().__init__(title, parent=parent)
-
-        # Create a layout for the content of the group box
-        if layout == "grid":
-            self.content_layout = QtWidgets.QGridLayout(self)
-        elif layout == "form":
-            self.content_layout = QtWidgets.QFormLayout(self)
-        self.content_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
-        self.content_layout.setSpacing(10)
-        self.content_layout.setContentsMargins(10, 10, 10, 10)
-
-        # Create a scroll area and set its content to the content layout
-        self.scroll_area = QtWidgets.QScrollArea(self)
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setWidget(QtWidgets.QWidget(self))
-        self.scroll_area.widget().setLayout(self.content_layout)
-
-        # Set the layout of the group box to the scroll area
-        self.setLayout(QtWidgets.QGridLayout(self))
-        self.layout().addWidget(self.scroll_area, 0, 0, 1, 2)
-
-    def add_widget(self, widget, row, column, height=1, width=1):
-        """Add a widget to the grid layout inside the scroll area."""
-        self.content_layout.addWidget(widget, row, column, height, width)
-
-    def remove_widget(self, widget):
-        """Remove a widget from the grid layout inside the scroll
-        area."""
-        self.content_layout.removeWidget(widget)
-
-    def remove_all_widgets(self, keep_labels=False):
-        """Remove all widgets. If ``keep_labels`` is True, the QLabels
-        are kept."""
-        for i in reversed(range(self.content_layout.count())):
-            widget = self.content_layout.itemAt(i).widget()
-            if keep_labels and isinstance(widget, QtWidgets.QLabel):
-                continue
-            widget.setParent(None)
-            widget.deleteLater()
-
-
-class LogDoubleSpinBox(QtWidgets.QDoubleSpinBox):
-    """QDoubleSpinBox with logarithmic step size."""
-
-    def __init__(
-        self, parent: QtWidgets.QWidget | None = None, factor: float = 1.2
-    ) -> None:
-        super().__init__(parent)
-        self._factor = factor  # multiply/divide by this on each step
-
-    def stepBy(self, steps: int) -> None:
-        if steps > 0:
-            if self.value() <= 10 ** (-self.decimals()):
-                self.setValue(2 * 10 ** (-self.decimals()))
-            else:
-                self.setValue(self.value() * (self._factor**steps))
-        elif steps < 0:
-            self.setValue(self.value() / (self._factor ** abs(steps)))
-
-
-class GenericPlotWindow(QtWidgets.QTabWidget):
-    """Interface for displaying matplotlib plots in a separate
-    window."""
-
-    def __init__(self, window_title, app_name):
-        from matplotlib.backends.backend_qt5agg import (
-            FigureCanvas,
-            NavigationToolbar2QT,
+    Returns
+    -------
+    progress : ProgressType
+        Object implementing the ``ProgressDialog`` interface.
+    """
+    if progress is None:
+        return MockProgress()
+    if isinstance(progress, str):
+        if progress == "console":
+            return TqdmProgress(description=description, unit=unit)
+        raise ValueError(
+            f"Invalid progress argument: {progress!r}. Must be None, "
+            "'console', or an object with the ProgressDialog interface."
         )
-
-        super().__init__()
-        self.setWindowTitle(window_title)
-        this_directory = os.path.dirname(os.path.realpath(__file__))
-        icon_path = os.path.join(this_directory, "icons", f"{app_name}.ico")
-        icon = QtGui.QIcon(icon_path)
-        self.setWindowIcon(icon)
-        self.resize(1000, 500)
-        self.figure = plt.Figure(constrained_layout=True)
-        self.canvas = FigureCanvas(self.figure)
-        vbox = QtWidgets.QVBoxLayout()
-        self.setLayout(vbox)
-        vbox.addWidget(self.canvas)
-        self.toolbar = NavigationToolbar2QT(self.canvas, self)
-        vbox.addWidget(self.toolbar)
+    if not callable(getattr(progress, "set_value", None)):
+        raise TypeError(
+            f"Invalid progress argument: {progress!r}. Must be None, "
+            "'console', or an object with the ProgressDialog interface "
+            "(set_value, setMaximum, zero_progress, ...)."
+        )
+    return progress
 
 
 class AutoDict(collections.defaultdict):
@@ -616,105 +460,6 @@ class AutoDict(collections.defaultdict):
         super().__init__(AutoDict, *args, **kwargs)
 
 
-class RemoveColumnsDialog(Dialog):
-    """Allow the user to select columns to be removed from the locs
-    DataFrame."""
-
-    def __init__(
-        self, window: QtWidgets.QMainWindow, columns: list[str]
-    ) -> None:
-        super().__init__(window)
-        self.window = window
-        self.setWindowTitle("Remove columns")
-        self.setModal(True)
-        vbox = QtWidgets.QVBoxLayout(self)
-        self.setLayout(vbox)
-        self.checks = {}
-        for column in columns:
-            check = QtWidgets.QCheckBox(column)
-            check.setChecked(False)
-            if column in REQUIRED_COLUMNS:
-                check.setEnabled(False)
-            vbox.addWidget(check)
-            self.checks[column] = check
-        # OK and Cancel buttons
-        self.buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
-            QtCore.Qt.Orientation.Horizontal,
-            self,
-        )
-        vbox.addWidget(self.buttons)
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-
-    @staticmethod
-    def getParams(
-        parent: QtWidgets.QMainWindow, columns: list[str]
-    ) -> tuple[list[str], bool]:
-        """Open the dialog and return the columns to be removed.
-
-        Parameters
-        ----------
-        parent : QMainWindow
-            Instance of the main window.
-        columns : list of str
-            List of column names in the locs DataFrame.
-
-        Returns
-        -------
-        to_remove : list of str
-            List of column names to be removed.
-        accepted : bool
-            True if the user clicked OK, False if the user clicked
-            Cancel.
-        """
-        dialog = RemoveColumnsDialog(parent, columns)
-        result = dialog.exec()
-        to_remove = []
-        for col in columns:
-            if dialog.checks[col].isChecked():
-                to_remove.append(col)
-        return to_remove, result == QtWidgets.QDialog.DialogCode.Accepted
-
-
-class HelpButton(QtWidgets.QToolButton):
-    """A reusable ? button that opens a URL."""
-
-    def __init__(
-        self, url: str, parent=None, size: int | tuple[int, int] = 22
-    ) -> None:
-        super().__init__(parent)
-        self.help_url = url
-        self.setText("?")
-        if isinstance(size, int):
-            size = (size, size)
-        self.setFixedSize(*size)
-        self.setToolTip("Open documentation")
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet(
-            """
-            QToolButton {
-                border: 1px solid palette(mid);
-                border-radius: 11px;
-                font-weight: bold;
-                font-size: 12px;
-                color: palette(button-text);
-                background: palette(button);
-            }
-            QToolButton:hover {
-                background: palette(highlight);
-                color: palette(highlighted-text);
-                border-color: palette(highlight);
-            }
-        """
-        )
-        self.clicked.connect(self._open_docs)
-
-    def _open_docs(self) -> None:
-        QtGui.QDesktopServices.openUrl(QtCore.QUrl(self.help_url))
-
-
 def deprecation_warning(message: str) -> None:
     """Display a deprecation warning message.
 
@@ -724,42 +469,6 @@ def deprecation_warning(message: str) -> None:
         The deprecation warning message to be displayed.
     """
     warnings.warn(message, DeprecationWarning, stacklevel=2)
-
-
-def cancel_dialogs():
-    """Closes all open dialogs (``ProgressDialog`` and ``StatusDialog``)
-    in the GUI."""
-    dialogs = [_ for _ in _dialogs]
-    for dialog in dialogs:
-        if isinstance(dialog, ProgressDialog):
-            dialog.cancel()
-        else:
-            dialog.close()
-    QtCore.QCoreApplication.instance().processEvents()  # just in case...
-
-
-def install_excepthook(window) -> None:
-    """Install a thread-safe excepthook that shows uncaught exceptions in a
-    QMessageBox. Safe to call from QThread workers because the error signal is
-    queued to the main thread by Qt's event loop."""
-
-    class _ErrorSignaler(QtCore.QObject):
-        error = QtCore.pyqtSignal(str)
-
-    signaler = _ErrorSignaler()
-
-    def _show_error(message: str) -> None:
-        cancel_dialogs()
-        QtWidgets.QMessageBox.critical(window, "An error occurred", message)
-
-    signaler.error.connect(_show_error)
-
-    def excepthook(type, value, tback):
-        message = "".join(traceback.format_exception(type, value, tback))
-        signaler.error.emit(message)
-        sys.__excepthook__(type, value, tback)
-
-    sys.excepthook = excepthook
 
 
 def get_sound_notification_path() -> str | None:
@@ -794,7 +503,7 @@ def get_sound_notification_path() -> str | None:
 
 def get_available_sound_notifications() -> list[str | None]:
     """Get a list of file names of the available sound notifications in
-    the folder ``gui/notification_sounds``.
+    the folder ``~/.picasso/notification_sounds``.
 
     Returns
     -------
@@ -831,48 +540,19 @@ def set_sound_notification(action: QtGui.QAction) -> None:
 
 
 def _sound_notification_dir() -> str:
-    """Return the path to the sound notification folder."""
-    return os.path.join(
-        os.path.dirname(os.path.realpath(__file__)),
-        "gui",
-        "notification_sounds",
+    """Return the path to the user sound notification folder
+    (``~/.picasso/notification_sounds``)."""
+    return io.notification_sounds_directory()
+
+
+def open_sound_notifications_folder() -> None:
+    """Open the user sound notification folder
+    (``~/.picasso/notification_sounds``) in the system file browser."""
+    from PyQt6 import QtCore, QtGui
+
+    QtGui.QDesktopServices.openUrl(
+        QtCore.QUrl.fromLocalFile(_sound_notification_dir())
     )
-
-
-def adjust_widget_size(
-    widget: QtWidgets.QWidget,
-    size_hint: QtCore.QSize,
-    width_offset: int = 0,
-    height_offset: int = 0,
-) -> None:
-    """Adjust the size of a QWidget based on its size hint. The user
-    can specify the offsets to be added to the width and height of the
-    size hint. The user can also specify whether to limit the width
-    and height to the screen size.
-
-    Parameters
-    ----------
-    widget : QtWidgets.QWidget
-        The widget to be adjusted.
-    size_hint : QtCore.QSize
-        The size hint of the widget. Can be obtained with
-        widget.sizeHint().
-    width_offset : int, optional
-        The offset to be added to the width of the size hint. Default is
-        0.
-    height_offset : int, optional
-        The offset to be added to the height of the size hint. Default
-        is 0.
-    """
-    intended_width = size_hint.width() + width_offset
-    intended_height = size_hint.height() + height_offset
-    # adjust to the screen size if necessary
-    screen = QtWidgets.QApplication.primaryScreen()
-    screen_height = 1000 if screen is None else screen.size().height()
-    screen_width = 1000 if screen is None else screen.size().width()
-    intended_width = min(intended_width, screen_width - 200)
-    intended_height = min(intended_height, screen_height - 200)
-    widget.resize(intended_width, intended_height)
 
 
 def get_from_metadata(
@@ -1159,6 +839,8 @@ def is_path_available(
     for path in paths:
         if os.path.exists(path):
             if parent is not None:
+                from PyQt6 import QtWidgets
+
                 box = QtWidgets.QMessageBox(parent)
                 box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
                 box.setWindowTitle("File or folder already exists")
@@ -1180,63 +862,6 @@ def is_path_available(
         else:
             paths_available.append(True)
     return paths_available
-
-
-def get_save_filename_ext_dialog(
-    parent: QtWidgets.QWidget,
-    caption: str = "",
-    directory: str = "",
-    filter: str = "",
-    check_ext: str | list[str] = "",
-) -> tuple[str, str]:
-    """Custom getSaveFileName dialog that can check for the existence of
-    files with other extensions (for example, if the user tries to save
-    a .yaml file with the same name as an existing .hdf5 file, it will
-    ask if the user wants to overwrite the .hdf5 file). The output is
-    the same as for QtWidgets.QFileDialog.getSaveFileName.
-
-    Parameters
-    ----------
-    parent : QWidget
-        Parent widget for the dialog.
-    caption : str, optional
-        Dialog caption. Default is "".
-    directory : str, optional
-        Initial directory. Default is "".
-    filter : str, optional
-        File filter, e.g., "YAML files (*.yaml);;HDF5 files (*.hdf5)".
-        Default is "".
-    check_ext : str or list of str, optional
-        Other extension(s) to be checked if they're available. Does not
-        have to be a strict ".ext" format, can also include a suffix to
-        the path, e.g., "_1.hdf5". If "", extensions are not checked,
-        giving the standard getSaveFileName dialog behavior. Default is
-        "".
-
-    Returns
-    -------
-    selected_path : str
-        Selected file path.
-    selected_filter : str
-        Selected file filter.
-    """
-    # first run the standard dialog to get the initial path and filter
-    selected_path, selected_filter = QtWidgets.QFileDialog.getSaveFileName(
-        parent, caption, directory, filter
-    )
-    # check for the existence of files with other extensions and ask the
-    # user if they want to overwrite them
-    if selected_path and check_ext:
-        paths_available = is_path_available(
-            selected_path, check_ext=check_ext, parent=parent
-        )
-        if not all(paths_available):
-            return "", ""
-    # if the user selected a .yml file, change the extension to .yaml
-    # for consistency
-    if selected_path.endswith(".yml"):
-        selected_path = selected_path[:-4] + ".yaml"
-    return selected_path, selected_filter
 
 
 @numba.njit
@@ -1266,7 +891,26 @@ def cumulative_exponential(
     t: float,
     c: float,
 ) -> FloatArray1D:
-    """Used for binding kinetics estimation."""
+    """Cumulative exponential ``a * (1 - exp(-x / t)) + c``.
+
+    Used for binding kinetics estimation, see :func:`fit_cum_exp`.
+
+    Parameters
+    ----------
+    x : FloatArray1D
+        Points to evaluate at.
+    a : float
+        Amplitude, i.e. the plateau above ``c``.
+    t : float
+        Decay constant, in the units of ``x``.
+    c : float
+        Offset.
+
+    Returns
+    -------
+    y : FloatArray1D
+        The function evaluated at ``x``.
+    """
     return a * (1 - np.exp(-(x / t))) + c
 
 
@@ -1485,58 +1129,6 @@ def plot_trace(
         return fig
 
 
-def unpack_calibration(
-    calibration: dict,
-    pixelsize: float,
-) -> tuple[FloatArray2D, FloatArray1D, float]:
-    """Extract calibration file for 3D G5M. Return spot widths and
-    heights and the corresponding z values + magnification factor.
-
-    New in v0.10.0: the function is deprecated and will be removed in
-    Picasso 0.11.0.
-
-    Parameters
-    ----------
-    calibration : dict
-        Calibration dictionary with x and y coefficients, z step
-        size and the number of frames.
-    pixelsize : float
-        Camera pixel size in nm.
-
-    Returns
-    -------
-    spot_size : FloatArray2D
-        Spot width and height from the 3D calibration for each z
-        position.
-    z_range : FloatArray1D
-        Z values (in camera pixels) corresponding to the spot ratios.
-    mag_factor : float
-        Magnification factor for the 3D calibration.
-    """
-    deprecation_warning(
-        "The function 'unpack_calibration' is deprecated and will be"
-        " removed in Picasso 0.11.0. 3D G5M, for which this function"
-        " was originally implemented, only requires x and y"
-        " coefficients."
-    )
-    cx = calibration["X Coefficients"]
-    cy = calibration["Y Coefficients"]
-    z_step_size = calibration["Step size in nm"]
-    n_frames = calibration["Number of frames"]
-    mag_factor = calibration["Magnification factor"]
-
-    frame_range = np.arange(n_frames)
-    z_total_range = (n_frames - 1) * z_step_size
-    z_range = -(frame_range * z_step_size - z_total_range / 2)
-
-    spot_width = np.polyval(cx, z_range)
-    spot_height = np.polyval(cy, z_range)
-    spot_size = np.stack((spot_width, spot_height))
-
-    z_range /= pixelsize
-    return spot_size, z_range, mag_factor
-
-
 def calculate_optimal_bins(
     data: FloatArray1D | IntArray1D,
     max_n_bins: int | None = None,
@@ -1613,7 +1205,7 @@ def hist2d_numba(
     """Fast 2D histogram with uniform bin edges.
 
     Non-finite points are skipped. Edge values (== x_max / == y_max) are
-    folded into the last bin to match the inclusive-right behaviour of
+    folded into the last bin to match the inclusive-right behavior of
     ``np.histogram2d``.
 
     Parameters
@@ -1783,6 +1375,38 @@ def _merge_locs(
     return locs
 
 
+def append_group(
+    locs: pd.DataFrame,
+    group: int | SeriesOrIntArray1D,
+) -> pd.DataFrame:
+    """Assign the ``group`` column of ``locs``, preserving any existing
+    grouping. If ``group`` already exists, its contents are moved to
+    ``group_input`` to preserve information.
+
+    The DataFrame is modified in place and returned for convenience.
+
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations to assign the group column to.
+    group : int or array-like of int
+        New group id(s). A scalar is broadcast to all localizations; an
+        array-like must have the same length as ``locs`` and is assigned
+        positionally.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        Localizations with the ``group`` column set. If a ``group``
+        column was already present, its previous values are stored in
+        the ``"group_input"`` column.
+    """
+    if "group" in locs.columns:
+        locs["group_input"] = locs["group"].to_numpy()
+    locs["group"] = group if np.isscalar(group) else np.asarray(group)
+    return locs
+
+
 def ensure_sanity(locs: pd.DataFrame, info: list[dict]) -> pd.DataFrame:
     """Ensure that localizations are within the image dimensions
     and have positive localization precisions and other parameters.
@@ -1879,6 +1503,374 @@ def locs_at(x: float, y: float, locs: pd.DataFrame, r: float) -> pd.DataFrame:
     is_picked = is_loc_at(x, y, locs, r)
     picked_locs = locs[is_picked]
     return picked_locs
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def is_loc_at_numba(
+    x: float,
+    y: float,
+    locs_xy: FloatArray2D,
+    r: float,
+) -> BoolArray1D:
+    """Numba implementation of ``is_loc_at``.
+
+    Parameters
+    ----------
+    x, y : float
+        Center of the circular pick.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+    r : float
+        Pick radius.
+
+    Returns
+    -------
+    is_picked : BoolArray1D
+        True where a localization lies within ``r`` of ``(x, y)``.
+    """
+    dx = locs_xy[0] - x
+    dy = locs_xy[1] - y
+    r2 = r**2
+    is_picked = dx**2 + dy**2 < r2
+    return is_picked
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def locs_at_numba(
+    x: float,
+    y: float,
+    locs_xy: FloatArray2D,
+    r: float,
+) -> FloatArray2D:
+    """Numba implementation of ``locs_at``.
+
+    Parameters
+    ----------
+    x, y : float
+        Center of the circular pick.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+    r : float
+        Pick radius.
+
+    Returns
+    -------
+    picked_xy : FloatArray2D
+        ``(2, n_picked)`` coordinates within ``r`` of ``(x, y)``.
+    """
+    is_picked = is_loc_at_numba(x, y, locs_xy, r)
+    return locs_xy[:, is_picked]
+
+
+@numba.jit(nopython=True, nogil=True)
+def rmsd_at_com(locs_xy: FloatArray2D) -> float:
+    """RMS distance of the localizations from their center of mass.
+
+    Parameters
+    ----------
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+
+    Returns
+    -------
+    rmsd : float
+        Root mean square distance from the center of mass.
+    """
+    com_x = np.mean(locs_xy[0])
+    com_y = np.mean(locs_xy[1])
+    return np.sqrt(
+        np.mean((locs_xy[0] - com_x) ** 2 + (locs_xy[1] - com_y) ** 2)
+    )
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def is_loc_in_square_numba(
+    x: float,
+    y: float,
+    locs_xy: FloatArray2D,
+    a: float,
+) -> BoolArray1D:
+    """Check which localizations are within the axis-aligned square of
+    side length ``a`` centered at ``(x, y)``.
+
+    Square analogue of ``is_loc_at_numba``. The bounds are exclusive,
+    matching ``postprocess._picked_square_locs``.
+
+    Parameters
+    ----------
+    x, y : float
+        Center of the square.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+    a : float
+        Side length of the square.
+
+    Returns
+    -------
+    is_picked : BoolArray1D
+        True if a localization is within the square.
+    """
+    half_a = 0.5 * a
+    dx = np.abs(locs_xy[0] - x)
+    dy = np.abs(locs_xy[1] - y)
+    is_picked = (dx < half_a) & (dy < half_a)
+    return is_picked
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def locs_in_square_numba(
+    x: float,
+    y: float,
+    locs_xy: FloatArray2D,
+    a: float,
+) -> FloatArray2D:
+    """Return localizations within the axis-aligned square of side
+    length ``a`` centered at ``(x, y)``.
+
+    Parameters
+    ----------
+    x, y : float
+        Center of the square.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+    a : float
+        Side length of the square.
+
+    Returns
+    -------
+    picked_xy : FloatArray2D
+        ``(2, n_picked)`` coordinates inside the square. See
+        ``is_loc_in_square_numba``.
+    """
+    is_picked = is_loc_in_square_numba(x, y, locs_xy, a)
+    return locs_xy[:, is_picked]
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def is_loc_in_rectangle_numba(
+    xc: float,
+    yc: float,
+    theta: float,
+    length: float,
+    width: float,
+    locs_xy: FloatArray2D,
+) -> BoolArray1D:
+    """Check which localizations are within an oriented rectangle.
+
+    The rectangle is centered at ``(xc, yc)``, its long (center) axis
+    points along ``theta`` and has the given ``length``, and it extends
+    by ``width`` perpendicular to that axis.
+
+    Unlike ``check_if_in_rectangle``, this rotates the localizations
+    into the rectangle's frame instead of ray casting, so it does not
+    allocate intermediate arrays per side and has no division by zero
+    for axis-aligned rectangles. It is the variant used in the picking
+    kernels.
+
+    Parameters
+    ----------
+    xc, yc : float
+        Center of the rectangle.
+    theta : float
+        Angle of the center axis (radians).
+    length : float
+        Length of the rectangle along ``theta``.
+    width : float
+        Width of the rectangle perpendicular to ``theta``.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+
+    Returns
+    -------
+    is_picked : BoolArray1D
+        True if a localization is within the rectangle.
+    """
+    ct = np.cos(theta)
+    st = np.sin(theta)
+    dx = locs_xy[0] - xc
+    dy = locs_xy[1] - yc
+    u = dx * ct + dy * st  # along the center axis
+    v = -dx * st + dy * ct  # perpendicular to the center axis
+    half_l = 0.5 * length
+    half_w = 0.5 * width
+    is_picked = (np.abs(u) < half_l) & (np.abs(v) < half_w)
+    return is_picked
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def locs_in_rectangle_numba(
+    xc: float,
+    yc: float,
+    theta: float,
+    length: float,
+    width: float,
+    locs_xy: FloatArray2D,
+) -> FloatArray2D:
+    """Return localizations within an oriented rectangle.
+
+    Parameters
+    ----------
+    xc, yc : float
+        Center of the rectangle.
+    theta : float
+        Orientation of its center axis, in radians.
+    length : float
+        Extent along the center axis.
+    width : float
+        Extent perpendicular to it.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+
+    Returns
+    -------
+    picked_xy : FloatArray2D
+        ``(2, n_picked)`` coordinates inside the rectangle. See
+        ``is_loc_in_rectangle_numba``.
+    """
+    is_picked = is_loc_in_rectangle_numba(
+        xc, yc, theta, length, width, locs_xy
+    )
+    return locs_xy[:, is_picked]
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def wrap_angle_pi(angle: float) -> float:
+    """Wrap an angle to ``[-pi/2, pi/2)``.
+
+    The orientation of a rectangle is a director, i.e., it is only
+    defined modulo pi (``theta`` and ``theta + pi`` give the same
+    rectangle). Wrapping is required whenever two orientations are
+    compared, otherwise, e.g., +89 deg and -89 deg appear to differ by
+    178 deg instead of 2 deg.
+
+    Parameters
+    ----------
+    angle : float
+        Angle in radians.
+
+    Returns
+    -------
+    angle : float
+        The equivalent angle in ``[-pi/2, pi/2)``.
+    """
+    return angle - np.pi * np.floor(angle / np.pi + 0.5)
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def principal_axis(
+    sxx: float,
+    sxy: float,
+    syy: float,
+) -> tuple[float, float, float]:
+    """Find the principal axis and the anisotropic RMSDs from the
+    central second moments of a set of 2D points.
+
+    Closed-form eigendecomposition of the 2x2 covariance matrix
+    ``[[sxx, sxy], [sxy, syy]]``. Note that
+    ``rmsd_along ** 2 + rmsd_across ** 2`` equals the squared isotropic
+    RMSD at the center of mass (``rmsd_at_com``).
+
+    Parameters
+    ----------
+    sxx, sxy, syy : float
+        Central second moments, i.e., ``mean((x - mx) ** 2)``,
+        ``mean((x - mx) * (y - my))`` and ``mean((y - my) ** 2)``.
+
+    Returns
+    -------
+    theta : float
+        Angle of the principal (major) axis, wrapped to
+        ``[-pi/2, pi/2)``. For an isotropic point cloud the axis is
+        undefined and 0.0 is returned; callers can detect this from
+        ``rmsd_along ** 2 - rmsd_across ** 2`` being (nearly) zero.
+    rmsd_along, rmsd_across : float
+        RMSD along the principal axis and perpendicular to it.
+    """
+    delta = np.sqrt((sxx - syy) ** 2 + 4 * sxy**2)
+    lambda_plus = 0.5 * (sxx + syy + delta)
+    lambda_minus = 0.5 * (sxx + syy - delta)
+    theta = 0.5 * np.arctan2(2 * sxy, sxx - syy)
+    rmsd_along = np.sqrt(max(lambda_plus, 0.0))
+    rmsd_across = np.sqrt(max(lambda_minus, 0.0))
+    return wrap_angle_pi(theta), rmsd_along, rmsd_across
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def rectangles_overlap(  # noqa: C901
+    x1: float,
+    y1: float,
+    theta1: float,
+    length1: float,
+    width1: float,
+    r1: float,
+    x2: float,
+    y2: float,
+    theta2: float,
+    length2: float,
+    width2: float,
+    r2: float,
+) -> bool:
+    """Check if two oriented rectangles overlap.
+
+    Uses the separating axis theorem: two convex polygons are disjoint
+    if and only if their projections onto one of the edge normals do not
+    overlap. For rectangles there are only four candidate axes (two per
+    rectangle). Two cheap tests based on the circumscribed and inscribed
+    circles are performed first.
+
+    Parameters
+    ----------
+    x1, y1, x2, y2 : float
+        Centers of the two rectangles.
+    theta1, theta2 : float
+        Angles of the center axes (radians).
+    length1, length2 : float
+        Lengths of the rectangles along their center axes.
+    width1, width2 : float
+        Widths of the rectangles.
+    r1, r2 : float
+        Circumscribed circle radii, i.e.,
+        ``sqrt(length ** 2 + width ** 2) / 2``. Passed in because they
+        are usually precomputed.
+
+    Returns
+    -------
+    overlap : bool
+        True if the two rectangles overlap.
+    """
+    dx = x2 - x1
+    dy = y2 - y1
+    d2 = dx**2 + dy**2
+    # cheap reject: circumscribed circles do not touch
+    if d2 > (r1 + r2) ** 2:
+        return False
+    # cheap accept: inscribed circles overlap
+    r_in = 0.5 * min(length1, width1) + 0.5 * min(length2, width2)
+    if d2 < r_in**2:
+        return True
+    # separating axis theorem
+    ct1 = np.cos(theta1)
+    st1 = np.sin(theta1)
+    ct2 = np.cos(theta2)
+    st2 = np.sin(theta2)
+    # only two distinct dot products exist between the two frames
+    c = abs(ct1 * ct2 + st1 * st2)
+    s = abs(ct1 * st2 - st1 * ct2)
+    half_l1 = 0.5 * length1
+    half_w1 = 0.5 * width1
+    half_l2 = 0.5 * length2
+    half_w2 = 0.5 * width2
+    # axes of the first rectangle
+    if abs(dx * ct1 + dy * st1) > half_l1 + half_l2 * c + half_w2 * s:
+        return False
+    if abs(-dx * st1 + dy * ct1) > half_w1 + half_l2 * s + half_w2 * c:
+        return False
+    # axes of the second rectangle
+    if abs(dx * ct2 + dy * st2) > half_l2 + half_l1 * c + half_w1 * s:
+        return False
+    if abs(-dx * st2 + dy * ct2) > half_w2 + half_l1 * s + half_w1 * c:
+        return False
+    return True
 
 
 @numba.jit(nopython=True)
@@ -2079,8 +2071,18 @@ def minimize_shifts(
 
 
 def n_futures_done(futures: list[Future]) -> int:
-    """Return the number of finished futures, used in
-    multiprocessing."""
+    """Return the number of finished futures, used in multiprocessing.
+
+    Parameters
+    ----------
+    futures : list of Future
+        The futures to poll.
+
+    Returns
+    -------
+    n_done : int
+        How many of them have completed.
+    """
     return sum([_.done() for _ in futures])
 
 
@@ -2393,7 +2395,7 @@ def plot_subclustering_check(
     ----------
     clustered_n_events : IntArray1D
         Number of events for clustered molecules.
-    sparse_n_eveents : IntArray1D
+    sparse_n_events : IntArray1D
         Number of events for sparse molecules.
     plot_path : str or list of strs, optional
         If provided, the plot is saved to this path. If a list of
@@ -2638,3 +2640,243 @@ def sync_groups(locs: list[pd.DataFrame]) -> list[pd.DataFrame]:
         mask = locs[i]["group"].isin(common_groups)
         locs[i] = locs[i][mask].reset_index(drop=True)
     return locs
+
+
+# ---------------------------------------------------------------------------
+# Lateral (x, y) corrections chained onto any calibration
+# ---------------------------------------------------------------------------
+# A calibration - Gaussian astigmatism (YAML), cubic-spline PSF (HDF5) or a
+# standalone lateral calibration - may carry an ORDERED list of lateral
+# corrections under LATERAL_TRANSFORMS_KEY. Each entry holds a geometric
+# transform (affine, projective or polynomial; see picasso.transforms) mapping
+# the coordinates of the movie being localized into a reference frame:
+#
+#   astigmatism : cylindrical-lens image -> reference (no-lens) image
+#   chromatic   : this color channel     -> reference color channel
+#
+# They compose: a 3D two-color experiment applies the astigmatism correction
+# and then the chromatic one, in the order they appear in the list.
+#
+# Single-channel only
+
+LATERAL_TRANSFORMS_KEY = "Lateral transforms"
+LATERAL_TRANSFORM_TYPES = ("astigmatism", "chromatic")
+
+
+def lateral_transforms(calibration: dict | list | None) -> list[dict]:
+    """The ordered lateral-correction entries carried by a calibration.
+
+    Parameters
+    ----------
+    calibration : dict or list or None
+        Any calibration dictionary (Gaussian astigmatism, spline PSF or a
+        standalone affine calibration), an already-extracted list of
+        entries, or None.
+
+    Returns
+    -------
+    transforms : list of dicts
+        The entries in the order they must be applied. Empty if the
+        calibration carries none.
+    """
+    if calibration is None:
+        return []
+    if isinstance(calibration, list):
+        return [t for t in calibration if t]
+    if not isinstance(calibration, dict):
+        # e.g. a calibration still given as a path; nothing to read
+        return []
+    return list(calibration.get(LATERAL_TRANSFORMS_KEY) or [])
+
+
+def lateral_transform_models(calibration: dict | list | None) -> list:
+    """The geometric transforms of ``lateral_transforms``, in the order they
+    must be applied.
+
+    Parameters
+    ----------
+    calibration : dict, list or None
+        A calibration carrying an ``"Affine transforms"`` list, that list
+        itself, or None. Its items may be entries (dicts with a
+        ``"Transform"`` key) or bare transforms.
+
+    Returns
+    -------
+    models : list of picasso.transforms.Transform
+        One transform per correction, in application order.
+    """
+    from picasso import transforms as _tf
+
+    models = []
+    for entry in lateral_transforms(calibration):
+        if isinstance(entry, dict) and "Transform" in entry:
+            entry = entry["Transform"]
+        models.append(_tf.from_dict(entry))
+    return models
+
+
+def append_lateral_transform(calibration: dict, entry: dict) -> dict:
+    """Append a lateral correction to ``calibration``'s ordered list.
+
+    An existing entry of the same ``"Type"`` is replaced in place (keeping
+    its position), so re-running a calibration updates it instead of
+    stacking a second copy of the same correction.
+
+    Parameters
+    ----------
+    calibration : dict
+        Calibration to append to; modified in place. May be empty, which
+        is how a standalone affine calibration file is started.
+    entry : dict
+        The transform entry, as built by
+        ``picasso.localize.fit_lateral_transform``. Must carry
+        ``"Transform"`` and ``"Type"``.
+
+    Returns
+    -------
+    calibration : dict
+        The same dictionary, with the entry appended or replaced.
+    """
+    transforms = lateral_transforms(calibration)
+    kind = entry.get("Type")
+    for i, existing in enumerate(transforms):
+        if existing.get("Type") == kind:
+            transforms[i] = entry
+            break
+    else:
+        transforms.append(entry)
+    calibration[LATERAL_TRANSFORMS_KEY] = transforms
+    return calibration
+
+
+def apply_lateral_transforms(
+    locs: pd.DataFrame, calibration: dict | list | None
+) -> pd.DataFrame:
+    """Map ``locs`` x/y through a calibration's lateral corrections.
+
+    The transforms are applied in stored order, in camera-pixel
+    coordinates. Returns ``locs`` unchanged (and untouched) when there is
+    nothing to apply, so this is safe to call on every fit path.
+
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations with ``x`` and ``y`` columns.
+    calibration : dict or list or None
+        A calibration carrying affine corrections, a list of entries, or
+        None.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        Localizations with corrected ``x`` and ``y``. A copy, if anything
+        was applied.
+    """
+    models = lateral_transform_models(calibration)
+    if not models or not len(locs):
+        return locs
+    locs = locs.copy()
+    xy = np.column_stack(
+        [
+            locs["x"].to_numpy(dtype=np.float64),
+            locs["y"].to_numpy(dtype=np.float64),
+        ]
+    )
+    for model in models:
+        xy = model.apply(xy)
+    locs["x"] = xy[:, 0].astype(np.float32)
+    locs["y"] = xy[:, 1].astype(np.float32)
+    return locs
+
+
+def is_same_lateral_transform(
+    a: dict | list, b: dict | list, tol: float = 1e-9
+) -> bool:
+    """Whether two lateral entries hold the same transform (within ``tol``).
+
+    Compared by the transform, not by identity or source path: the same
+    correction saved twice under different names must count as one, since
+    applying it twice would correct twice.
+
+    Parameters
+    ----------
+    a, b : dict or list
+        Lateral correction entries (dicts with a ``"Transform"`` key) or bare
+        transforms.
+    tol : float, optional
+        Absolute tolerance of the parameter comparison. Default 1e-9.
+
+    Returns
+    -------
+    is_same : bool
+    """
+    from picasso import transforms as _tf
+
+    if isinstance(a, dict) and "Transform" in a:
+        a = a["Transform"]
+    if isinstance(b, dict) and "Transform" in b:
+        b = b["Transform"]
+    return _tf.from_dict(a).allclose(_tf.from_dict(b), tol)
+
+
+def drop_duplicate_lateral_transforms(
+    transforms: dict | list | None, applied: dict | list | None
+) -> tuple[list[dict], list[dict]]:
+    """Split ``transforms`` into the ones still to apply and the ones
+    ``applied`` already covers.
+
+    A calibration carries its own corrections and applies them itself, so an
+    extra correction loaded alongside it - typically the very same file, or a
+    standalone copy of the same transform - must not be applied a second
+    time.
+
+    Parameters
+    ----------
+    transforms : dict or list or None
+        The extra corrections, as a calibration or a list of entries.
+    applied : dict or list or None
+        Corrections the fit applies on its own, i.e. those carried by its
+        calibration.
+
+    Returns
+    -------
+    new : list of dicts
+        Entries of ``transforms`` not already in ``applied``, in order.
+    duplicates : list of dicts
+        Entries dropped because ``applied`` already covers them.
+    """
+    already = lateral_transforms(applied)
+    new, duplicates = [], []
+    for transform in lateral_transforms(transforms):
+        if any(is_same_lateral_transform(transform, a) for a in already):
+            duplicates.append(transform)
+        else:
+            new.append(transform)
+    return new, duplicates
+
+
+def describe_lateral_transforms(calibration: dict | list | None) -> list[str]:
+    """One human-readable line per lateral correction.
+
+    For metadata and GUI labels, e.g.
+    ``"astigmatism, projective (25 bead pairs)"``.
+
+    Parameters
+    ----------
+    calibration : dict, list or None
+        A calibration carrying an ``"Affine transforms"`` list, that list
+        itself, or None.
+
+    Returns
+    -------
+    described : list of str
+        One line per correction, in application order.
+    """
+    described = []
+    for transform in lateral_transforms(calibration):
+        purpose = transform.get("Type", "lateral")
+        model = (transform.get("Transform") or {}).get("model")
+        pairs = transform.get("Bead pairs")
+        label = f"{purpose}, {model}" if model else str(purpose)
+        described.append(f"{label} ({pairs} bead pairs)" if pairs else label)
+    return described

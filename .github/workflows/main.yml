@@ -19,6 +19,10 @@ jobs:
 
     env:
       QT_QPA_PLATFORM: offscreen
+      # A GUI test that aborts the interpreter takes pytest's captured output
+      # with it; tests/conftest.py writes the exception / Qt message that
+      # caused it to this file instead, and the step below prints it.
+      PICASSO_CRASH_LOG: ${{ github.workspace }}/pytest-crash.log
     steps:
     - uses: actions/checkout@v4
     - name: Set up Python ${{ matrix.python-version }}
@@ -43,12 +47,19 @@ jobs:
     - name: Test with pytest
       run: |
         pip install pytest
-        pytest
+        # tee-sys: a crash in a GUI test kills the process before pytest can
+        # report the captured output, so the Qt/Python messages that explain
+        # it have to reach the log as they are written.
+        pytest --capture=tee-sys
+    - name: Show the crash log
+      if: always()
+      run: cat "$PICASSO_CRASH_LOG" || echo "no crash log"
 
   test-minimum-versions:
       runs-on: ubuntu-latest
       env:
         QT_QPA_PLATFORM: offscreen
+        PICASSO_CRASH_LOG: ${{ github.workspace }}/pytest-crash.log
       steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -64,4 +75,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install . --constraint constraints-minimum.txt
           pip install pytest
-          pytest
+          pytest --capture=tee-sys
+      - name: Show the crash log
+        if: always()
+        run: cat "$PICASSO_CRASH_LOG" || echo "no crash log"

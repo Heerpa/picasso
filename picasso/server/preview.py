@@ -1,20 +1,30 @@
 import streamlit as st
-from helper import _db_filename
+from helper import db_filename
 from sqlalchemy import create_engine
 import pandas as pd
 import os
 import numpy as np
 from picasso import io
+from picasso import lib
 from picasso import render
 import matplotlib.pyplot as plt
 
 
 @st.cache_data
 def load_file(path: str):
-    """Loads localization from files. Cached version.
+    """Load localizations from a file. Cached version.
 
-    Args:
-        path (str): Path to file.
+    Parameters
+    ----------
+    path : str
+        Path to the localizations file.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        The localizations.
+    info : list of dicts
+        Localizations metadata.
     """
     locs, info = io.load_locs(path)
     return locs, info
@@ -22,20 +32,31 @@ def load_file(path: str):
 
 @st.cache_data
 def picasso_render(
-    locs: pd.DataFrame, info: list[dict], viewport: tuple, oversampling: float
+    locs: pd.DataFrame, info: list[dict], viewport: tuple, disp_px_size: float
 ):
-    """Helper function to render a viewport. Cached.
+    """Render a viewport. Cached.
 
-    Args:
-        locs (pd.DataFrame): Localizations.
-        viewport (tuple): Viewport as tuple.
-        oversampling (int): Oversampling.
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations.
+    info : list of dicts
+        Localizations metadata.
+    viewport : tuple
+        ``((y_min, x_min), (y_max, x_max))`` in camera pixels.
+    disp_px_size : float
+        Display pixel size of the rendered image in nm.
+
+    Returns
+    -------
+    image : np.ndarray
+        The rendered image.
     """
     len_x, image = render.render(
         locs,
-        info=info,
+        info,
+        disp_px_size=disp_px_size,
         viewport=viewport,
-        oversampling=oversampling,
         blur_method="smooth",
     )
 
@@ -52,7 +73,7 @@ def preview():
         "Select a movie from the database. All hdf files with the same base "
         "path as the movie will be selectable."
     )
-    engine = create_engine("sqlite:///" + _db_filename(), echo=False)
+    engine = create_engine("sqlite:///" + db_filename(), echo=False)
 
     try:
         df = pd.read_sql_table("files", con=engine)
@@ -76,7 +97,7 @@ def preview():
 
                 st.info(
                     "Performance Warning: This preview will render the full "
-                    "image, so it might be slow for large oversampling."
+                    "image, so it might be slow for small display pixel size."
                 )
 
                 with st.spinner("Loading file"):
@@ -93,15 +114,15 @@ def preview():
 
                         c1, c2, c3 = st.columns(3)
 
-                        oversampling = c1.number_input(
-                            "Oversampling",
-                            value=5.0,
+                        disp_px_size = c1.number_input(
+                            "Display pixel size",
+                            value=50,
                             min_value=1.0,
-                            max_value=40.0,
+                            max_value=40000.0,
                         )
 
                         image = picasso_render(
-                            locs, info, viewport, oversampling
+                            locs, info, viewport, disp_px_size
                         )
 
                         vmin = c2.number_input(
