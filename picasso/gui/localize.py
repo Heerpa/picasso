@@ -5720,10 +5720,12 @@ class Window(QtWidgets.QMainWindow):
         # with, so a slow file read can never cost the user their
         # settings, however the process ends below.
         self._stop_movie_load()
-        if self._loads_still_running():
+        self._stop_active_worker()
+        if self._loads_still_running() or self._worker_still_running():
             # A loader is stuck in an io call that cannot be interrupted
-            # (a hung network share, say). Waiting for it would freeze
-            # the quit, and letting Qt destroy a live QThread aborts the
+            # (a hung network share, say), or an identification/fit did
+            # not come back in time. Waiting for it would freeze the
+            # quit, and letting Qt destroy a live QThread aborts the
             # process with a crash report, so leave right here instead.
             # Nothing is being written, so there is nothing to lose.
             os._exit(0)
@@ -7166,6 +7168,42 @@ class Window(QtWidgets.QMainWindow):
             if thread is not None:
                 thread.quit()
                 thread.wait(WAIT_MS)
+
+    def _stop_active_worker(self) -> None:
+        """Interrupt the running identification or fit before the window is
+        destroyed, because destroying a live QThread aborts the process.
+
+        The workers poll ``isInterruptionRequested`` between frames, so this
+        returns as soon as the frame in flight is done. Waits only briefly:
+        ``_worker_still_running`` then reports that one is left over, so
+        ``closeEvent`` can leave the process without destroying it."""
+        WAIT_MS = 5000
+        for worker in self._compute_workers():
+            worker.requestInterruption()
+            worker.wait(WAIT_MS)
+
+    def _compute_workers(self) -> list:
+        """The identification/fit threads that are still running."""
+        workers = [
+            getattr(self, name, None)
+            for name in (
+                "_active_worker",
+                "identification_worker",
+                "fit_worker",
+                "fit_z_worker",
+            )
+        ]
+        running = []
+        for worker in workers:
+            if worker is None or not worker.isRunning():
+                continue
+            if not any(worker is other for other in running):
+                running.append(worker)
+        return running
+
+    def _worker_still_running(self) -> bool:
+        """True if an identification/fit thread has not come back."""
+        return bool(self._compute_workers())
 
     def _loads_still_running(self) -> bool:
         """True if a loader thread is still inside an io call."""

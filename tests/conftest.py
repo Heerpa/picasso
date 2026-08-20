@@ -34,6 +34,59 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ---------------------------------------------------------------------------
+# Crash log
+# ---------------------------------------------------------------------------
+
+# PyQt aborts the process when an exception escapes a slot, and Qt itself
+# aborts on a fatal message. Either kills pytest before it can report the
+# output it captured, so the one thing that says *why* is lost - which is
+# exactly what happened to the CI runs that died inside
+# ``QApplication.processEvents()``. Set ``PICASSO_CRASH_LOG`` to a path and
+# both are appended to that file as they happen, so it survives the abort and
+# the CI job can print it afterwards. Off unless the variable is set.
+_CRASH_LOG = os.environ.get("PICASSO_CRASH_LOG")
+
+
+def _write_crash_log(text: str) -> None:
+    """Append to the crash log, flushed to disk before returning."""
+    with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _install_crash_log() -> None:
+    """Record unhandled exceptions and Qt messages to ``PICASSO_CRASH_LOG``."""
+    import sys
+    import traceback
+
+    previous_hook = sys.excepthook
+
+    def excepthook(exc_type, exc, tb):
+        _write_crash_log(
+            "\n=== unhandled exception (a Qt slot aborts on one) ===\n"
+            + "".join(traceback.format_exception(exc_type, exc, tb))
+        )
+        previous_hook(exc_type, exc, tb)
+
+    sys.excepthook = excepthook
+
+    try:
+        from PyQt6 import QtCore
+    except ImportError:  # pragma: no cover - Qt is optional here
+        return
+
+    def message_handler(mode, context, message):
+        _write_crash_log(f"\n=== Qt {mode.name}: {message}\n")
+
+    QtCore.qInstallMessageHandler(message_handler)
+
+
+if _CRASH_LOG:
+    _install_crash_log()
+
+
+# ---------------------------------------------------------------------------
 # Qt
 # ---------------------------------------------------------------------------
 
