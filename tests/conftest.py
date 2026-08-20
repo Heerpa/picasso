@@ -34,43 +34,45 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ---------------------------------------------------------------------------
-# Crash log
+# Unhandled exceptions
 # ---------------------------------------------------------------------------
 
-# PyQt aborts the process when an exception escapes a slot, and Qt itself
-# aborts on a fatal message. Either kills pytest before it can report the
-# output it captured, so the one thing that says *why* is lost - which is
-# exactly what happened to the CI runs that died inside
-# ``QApplication.processEvents()``. Set ``PICASSO_CRASH_LOG`` to a path and
-# both are appended to that file as they happen, so it survives the abort and
-# the CI job can print it afterwards. Off unless the variable is set.
+# An exception that escapes a Qt slot (or a ``QThread.run``) never reaches the
+# test that caused it: Python hands it to ``sys.excepthook`` and PyQt aborts
+# the interpreter, taking pytest's captured output with it - a bare
+# "Fatal Python error: Aborted" and no traceback, which is how these went
+# unnoticed. Recording them here both keeps the process alive and, through
+# ``_no_unhandled_exceptions`` below, fails the test that produced one instead
+# of the whole run. Set ``PICASSO_CRASH_LOG`` to also append them (and the Qt
+# messages) to a file, for a run that dies anyway.
 _CRASH_LOG = os.environ.get("PICASSO_CRASH_LOG")
+_unhandled: list[str] = []
 
 
 def _write_crash_log(text: str) -> None:
     """Append to the crash log, flushed to disk before returning."""
+    if not _CRASH_LOG:
+        return
     with open(_CRASH_LOG, "a", encoding="utf-8") as f:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
 
 
-def _install_crash_log() -> None:
-    """Record unhandled exceptions and Qt messages to ``PICASSO_CRASH_LOG``."""
+def _install_exception_recorder() -> None:
+    """Record unhandled exceptions instead of letting PyQt abort on them."""
     import sys
     import traceback
 
-    previous_hook = sys.excepthook
-
     def excepthook(exc_type, exc, tb):
-        _write_crash_log(
-            "\n=== unhandled exception (a Qt slot aborts on one) ===\n"
-            + "".join(traceback.format_exception(exc_type, exc, tb))
-        )
-        previous_hook(exc_type, exc, tb)
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        _unhandled.append(text)
+        _write_crash_log("\n=== unhandled exception ===\n" + text)
 
     sys.excepthook = excepthook
 
+    if not _CRASH_LOG:
+        return
     try:
         from PyQt6 import QtCore
     except ImportError:  # pragma: no cover - Qt is optional here
@@ -82,8 +84,26 @@ def _install_crash_log() -> None:
     QtCore.qInstallMessageHandler(message_handler)
 
 
-if _CRASH_LOG:
-    _install_crash_log()
+_install_exception_recorder()
+
+
+@pytest.fixture(autouse=True)
+def _no_unhandled_exceptions():
+    """Fail a test that let an exception escape a slot or a worker thread.
+
+    Delivered signals run outside the test's own call stack, so an exception
+    in one is invisible to its assertions - and fatal to the interpreter.
+    """
+    del _unhandled[:]
+    yield
+    if _unhandled:
+        report = "\n".join(_unhandled)
+        del _unhandled[:]
+        pytest.fail(
+            "an exception escaped a Qt slot or a worker thread (PyQt aborts "
+            f"the process on one):\n{report}",
+            pytrace=False,
+        )
 
 
 # ---------------------------------------------------------------------------
