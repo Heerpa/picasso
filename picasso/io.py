@@ -1759,22 +1759,32 @@ class ND2Movie(AbstractPicassoMovie):
         self.dask = self.nd2file.to_dask()
         self.sizes = self.nd2file.sizes
 
-        required_dims = ["T", "Y", "X"]  # always required
-        for dim in required_dims:
+        for dim in ["Y", "X"]:  # always required
             if dim not in self.nd2file.sizes.keys():
                 raise KeyError(
                     "Required dimension {:s} not in file {:s}".format(
                         dim, self.path
                     )
                 )
+        # Movies are indexed along T. Files without a time axis (e.g. z
+        # stacks) are read along Z instead, treating each slice as a
+        # frame.
+        if "T" in self.nd2file.sizes:
+            self.frame_axis = "T"
+        elif "Z" in self.nd2file.sizes:
+            self.frame_axis = "Z"
+        else:
+            raise KeyError(
+                "Neither dimension T nor Z in file {:s}".format(self.path)
+            )
         # Allow an optional channel (C) axis; reject any other extra
-        # dimension (e.g. Z, P), as before.
-        allowed_dims = set(required_dims) | {"C"}
+        # dimension (e.g. the unused one of T/Z, or P), as before.
+        allowed_dims = {self.frame_axis, "Y", "X", "C"}
         extra_dims = set(self.nd2file.sizes.keys()) - allowed_dims
         if extra_dims:
             raise KeyError(
-                "File {:s} has unsupported dimensions {:s}; only T, Y, X "
-                "and C are supported.".format(
+                "File {:s} has unsupported dimensions {:s}; only T (or Z), "
+                "Y, X and C are supported.".format(
                     self.path, str(sorted(extra_dims))
                 )
             )
@@ -1800,7 +1810,7 @@ class ND2Movie(AbstractPicassoMovie):
         except Exception:
             self.meta = None
         self._shape = [
-            self.nd2file.sizes["T"],
+            self.nd2file.sizes[self.frame_axis],
             self.nd2file.sizes["X"],
             self.nd2file.sizes["Y"],
         ]
@@ -1832,7 +1842,7 @@ class ND2Movie(AbstractPicassoMovie):
             "Height": nd2file.sizes["Y"],
             "Width": nd2file.sizes["X"],
             "Data Type": nd2file.dtype.name,
-            "Frames": nd2file.sizes["T"],
+            "Frames": nd2file.sizes[self.frame_axis],
         }
         info["Acquisition Comments"] = ""
 
@@ -2055,11 +2065,11 @@ class ND2Movie(AbstractPicassoMovie):
         return self.get_frame(it)
 
     def __iter__(self):
-        for i in range(self.sizes["T"]):
+        for i in range(self.sizes[self.frame_axis]):
             yield self[i]
 
     def __len__(self):
-        return self.sizes["T"]
+        return self.sizes[self.frame_axis]
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -2086,7 +2096,7 @@ class ND2Movie(AbstractPicassoMovie):
         # plain (T, Y, X) file this reduces to ``self.dask[index]``.
         selection = []
         for dim in self.sizes:
-            if dim == "T":
+            if dim == self.frame_axis:
                 selection.append(index)
             elif dim == "C":
                 selection.append(self._channel)
