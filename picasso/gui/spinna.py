@@ -4615,7 +4615,7 @@ class SimulationsTab(lib.Dialog):
                 counts, bins = np.histogram(
                     data,
                     bins=np.arange(0, 1000, plot_params["binsize_sim"]),
-                    density=True,
+                    density=data.size > 0,  # avoid division by zero
                 )
                 current_hist_data["bins"].append(bins)
                 current_hist_data["counts"].append(counts)
@@ -4655,7 +4655,7 @@ class SimulationsTab(lib.Dialog):
             counts, bins = np.histogram(
                 data,
                 bins=np.arange(0, 1000, plot_params["binsize_exp"]),
-                density=True,
+                density=data.size > 0,  # avoid division by zero
             )
             current_hist_data["bins"].append(bins)
             current_hist_data["counts"].append(counts)

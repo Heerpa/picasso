@@ -5,6 +5,7 @@ Last change: 24-AUG-2026 CEST
 ## 0.11.1
 - Localize loads z-stack `.nd2` files
 - Fixed save cluster areas for SMLM clusterer ([#697](https://github.com/jungmannlab/picasso/issues/697))
+- Fixed SPINNA simulations for empty targets
 
 ## 0.11.0
 
