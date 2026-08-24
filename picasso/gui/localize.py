@@ -330,18 +330,40 @@ OPTIMIZER_TOOLTIP = (
 )
 
 
+def _copied_rois(rois: list) -> list:
+    """Copy a list of ROI rectangles down to their corners.
+
+    ROIs are edited in place all over the view (a region is moved by
+    rewriting its corners, a double click deletes one from the list), so a
+    snapshot that shares those lists changes underneath whoever took it -
+    a stale identification would keep comparing equal to the edited ROIs
+    in ``identifications_outdated``. Corners are plain ints, so copying the
+    two corner lists is deep enough.
+    """
+    return [[list(rect[0]), list(rect[1])] for rect in rois]
+
+
 def _filtered_identification_movie(
     movie,
     window: int,
     sigma: float,
-    rois: list | None,
-    roi_pad: int,
     cache: list,
 ) -> tuple[object, list]:
     """Put the identification filters on top of ``movie``: the temporal
-    median background subtraction, then the Gaussian smoothing - built
-    exactly the way ``localize.identify`` builds them, so the preview and
-    the batch run search the same image.
+    median background subtraction, then the Gaussian smoothing - the same
+    two stages ``localize.identify`` puts on top of the movie it searches,
+    so the preview and the batch run find the same spots.
+
+    Unlike the batch run, the stack is always built over the *whole* frame,
+    never restricted to the drawn ROIs. The display reads its frames from
+    here (see ``Window._draw_frame``), and a ROI-restricted temporal median
+    leaves everything outside its bounding box at zero: with the filter on,
+    drawing the first ROI would black out the rest of the movie and the
+    next ROI could not be placed. Identification is unaffected - the median
+    is computed per pixel, so inside the ROIs (and the padding around them
+    the gradients are read from) the filtered frames are identical either
+    way. Restricting the median stays a batch-run optimization, where
+    nothing is displayed.
 
     Both stages are lazy views, so ``cache`` (a ``[temporal, gaussian]``
     pair) keeps them across redraws: a stage is rebuilt only when its
@@ -358,14 +380,10 @@ def _filtered_identification_movie(
             temporal is None
             or temporal.raw is not movie
             or temporal.window != min(window, len(movie))
-            or temporal.roi != rois
-            or temporal.roi_pad != roi_pad
         ):
             # comparing against the raw movie by identity means loading a
             # movie or switching channel invalidates this for free
-            temporal = localize.TemporalMedianMovie(
-                movie, window, roi=rois, roi_pad=roi_pad
-            )
+            temporal = localize.TemporalMedianMovie(movie, window)
         movie = temporal
     else:
         temporal = None
@@ -8402,19 +8420,10 @@ class Window(QtWidgets.QMainWindow):
         if movie is None:
             return None
         parameters = self.channel_parameters(channel)
-        sigma = parameters["Gaussian Filter Sigma"]
-        rois = self.identification_rois() or None
-        roi_pad = (
-            localize.identification_roi_pad(parameters["Box Size"], sigma)
-            if rois
-            else 0
-        )
         movie, cache = _filtered_identification_movie(
             movie,
             parameters["Temporal Median Window"],
-            sigma,
-            rois,
-            roi_pad,
+            parameters["Gaussian Filter Sigma"],
             self._channel_filter_cache.get(channel, [None, None]),
         )
         self._channel_filter_cache[channel] = cache
@@ -9144,15 +9153,22 @@ class Window(QtWidgets.QMainWindow):
         These are the drawn ROIs, except on the channel sum of split-FOV data:
         only the reference region of the summed canvas holds the sum (the other
         regions have been mapped into it), so it alone is searched - and the
-        detections are then already in reference-channel coordinates."""
+        detections are then already in reference-channel coordinates.
+
+        The rectangles are copied out of the view, so that whatever holds on
+        to them (a worker's ROIs, ``last_identification_info["ROI"]``) keeps
+        the regions as they were and not a live reference: the ROIs are also
+        edited in place - a split-FOV region is moved by rewriting its corners
+        (see ``View._move_region``) - and an aliased snapshot would silently
+        agree with the edited list and never look outdated."""
         summed = self.channel_sum_view()
         if (
             summed is not None
             and summed.regions is not None
             and self.identify_mode() == IDENTIFY_MODE_SUM
         ):
-            return [summed.regions[summed.reference]]
-        return self.view.rois
+            return _copied_rois([summed.regions[summed.reference]])
+        return _copied_rois(self.view.rois)
 
     def drop_channel_sum(self) -> None:
         """Forget the channel sum: its detections, its registration and the
@@ -9289,8 +9305,10 @@ class Window(QtWidgets.QMainWindow):
         """The movie the display and the identification preview run on:
         the raw movie (or the channel sum, in ``IDENTIFY_MODE_SUM``),
         optionally temporal median filtered and then Gaussian smoothed -
-        built exactly the way ``localize.identify`` builds it, so that the
-        preview and the batch run agree.
+        built the way ``localize.identify`` builds it, so that the preview
+        and the batch run agree. The one difference is that the filters
+        always cover the whole frame here, since this movie is also what is
+        displayed (see ``_filtered_identification_movie``).
 
         Never used for fitting - ``FitWorker`` and ``save_spots`` always
         cut spots out of ``self.movie``.
@@ -9316,16 +9334,6 @@ class Window(QtWidgets.QMainWindow):
         parameters = self.parameters
         window = parameters["Temporal Median Window"]
         sigma = parameters["Gaussian Filter Sigma"]
-        rois = self.identification_rois() or None
-        # grown by the Gaussian's kernel radius, see identification_roi_pad.
-        # Without a ROI the pad has no effect (the median covers the whole
-        # frame either way), and pinning it to 0 there keeps nudging the
-        # sigma spinbox from throwing away every cached median.
-        roi_pad = (
-            localize.identification_roi_pad(parameters["Box Size"], sigma)
-            if rois
-            else 0
-        )
         if not self.temporal_median_applicable():
             window = 0
         try:
@@ -9335,7 +9343,7 @@ class Window(QtWidgets.QMainWindow):
             # cached filter stack yet
             cache = [None, None]
         movie, cache = _filtered_identification_movie(
-            movie, window, sigma, rois, roi_pad, cache
+            movie, window, sigma, cache
         )
         self._temporal_movie, self._gaussian_movie = cache
         return movie
@@ -11521,7 +11529,10 @@ class IdentificationWorker(QtCore.QThread):
         super().__init__()
         self.window = window
         self.movie = window.movie if movie is None else movie
-        self.rois = list(window.view.rois) if rois is None else rois
+        # copied down to the corners: the worker's ROIs are handed back with
+        # the finished identifications and stored as the settings it ran with
+        # (see ``_copied_rois``)
+        self.rois = _copied_rois(window.view.rois if rois is None else rois)
         self.frame_range = window.frame_range
         if parameters is None:
             parameters = window.parameters

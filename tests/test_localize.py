@@ -7321,21 +7321,37 @@ class TestGaussianFilterGui:
         finally:
             dialog.close()
 
-    def test_roi_pad_grows_with_the_sigma(self):
-        """The preview must pad the temporal median's bounding box exactly
-        as ``localize.identify`` does, or the two disagree on ROI borders.
+    def test_the_preview_filters_are_never_restricted_to_the_rois(self):
+        """The preview movie is what the window displays, so its filters
+        have to cover the whole frame: a ROI-restricted temporal median
+        leaves everything outside its bounding box at zero, and with the
+        filter on, drawing the first ROI would black out the rest of the
+        movie - the next one could not be placed. The detections must
+        still match ``localize.identify``, which does restrict it.
         """
-        rng = np.random.default_rng(1)
-        movie = rng.integers(0, 4000, size=(20, 40, 40), dtype=np.uint16)
+        n_frames, size = 12, 64
+        yy, xx = np.mgrid[0:size, 0:size]
+        rng = np.random.default_rng(5)
+        movie = rng.integers(90, 110, size=(n_frames, size, size)).astype(
+            np.uint16
+        )
+        # blinking, or the temporal median would subtract them away
+        for frame_number in (2, 3, 8):
+            for cy, cx in ((26, 26), (48, 48)):  # inside and outside the ROI
+                movie[frame_number] += (
+                    4000
+                    * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 1.2**2))
+                ).astype(np.uint16)
+        rois = [[[20, 20], [32, 32]]]
         window = localize_gui.Window.__new__(localize_gui.Window)
         window.parameters_dialog = self._dialog()
         dialog = window.parameters_dialog
         try:
-            rois = [((0, 0), (8, 8))]
             window.view = type("_View", (), {"rois": rois})()
             window.movie = movie
             window._temporal_movie = None
             window._gaussian_movie = None
+            window.frame_range = None
             dialog.temporal_median_checkbox.setChecked(True)
             dialog.temporal_median_spinbox.setValue(5)
             for sigma in (0.0, 1.5):
@@ -7346,17 +7362,36 @@ class TestGaussianFilterGui:
                     if isinstance(filtered, localize.GaussianFilteredMovie)
                     else filtered
                 )
-                assert median.roi_pad == localize.identification_roi_pad(
-                    dialog.box_spinbox.value(), sigma
+                # the whole frame stays filtered, and stays visible
+                assert median.roi is None
+                assert filtered[3][40:, 40:].max() > 0
+                # ... and identification still agrees with the batch run,
+                # which restricts the median to the ROI
+                preview = localize.identify_by_frame_number(
+                    filtered, 200, BOX, 3, roi=rois
+                )
+                batch = localize.identify(
+                    movie,
+                    200,
+                    BOX,
+                    roi=rois,
+                    threaded=False,
+                    temporal_median_window=5,
+                    gaussian_filter_sigma=sigma,
+                    return_info=False,
+                )
+                batch = batch[batch["frame"] == 3]
+                assert len(preview) == len(batch) == 1
+                np.testing.assert_allclose(
+                    preview["net_gradient"].to_numpy(),
+                    batch["net_gradient"].to_numpy(),
+                    rtol=1e-4,
                 )
 
-            # without a ROI the pad is irrelevant, so changing sigma must
-            # not throw away the (expensive) cached medians
-            window.view.rois = []
-            window._temporal_movie = None
-            window._gaussian_movie = None
-            dialog.gaussian_filter_spinbox.setValue(1.0)
+            # the ROIs no longer key the median, so drawing one (or nudging
+            # the sigma) must not throw away the expensive cached medians
             median_stage = window.identification_movie().raw
+            window.view.rois = rois + [[[40, 40], [56, 56]]]
             dialog.gaussian_filter_spinbox.setValue(2.0)
             assert window.identification_movie().raw is median_stage
         finally:
@@ -7477,6 +7512,69 @@ class TestGaussianFilterGui:
             assert not window.identifications_outdated()
         finally:
             window.close()
+
+
+class TestRoiSnapshotsGui:
+    """ROIs are edited in place all over Picasso: Localize - a region is
+    moved by rewriting its corners, a double click deletes one from the
+    list. Anything that snapshots them (the identification worker, the
+    settings the identifications were made with) therefore has to copy
+    them, or the snapshot changes underneath it and keeps agreeing with
+    the edited ROIs.
+    """
+
+    _dialog = staticmethod(TestTemporalMedianGui._dialog)
+
+    @staticmethod
+    def _window(dialog, rois):
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        window.parameters_dialog = dialog
+        window.view = type("_View", (), {"rois": rois})()
+        window.movie = np.zeros((4, 8, 8), np.uint16)
+        window.frame_range = None
+        return window
+
+    def test_identification_rois_are_copied_out_of_the_view(self):
+        dialog = self._dialog()
+        rois = [[[0, 0], [8, 8]]]
+        try:
+            window = self._window(dialog, rois)
+            copied = window.identification_rois()
+            assert copied == rois
+            copied[0][0][0] = 4
+            copied.append([[10, 10], [20, 20]])
+            assert rois == [[[0, 0], [8, 8]]]
+        finally:
+            dialog.close()
+
+    def test_moving_a_region_invalidates_identifications(self):
+        dialog = self._dialog()
+        rois = [[[0, 0], [8, 8]]]
+        try:
+            window = self._window(dialog, rois)
+            window.last_identification_info = {
+                **window.parameters,
+                "ROI": window.identification_rois(),
+                "Frame bounds": None,
+            }
+            assert not window.identifications_outdated()
+            # as ``View._move_region`` moves a split-FOV region
+            rois[0] = [[2, 2], [10, 10]]
+            assert window.identifications_outdated()
+        finally:
+            dialog.close()
+
+    def test_worker_rois_do_not_follow_the_view(self):
+        dialog = self._dialog()
+        rois = [[[0, 0], [8, 8]]]
+        try:
+            window = self._window(dialog, rois)
+            worker = localize_gui.IdentificationWorker(window, False, False)
+            rois[0][1][0] = 16
+            rois.append([[10, 10], [20, 20]])
+            assert worker.rois == [[[0, 0], [8, 8]]]
+        finally:
+            dialog.close()
 
 
 def _two_region_frame() -> np.ndarray:
