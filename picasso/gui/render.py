@@ -8502,12 +8502,12 @@ class View(QtWidgets.QLabel):
             progress = lib.ProgressDialog(
                 "Calculating cluster areas",
                 0,
-                len(np.unique(locs.group)),
+                len(np.unique(clustered_locs.group)),
                 self,
             )
             progress.set_value(0)
             areas = clusterer.cluster_areas(
-                locs, self.infos[channel], progress.set_value
+                clustered_locs, self.infos[channel], progress.set_value
             )
             path = os.path.splitext(path)[0] + "_areas.csv"
             areas.to_csv(path, index=False)

@@ -1,6 +1,9 @@
 # Changelog
 
-Last change: 20-AUG-2026 CEST
+Last change: 24-AUG-2026 CEST
+
+## 0.11.1
+- Fixed save cluster areas for SMLM clusterer ([#697](https://github.com/jungmannlab/picasso/issues/697))
 
 ## 0.11.0
 
