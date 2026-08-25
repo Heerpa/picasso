@@ -10290,12 +10290,47 @@ class TestCameraCalibrationDialogs:
         dialog = localize_gui.CameraCalibrationDialog(None)
         try:
             assert dialog.bright_paths() == []
-            dialog.bright_list.addItem("/a.raw")
-            dialog.bright_list.addItem("/b.raw")
+            dialog.add_bright("/a.raw")
+            dialog.add_bright("/b.raw")
             assert dialog.bright_paths() == ["/a.raw", "/b.raw"]
-            dialog.bright_list.item(0).setSelected(True)
+            dialog.bright_list.selectRow(0)
             dialog.remove_bright()
             assert dialog.bright_paths() == ["/b.raw"]
+        finally:
+            dialog.close()
+
+    def test_illumination_levels_are_read_back(self):
+        """The optional column, which only the diagnostic plot uses."""
+        dialog = localize_gui.CameraCalibrationDialog(None)
+        try:
+            dialog.add_bright("/a.raw", "0.1")
+            dialog.add_bright("/b.raw", "1")
+            dialog.add_bright("/c.raw", "10")
+            assert dialog.bright_levels() == [0.1, 1.0, 10.0]
+        finally:
+            dialog.close()
+
+    def test_no_illumination_levels_is_not_an_error(self):
+        dialog = localize_gui.CameraCalibrationDialog(None)
+        try:
+            dialog.add_bright("/a.raw")
+            dialog.add_bright("/b.raw")
+            assert dialog.bright_levels() is None
+        finally:
+            dialog.close()
+
+    def test_a_partly_filled_or_non_numeric_column_is_refused(self):
+        """Either is a slip; a level list that does not match the movies
+        cannot be plotted against."""
+        dialog = localize_gui.CameraCalibrationDialog(None)
+        try:
+            dialog.add_bright("/a.raw", "0.1")
+            dialog.add_bright("/b.raw")
+            with pytest.raises(ValueError, match="every row"):
+                dialog.bright_levels()
+            dialog.bright_list.item(1, 1).setText("bright")
+            with pytest.raises(ValueError, match="numbers only"):
+                dialog.bright_levels()
         finally:
             dialog.close()
 

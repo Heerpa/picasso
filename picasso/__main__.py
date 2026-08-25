@@ -1540,12 +1540,22 @@ def _camera_calibrate(args: argparse.Namespace) -> None:
             "per-pixel gain as well."
         )
 
+    powers = args.power or None
+    if powers is not None and len(powers) != len(bright_movies):
+        raise ValueError(
+            f"Got {len(powers)} -p/--power value(s) for "
+            f"{len(bright_movies)} light movie(s). Pass one per movie, in "
+            "the same order, or none at all."
+        )
+
     calibration = scmos.calibrate_scmos(
         dark_movie,
         bright_movies or None,
         progress_callback="console",
         dark_path=args.dark,
         bright_paths=bright_paths,
+        bright_levels=powers,
+        level_unit=args.power_unit,
     )
 
     out_path = args.output
@@ -1581,6 +1591,16 @@ def _camera_calibrate(args: argparse.Namespace) -> None:
             f"{calibration['Gain max (ADU/e-)']:.3f} "
             f"({calibration['Gain levels']} illumination levels)"
         )
+        signal = calibration.get("Level median signal (ADU)") or []
+        if len(signal) > 1:
+            # The gain fit assumes the response is linear over the range the
+            # series covers, and nothing in the fit itself would complain if
+            # a level had saturated.
+            print(
+                "Level medians:     "
+                + ", ".join(f"{value:.1f}" for value in signal)
+                + " ADU (mean - offset)"
+            )
         if calibration["Gain fallback pixels"]:
             print(
                 f"                   {calibration['Gain fallback pixels']} "
@@ -3264,6 +3284,26 @@ def main():  # noqa: C901
             "paper used 15, spanning 20-200 photons per pixel) to measure "
             "the per-pixel gain. Omit for offset and variance only"
         ),
+    )
+    camera_calib_parser.add_argument(
+        "-p",
+        "--power",
+        type=float,
+        action="append",
+        help=(
+            "illumination each -l/--light movie was recorded at (laser "
+            "power, exposure time, ...), repeated once per light movie in "
+            "the same order. Not used by the gain fit; it lets the "
+            "diagnostic plot show the response against what was actually "
+            "set, which is the only way to judge linearity when the levels "
+            "are not evenly spaced"
+        ),
+    )
+    camera_calib_parser.add_argument(
+        "--power-unit",
+        type=str,
+        default="mW",
+        help="unit of -p/--power, for the plot axis (default: mW)",
     )
     camera_calib_parser.add_argument(
         "-o",

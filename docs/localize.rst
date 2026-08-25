@@ -155,9 +155,25 @@ Two acquisitions feed it:
 
 The maps are stored raw and camera-native — offset in ADU, variance in ADU², gain in ADU per photoelectron — in a single HDF5 file, so a calibration does not depend on any Picasso setting.
 
-Alongside the ``.hdf5`` Picasso writes a ``*_maps.png`` showing each map next to its histogram, as in Supplementary Fig. 1 of Huang et al., from both the GUI and the command line.
-
 Make sure the camera's offset is high enough that readout noise never drives a pixel below zero ADU. That is what the offset is engineered for, but with an unusually noisy pixel and a low offset the raw counts can clip or wrap, and the measured variance for that pixel then becomes meaningless.
+
+Optionally, record the illumination each bright movie was taken at — the laser power, the exposure time, whatever was varied — in the dialog's ``Illumination`` column, or with one ``-p`` per ``-l`` on the command line::
+
+    picasso camera-calibrate dark.raw -l light_01.raw -p 0.1 -l light_02.raw -p 1 -l light_03.raw -p 10 --power-unit mW -o mycam_scmos_calib.hdf5
+
+Nothing in the gain fit uses these numbers; they only label the x-axis of the linearity plot described below, which is what makes that plot readable when the levels are not evenly spaced. Give one per bright movie or none at all.
+
+Reading the sCMOS calibration plot
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Alongside the ``.hdf5`` Picasso writes a ``*_maps.png``, from both the GUI and the command line. Each map appears next to its own histogram showing the distribution, as in Supplementary Fig. 1 of Huang et al. Readout variance, offset and gain are shown.
+
+A bright series of more than one level adds a fourth row, asking whether the sensor responded linearly over the range the gain was fitted on. Both panels are chip medians, one point per illumination level:
+
+- **Linearity** — the median signal (per-pixel temporal mean, minus the offset map) against the illumination it was recorded at, or against the level index when none was given. The points should lie on a straight line; the fitted line is drawn and the title reports the worst point's deviation as a percentage of the span. Levels that flatten off at the top are saturating, and every level above that knee biases the gain fit without making it fail. A nonzero intercept is not a nonlinearity — it usually means stray light or background — and the fit absorbs it. When no illumination was recorded the axis says so, the points are only joined by a guide line, and no deviation is quoted, because equal steps on the axis then stand for unknown steps in illumination.
+- **Photon transfer curve** — the median excess variance (per-pixel temporal variance, minus the readout-variance map) against that same median signal, with the median of the fitted gain map drawn through the origin as a line. Since the signal is ``g·u`` and the excess variance ``g²·u``, the points lie on a line of slope ``g`` whatever the illumination levels were, which makes this the panel to read when they were uneven or unknown. Curving *down* at the bright end is saturation; curving *up* is can be an unstable laser, whose frame-to-frame intensity fluctuation adds a variance term growing as ``u²``; missing the origin means the dark movie does not describe these movies, through a changed camera setting, a temperature drift, or light leaking into the dark acquisition.
+
+The two fail separately: a linear camera behind a nonlinear laser gives a straight transfer curve and a bent linearity panel, which says to fix the power calibration rather than the camera.
 
 Using the maps
 ~~~~~~~~~~~~~~

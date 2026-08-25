@@ -1803,18 +1803,41 @@ class CameraCalibrationDialog(lib.Dialog):
             "a different intensity (Huang et al. used 15 levels spanning "
             "20-200 photons per pixel). Without them there is no gain map "
             "and the scalar Sensitivity keeps being used. The movies do not "
-            "need to be ordered by intensity."
+            "need to be ordered by intensity.\n\n"
+            "The illumination column is optional and changes nothing in the "
+            "calibration: it lets the diagnostic plot show the response "
+            "against the laser power (or exposure time) that was actually "
+            "set and read linearity off it when the levels are not evenly "
+            "spaced. Fill in every row or none."
         )
         bright_hint.setWordWrap(True)
         bright_layout.addWidget(bright_hint)
-        self.bright_list = QtWidgets.QListWidget()
+        self.bright_list = QtWidgets.QTableWidget(0, 2)
+        self.bright_list.setHorizontalHeaderLabels(
+            ["Movie", "Illumination (optional)"]
+        )
+        self.bright_list.verticalHeader().setVisible(False)
+        self.bright_list.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
         self.bright_list.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
         )
-        self.bright_list.setMaximumHeight(110)
+        header = self.bright_list.horizontalHeader()
+        header.setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        header.setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.bright_list.setMaximumHeight(130)
         bright_layout.addWidget(self.bright_list)
         bright_row = QtWidgets.QHBoxLayout()
         bright_layout.addLayout(bright_row)
+        bright_row.addWidget(QtWidgets.QLabel("Illumination unit:"))
+        self.unit_edit = QtWidgets.QLineEdit("mW")
+        self.unit_edit.setMaximumWidth(70)
+        bright_row.addWidget(self.unit_edit)
         bright_row.addStretch(1)
         add_button = QtWidgets.QPushButton("Add...")
         add_button.setAutoDefault(False)
@@ -1886,11 +1909,28 @@ class CameraCalibrationDialog(lib.Dialog):
         existing = self.bright_paths()
         for path in paths:
             if path not in existing:
-                self.bright_list.addItem(path)
+                self.add_bright(path)
+
+    def add_bright(self, path: str, illumination: str = "") -> None:
+        """Append one bright movie row; its illumination cell stays editable
+        while the path cell does not, since the path came from a picker."""
+        row = self.bright_list.rowCount()
+        self.bright_list.insertRow(row)
+        item = QtWidgets.QTableWidgetItem(path)
+        item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+        self.bright_list.setItem(row, 0, item)
+        self.bright_list.setItem(
+            row, 1, QtWidgets.QTableWidgetItem(illumination)
+        )
 
     def remove_bright(self) -> None:
-        for item in self.bright_list.selectedItems():
-            self.bright_list.takeItem(self.bright_list.row(item))
+        # Descending, so removing one row does not renumber the rest.
+        rows = sorted(
+            {index.row() for index in self.bright_list.selectedIndexes()},
+            reverse=True,
+        )
+        for row in rows:
+            self.bright_list.removeRow(row)
 
     def browse_out(self) -> None:
         base, _ = os.path.splitext(self.dark_edit.text())
@@ -1905,23 +1945,77 @@ class CameraCalibrationDialog(lib.Dialog):
 
     def bright_paths(self) -> list[str]:
         return [
-            self.bright_list.item(row).text()
-            for row in range(self.bright_list.count())
+            self.bright_list.item(row, 0).text()
+            for row in range(self.bright_list.rowCount())
         ]
+
+    def bright_levels(self) -> list[float] | None:
+        """The illumination of each bright movie, or None if the column was
+        left empty.
+
+        Raises
+        ------
+        ValueError
+            If some rows carry a level and others do not, or if one of them
+            is not a number. A partly filled column cannot be plotted against
+            and is more likely a slip than an intention.
+        """
+        texts = [
+            (
+                self.bright_list.item(row, 1).text().strip()
+                if self.bright_list.item(row, 1) is not None
+                else ""
+            )
+            for row in range(self.bright_list.rowCount())
+        ]
+        filled = [text for text in texts if text]
+        if not filled:
+            return None
+        if len(filled) != len(texts):
+            raise ValueError(
+                f"Only {len(filled)} of {len(texts)} bright movies have an "
+                "illumination. Fill in every row or leave the column empty."
+            )
+        try:
+            return [float(text) for text in texts]
+        except ValueError:
+            raise ValueError(
+                "The illumination column must contain numbers only "
+                f"(got {', '.join(repr(t) for t in texts)})."
+            ) from None
 
     @staticmethod
     def getCalibrationSpecs(
         parent: QtWidgets.QWidget | None = None,
-    ) -> tuple[str, list[str], str, bool]:
-        """Show the dialog and return the dark movie, the bright movies, the
-        output path and whether it was accepted."""
+    ) -> tuple[str, list[str], list[float] | None, str, str, bool]:
+        """Show the dialog and return the dark movie, the bright movies,
+        their illumination levels and unit, the output path and whether it
+        was accepted.
+
+        Re-shown, with the offending cells kept, if the illumination column
+        was filled in only partly or not with numbers."""
         dialog = CameraCalibrationDialog(parent)
-        result = dialog.exec()
+        while True:
+            result = dialog.exec()
+            accepted = result == QtWidgets.QDialog.DialogCode.Accepted
+            try:
+                levels = dialog.bright_levels()
+            except ValueError as error:
+                if not accepted:
+                    levels = None
+                    break
+                QtWidgets.QMessageBox.warning(
+                    parent, "Camera calibration", str(error)
+                )
+                continue
+            break
         return (
             dialog.dark_edit.text(),
             dialog.bright_paths(),
+            levels,
+            dialog.unit_edit.text().strip(),
             dialog.out_edit.text(),
-            result == QtWidgets.QDialog.DialogCode.Accepted,
+            accepted,
         )
 
 
@@ -6240,6 +6334,8 @@ class Window(QtWidgets.QMainWindow):
         (
             dark_path,
             light_paths,
+            light_levels,
+            level_unit,
             out_path,
             accepted,
         ) = CameraCalibrationDialog.getCalibrationSpecs(self)
@@ -6269,6 +6365,8 @@ class Window(QtWidgets.QMainWindow):
                     progress_callback=progress.set_value,
                     dark_path=dark_path,
                     bright_paths=light_paths,
+                    bright_levels=light_levels,
+                    level_unit=level_unit,
                 )
         except Exception as error:
             progress.close()
