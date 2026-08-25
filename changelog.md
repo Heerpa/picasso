@@ -8,6 +8,7 @@ Last change: 25-AUG-2026 CEST
 - Fixed drawing ROIs in Localize while the temporal median filter is on.
 - Render asks for the camera pixel size when loading `.hdf5` files whose metadata does not contain `Pixelsize` (e.g. saved by old Picasso versions), instead of raising an error at rendering.
 - Fixed save cluster areas for SMLM clusterer ([#697](https://github.com/jungmannlab/picasso/issues/697)).
+- Fixed the occasional "AttributeError: 'ViewRotation' object has no attribute 'viewport'" before the 3D window was opened
 - Fixed SPINNA simulations for empty targets.
 - Average uses the shared global process pool: thus the initialization is not needed for each iteration
 - Capping multiprocessing at 61 processes only on Windows

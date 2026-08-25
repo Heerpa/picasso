@@ -788,8 +788,9 @@ class ViewRotation(QtWidgets.QLabel):
         rotations beyond 180 degrees in animation segments.
     _last_mouse_x, _last_mouse_y : int
         Previous mouse position (Qt coords) during a trackball drag.
-    viewport : tuple
-        Defines current field of view.
+    viewport : tuple or None
+        Defines current field of view; None until localizations are
+        loaded.
     window : QMainWindow
         Instance of the rotation window.
     """
@@ -807,6 +808,7 @@ class ViewRotation(QtWidgets.QLabel):
         self.locs = []
         self.infos = []
         self.paths = []
+        self.viewport = None
         self.group_color = []
         self.x_render_state = False
         self.x_locs = []
@@ -1477,21 +1479,40 @@ class ViewRotation(QtWidgets.QLabel):
         self._pan_z -= dz_w
         self.shift_viewport(dx_w, dy_w)
 
+    def _arrow_pan_relative(self, fx: float, fy: float) -> None:
+        """Arrow-key pan by fractions of the viewport width/height.
+
+        Does nothing if no localizations have been loaded yet, i.e. if
+        there is no viewport to pan.
+
+        Parameters
+        ----------
+        fx, fy : float
+            Shift in x and y as fractions of the viewport's width and
+            height.
+        """
+        if self.viewport is None:
+            return
+        self._arrow_pan(
+            fx * render.viewport_width(self.viewport),
+            fy * render.viewport_height(self.viewport),
+        )
+
     def to_left_rot(self) -> None:
         """Shift pick in the main window."""
-        self._arrow_pan(-SHIFT * render.viewport_width(self.viewport), 0.0)
+        self._arrow_pan_relative(-SHIFT, 0.0)
 
     def to_right_rot(self) -> None:
         """Shift pick in the main window."""
-        self._arrow_pan(SHIFT * render.viewport_width(self.viewport), 0.0)
+        self._arrow_pan_relative(SHIFT, 0.0)
 
     def to_up_rot(self) -> None:
         """Shift pick in the main window."""
-        self._arrow_pan(0.0, -SHIFT * render.viewport_height(self.viewport))
+        self._arrow_pan_relative(0.0, -SHIFT)
 
     def to_down_rot(self) -> None:
         """Shift pick in the main window."""
-        self._arrow_pan(0.0, SHIFT * render.viewport_height(self.viewport))
+        self._arrow_pan_relative(0.0, SHIFT)
 
     def set_optimal_scalebar(
         self, force: bool = False, silent: bool = False
