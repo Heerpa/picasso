@@ -4,6 +4,7 @@ Last change: 25-AUG-2026 CEST
 
 ## 0.11.1
 - Localize loads z-stack `.nd2` files.
+- Fixed empty space in Localize's Parameters dialog 
 - Fixed drawing ROIs in Localize while the temporal median filter is on.
 - Render asks for the camera pixel size when loading `.hdf5` files whose metadata does not contain `Pixelsize` (e.g. saved by old Picasso versions), instead of raising an error at rendering.
 - Fixed save cluster areas for SMLM clusterer ([#697](https://github.com/jungmannlab/picasso/issues/697)).

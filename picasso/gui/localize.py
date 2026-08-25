@@ -3556,7 +3556,6 @@ class ParametersDialog(lib.Dialog):
             cb.stateChanged.connect(self.on_link_params_changed)
             link_layout.addWidget(cb)
         link_layout.addStretch(1)
-        _retain_size_when_hidden(self.link_groupbox)
         self.link_groupbox.hide()  # shown by the window for >1 channel
 
         # Camera:
@@ -6721,9 +6720,11 @@ class Window(QtWidgets.QMainWindow):
         'Identify on' needs channels to add together, so it follows the same
         rule as 'Link colors'.
 
-        All three are hidden rather than disabled, and all three keep their
-        space while hidden (see ``_retain_size_when_hidden``), so opening or
-        closing channels never reflows the dialog."""
+        All three are hidden rather than disabled. The two row widgets keep
+        their space while hidden (see ``_retain_size_when_hidden``), so the
+        rows they sit in do not reflow; the shared-settings group box does
+        not, since reserving a whole group box leaves a visible gap in the
+        single-channel dialog."""
         separate_channels = len(self.channels) > 1
         multichannel = separate_channels or self.view.split_fov_mode
         pdialog = self.parameters_dialog
