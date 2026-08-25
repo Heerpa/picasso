@@ -10,6 +10,7 @@ Last change: 25-AUG-2026 CEST
 - Fixed save cluster areas for SMLM clusterer ([#697](https://github.com/jungmannlab/picasso/issues/697)).
 - Fixed SPINNA simulations for empty targets.
 - Capping multiprocessing at 61 processes only on Windows
+- More instructions on plugins
 
 ## 0.11.0
 

@@ -18,6 +18,8 @@ The easiest way to get plugins is the built-in store: open **Plugins → Browse 
 
 Each row also offers **View source** (**View changes** for an update), which downloads the file, verifies it against the registry hash and shows it read-only. Most plugins are short; reading one before enabling it is realistic and is the only check that actually tells you what a plugin does.
 
+The instructions on how to use a plugin are written in the docstring at the very top of its ``.py`` file, so **View source** is also where you read them: the first block of text you see explains what the plugin does and how to use it.
+
 A plugin you install this way is enabled automatically — clicking *Install* and confirming the warning *is* the consent step. Picasso shows that warning once, before your first install.
 
 If a plugin is listed as **No integrity hash**, the registry does not publish a SHA-256 for it and Picasso will refuse to install it. That is a problem with the registry entry, not with your setup; please report it in the `picasso_plugins repository <https://github.com/jungmannlab/picasso_plugins>`_.
@@ -41,6 +43,8 @@ Because the plugins folder lives in your home directory and not inside the Picas
 For developers
 --------------
 To create a plugin, you can use the template provided in `picasso/plugin_template.py <https://github.com/jungmannlab/picasso/blob/master/plugin_template.py>`_. For more examples of plugins, please see the `GitHub repo <https://github.com/jungmannlab/picasso_plugins>`_.
+
+**Document your plugin in the module docstring at the top of the file.** Picasso has no separate place to show a plugin's documentation, and users read plugins through **View source**, so the docstring that opens the ``.py`` file is the plugin's manual. Put the usage instructions there — what the plugin does, which menu entry it adds, what input it expects and what it produces, plus any requirements or caveats — before the imports and any other code, so it is the first thing the user sees. Keep further explanation of the implementation in the docstrings of the individual functions and classes.
 
 Registry entries
 ~~~~~~~~~~~~~~~~
