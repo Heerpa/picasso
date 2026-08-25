@@ -62,7 +62,6 @@ multi-channel single-molecule localization." Nature Communications 13,
 
 from __future__ import annotations
 
-import multiprocessing
 import threading
 from concurrent import futures
 from concurrent.futures import Future
@@ -1451,10 +1450,9 @@ def n_workers() -> int:
     Returns
     -------
     n_threads : int
-        75% of the CPU count, clipped to ``[1, 60]``.
+        75% of the CPU count, see :func:`picasso.lib.n_workers`.
     """
-    # Python crashes when using >64 cores.
-    return min(60, max(1, int(0.75 * multiprocessing.cpu_count())))
+    return lib.n_workers()
 
 
 def fit_spots(

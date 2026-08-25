@@ -16,7 +16,6 @@ import time
 import warnings
 from typing import Literal
 from concurrent import futures
-from multiprocessing import cpu_count
 from itertools import product as it_prod
 from copy import deepcopy
 from numbers import Number
@@ -3353,9 +3352,7 @@ class SPINNA:
             Contain the scoring for each combination of structures
         """
         # get number of threads and tasks
-        n_workers = min(
-            60, max(1, int(0.75 * cpu_count()))
-        )  # Python crashes when using >64 cores
+        n_workers = lib.n_workers()
 
         # split N_structures into groups that are tested by each Process
         # separately

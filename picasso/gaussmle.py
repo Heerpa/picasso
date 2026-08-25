@@ -31,7 +31,6 @@ Smith, et al. Nature Methods, 2010.
 from __future__ import annotations
 
 import math
-import multiprocessing
 import threading
 from concurrent import futures
 from typing import Callable, Literal
@@ -573,9 +572,7 @@ def _gaussmle_async(
     CRLBs = np.inf * np.ones((N, 6), dtype=np.float32)
     likelihoods = np.zeros(N, dtype=np.float32)
     iterations = np.zeros(N, dtype=np.int32)
-    n_workers = min(
-        60, max(1, int(0.75 * multiprocessing.cpu_count()))
-    )  # Python crashes when using >64 cores
+    n_workers = lib.n_workers()
     lock = threading.Lock()
     current = [0]
     if method == "sigma":

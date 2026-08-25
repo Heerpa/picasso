@@ -1,6 +1,6 @@
 # Changelog
 
-Last change: 24-AUG-2026 CEST
+Last change: 25-AUG-2026 CEST
 
 ## 0.11.1
 - Localize loads z-stack `.nd2` files.
@@ -8,6 +8,7 @@ Last change: 24-AUG-2026 CEST
 - Render asks for the camera pixel size when loading `.hdf5` files whose metadata does not contain `Pixelsize` (e.g. saved by old Picasso versions), instead of raising an error at rendering.
 - Fixed save cluster areas for SMLM clusterer ([#697](https://github.com/jungmannlab/picasso/issues/697)).
 - Fixed SPINNA simulations for empty targets.
+- Capping multiprocessing at 61 processes only on Windows
 
 ## 0.11.0
 

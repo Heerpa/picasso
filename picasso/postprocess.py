@@ -12,7 +12,6 @@ Data analysis of localization lists.
 from __future__ import annotations
 
 import itertools
-import multiprocessing
 import os
 import warnings
 from collections import OrderedDict
@@ -1873,9 +1872,7 @@ def distance_histogram(
         locs, info, r_max
     )
     N = len(locs)
-    n_threads = min(
-        60, max(1, int(0.75 * multiprocessing.cpu_count()))
-    )  # Python crashes when using >64 cores
+    n_threads = lib.n_workers()
     chunk = int(N / n_threads)
     starts = range(0, N, chunk)
     args = [
@@ -2481,9 +2478,7 @@ def compute_local_density(
         get_index_blocks(locs, info, radius)
     )
     N = len(locs)
-    n_threads = min(
-        60, max(1, int(0.75 * multiprocessing.cpu_count()))
-    )  # Python crashes when using >64 cores
+    n_threads = lib.n_workers()
     chunk = int(N / n_threads)
     starts = range(0, N, chunk)
     args = [

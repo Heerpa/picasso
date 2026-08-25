@@ -1664,9 +1664,7 @@ def identify_async(
     settings["Localize"]["cpu_utilization"] = cpu_utilization
     io.save_user_settings(settings)
 
-    n_workers = min(
-        60, max(1, int(cpu_utilization * multiprocessing.cpu_count()))
-    )  # Python crashes when using >64 cores
+    n_workers = lib.n_workers(cpu_utilization)
 
     lock = threading.Lock()
     current = [0]
@@ -2293,8 +2291,7 @@ def _n_io_workers() -> int:
         cpu_utilization = 0.8
     if not isinstance(cpu_utilization, float) or cpu_utilization >= 1:
         cpu_utilization = 0.8
-    # Python crashes when using >64 cores
-    return min(60, max(1, int(cpu_utilization * multiprocessing.cpu_count())))
+    return lib.n_workers(cpu_utilization)
 
 
 @numba.jit(nopython=True, cache=False)

@@ -14,7 +14,6 @@ import os
 import sys
 import datetime
 import threading
-import multiprocessing
 import joblib
 import yaml
 import concurrent.futures
@@ -435,9 +434,7 @@ class Predictor(QtCore.QThread):
 
         lock = threading.Lock()
 
-        n_workers = min(
-            60, max(1, int(0.75 * multiprocessing.cpu_count()))
-        )  # Python crashes when using >64 cores
+        n_workers = lib.n_workers()
 
         current = [0]
         finished = [0]

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import os
 import math
-import multiprocessing
 import time
 import warnings
 from concurrent import futures
@@ -416,9 +415,7 @@ def _fit_z_parallel(
 ) -> pd.DataFrame | list[futures.Future]:
     """Internal function for fitting z coordinates to the localizations
     using multiprocessing. See `zfit` for details."""
-    n_workers = min(
-        60, max(1, int(0.75 * multiprocessing.cpu_count()))
-    )  # Python crashes when using >64 cores
+    n_workers = lib.n_workers()
     n_locs = len(locs)
     n_tasks = 100 * n_workers
     spots_per_task = [

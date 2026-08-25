@@ -14,7 +14,9 @@ import glob
 import collections
 import colorsys
 import importlib
+import multiprocessing
 import os
+import sys
 import warnings
 from copy import deepcopy
 from typing import Any, TypeAlias, Literal, TYPE_CHECKING
@@ -118,6 +120,32 @@ def __getattr__(name: str) -> Any:
         globals()[name] = value  # cache for subsequent lookups
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+#: Maximum number of workers on Windows, where ``WaitForMultipleObjects``
+#: cannot wait on more than 64 handles at once and Python crashes above it.
+WINDOWS_MAX_WORKERS = 61
+
+
+def n_workers(cpu_utilization: float = 0.75) -> int:
+    """Number of workers (processes or threads) to use for parallel
+    computation.
+
+    Parameters
+    ----------
+    cpu_utilization : float, optional
+        Fraction of the available CPUs to use. Default 0.75.
+
+    Returns
+    -------
+    n_workers : int
+        ``cpu_utilization`` times the CPU count, at least 1 and, on
+        Windows only, at most ``WINDOWS_MAX_WORKERS``.
+    """
+    n = max(1, int(cpu_utilization * multiprocessing.cpu_count()))
+    if sys.platform == "win32":
+        n = min(WINDOWS_MAX_WORKERS, n)
+    return n
 
 
 def normalize_frame_bounds(frame_bounds, n_frames):

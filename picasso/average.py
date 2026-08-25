@@ -423,9 +423,7 @@ def average(
     angles = np.arange(0, 2 * np.pi, a_step)
 
     # Setup multiprocessing
-    n_workers = min(
-        60, max(1, int(0.75 * multiprocessing.cpu_count()))
-    )  # Python crashes when using >64 cores
+    n_workers = lib.n_workers()
     manager = multiprocessing.Manager()
     counter = manager.Value("d", 0)
     lock = manager.Lock()

@@ -9,7 +9,6 @@ interest (ROI).
 :copyright: Copyright (c) 2016-2026 Jungmann Lab, MPI of Biochemistry
 """
 
-import multiprocessing
 from concurrent import futures
 from typing import Callable, Literal
 
@@ -111,9 +110,7 @@ def fit_spots_parallel(
         ``(n_spots, 6)`` fit parameters, or the list of futures if
         ``asynch``; pass those to :func:`fits_from_futures`.
     """
-    n_workers = min(
-        60, max(1, int(0.75 * multiprocessing.cpu_count()))
-    )  # Python crashes when using >64 cores
+    n_workers = lib.n_workers()
     n_spots = len(spots)
     n_tasks = 100 * n_workers
     spots_per_task = [
