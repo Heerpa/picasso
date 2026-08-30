@@ -29,7 +29,7 @@ Fitting can run on a CUDA-capable GPU (see `GPU fitting`_ below). The kernels ar
 - Leica ``.lif`` (requires ``pip install picassosr[lif]``, Python ≥ 3.12; available in the one-click installer),
 - ``.raw``,
 - ``.ims`` (supported only on Windows),
-- ``.nd2``,
+- ``.nd2`` (either time series or a z-stack; ``T`` or ``Z`` axis),
 - ``.stk``.
 
 TIFF-family files (``.tif``, ``.tiff``, ``.ome.tif``, ``.btf``, ``.tf8``, ``.tf2``, ``.lsm``) are read via the `tifffile <https://github.com/cgohlke/tifffile>`_ library. **Picasso expects grayscale image stacks with one frame per TIFF page; multi-channel, RGB or tiled whole-slide TIFF variants are not supported.** ImageJ "contiguous stack" files — where ImageJ stores the whole stack as a single TIFF page followed by all planes' pixel data (as its "Save As > Tiff" does for large stacks, e.g. when re-saving a folder of separate images as one ``.tiff``) — are also read correctly, with every plane detected as a frame.
