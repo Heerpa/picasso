@@ -7459,13 +7459,8 @@ class Window(QtWidgets.QMainWindow):
         self._populate_channel_combo()
         self.frame_slider.setEnabled(True)
         self.contrast_slider.setEnabled(True)
-        # A fresh load starts at frame 0. The previous movie's contrast
-        # (manual black/white values, if Auto is off) is almost certainly
-        # wrong for the new one's intensity scale, so it is re-derived
-        # from the new first frame rather than carried over.
         self.curr_frame_number = 0
         self._restore_current_channel()
-        self.contrast_dialog.reset_to_frame()
         self.draw_frame()
         self.parameters_dialog.reset_quality_check()
 
