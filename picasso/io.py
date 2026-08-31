@@ -4219,25 +4219,29 @@ def _read_locs_dataset(path: str, progress=None) -> pd.DataFrame:
         if "locs" not in locs_file:
             raise KeyError(f"File: {path} does not contain a 'locs' dataset.")
         dataset = locs_file["locs"]
-        names = getattr(dataset.dtype, "names", None)
-        if not isinstance(dataset, h5py.Dataset) or names is None:
-            dataset = None  # not a Picasso-written compound dataset
-        if dataset is not None:
-            n_locs = len(dataset)
-            # fill one contiguous array per column, such that no copy of
-            # the whole dataset is needed to build the DataFrame
-            columns = {
-                name: np.empty(n_locs, dtype=dataset.dtype[name])
-                for name in names
-            }
-            for start in range(0, max(n_locs, 1), BLOCK_SIZE):
-                stop = min(start + BLOCK_SIZE, n_locs)
-                block = dataset[start:stop]
-                for name in names:
-                    columns[name][start:stop] = block[name]
-                if progress is not None:
-                    progress(stop, n_locs)
-            return pd.DataFrame(columns, copy=False)
+
+        # Only Picasso compound datasets can be read block-wise with h5py.
+        if isinstance(dataset, h5py.Dataset):
+            names = getattr(dataset.dtype, "names", None)
+
+            if names is not None:
+                n_locs = len(dataset)
+                # fill one contiguous array per column, such that no copy of
+                # the whole dataset is needed to build the DataFrame
+                columns = {
+                    name: np.empty(n_locs, dtype=dataset.dtype[name])
+                    for name in names
+                }
+                for start in range(0, max(n_locs, 1), BLOCK_SIZE):
+                    stop = min(start + BLOCK_SIZE, n_locs)
+                    block = dataset[start:stop]
+                    for name in names:
+                        columns[name][start:stop] = block[name]
+                    if progress is not None:
+                        progress(stop, n_locs)
+                return pd.DataFrame(columns, copy=False)
+             
+    # Non-compound HDF5 layouts are handled by PyTables/pandas.
     return pd.read_hdf(path, key="locs")
 
 
