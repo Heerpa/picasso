@@ -4,6 +4,7 @@ Last change: 31-AUG-2026 CEST
 
 ## 0.11.1
 - Errors are no longer silently swallowed in the one-click installers. Picasso now redirects errors to a log file (`~/.picasso/logs/picasso.log`), logs every uncaught exception (main thread, worker threads and unraisable ones) there, and shows it in a message box - whose *Show Details...* holds the full traceback.
+- Every GUI now starts through the shared `picasso.gui.app.run_gui`. Error reporting is installed *first*, so a failure while the main window is being built - a missing bundled library, a broken `settings.yaml` - is now shown and logged instead of killing the app without a word.
 - Localize loads z-stack `.nd2` files.
 - Localize's contrast is not set to auto on opening a new movie.
 - Fixed empty space in Localize's Parameters dialog.

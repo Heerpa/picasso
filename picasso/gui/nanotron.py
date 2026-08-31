@@ -27,9 +27,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix
 
 from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtGui import QIcon
 
 from .. import io, lib, render, nanotron, __version__
+from .app import run_gui
 
 DEFAULT_MODEL_PATH = os.path.join(
     os.sep,
@@ -1557,29 +1557,15 @@ class Window(QtWidgets.QMainWindow):
                 yaml.dump(pick_regions, f)
 
 
-def main():
+def main() -> None:
+    """Start Picasso: Nanotron - see ``picasso.gui.app.run_gui``."""
 
-    app = QtWidgets.QApplication(sys.argv)
-    this_directory = os.path.dirname(os.path.realpath(__file__))
-    icon_path = os.path.join(this_directory, "icons", "nanotron.ico")
-    app.setWindowIcon(QIcon(icon_path))
-    window = Window()
-
-    # load plugins from ~/.picasso/plugins
-    from .plugins_loader import load_plugins, add_plugins_menu_actions
-
-    load_plugins(window, "nanotron")
-    add_plugins_menu_actions(window, "nanotron")
-
-    window.show()
-
-    from ..updater import setup_gui_update_check
-
-    setup_gui_update_check(window)
-
-    lib.install_excepthook(window)
-
-    sys.exit(app.exec())
+    icon = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)),
+        "icons",
+        "nanotron.ico",
+    )
+    sys.exit(run_gui(Window, "nanotron", icon=icon))
 
 
 if __name__ == "__main__":

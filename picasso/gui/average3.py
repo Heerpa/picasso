@@ -25,6 +25,7 @@ from scipy import signal
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .. import io, lib, render, __version__
+from .app import run_gui
 
 from cmath import rect, phase
 
@@ -2094,20 +2095,9 @@ class Window(QtWidgets.QMainWindow):
         return image
 
 
-def main():
-
-    app = QtWidgets.QApplication(sys.argv)
-    window = Window()
-
-    window.show()
-
-    from ..updater import setup_gui_update_check
-
-    setup_gui_update_check(window)
-
-    lib.install_excepthook(window)
-
-    sys.exit(app.exec())
+def main() -> None:
+    """Start Picasso: Average3 - see ``picasso.gui.app.run_gui``."""
+    sys.exit(run_gui(Window))
 
 
 if __name__ == "__main__":

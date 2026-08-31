@@ -23,6 +23,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets, QtPrintSupport
 from .. import io as _io
 from .. import design, design_sequences
 from .. import lib, __version__
+from .app import run_gui
 
 BASE_SEQUENCES = design_sequences.base_sequences
 PAINT_SEQUENCES = design_sequences.paint_sequences
@@ -1792,25 +1793,9 @@ class MainWindow(QtWidgets.QWidget):
         self.plugin_menu = menu_bar.addMenu("Plugins")  # do not delete
 
 
-def main():
-    app = QtWidgets.QApplication(sys.argv)
-    window = MainWindow()
-
-    # load plugins from ~/.picasso/plugins
-    from .plugins_loader import load_plugins, add_plugins_menu_actions
-
-    load_plugins(window, "design")
-    add_plugins_menu_actions(window, "design")
-
-    window.show()
-
-    from ..updater import setup_gui_update_check
-
-    setup_gui_update_check(window)
-
-    lib.install_excepthook(window)
-
-    sys.exit(app.exec())
+def main() -> None:
+    """Start Picasso: Design - see ``picasso.gui.app.run_gui``."""
+    sys.exit(run_gui(MainWindow, "design"))
 
 
 if __name__ == "__main__":

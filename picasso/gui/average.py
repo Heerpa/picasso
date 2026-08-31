@@ -19,6 +19,7 @@ import pandas as pd
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .. import io, lib, average, render, __version__
+from .app import run_gui
 
 
 class PoolWorker(QtCore.QThread):
@@ -611,25 +612,8 @@ class Window(QtWidgets.QMainWindow):
 
 
 def main() -> None:
-    """Start Picasso: Average, load its plugins and run the Qt event loop."""
-    app = QtWidgets.QApplication(sys.argv)
-    window = Window()
-
-    # load plugins from ~/.picasso/plugins
-    from .plugins_loader import load_plugins, add_plugins_menu_actions
-
-    load_plugins(window, "average")
-    add_plugins_menu_actions(window, "average")
-
-    window.show()
-
-    from ..updater import setup_gui_update_check
-
-    setup_gui_update_check(window)
-
-    lib.install_excepthook(window)
-
-    sys.exit(app.exec())
+    """Start Picasso: Average - see ``picasso.gui.app.run_gui``."""
+    sys.exit(run_gui(Window, "average"))
 
 
 if __name__ == "__main__":

@@ -1242,6 +1242,11 @@ class HelpButton(QtWidgets.QToolButton):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl(self.help_url))
 
 
+#: Emitter of the excepthook installed by ``install_excepthook``, kept
+#: alive here because the hook outlives the call that installed it.
+_error_signaler = None
+
+
 def cancel_dialogs():
     """Closes all open dialogs (``ProgressDialog`` and ``StatusDialog``)
     in the GUI.
@@ -1268,7 +1273,7 @@ def cancel_dialogs():
     QtCore.QCoreApplication.instance().processEvents()  # just in case...
 
 
-def install_excepthook(window) -> None:
+def install_excepthook(window=None) -> None:
     """Install hooks that show uncaught exceptions in a QMessageBox and
     write them to the Picasso log (``~/.picasso/logs/picasso.log``).
 
@@ -1277,10 +1282,15 @@ def install_excepthook(window) -> None:
     QThread workers because the error signal is queued to the main thread
     by Qt's event loop.
 
+    Call it again once the main window exists to parent the box on it;
+    the previous hooks are replaced, not chained.
+
     Parameters
     ----------
-    window : QtWidgets.QWidget
-        Parent of the message box.
+    window : QtWidgets.QWidget, optional
+        Parent of the message box. None (default) shows a parentless box,
+        which is what ``picasso.gui.app.run_gui`` uses to report failures
+        that happen while the main window is still being built.
     """
 
     # no-op unless the GUI runs without a console (one-click builds),
@@ -1317,8 +1327,10 @@ def install_excepthook(window) -> None:
             showing.clear()
 
     signaler.error.connect(_show_error)
-    # keep the signaler alive for the lifetime of the window
-    window._error_signaler = signaler
+    # keep the signaler (and hence the connection) alive; module level
+    # because ``window`` may not exist yet
+    global _error_signaler
+    _error_signaler = signaler
 
     diagnostics.install_excepthooks(report=signaler.error.emit)
 
