@@ -3005,6 +3005,14 @@ def main():  # noqa: C901
     handler. Called by the ``picasso`` console script and by
     ``python -m picasso``. Run ``picasso -h`` for the full list.
     """
+    from .diagnostics import ensure_std_streams, install_excepthooks
+
+    # in the windowed one-click build there is no console: give the
+    # process usable streams and log uncaught exceptions to
+    # ~/.picasso/logs/picasso.log instead of dropping them
+    ensure_std_streams()
+    install_excepthooks()
+
     # Main parser
     parser = argparse.ArgumentParser("picasso")
     subparsers = parser.add_subparsers(dest="command")

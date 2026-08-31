@@ -43,3 +43,12 @@ If you installed Picasso using the one click installer from `the Picasso release
 
 - Navigate to your Applications folder and right-click on the picasso app, then select "Show Package Contents".
 - Add your sound files to ``Contents/Frameworks/picasso/gui/notification_sounds``.
+
+
+Error log
+---------
+Every uncaught error is appended to ``~/.picasso/logs/picasso.log`` (i.e. ``C:\Users\<you>\.picasso\logs\picasso.log`` on Windows), together with the tracebacks of failing background threads. The file rotates to ``picasso.log.1`` once it exceeds 5 MB.
+
+This matters most for the one-click installers: their GUIs are started from a windowed executable with no console attached, so anything the program prints has nowhere to go. Picasso therefore redirects its output to that log file. When an error occurs, Picasso shows it in a message box (click *Show Details...* for the full traceback) and writes the same traceback to the log.
+
+When reporting a problem on `GitHub <https://github.com/jungmannlab/picasso/issues>`__, please attach the log file - it contains the traceback of the failure.

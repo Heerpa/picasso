@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import math
 import os
-import sys
 import time
 import traceback
 from collections.abc import Callable
@@ -27,7 +26,7 @@ import matplotlib.pyplot as plt
 from PyQt6 import QtCore, QtWidgets, QtGui
 from playsound3 import playsound
 
-from picasso import io
+from picasso import diagnostics, io
 from picasso.lib import (
     _dialogs,
     SOUND_NOTIFICATION_DURATION,
@@ -371,7 +370,8 @@ class ProgressDialog(QtWidgets.QProgressDialog):
         event : QtGui.QCloseEvent
             The Qt close event.
         """
-        _dialogs.remove(self)
+        if self in _dialogs:  # not armed yet, or closed twice
+            _dialogs.remove(self)
         if self.finished is False:
             self.finished = True
             self.play_sound_notification()
@@ -395,10 +395,22 @@ class ProgressDialog(QtWidgets.QProgressDialog):
 
     def play_sound_notification(self):
         """Play a sound notification if a sound file is specified and
-        at least a minute has passed since the dialog was opened."""
+        at least a minute has passed since the dialog was opened.
+
+        A missing or broken audio backend (which happens in the one-click
+        builds) is logged, not raised: closing a dialog must always
+        succeed, especially while an error is being reported.
+        """
         if self.sound_notification_path is not None:
             if time.time() - self.t0 > SOUND_NOTIFICATION_DURATION:
-                playsound(self.sound_notification_path, block=False)
+                try:
+                    playsound(self.sound_notification_path, block=False)
+                except Exception:  # noqa: BLE001 - notification only
+                    diagnostics.log_message(
+                        "Could not play the sound notification"
+                        f" {self.sound_notification_path}:\n"
+                        f"{traceback.format_exc()}"
+                    )
 
     def get_iterator(self, start=None, end=None):
         """Get an iterator that spans the dialog's remaining progress.
@@ -444,10 +456,18 @@ class StatusDialog(Dialog):
         event : QtGui.QCloseEvent
             The Qt close event.
         """
-        _dialogs.remove(self)
+        if self in _dialogs:  # closed twice
+            _dialogs.remove(self)
         if self.sound_notification_path is not None:
             if time.time() - self.t0 > SOUND_NOTIFICATION_DURATION:
-                playsound(self.sound_notification_path, block=False)
+                try:
+                    playsound(self.sound_notification_path, block=False)
+                except Exception:  # noqa: BLE001 - notification only
+                    diagnostics.log_message(
+                        "Could not play the sound notification"
+                        f" {self.sound_notification_path}:\n"
+                        f"{traceback.format_exc()}"
+                    )
 
 
 # type alias for the progress dialogs
@@ -1224,22 +1244,38 @@ class HelpButton(QtWidgets.QToolButton):
 
 def cancel_dialogs():
     """Closes all open dialogs (``ProgressDialog`` and ``StatusDialog``)
-    in the GUI."""
+    in the GUI.
+
+    Called from the excepthook while an error is being reported, so a
+    dialog that fails to close is logged and skipped: it must not stop
+    the remaining dialogs from closing, nor the error from reaching the
+    user.
+    """
     dialogs = [_ for _ in _dialogs]
     for dialog in dialogs:
-        if isinstance(dialog, ProgressDialog):
-            dialog.cancel()
-        else:
-            dialog.close()
+        try:
+            if isinstance(dialog, ProgressDialog):
+                dialog.cancel()
+            else:
+                dialog.close()
+        except Exception:  # noqa: BLE001 - cleanup must not raise
+            diagnostics.log_message(
+                f"Failed to close {type(dialog).__name__}:\n"
+                f"{traceback.format_exc()}"
+            )
+            if dialog in _dialogs:
+                _dialogs.remove(dialog)
     QtCore.QCoreApplication.instance().processEvents()  # just in case...
 
 
 def install_excepthook(window) -> None:
-    """Install a thread-safe excepthook that shows uncaught exceptions in a
-    QMessageBox.
+    """Install hooks that show uncaught exceptions in a QMessageBox and
+    write them to the Picasso log (``~/.picasso/logs/picasso.log``).
 
-    Safe to call from QThread workers because the error signal is queued to
-    the main thread by Qt's event loop.
+    Covers the main thread, worker threads (``threading.excepthook``) and
+    unraisable exceptions - see ``picasso.diagnostics``. Safe to call from
+    QThread workers because the error signal is queued to the main thread
+    by Qt's event loop.
 
     Parameters
     ----------
@@ -1247,23 +1283,44 @@ def install_excepthook(window) -> None:
         Parent of the message box.
     """
 
+    # no-op unless the GUI runs without a console (one-click builds),
+    # where sys.stdout/sys.stderr are None
+    diagnostics.ensure_std_streams()
+
     class _ErrorSignaler(QtCore.QObject):
         error = QtCore.pyqtSignal(str)
 
     signaler = _ErrorSignaler()
+    showing = []  # non-empty while an error box is open
 
     def _show_error(message: str) -> None:
-        cancel_dialogs()
-        QtWidgets.QMessageBox.critical(window, "An error occurred", message)
+        if showing:  # do not stack one box per failed worker
+            return
+        showing.append(True)
+        try:
+            try:
+                cancel_dialogs()
+            except Exception:  # noqa: BLE001 - report the original error
+                diagnostics.log_message(traceback.format_exc())
+            lines = message.strip().splitlines()
+            summary = lines[-1] if lines else "An unknown error occurred."
+            box = QtWidgets.QMessageBox(window)
+            box.setIcon(QtWidgets.QMessageBox.Icon.Critical)
+            box.setWindowTitle("An error occurred")
+            box.setText(summary)
+            box.setInformativeText(
+                f"The full traceback was written to\n{diagnostics.log_path()}"
+            )
+            box.setDetailedText(message)
+            box.exec()
+        finally:
+            showing.clear()
 
     signaler.error.connect(_show_error)
+    # keep the signaler alive for the lifetime of the window
+    window._error_signaler = signaler
 
-    def excepthook(type, value, tback):
-        message = "".join(traceback.format_exception(type, value, tback))
-        signaler.error.emit(message)
-        sys.__excepthook__(type, value, tback)
-
-    sys.excepthook = excepthook
+    diagnostics.install_excepthooks(report=signaler.error.emit)
 
 
 def adjust_widget_size(
