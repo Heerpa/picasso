@@ -192,6 +192,28 @@ class TestSaveLoadLocs:
         np.testing.assert_allclose(
             loaded["x"].to_numpy(), locs["x"].to_numpy()
         )
+    
+    def test_load_locs_falls_back_for_hdf5_group(
+        self, tmp_path, locs, info
+    ):
+        # Regression test for HDF5 files where /locs is an h5py.Group
+        # rather than a Picasso compound Dataset. The h5py reader must
+        # not access .dtype on the Group and should fall back to pandas.
+        path = tmp_path / "locs.hdf5"
+
+        locs.to_hdf(path, key="locs", mode="w", format="fixed")
+
+        with h5py.File(path, "r") as f:
+            assert isinstance(f["locs"], h5py.Group)
+
+        loaded = io._read_locs_dataset(str(path))
+
+        assert len(loaded) == len(locs)
+        assert set(loaded.columns) == set(locs.columns)
+        np.testing.assert_allclose(
+            loaded["x"].to_numpy(),
+            locs["x"].to_numpy(),
+        )
 
     def test_combine_channels_inner_join_preserves_all_rows(
         self, tmp_path, locs, info
