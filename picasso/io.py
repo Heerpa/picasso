@@ -4209,11 +4209,11 @@ def _read_locs_dataset(path: str, progress=None) -> pd.DataFrame:
         if "locs" not in locs_file:
             raise KeyError(f"File: {path} does not contain a 'locs' dataset.")
         dataset = locs_file["locs"]
-        
+
         # Only Picasso compound datasets can be read block-wise with h5py.
         if isinstance(dataset, h5py.Dataset):
             names = getattr(dataset.dtype, "names", None)
-            
+
             if names is not None:
                 n_locs = len(dataset)
                 # fill one contiguous array per column, such that no copy of
@@ -4231,8 +4231,8 @@ def _read_locs_dataset(path: str, progress=None) -> pd.DataFrame:
                         progress(stop, n_locs)
                 return pd.DataFrame(columns, copy=False)
              
-        # Non-compound HDF5 layouts are handled by PyTables/pandas.
-        return pd.read_hdf(path, key="locs")
+    # Non-compound HDF5 layouts are handled by PyTables/pandas.
+    return pd.read_hdf(path, key="locs")
 
 
 def load_locs(
