@@ -445,7 +445,17 @@ class StatusDialog(Dialog):
         self.sound_notification_path = get_sound_notification_path()
         self.t0 = time.time()
         self.show()
-        QtCore.QCoreApplication.instance().processEvents()
+        self.raise_()
+        # Paint the dialog before the caller starts its (blocking) work.
+        # A single processEvents() is not enough: the window may be mapped
+        # before its paint event is delivered, leaving an empty dialog for
+        # the whole computation. repaint() forces the paint synchronously.
+        app = QtCore.QCoreApplication.instance()
+        if app is not None:
+            app.processEvents()
+        self.repaint()
+        if app is not None:
+            app.processEvents()
 
     def closeEvent(self, event):
         """Unregister the dialog and play the notification sound if the task
