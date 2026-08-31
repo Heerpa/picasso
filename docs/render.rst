@@ -9,7 +9,7 @@ render
 Opening Files
 -------------
 1. Rendering of the super-resolution image: In ``Picasso: Render``, open a movie file by dragging a localization file (ending with '.hdf5') into the window or by selecting ``File > Open``. The super-resolution image will be rendered automatically. A region of choice can be zoomed into by a rectangular selection using the left mouse button. The 'View' menu contains more options for zooming and panning.
-2. (Optional) Adjust rendering options by selecting ``View > Display Settings``. The field 'Display pixel size (nm)' defines the size of the rendered pixels of the super-resolution image. The contrast settings ``Min. Density`` and ``Max. Density`` define at which number of localizations per super-resolution pixel the minimum and maximum color of the colormap should be applied.
+2. (Optional) Adjust rendering options by selecting ``View > Display Settings``. The field 'Display pixel size (nm)' defines the size of the rendered pixels of the super-resolution image. The contrast settings ``Min. Density`` and ``Max. Density`` define at which number of localizations per super-resolution pixel the minimum and maximum color of the colormap should be applied. They can be typed in or dragged on the two-handle slider below them, whose track is logarithmic and spans the densities present in the rendered image.
 3. (Optional) For multiplexed image acquisition, open HDF5 localization files from other channels subsequently. Alternatively, drag and drop all HDF5 files to be displayed simultaneously.
 
 Drift Correction

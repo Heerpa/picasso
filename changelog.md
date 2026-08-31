@@ -4,16 +4,17 @@ Last change: 31-AUG-2026 CEST
 
 ## 0.11.1
 - Localize loads z-stack `.nd2` files.
-- Localize's contrast is not set to auto on opening a new movie
-- Fixed empty space in Localize's Parameters dialog 
+- Localize's contrast is not set to auto on opening a new movie.
+- Fixed empty space in Localize's Parameters dialog.
 - Fixed drawing ROIs in Localize while the temporal median filter is on.
+- Log-scale contrast slider in the Display Settings dialogs of Render and of the 3D (rotation) window.
 - Render asks for the camera pixel size when loading `.hdf5` files whose metadata does not contain `Pixelsize` (e.g. saved by old Picasso versions), instead of raising an error at rendering.
 - Fixed save cluster areas for SMLM clusterer ([#697](https://github.com/jungmannlab/picasso/issues/697)).
-- Fixed the occasional "AttributeError: 'ViewRotation' object has no attribute 'viewport'" before the 3D window was opened
+- Fixed the occasional "AttributeError: 'ViewRotation' object has no attribute 'viewport'" before the 3D window was opened.
 - Fixed SPINNA simulations for empty targets.
-- Average uses the shared global process pool: thus the initialization is not needed for each iteration
-- Capping multiprocessing at 61 processes only on Windows
-- More instructions on plugins
+- Average uses the shared global process pool: thus the initialization is not needed for each iteration.
+- Capping multiprocessing at 61 processes only on Windows.
+- More instructions on plugins.
 
 ## 0.11.0
 

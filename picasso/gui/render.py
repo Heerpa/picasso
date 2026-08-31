@@ -6461,6 +6461,9 @@ class DisplaySettingsDialog(lib.Dialog):
         properties.
     color_step : QSpinBox
         Defines how many colors are to be rendered.
+    contrast_slider : DensityContrastSlider(RangeSlider)
+        Log-scale two-handle slider mirroring the minimum and maximum
+        density spin boxes.
     disp_px_size : QDoubleSpinBox
         Contains the size of super-resolution pixels in nm.
     dynamic_disp_px : QCheckBox
@@ -6580,13 +6583,23 @@ class DisplaySettingsDialog(lib.Dialog):
         self.maximum.setKeyboardTracking(False)
         self.maximum.valueChanged.connect(self.update_scene)
         contrast_grid.addWidget(self.maximum, 1, 1)
+        # log-scale slider mirroring the two spin boxes, for dragging the
+        # contrast instead of typing it
+        self.contrast_slider = lib.DensityContrastSlider(
+            self.minimum,
+            self.maximum,
+            image=lambda: getattr(
+                getattr(self.window, "view", None), "image", None
+            ),
+        )
+        contrast_grid.addWidget(self.contrast_slider, 2, 0, 1, 2)
         c_label = QtWidgets.QLabel("Colormap:")
         c_label.setToolTip("Colormap used for rendering single-channel data.")
-        contrast_grid.addWidget(c_label, 2, 0)
+        contrast_grid.addWidget(c_label, 3, 0)
         self.colormap = QtWidgets.QComboBox()
         self.colormap.addItems(plt.colormaps())
         self.colormap.addItem("Custom")
-        contrast_grid.addWidget(self.colormap, 2, 1)
+        contrast_grid.addWidget(self.colormap, 3, 1)
         self.colormap.currentIndexChanged.connect(self.on_cmap_changed)
 
         # Blur
@@ -6878,12 +6891,15 @@ class DisplaySettingsDialog(lib.Dialog):
         self.minimum.blockSignals(True)
         self.minimum.setValue(value)
         self.minimum.blockSignals(False)
+        # the spin box' signals are blocked, so the slider is moved here
+        self.contrast_slider.sync()
 
     def silent_maximum_update(self, value: float) -> None:
         """Change the value of self.maximum in the background."""
         self.maximum.blockSignals(True)
         self.maximum.setValue(value)
         self.maximum.blockSignals(False)
+        self.contrast_slider.sync()
 
     def render_scene(self, *args, **kwargs) -> None:
         """Update scene in the main window."""

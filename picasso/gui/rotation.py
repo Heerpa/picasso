@@ -45,6 +45,9 @@ class DisplaySettingsRotationDialog(lib.Dialog):
         Contains available localization blur methods.
     colormap : QComboBox
         Contains strings with available colormaps (single channel only).
+    contrast_slider : DensityContrastSlider(RangeSlider)
+        Log-scale two-handle slider mirroring the minimum and maximum
+        density spin boxes.
     dynamic_disp_px : QCheckBox
         Tick to automatically adjust to current window size when
         zooming.
@@ -129,12 +132,22 @@ class DisplaySettingsRotationDialog(lib.Dialog):
         self.maximum.setKeyboardTracking(False)
         self.maximum.valueChanged.connect(self.render_scene)
         contrast_grid.addWidget(self.maximum, 1, 1)
+        # log-scale slider mirroring the two spin boxes, for dragging the
+        # contrast instead of typing it
+        self.contrast_slider = lib.DensityContrastSlider(
+            self.minimum,
+            self.maximum,
+            image=lambda: getattr(
+                getattr(self.window, "view_rot", None), "image", None
+            ),
+        )
+        contrast_grid.addWidget(self.contrast_slider, 2, 0, 1, 2)
         c_label = QtWidgets.QLabel("Colormap:")
         c_label.setToolTip("Colormap used to render localizations.")
-        contrast_grid.addWidget(c_label, 2, 0)
+        contrast_grid.addWidget(c_label, 3, 0)
         self.colormap = QtWidgets.QComboBox()
         self.colormap.addItems(plt.colormaps())
-        contrast_grid.addWidget(self.colormap, 2, 1)
+        contrast_grid.addWidget(self.colormap, 3, 1)
         self.colormap.currentIndexChanged.connect(self.render_scene)
 
         # blur
@@ -263,12 +276,15 @@ class DisplaySettingsRotationDialog(lib.Dialog):
         self.minimum.blockSignals(True)
         self.minimum.setValue(value)
         self.minimum.blockSignals(False)
+        # the spin box' signals are blocked, so the slider is moved here
+        self.contrast_slider.sync()
 
     def silent_maximum_update(self, value: float) -> None:
         """Change the value of self.maximum in the background."""
         self.maximum.blockSignals(True)
         self.maximum.setValue(value)
         self.maximum.blockSignals(False)
+        self.contrast_slider.sync()
 
     def _uncheck_optimal_scalebar(self, *args) -> None:
         """Uncheck the automatic scale bar checkbox when the user

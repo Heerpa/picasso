@@ -102,6 +102,7 @@ _QT_NAMES = (
     "ScrollableGroupBox",
     "LogDoubleSpinBox",
     "RangeSlider",
+    "DensityContrastSlider",
     "GenericPlotWindow",
     "RemoveColumnsDialog",
     "HelpButton",

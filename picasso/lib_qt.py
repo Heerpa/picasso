@@ -14,10 +14,12 @@ PyQt6 is only imported on first use.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import time
 import traceback
+from collections.abc import Callable
 from typing import TypeAlias
 
 import yaml
@@ -556,6 +558,10 @@ class RangeSlider(QtWidgets.QWidget):
     ``valuesChanged`` is emitted whenever the pair changes, both on user
     interaction and on a programmatic ``setValues`` / ``setRange`` (like
     ``QSlider.setValue``); block the signals to update silently.
+
+    The track is linear by default; ``setLogScale`` switches it to a
+    logarithmic one, which is what strongly skewed quantities (rendered
+    localization densities, for instance) need to be adjustable at all.
     """
 
     valuesChanged = QtCore.pyqtSignal(float, float)
@@ -574,6 +580,9 @@ class RangeSlider(QtWidgets.QWidget):
         # consumers that quantize the values (e.g. to integers) set it to
         # the quantum so that low and high cannot collapse onto each other.
         self._min_gap = 0.0
+        # Number of decades the track spans when logarithmic; 0 is linear.
+        # See ``setLogScale``.
+        self._log_decades = 0.0
         self._pressed_handle = None  # None, "low" or "high"
         self._last_handle = "low"  # the one the arrow keys move
         self._value_labels = ("Min", "Max")
@@ -683,6 +692,32 @@ class RangeSlider(QtWidgets.QWidget):
         """
         self._value_labels = (low_label, high_label)
         self._update_tooltip()
+
+    def setLogScale(self, log: bool, decades: float = 3.0) -> None:
+        """Make the track logarithmic (or linear again).
+
+        The mapping is a symmetric-log one, ``log10(1 + f / c)`` of the
+        linear fraction ``f`` with ``c = 10 ** -decades``, normalized to
+        span the widget. It is scale-free (it only depends on where a
+        value sits within the track) and, unlike a plain logarithm, it is
+        defined at the lower end of the track, so a track starting at
+        zero works.
+
+        Parameters
+        ----------
+        log : bool
+            True for a logarithmic track, False for a linear one.
+        decades : float, optional
+            Number of decades below the top of the track that stay
+            resolvable; everything below is squeezed into the first
+            pixels. Default is 3.
+        """
+        self._log_decades = max(0.0, float(decades)) if log else 0.0
+        self.update()
+
+    def logScale(self) -> bool:
+        """Whether the track is logarithmic."""
+        return bool(self._log_decades)
 
     # -- Painting ----------------------------------------------------
 
@@ -808,13 +843,23 @@ class RangeSlider(QtWidgets.QWidget):
             QtCore.Qt.Key.Key_Down,
             QtCore.Qt.Key.Key_Up,
         ):
-            step = self._step()
-            if key in (QtCore.Qt.Key.Key_Left, QtCore.Qt.Key.Key_Down):
-                step = -step
+            direction = (
+                -1
+                if key in (QtCore.Qt.Key.Key_Left, QtCore.Qt.Key.Key_Down)
+                else 1
+            )
             if self._last_handle == "high":
-                self.setValues(self._low, self._high + step, moved="high")
+                self.setValues(
+                    self._low,
+                    self._stepped(self._high, direction),
+                    moved="high",
+                )
             else:
-                self.setValues(self._low + step, self._high, moved="low")
+                self.setValues(
+                    self._stepped(self._low, direction),
+                    self._high,
+                    moved="low",
+                )
             event.accept()
             return
         super().keyPressEvent(event)
@@ -838,21 +883,61 @@ class RangeSlider(QtWidgets.QWidget):
         span = self._maximum - self._minimum
         return max(self._min_gap, span / 100.0) if span else 0.0
 
+    def _stepped(self, value: float, direction: int) -> float:
+        """The value one arrow-key step away from ``value``.
+
+        On a logarithmic track the step is a constant fraction of the
+        widget's width, so that the handle moves by the same distance
+        everywhere; on a linear one it is a constant value.
+
+        Parameters
+        ----------
+        value : float
+            The handle's current value.
+        direction : int
+            +1 to step up, -1 to step down.
+
+        Returns
+        -------
+        float
+            The stepped value.
+        """
+        if self._log_decades:
+            fraction = self._value_to_fraction(value) + direction / 100.0
+            return self._fraction_to_value(fraction)
+        return value + direction * self._step()
+
+    def _value_to_fraction(self, value: float) -> float:
+        """Where ``value`` sits along the track, as a fraction in [0, 1],
+        after the log mapping (if any)."""
+        span = self._maximum - self._minimum
+        fraction = (value - self._minimum) / span if span else 0.0
+        fraction = min(max(fraction, 0.0), 1.0)
+        if self._log_decades:
+            c = 10.0**-self._log_decades
+            fraction = math.log10(1.0 + fraction / c) / math.log10(1.0 + 1 / c)
+        return fraction
+
+    def _fraction_to_value(self, fraction: float) -> float:
+        """Inverse of ``_value_to_fraction``."""
+        fraction = min(max(fraction, 0.0), 1.0)
+        if self._log_decades:
+            c = 10.0**-self._log_decades
+            fraction = c * ((1.0 + 1 / c) ** fraction - 1.0)
+        return self._minimum + fraction * (self._maximum - self._minimum)
+
     def _usable_width(self) -> float:
         return max(1.0, self.width() - self.HANDLE_WIDTH)
 
     def _value_to_x(self, value: float) -> float:
         """Pixel position of a handle's center, inset by half a handle so
         that the handles stay inside the widget at both ends."""
-        span = self._maximum - self._minimum
-        fraction = (value - self._minimum) / span if span else 0.0
-        fraction = min(max(fraction, 0.0), 1.0)
+        fraction = self._value_to_fraction(value)
         return self.HANDLE_WIDTH / 2 + fraction * self._usable_width()
 
     def _x_to_value(self, x: float) -> float:
         fraction = (x - self.HANDLE_WIDTH / 2) / self._usable_width()
-        fraction = min(max(fraction, 0.0), 1.0)
-        return self._minimum + fraction * (self._maximum - self._minimum)
+        return self._fraction_to_value(fraction)
 
     def _handle_at(self, x: float) -> str:
         """The handle a click at ``x`` grabs: the one under the cursor, or
@@ -875,9 +960,141 @@ class RangeSlider(QtWidgets.QWidget):
 
     def _update_tooltip(self) -> None:
         low_label, high_label = self._value_labels
-        self.setToolTip(
-            f"{low_label}: {self._low:,.0f}, {high_label}: {self._high:,.0f}"
-        )
+        low = self._format_value(self._low)
+        high = self._format_value(self._high)
+        self.setToolTip(f"{low_label}: {low}, {high_label}: {high}")
+
+    def _format_value(self, value: float) -> str:
+        """Format a handle value for the tooltip, keeping the decimals
+        that a small track (e.g. localization densities below one) needs
+        and dropping them for a large one (e.g. camera counts)."""
+        span = self._maximum - self._minimum
+        if span >= 100:
+            return f"{value:,.0f}"
+        if span >= 10:
+            return f"{value:,.1f}"
+        return f"{value:,.4g}"
+
+
+class DensityContrastSlider(RangeSlider):
+    """Log-scale two-handle slider bound to a pair of density spin boxes.
+
+    Used by the Display Settings dialogs of Picasso: Render and of the
+    rotation window to drag the minimum and maximum rendered density
+    instead of typing them. The spin boxes stay the single source of
+    truth: the slider writes into them (so their usual re-render is
+    triggered) and is moved back onto their values by ``sync``.
+
+    The track runs from zero to the brightest pixel of the currently
+    rendered image, and is logarithmic, because rendered densities are
+    strongly skewed - on a linear track the useful part of the range
+    would sit within a couple of pixels of the left end.
+
+    Attributes
+    ----------
+    minimum_box, maximum_box : QDoubleSpinBox
+        The spin boxes holding the minimum and maximum density.
+    """
+
+    def __init__(
+        self,
+        minimum_box: QtWidgets.QDoubleSpinBox,
+        maximum_box: QtWidgets.QDoubleSpinBox,
+        image: Callable[[], object] | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        minimum_box, maximum_box : QDoubleSpinBox
+            The spin boxes the slider is bound to.
+        image : callable, optional
+            Returns the raw (grayscale) rendered image, whose maximum
+            gives the top of the track, or None if nothing is rendered
+            yet. Called on every ``sync``. Default is None, which sizes
+            the track from the spin box values alone.
+        parent : QWidget, optional
+            The parent widget. Default is None.
+        """
+        super().__init__(parent)
+        self.minimum_box = minimum_box
+        self.maximum_box = maximum_box
+        self._image = image
+        # guards the two-way binding: while the slider writes into the
+        # spin boxes, their signals must not move the slider back
+        self._updating = False
+        # the last image the track was sized from, and its maximum, so
+        # that dragging does not scan the image on every mouse move
+        self._last_image = None
+        self._last_upper = 0.0
+        self.setLogScale(True)
+        self.setValueLabels("Min. density", "Max. density")
+        # the spin boxes quantize the values, so the handles must not be
+        # able to collapse onto each other
+        self.setMinimumGap(10 ** -maximum_box.decimals())
+        self.setMaximumHeight(15)
+        self.valuesChanged.connect(self._on_values_changed)
+        minimum_box.valueChanged.connect(self.sync)
+        maximum_box.valueChanged.connect(self.sync)
+        self.sync()
+
+    def sync(self, *args) -> None:
+        """Re-derive the track from the rendered image and move the
+        handles onto the spin box values, without emitting
+        ``valuesChanged``.
+
+        Parameters
+        ----------
+        *args
+            Ignored; lets the method be connected to value signals.
+        """
+        if self._updating:  # the slider itself is driving the change
+            return
+        low = self.minimum_box.value()
+        high = self.maximum_box.value()
+        # never cut off a value the user (or autoscaling) has set
+        upper = max(self._image_maximum(), low, high)
+        if upper <= 0:
+            upper = 1.0
+        self.blockSignals(True)
+        try:
+            self.setRange(0.0, upper)
+            self.setValues(low, high)
+        finally:
+            self.blockSignals(False)
+        self.update()
+
+    def _image_maximum(self) -> float:
+        """The brightest pixel of the rendered image, or 0 if there is
+        none. Cached, as ``sync`` runs on every drag step."""
+        if self._image is None:
+            return 0.0
+        image = self._image()
+        if image is None or not getattr(image, "size", 0):
+            return 0.0
+        if image is not self._last_image:
+            self._last_image = image
+            self._last_upper = float(image.max())
+        return self._last_upper
+
+    def _on_values_changed(self, low: float, high: float) -> None:
+        """Write a dragged handle into its spin box, which re-renders.
+
+        Parameters
+        ----------
+        low, high : float
+            The new handle positions.
+        """
+        self._updating = True
+        try:
+            # only the handle that actually moved, so that a drag
+            # triggers a single re-render
+            if low != self.minimum_box.value():
+                self.minimum_box.setValue(low)
+            if high != self.maximum_box.value():
+                self.maximum_box.setValue(high)
+        finally:
+            self._updating = False
 
 
 class GenericPlotWindow(QtWidgets.QTabWidget):
