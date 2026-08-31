@@ -3469,9 +3469,10 @@ class TestClustererDialog(lib.Dialog):
         Channel index for localizations that are tested.
     clusterer_name : QComboBox
         Contains all clusterer types available in Picasso: Render.
-    contrast_slider : QSlider
-        Adjusts the brightness (contrast) of the rendered view. The
-        center position corresponds to automatic contrast.
+    contrast_slider : RangeSlider
+        Log-scale two-handle slider holding the minimum and maximum
+        density of the rendered view. Seeded with the automatic contrast
+        limits of the first rendering.
     display_all_locs : QCheckBox
         If ticked, unclustered locs are displayed in separate channel.
     pick : list
@@ -3592,15 +3593,16 @@ class TestClustererDialog(lib.Dialog):
         contrast_label = QtWidgets.QLabel("Contrast:")
         contrast_label.setToolTip("Adjust the brightness of the rendering.")
         contrast_layout.addWidget(contrast_label)
-        self.contrast_slider = QtWidgets.QSlider(
-            QtCore.Qt.Orientation.Horizontal
-        )
+        # log-scale track, like in the Display Settings dialog: the
+        # rendered densities are strongly skewed, so a linear one would
+        # squeeze the useful range into a few pixels
+        self.contrast_slider = lib.RangeSlider()
         self.contrast_slider.setToolTip(
-            "Adjust the brightness of the rendering."
+            "Adjust the minimum and maximum rendered density."
         )
-        self.contrast_slider.setRange(-100, 100)
-        self.contrast_slider.setValue(0)
-        self.contrast_slider.valueChanged.connect(self.view._apply_contrast)
+        self.contrast_slider.setLogScale(True)
+        self.contrast_slider.setValueLabels("Min. density", "Max. density")
+        self.contrast_slider.valuesChanged.connect(self.view._apply_contrast)
         contrast_layout.addWidget(self.contrast_slider)
         parameters_grid.addLayout(contrast_layout, 6, 0, 1, 2)
 
@@ -4326,6 +4328,9 @@ class TestClustererView(QtWidgets.QLabel):
         # without re-rendering the localizations
         self._raw_image = None
         self._auto_contrast = None
+        # whether the contrast slider has been given its initial values;
+        # afterwards the user's limits are kept across re-renderings
+        self._contrast_seeded = False
         self._render_locs = None
         self._render_info = None
         self._render_colors = None
@@ -4420,20 +4425,46 @@ class TestClustererView(QtWidgets.QLabel):
         self._render_locs = locs
         self._render_info = info
         self._render_colors = colors
+        self._sync_contrast_slider()
         self._apply_contrast()
 
-    def _apply_contrast(self) -> None:
-        """Rescale the cached raw image with the contrast slider value
+    def _sync_contrast_slider(self) -> None:
+        """Fit the contrast slider's track to the image just rendered,
+        seeding its handles with the auto-contrast limits the first time.
+
+        Later renderings keep whatever limits the user has dragged, so
+        that two clustering settings can be compared at one contrast.
+        """
+        slider = self.dialog.contrast_slider
+        vmin, vmax = self._auto_contrast
+        upper = float(self._raw_image.max()) if self._raw_image.size else 0.0
+        # never cut off the auto-contrast limits, nor the handles the
+        # user has set (before seeding they are still the widget's
+        # defaults and say nothing about the data)
+        low, high = slider.values()
+        upper = max(upper, vmax, high if self._contrast_seeded else 0.0, 1e-6)
+        slider.blockSignals(True)
+        try:
+            # the handles must not be able to collapse onto each other,
+            # or the rendering would divide by a zero contrast range
+            slider.setMinimumGap(upper / 1e4)
+            slider.setRange(0.0, upper)
+            if self._contrast_seeded:
+                slider.setValues(low, high)
+            else:
+                slider.setValues(vmin, vmax)
+                self._contrast_seeded = True
+        finally:
+            slider.blockSignals(False)
+        slider.update()
+
+    def _apply_contrast(self, *args) -> None:
+        """Rescale the cached raw image with the contrast slider's limits
         and display it. Cheap compared to ``update_scene`` as it reuses
         the cached raw image instead of re-rendering localizations."""
         if self._raw_image is None:
             return
-        vmin, vmax = self._auto_contrast
-        # slider in [-100, 100] maps exponentially to a brightness
-        # factor in [0.25, 4], with 0 (default) leaving auto-contrast
-        # unchanged; brighter means a lower upper contrast limit
-        factor = 2 ** (self.dialog.contrast_slider.value() / 50.0)
-        contrast = (vmin, vmax / factor)
+        contrast = self.dialog.contrast_slider.values()
         qimage = render.render_scene(
             locs=self._render_locs,
             info=self._render_info,

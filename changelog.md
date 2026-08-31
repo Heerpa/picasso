@@ -7,7 +7,7 @@ Last change: 31-AUG-2026 CEST
 - Localize's contrast is not set to auto on opening a new movie.
 - Fixed empty space in Localize's Parameters dialog.
 - Fixed drawing ROIs in Localize while the temporal median filter is on.
-- Log-scale contrast slider in the Display Settings dialogs of Render and of the 3D (rotation) window.
+- Log-scale contrast sliders in Render: in the Display Settings dialogs of the main and of the 3D (rotation) window, and in the Test Clustering dialog.
 - Render asks for the camera pixel size when loading `.hdf5` files whose metadata does not contain `Pixelsize` (e.g. saved by old Picasso versions), instead of raising an error at rendering.
 - Fixed save cluster areas for SMLM clusterer ([#697](https://github.com/jungmannlab/picasso/issues/697)).
 - Fixed the occasional "AttributeError: 'ViewRotation' object has no attribute 'viewport'" before the 3D window was opened.
