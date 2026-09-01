@@ -361,6 +361,21 @@ class ProgressDialog(QtWidgets.QProgressDialog):
                 self.t0_est = time.time()
         self.app.processEvents()
 
+    def close(self):
+        """Close the dialog for good, cancelling a pending delayed show.
+
+        The first ``set_value`` arms Qt's ``minimumDuration`` timer, which
+        calls ``forceShow()`` when it fires. If the task finishes before
+        that (which happens with small datasets, while long tasks show the
+        dialog on time), the timer would pop the dialog up *after* it was
+        closed, leaving it on screen with no one left to close it.
+        ``reset()`` stops that timer, hides the bar and clears Qt's
+        internal show state, so the dialog cannot re-appear.
+        """
+        if self.initalized:
+            self.reset()
+        return super().close()
+
     def closeEvent(self, event):
         """Unregister the dialog and play the finish sound if it was not
         already played.
