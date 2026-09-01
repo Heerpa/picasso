@@ -4188,6 +4188,42 @@ def save_locs(path: str, locs: pd.DataFrame, info: list[dict]) -> None:
         save_info(info_path, info)
 
 
+def _raise_if_truncated(path: str, error: OSError) -> None:
+    """Re-raise an HDF5 open error as a readable "file is incomplete".
+
+    HDF5 refuses to open a file whose size on disk is smaller than the
+    size recorded in its superblock and reports this as a ``truncated
+    file: ... stored_eof = N`` message. Such a file is almost always
+    still being downloaded, copied or written by another program, which
+    the raw HDF5 message does not convey. Errors of any other kind, and
+    files that are not in fact short, are left to the caller.
+
+    Parameters
+    ----------
+    path : str
+        The path to the HDF5 file that could not be opened.
+    error : OSError
+        The error raised by ``h5py`` when opening ``path``.
+
+    Raises
+    ------
+    OSError
+        If ``path`` is shorter than the size recorded in its superblock.
+    """
+    match = re.search(r"stored_eof\s*=\s*(\d+)", str(error))
+    if match is None:
+        return
+    expected = int(match.group(1))
+    actual = os.path.getsize(path)
+    if actual >= expected:
+        return
+    raise OSError(
+        f"File {path} is incomplete: {actual:,} bytes on disk, "
+        f"{expected:,} bytes expected. It may still be downloading, "
+        "copying, or being written by another program."
+    ) from error
+
+
 def _read_locs_dataset(path: str, progress=None) -> pd.DataFrame:
     """Read the ``locs`` dataset of an .hdf5 file in row blocks.
 
@@ -4215,7 +4251,12 @@ def _read_locs_dataset(path: str, progress=None) -> pd.DataFrame:
     BLOCK_SIZE = LOCS_BLOCK_SIZE
     if not os.path.isfile(path):
         raise FileNotFoundError(f"File {path} does not exist.")
-    with h5py.File(path, "r") as locs_file:
+    try:
+        locs_file = h5py.File(path, "r")
+    except OSError as error:
+        _raise_if_truncated(path, error)
+        raise
+    with locs_file:
         if "locs" not in locs_file:
             raise KeyError(f"File: {path} does not contain a 'locs' dataset.")
         dataset = locs_file["locs"]
@@ -4240,7 +4281,7 @@ def _read_locs_dataset(path: str, progress=None) -> pd.DataFrame:
                     if progress is not None:
                         progress(stop, n_locs)
                 return pd.DataFrame(columns, copy=False)
-             
+
     # Non-compound HDF5 layouts are handled by PyTables/pandas.
     return pd.read_hdf(path, key="locs")
 
