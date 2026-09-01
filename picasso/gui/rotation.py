@@ -825,6 +825,11 @@ class ViewRotation(QtWidgets.QLabel):
         self.infos = []
         self.paths = []
         self.viewport = None
+        # the pick this window shows, copied from the main window when
+        # it is opened (see ``_sync_from_main_window``); None until then
+        self.pick = None
+        self.pick_shape = None
+        self.pick_size = None
         self.group_color = []
         self.x_render_state = False
         self.x_locs = []
@@ -1424,8 +1429,12 @@ class ViewRotation(QtWidgets.QLabel):
         viewport : list or None
             ``[(y_min, x_min), (y_max, x_max)]`` bounding the pick. Only
             returned if ``get_viewport``; otherwise the scene is updated and
-            None is returned.
+            None is returned. None is also returned when no pick has been
+            copied from the main window yet, i.e. before this window has
+            been opened for the first time.
         """
+        if self.pick_shape is None:  # never opened; nothing to fit to
+            return None
         if self.pick_shape == "Circle":
             d = self.pick_size
             r = d / 2
@@ -2243,6 +2252,9 @@ class RotationWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(rotate_tool_action)
 
         self.menus = [file_menu, view_menu, tools_menu]
+        # the window is built here but shown only on demand; see
+        # ``hideEvent`` for why its shortcuts must stay inert
+        self.menu_bar.setEnabled(False)
         self.setMinimumSize(100, 100)
         self.move(20, 20)
 
@@ -2379,6 +2391,23 @@ class RotationWindow(QtWidgets.QMainWindow):
     def update_scene(self) -> None:
         """Update the scene in ViewRotation."""
         self.view_rot.update_scene()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        """Arm the menu bar when the window is shown, see ``hideEvent``."""
+        self.menu_bar.setEnabled(True)
+        QtWidgets.QMainWindow.showEvent(self, event)
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        """Disable the menu bar while the window is hidden.
+
+        This window is built together with the main Render window but
+        only shown on demand. macOS shares one native menu bar across
+        the application, so its shortcuts (Ctrl+W, Ctrl+S, ...) would
+        otherwise fire from the main window while this one has never
+        been opened - the shortcuts of a disabled menu do not.
+        """
+        self.menu_bar.setEnabled(False)
+        QtWidgets.QMainWindow.hideEvent(self, event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         """Close all children dialogs and self."""
