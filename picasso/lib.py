@@ -750,6 +750,9 @@ def overwrite_metadata(
     dictionaries or a dictionary). If the key does not exist an error
     is raised.
 
+    Only the memory copy of the data is modified, the disk storage stays
+    untouched.
+
     Parameters
     ----------
     info : list of dicts or dict

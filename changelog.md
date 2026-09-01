@@ -12,6 +12,7 @@ Last change: 01-SEP-2026 CEST
 - Fixed drawing ROIs in Localize while the temporal median filter is on.
 - Log-scale contrast sliders in Render: in the Display Settings dialogs of the main and of the 3D (rotation) window, and in the Test Clustering dialog.
 - Render asks for the camera pixel size when loading `.hdf5` files whose metadata does not contain `Pixelsize` (e.g. saved by old Picasso versions), instead of raising an error at rendering.
+- Render warns when the loaded channels have different camera pixel sizes and lets the user pick one pixel size for all of them, instead of raising an error at rendering.
 - Fixed save cluster areas for SMLM clusterer ([#697](https://github.com/jungmannlab/picasso/issues/697)).
 - Fixed the occasional "AttributeError: 'ViewRotation' object has no attribute 'viewport'" before the 3D window was opened.
 - Fixed reading of old Picasso files ([#698](https://github.com/jungmannlab/picasso/pull/698)); thanks to @boydcpeters.
