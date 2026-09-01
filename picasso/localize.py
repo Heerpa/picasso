@@ -5548,9 +5548,10 @@ _EXTRAPOLATION_TOLERANCE = 0.2
 
 def _warn_if_extrapolating(transform, rect, channel: int) -> None:
     """Warn when ``rect`` reaches outside the field ``transform`` was fitted
-    on. Only non-affine models can misbehave there, so only they warn."""
+    on. Only non-affine models can misbehave there, so only they warn (a
+    translation is an affine, and extrapolates just as harmlessly)."""
     domain = getattr(transform, "domain", None)
-    if domain is None or transform.model == "affine":
+    if domain is None or isinstance(transform, tform.AffineTransform):
         return
     (y0, x0), (y1, x1) = _normalize_rect(rect)
     corners = np.array(

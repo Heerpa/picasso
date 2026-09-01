@@ -384,6 +384,7 @@ Beads are detected with the current ``Box side length`` and ``Min. net gradient`
 
 ``Transform model`` chooses how the two frames are related:
 
+- **Translation** (2 DOF, at least 1 bead pair) — a shift in x and y and nothing else. The right choice when the two frames are known to differ only by an offset: with one free parameter per axis it is the least noise-prone of the models, and a rotation or scale it cannot absorb shows up in the residual instead of being fitted away.
 - **Affine** (6 DOF, at least 3 bead pairs) — translation, rotation, scale and shear. The default, and what a well-aligned optical path does to first order.
 - **Projective** (8 DOF, at least 4 pairs) — adds the perspective (keystone) term that a tilted dichroic or an unequal path length introduces. The residual an affine leaves grows towards the edges of the field, which is exactly what this removes.
 - **Polynomial2 / Polynomial3** (at least 6 / 10 pairs) — a smooth warp of that degree that follows genuine field distortion. This is not an optical model, and it extrapolates badly outside the region the beads span, so use it only with many, well-spread beads. Its reverse map is fitted independently rather than inverted algebraically, so round-tripping a coordinate is accurate only to the round-trip RMS reported with the calibration; no fitted coordinate depends on that reverse map.
@@ -528,7 +529,7 @@ If photon counts are not linked, the resulting localizations contain per-channel
 - ``photons_ch<c>`` and ``bg_ch<c>`` — that channel's photon count and background. ``photons`` and ``bg`` are their sums.
 - ``rel_photons_ch<c>`` — that channel's share of the total photons, so the values sum to 1 per localization.
 
-Picasso builds a PSF for every channel and registers each non-reference channel to the reference by a transform estimated from matching beads; the per-channel PSFs and transforms are stored in one calibration ``.hdf5``. ``Channel registration`` in the calibration dialog chooses the model — ``affine`` (the default), ``projective``, ``polynomial2`` or ``polynomial3`` — with the same trade-offs as the lateral corrections above; the choice is recorded in the calibration and used automatically at fit time, where each spot is linearized about its own position. Alongside the usual diagnostic plot, a ``<base>_registration.png`` is written showing how well the channels align (residuals and the decomposed shift / rotation / scale / mirror) — check it before fitting.
+Picasso builds a PSF for every channel and registers each non-reference channel to the reference by a transform estimated from matching beads; the per-channel PSFs and transforms are stored in one calibration ``.hdf5``. ``Channel registration`` in the calibration dialog chooses the model — ``translation`` (a pure xy shift), ``affine`` (the default), ``projective``, ``polynomial2`` or ``polynomial3`` — with the same trade-offs as the lateral corrections above; the choice is recorded in the calibration and used automatically at fit time, where each spot is linearized about its own position. Alongside the usual diagnostic plot, a ``<base>_registration.png`` is written showing how well the channels align (residuals and the decomposed shift / rotation / scale / mirror) — check it before fitting.
 
 The registration is only as good as the bead stack it comes from: image **sparse beads** (so that a bead can only be paired with its own image in the other channel) over **several fields of view**, so that the correspondences cover the whole sensor rather than one part of it, and acquire the stack **on the same day as the measurement**, ideally directly before or after it to minimize the effect of drift.
 
@@ -591,7 +592,7 @@ Then build a registration with ``Calibration`` > ``Register channels (2D)``, whi
 
   This route both **builds** a registration from scratch and **re-aligns** one that has drifted: when a registration is already loaded it seeds the pairing, otherwise the pairing is bootstrapped from the data alone.
 
-``Transform model`` chooses how the channels are related — ``affine`` (the default), ``projective``, ``polynomial2`` or ``polynomial3`` — with the same trade-offs as described under *Lateral corrections of x and y* above.
+``Transform model`` chooses how the channels are related — ``translation`` (a pure xy shift), ``affine`` (the default), ``projective``, ``polynomial2`` or ``polynomial3`` — with the same trade-offs as described under *Lateral corrections of x and y* above.
 
 The registration is saved as a small ``.yaml`` (by default ``<movie>_channel_reg.yaml``) and loaded straight away. Picasso reports, per channel, how many correspondences were paired and the residual RMS in camera pixels — check those before fitting: a registration built from too few pairs, or with an RMS approaching a pixel, will hold the channels together at the wrong place.
 

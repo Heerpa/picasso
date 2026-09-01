@@ -7949,12 +7949,15 @@ class TestFitAffineTransform:
         cyl_xy = _apply_homogeneous(inverse, ref_xy)
         return _affine_bead_image(ref_xy), _affine_bead_image(cyl_xy), ref_xy
 
-    @pytest.mark.parametrize("model", transforms.MODELS)
+    @pytest.mark.parametrize(
+        "model", [m for m in transforms.MODELS if m != "translation"]
+    )
     def test_every_model_recovers_the_applied_transform(
         self, bead_movies, model
     ):
-        """The correction is a pure affine here, which every model can
-        represent - so each must recover it, and record which one it is."""
+        """The correction is a pure affine here, which every model except the
+        translation can represent - so each must recover it, and record which
+        one it is. The translation is covered on a pure shift below."""
         movie_ref, movie_cyl, ref_xy = bead_movies
         calibration, _ = localize.fit_lateral_transform(
             movie_ref,
@@ -7969,6 +7972,28 @@ class TestFitAffineTransform:
         cyl_xy = _apply_homogeneous(np.linalg.inv(self.TRUTH), ref_xy)
         mapped = transforms.from_dict(entry["Transform"]).apply(cyl_xy)
         assert np.allclose(mapped, ref_xy, atol=0.3)
+
+    def test_a_translation_recovers_a_pure_shift(self):
+        """The 2-DOF model on the only correction it claims to fit. It is
+        given its own bead pair because the class-wide ``TRUTH`` rotates and
+        scales, which a translation must *not* absorb."""
+        shift = np.array([3.5, -2.25])
+        ref_xy = _affine_bead_grid()
+        movie_ref = _affine_bead_image(ref_xy)
+        movie_shifted = _affine_bead_image(ref_xy - shift)
+        calibration, _ = localize.fit_lateral_transform(
+            movie_ref,
+            movie_shifted,
+            {},
+            box=BOX,
+            minimum_ng=1000,
+            model="translation",
+        )
+        (entry,) = lib.lateral_transforms(calibration)
+        assert entry["Transform"]["model"] == "translation"
+        transform = transforms.from_dict(entry["Transform"])
+        assert np.allclose(transform.shift, shift, atol=0.1)
+        assert np.allclose(transform.apply(ref_xy - shift), ref_xy, atol=0.3)
 
     def test_too_few_pairs_for_the_model_raises(self):
         """Enough beads for an affine, too few for a degree-3 polynomial: the

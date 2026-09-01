@@ -3393,8 +3393,9 @@ def main():  # noqa: C901
         default="affine",
         help=(
             "how the channels are registered to the reference in a"
-            " multichannel or split-FOV calibration: affine (6 DOF, the"
-            " default), projective (8 DOF, adds the perspective term) or"
+            " multichannel or split-FOV calibration: translation (2 DOF, a"
+            " pure xy shift), affine (6 DOF, the default), projective (8 DOF,"
+            " adds the perspective term) or"
             " polynomial2 / polynomial3 (a smooth field-distortion warp,"
             " needing 6 / 10 well-spread beads). Ignored for a"
             " single-channel calibration"
@@ -3509,9 +3510,10 @@ def main():  # noqa: C901
         choices=list(TRANSFORM_MODELS),
         default="affine",
         help=(
-            "transform model: affine (6 DOF, the default), projective (8 DOF),"
-            " polynomial2 or polynomial3, needing at least 3 / 4 / 6 / 10"
-            " bead pairs respectively"
+            "transform model: translation (2 DOF, a pure xy shift), affine"
+            " (6 DOF, the default), projective (8 DOF), polynomial2 or"
+            " polynomial3, needing at least 1 / 3 / 4 / 6 / 10 bead pairs"
+            " respectively"
         ),
     )
     lateral_parser.add_argument(

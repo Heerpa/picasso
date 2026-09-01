@@ -147,6 +147,28 @@ class TestBeadRegistration:
         )
         np.testing.assert_allclose(mapped, _apply(grid, truth), atol=0.15)
 
+    def test_translation_model_fits_a_pure_shift_from_two_beads(self):
+        """The 2-DOF model needs one pair, so a bead count that is below the
+        affine minimum still registers - and it must not absorb anything
+        beyond the shift."""
+        sparse = np.array([[30.0, 30.0], [80.0, 80.0]])
+        truth = _rotation(0.0, 6.0, -5.0)
+        movies = [
+            _bead_image(sparse, seed=1),
+            _bead_image(_apply(sparse, truth), seed=2),
+        ]
+
+        calibration = registration.calibrate_channel_registration_from_beads(
+            movies, box=BOX, minimum_ng=2000.0, model="translation"
+        )
+
+        transform = tform.from_dict(calibration["channel_transforms"][1])
+        assert transform.model == "translation"
+        np.testing.assert_allclose(transform.shift, [6.0, -5.0], atol=0.15)
+        np.testing.assert_allclose(
+            transform.jacobian(sparse[:1])[0], np.eye(2)
+        )
+
     def test_rejects_a_single_channel(self):
         with pytest.raises(ValueError, match="at least 2 channels"):
             registration.calibrate_channel_registration_from_beads(
