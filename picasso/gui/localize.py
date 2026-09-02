@@ -3280,7 +3280,7 @@ class ParametersDialog(lib.Dialog):
         # different thing (region-local transforms).
         self.channel_registration_calibration = {}
         self.channel_registration_path = None
-        # Standalone (2D) affine corrections applied after the fit; those
+        # Standalone lateral corrections applied after the fit; those
         # carried by the 3D / spline calibration are applied by the fit
         # itself (see load_affine_calib).
         self.lateral_transforms = []
@@ -4126,29 +4126,34 @@ class ParametersDialog(lib.Dialog):
         self.gauss_link_photons_checkbox.hide()  # shown for 2-6 channels
         reg_grid.addWidget(self.gauss_link_photons_checkbox, 1, 0, 1, 3)
 
-        # Lateral (x, y) affine corrections for 2D data, applied after
-        # fitting. This is how a chromatic correction is used on its own,
-        # with no 3D calibration to append it to; for 3D the correction goes
-        # into the 3D / spline calibration above, which applies it itself.
-        affine_groupbox = QtWidgets.QGroupBox("2D lateral correction (x, y)")
+        # Lateral (x, y) corrections kept outside the calibration used for
+        # fitting, applied after it. For 2D data this is the only route;
+        # for 3D it is the alternative to appending the correction to the
+        # 3D / spline calibration, and gives the same coordinates.
+        affine_groupbox = QtWidgets.QGroupBox("Lateral correction (x, y)")
         affine_groupbox.setToolTip(
-            "Affine corrections applied to the fitted x/y of 2D data,\n"
-            "typically a chromatic-aberration correction. Build one with\n"
-            "3D > Calibrate lateral transform and load the standalone\n"
-            "calibration here.\n\n"
-            "For 3D data, append the correction to the 3D or spline\n"
-            "calibration instead: those are applied automatically during\n"
-            "the fit and must not be loaded here as well.\n\n"
+            "Corrections applied to the fitted x/y, typically a\n"
+            "chromatic-aberration correction. Build one with\n"
+            "3D > Calibrate lateral transform and load it here.\n\n"
+            "Works with 2D and 3D fits alike. With astigmatic 3D fitting\n"
+            "these are applied after the z fit, on top of any correction\n"
+            "the 3D calibration carries - so keeping a correction in its\n"
+            "own file gives the same result as appending it to the 3D\n"
+            "calibration (the recommended route, since the calibration\n"
+            "then travels with its correction).\n\n"
+            "A correction the loaded 3D or spline calibration already\n"
+            "carries is refused here: it is applied during the fit, and\n"
+            "applying it twice would correct the coordinates twice.\n\n"
             "Several files are applied in the order listed. Single-channel\n"
-            "data only: a multichannel (global) spline fit registers its\n"
+            "data only: a multichannel (global) fit registers its\n"
             "channels itself and ignores these."
         )
         vbox.addWidget(affine_groupbox)
         affine_grid = QtWidgets.QGridLayout(affine_groupbox)
-        load_affine_calib = QtWidgets.QPushButton("Load 2D correction")
+        load_affine_calib = QtWidgets.QPushButton("Load correction")
         load_affine_calib.setToolTip(
-            "Load a standalone lateral calibration (.yaml) to apply to this\n"
-            "2D measurement."
+            "Load a standalone lateral calibration (.yaml) to apply to\n"
+            "this measurement, 2D or 3D."
         )
         load_affine_calib.setAutoDefault(False)
         load_affine_calib.clicked.connect(self.load_affine_calib)
@@ -4160,7 +4165,7 @@ class ParametersDialog(lib.Dialog):
         )
         affine_grid.addWidget(clear_affine_calib, 0, 2)
         self.affine_calib_label = QtWidgets.QLabel(
-            "-- no 2D correction loaded --"
+            "-- no correction loaded --"
         )
         self.affine_calib_label.setAlignment(
             QtCore.Qt.AlignmentFlag.AlignCenter
@@ -4680,14 +4685,16 @@ class ParametersDialog(lib.Dialog):
             self.update_spline_calib(path)
 
     def load_affine_calib(self) -> None:
-        """Load one or more standalone lateral calibrations to apply to this
-        2D measurement after fitting.
+        """Load one or more standalone lateral calibrations to apply after
+        fitting, whether the fit is 2D or 3D.
 
-        Any calibration file works as a carrier - only its affine
-        corrections are read - but for 3D data the correction belongs in
-        the 3D / spline calibration itself, which applies it during the
-        fit; corrections that calibration already carries are rejected
-        here. Selecting several files applies them in the order chosen.
+        Any calibration file works as a carrier - only its lateral
+        corrections are read. With astigmatic 3D fitting they are applied
+        after the z fit, on top of the ones the 3D calibration carries, so
+        a correction kept in its own file lands exactly where an appended
+        one would; a correction the loaded 3D / spline calibration already
+        carries is rejected here, since that one is applied during the fit.
+        Selecting several files applies them in the order chosen.
         """
         if self.affine_calibration_paths:
             dialog_directory, _ = os.path.split(
@@ -4697,7 +4704,7 @@ class ParametersDialog(lib.Dialog):
             dialog_directory = None
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
-            "Load 2D lateral correction",
+            "Load lateral correction",
             directory=dialog_directory,
             filter="Calibration files (*.yaml *.hdf5)",
         )
@@ -4705,14 +4712,14 @@ class ParametersDialog(lib.Dialog):
             self.update_affine_calib(paths)
 
     def update_affine_calib(self, paths: list[str] | None) -> None:
-        """Load (or clear) the 2D lateral corrections applied after fitting."""
+        """Load (or clear) the lateral corrections applied after fitting."""
         if not paths:
             self.lateral_transforms = []
             self.affine_calibration_paths = []
             self.affine_calib_label.setAlignment(
                 QtCore.Qt.AlignmentFlag.AlignCenter
             )
-            self.affine_calib_label.setText("-- no 2D correction loaded --")
+            self.affine_calib_label.setText("-- no correction loaded --")
             self.affine_calib_label.setToolTip("")
             return
 
@@ -4723,7 +4730,7 @@ class ParametersDialog(lib.Dialog):
             except Exception as e:
                 QtWidgets.QMessageBox.warning(
                     self,
-                    "Load 2D lateral correction",
+                    "Load lateral correction",
                     f"Could not read {os.path.basename(path)}:\n{e}",
                 )
                 continue
@@ -4748,7 +4755,7 @@ class ParametersDialog(lib.Dialog):
         if empty:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Load 2D lateral correction",
+                "Load lateral correction",
                 "No affine corrections found in: "
                 + ", ".join(empty)
                 + ".\nBuild one with 3D > Calibrate lateral transform.",
@@ -4756,7 +4763,7 @@ class ParametersDialog(lib.Dialog):
         if already:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Load 2D lateral correction",
+                "Load lateral correction",
                 "Not loaded: "
                 + ", ".join(lib.describe_lateral_transforms(already))
                 + ".\n\nThe loaded 3D / spline calibration already carries "
@@ -5868,6 +5875,9 @@ class Window(QtWidgets.QMainWindow):
         self.bead_diagnostics = []
         self.bead_calibration_path = None
         self._active_worker = None
+        # Lateral corrections the last fit applied, as descriptions, for the
+        # saved metadata (see _record_applied_lateral).
+        self._applied_lateral = []
         # Affine-transform (astigmatism) calibration dialog and its worker;
         # both created lazily when the calibration is first opened/run.
         self._affine_dialog = None
@@ -11094,7 +11104,7 @@ class Window(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "Multichannel Gaussian fit",
-                "2D lateral corrections apply to single-channel data only and "
+                "Lateral corrections apply to single-channel data only and "
                 "are not used here: the multichannel fit registers its "
                 "channels itself, from the loaded channel registration.",
             )
@@ -11689,6 +11699,27 @@ class Window(QtWidgets.QMainWindow):
         self.abort_action.setEnabled(True)
         self.fit_z_worker.start()
 
+    def _record_applied_lateral(self, worker) -> None:
+        """Keep what the finished fit did with the lateral corrections, so
+        that ``save_locs`` can write it into the metadata.
+
+        The workers discard the info their fit returns - it is rebuilt from
+        the dialog when saving - so without this a corrected file would
+        carry no record of the correction, and the CLI's would.
+        """
+        self._applied_lateral = list(
+            getattr(worker, "applied_lateral_transforms", None) or []
+        )
+        skipped = list(
+            getattr(worker, "skipped_lateral_transforms", None) or []
+        )
+        if skipped:
+            self.status_bar.showMessage(
+                "Skipped "
+                + ", ".join(skipped)
+                + ": already applied by the calibration used for fitting."
+            )
+
     def _extra_lateral_transforms(self, calibration: dict | None) -> list:
         """The loaded affine corrections minus those ``calibration`` carries
         and therefore applies itself.
@@ -11770,6 +11801,7 @@ class Window(QtWidgets.QMainWindow):
         """Handle the completion of the fitting process. Draw fit
         markers, fit/calibration z coordinates, if requested, save
         localizations."""
+        self._record_applied_lateral(self._active_worker)
         self._active_worker = None
         self.abort_action.setEnabled(False)
         self.status_bar.showMessage(
@@ -11901,6 +11933,7 @@ class Window(QtWidgets.QMainWindow):
         ``self.locs_display`` is left untouched so the on-screen
         FitMarker overlays stay at their pre-z-fit, pre-affine
         positions (mirroring the drift-correction pattern)."""
+        self._record_applied_lateral(self._active_worker)
         self._active_worker = None
         self.abort_action.setEnabled(False)
         self.status_bar.showMessage(
@@ -12189,6 +12222,18 @@ class Window(QtWidgets.QMainWindow):
             localize_info["Z Calibration"] = (
                 self.parameters_dialog.z_calibration
             )
+        # A correction loaded separately from the calibration leaves no
+        # other trace in the metadata (the calibration dicts below only
+        # record the ones they carry themselves), so name every correction
+        # the fit applied, and where the separate ones came from.
+        if self._applied_lateral:
+            localize_info["Lateral corrections applied"] = list(
+                self._applied_lateral
+            )
+            if self.parameters_dialog.affine_calibration_paths:
+                localize_info["Lateral correction paths"] = list(
+                    self.parameters_dialog.affine_calibration_paths
+                )
         if FIT_MODELS.get(model, {}).get("needs_spline_calibration"):
             # Record the path and model only; the coefficient table is far
             # too large to embed in the metadata.
@@ -12462,6 +12507,10 @@ class FitWorker(QtCore.QThread):
         self.calibrate_z = calibrate_z
         self.spline_calibration = spline_calibration
         self.lateral_transforms = lateral_transforms or []
+        # What the fit did with them, for the metadata (see
+        # Window._record_applied_lateral). A 3D astigmatism run leaves this
+        # empty: FitZWorker applies them after the z fit and reports there.
+        self.applied_lateral_transforms = []
         self.camera_calibration = camera_calibration
         self.N = len(identifications)
         self._last_cut_emit = 0
@@ -12509,7 +12558,12 @@ class FitWorker(QtCore.QThread):
             self.aborted.emit()
             return
         if not self.fit_z:
+            # With a z fit to follow, FitZWorker applies them after it, so
+            # that they land on the final coordinates either way.
             locs = lib.apply_lateral_transforms(locs, self.lateral_transforms)
+            self.applied_lateral_transforms = lib.describe_lateral_transforms(
+                self.spline_calibration
+            ) + lib.describe_lateral_transforms(self.lateral_transforms)
         self.progressMade.emit(self.N + 1, self.N)
         dt = time.time() - t0
         self.finished.emit(locs, dt, self.fit_z, self.calibrate_z)
@@ -13063,6 +13117,10 @@ class FitZWorker(QtCore.QThread):
         self.fitting_method = fitting_method
         self.gpu = gpu
         self.lateral_transforms = lateral_transforms or []
+        # What the fit actually did with the lateral corrections, for the
+        # metadata and the status bar (see Window._record_applied_lateral).
+        self.applied_lateral_transforms = []
+        self.skipped_lateral_transforms = []
 
     def on_progress(self, n_done: int) -> None:
         self.progressMade.emit(n_done, len(self.locs))
@@ -13070,21 +13128,38 @@ class FitZWorker(QtCore.QThread):
     def run(self) -> None:
         t0 = time.time()
         # we ignore info since we will merge the metadata from 2D
-        # localization as well when saving localizations
-        locs, info = zfit.zfit(
-            locs=self.locs,
-            info=self.info,
-            calibration=self.calibration,
-            magnification_factor=self.magnification_factor,
-            pixelsize=self.pixelsize,
-            fitting_method=self.fitting_method,
-            multiprocess=not self.gpu,
-            gpu=self.gpu,
-            progress_callback=self.on_progress,
-            abort_callback=self.isInterruptionRequested,
-        )
-        if locs is not None:
-            locs = lib.apply_lateral_transforms(locs, self.lateral_transforms)
+        # localization as well when saving localizations - except for what
+        # zfit reports about the lateral corrections, which is kept below
+        # because nothing else records it.
+        # The separately loaded corrections go through zfit as well, so that
+        # they are applied after the ones the 3D calibration carries and a
+        # correction present in both is applied once, exactly as when it is
+        # appended to the calibration. zfit warns about that skip; the
+        # window says it in the status bar instead.
+        with warnings.catch_warnings():
+            warnings.simplefilter(
+                "ignore", lib.DuplicateLateralTransformWarning
+            )
+            locs, info = zfit.zfit(
+                locs=self.locs,
+                info=self.info,
+                calibration=self.calibration,
+                magnification_factor=self.magnification_factor,
+                pixelsize=self.pixelsize,
+                fitting_method=self.fitting_method,
+                lateral_transforms=self.lateral_transforms,
+                multiprocess=not self.gpu,
+                gpu=self.gpu,
+                progress_callback=self.on_progress,
+                abort_callback=self.isInterruptionRequested,
+            )
+        if info is not None:
+            self.applied_lateral_transforms = (
+                info[-1].get("Lateral corrections applied") or []
+            )
+            self.skipped_lateral_transforms = (
+                info[-1].get("Lateral corrections skipped") or []
+            )
         dt = time.time() - t0
         self.finished.emit(locs, dt)
 

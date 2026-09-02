@@ -8741,9 +8741,11 @@ class TestChainedAffineTransforms:
         )
         assert len(new) == 2 and duplicates == []
 
-    def test_localize_3d_drops_a_duplicate_of_the_z_calibration(self):
-        """The pipeline applies the 3D calibration's transform via zfit and
-        must not re-apply the same one handed in as an extra."""
+    def test_a_duplicate_of_the_fits_own_calibration_is_dropped(self):
+        """The 2D / spline route: the fit applies what its calibration
+        carries, so the same one handed in as an extra must be skipped.
+        (The astigmatic 3D route does this inside ``zfit`` - see
+        ``TestZfitSeparatelyLoadedLateralCorrections``.)"""
         locs = pd.DataFrame(
             {"x": [10.0, 20.0], "y": [30.0, 40.0], "frame": [0, 1]}
         )
@@ -8755,7 +8757,7 @@ class TestChainedAffineTransforms:
         assert out is locs  # untouched
         assert info == []
 
-    def test_localize_3d_applies_a_genuinely_new_correction(self):
+    def test_a_genuinely_new_correction_is_applied(self):
         locs = pd.DataFrame(
             {"x": [10.0, 20.0], "y": [30.0, 40.0], "frame": [0, 1]}
         )
@@ -13192,6 +13194,192 @@ class TestFitSplitFovIndependent:
             localize.fit_split_fov_independent(
                 movie, CAMERA_INFO_WITH_PIXELSIZE, ids, BOX, [], "gausslq"
             )
+
+
+class TestLocalizeCliSeparateLateralCorrection:
+    """``picasso localize -ac`` alongside ``-zc``: a lateral correction kept
+    in its own file must land exactly where an appended one would, compose
+    with the one the 3D calibration carries, and never be applied twice.
+    """
+
+    CHROMATIC = [[1.0, 0.0, 5.0], [0.0, 1.0, 2.0], [0.0, 0.0, 1.0]]
+    ASTIG = [[1.0, 0.0, 3.0], [0.0, 1.0, -1.5], [0.0, 0.0, 1.0]]
+
+    @staticmethod
+    def _entry(kind, matrix):
+        return {"Type": kind, "Transform": affine(matrix).to_dict()}
+
+    def _movie_path(self, tmp_path):
+        movie, _ = _independent_movie(spots=[(12.4, 15.6, 900.0)])
+        path = str(tmp_path / "movie.raw")
+        io.save_raw(
+            path,
+            movie.astype(np.uint16),
+            [
+                {
+                    "Byte Order": "<",
+                    "Data Type": "uint16",
+                    "Frames": int(movie.shape[0]),
+                    "Height": int(movie.shape[1]),
+                    "Width": int(movie.shape[2]),
+                }
+            ],
+        )
+        return path
+
+    def _calibration(self, tmp_path, name, *entries):
+        calibration = dict(CALIB_3D)
+        for entry in entries:
+            lib.append_lateral_transform(calibration, entry)
+        path = str(tmp_path / name)
+        io.save_any_calibration(path, calibration)
+        return path
+
+    def _run(self, tmp_path, monkeypatch, movie, suffix, method, *extra):
+        from picasso import __main__ as cli
+
+        # "lq-3d" is what turns --zc into an astigmatic z fit; "lq" is the
+        # plain 2D fit.
+        argv = [
+            "picasso",
+            "localize",
+            movie,
+            "-b",
+            "7",
+            "-g",
+            "100",
+            "-a",
+            method,
+            "-d",
+            "0",
+            "-mf",
+            "0.79",
+            "-sf",
+            suffix,
+            *extra,
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+        cli.main()
+        return io.load_locs(str(tmp_path / f"movie{suffix}_locs.hdf5"))
+
+    def test_separate_matches_appended(self, tmp_path, monkeypatch):
+        movie = self._movie_path(tmp_path)
+        appended = self._calibration(
+            tmp_path,
+            "both_3d_calib.yaml",
+            self._entry("astigmatism", self.ASTIG),
+            self._entry("chromatic", self.CHROMATIC),
+        )
+        astig_only = self._calibration(
+            tmp_path,
+            "astig_3d_calib.yaml",
+            self._entry("astigmatism", self.ASTIG),
+        )
+        chromatic = str(tmp_path / "chromatic.yaml")
+        io.save_any_calibration(
+            chromatic,
+            lib.append_lateral_transform(
+                {}, self._entry("chromatic", self.CHROMATIC)
+            ),
+        )
+
+        ref, ref_info = self._run(
+            tmp_path,
+            monkeypatch,
+            movie,
+            "_appended",
+            "lq-3d",
+            "-zc",
+            appended,
+        )
+        out, info = self._run(
+            tmp_path,
+            monkeypatch,
+            movie,
+            "_separate",
+            "lq-3d",
+            "-zc",
+            astig_only,
+            "-ac",
+            chromatic,
+        )
+        assert len(out) == len(ref) and len(out)
+        np.testing.assert_allclose(
+            out["x"].to_numpy(), ref["x"].to_numpy(), atol=1e-5
+        )
+        np.testing.assert_allclose(
+            out["y"].to_numpy(), ref["y"].to_numpy(), atol=1e-5
+        )
+        # both routes name both corrections, in application order
+        for each in (ref_info, info):
+            assert lib.get_from_metadata(
+                each, "Lateral corrections applied"
+            ) == ["astigmatism, affine", "chromatic, affine"]
+
+    def test_a_duplicate_of_the_z_calibration_is_skipped(
+        self, tmp_path, monkeypatch
+    ):
+        movie = self._movie_path(tmp_path)
+        appended = self._calibration(
+            tmp_path,
+            "astig_3d_calib.yaml",
+            self._entry("astigmatism", self.ASTIG),
+        )
+        # the same transform, saved on its own under another name
+        copy = str(tmp_path / "astig_copy.yaml")
+        io.save_any_calibration(
+            copy,
+            lib.append_lateral_transform(
+                {}, self._entry("astigmatism", self.ASTIG)
+            ),
+        )
+        ref, _ = self._run(
+            tmp_path, monkeypatch, movie, "_once", "lq-3d", "-zc", appended
+        )
+        out, info = self._run(
+            tmp_path,
+            monkeypatch,
+            movie,
+            "_twice",
+            "lq-3d",
+            "-zc",
+            appended,
+            "-ac",
+            copy,
+        )
+        np.testing.assert_allclose(
+            out["x"].to_numpy(), ref["x"].to_numpy(), atol=1e-5
+        )
+        assert lib.get_from_metadata(info, "Lateral corrections applied") == [
+            "astigmatism, affine"
+        ]
+        assert lib.get_from_metadata(info, "Lateral corrections skipped") == [
+            "astigmatism, affine"
+        ]
+
+    def test_applied_to_a_2d_fit_as_well(self, tmp_path, monkeypatch):
+        """No -zc at all: the same flag corrects a plain 2D fit."""
+        movie = self._movie_path(tmp_path)
+        chromatic = str(tmp_path / "chromatic.yaml")
+        io.save_any_calibration(
+            chromatic,
+            lib.append_lateral_transform(
+                {}, self._entry("chromatic", self.CHROMATIC)
+            ),
+        )
+        plain, _ = self._run(tmp_path, monkeypatch, movie, "_plain", "lq")
+        out, info = self._run(
+            tmp_path, monkeypatch, movie, "_corrected", "lq", "-ac", chromatic
+        )
+        np.testing.assert_allclose(
+            out["x"].to_numpy(), plain["x"].to_numpy() + 5.0, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            out["y"].to_numpy(), plain["y"].to_numpy() + 2.0, atol=1e-5
+        )
+        assert lib.get_from_metadata(info, "Lateral corrections applied") == [
+            "chromatic, affine"
+        ]
 
 
 class TestLocalizeCliRegionsSeparately:

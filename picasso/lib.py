@@ -2695,6 +2695,16 @@ LATERAL_TRANSFORMS_KEY = "Lateral transforms"
 LATERAL_TRANSFORM_TYPES = ("astigmatism", "chromatic")
 
 
+class DuplicateLateralTransformWarning(UserWarning):
+    """A lateral correction was loaded separately although the calibration
+    used for fitting already carries it, and was skipped.
+
+    Its own category so that the CLI and the GUI can report the skip in
+    their own idiom (a console line, a status-bar message) by filtering
+    just this warning, instead of the same thing being said twice.
+    """
+
+
 def lateral_transforms(calibration: dict | list | None) -> list[dict]:
     """The ordered lateral-correction entries carried by a calibration.
 
@@ -2719,6 +2729,41 @@ def lateral_transforms(calibration: dict | list | None) -> list[dict]:
         # e.g. a calibration still given as a path; nothing to read
         return []
     return list(calibration.get(LATERAL_TRANSFORMS_KEY) or [])
+
+
+def resolve_lateral_transforms(source: dict | list | str | None) -> list:
+    """The lateral corrections held by ``source``, reading it from disk if
+    it is a path.
+
+    Parameters
+    ----------
+    source : dict, list, str or None
+        A calibration dictionary, a list of entries, the path of a
+        calibration file of any kind (see ``io.load_any_calibration``), or
+        None.
+
+    Returns
+    -------
+    transforms : list of dicts
+        The entries in the order they must be applied. Empty if `source`
+        is None or carries none.
+
+    Raises
+    ------
+    ValueError
+        If `source` is a path to a file that carries no lateral
+        corrections, which would otherwise be a silent no-op.
+    """
+    if not isinstance(source, str):
+        return lateral_transforms(source)
+    transforms = lateral_transforms(io.load_any_calibration(source))
+    if not transforms:
+        raise ValueError(
+            f"No lateral corrections found in {source}. Build one with "
+            "'picasso lateral-calibrate' or the 'Calibrate lateral "
+            "transform' dialog in Picasso: Localize."
+        )
+    return transforms
 
 
 def lateral_transform_models(calibration: dict | list | None) -> list:

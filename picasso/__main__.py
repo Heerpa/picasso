@@ -1152,11 +1152,13 @@ def _localize_process_file(
         Cubic-spline PSF calibration when the fit method is a spline method;
         else ``None``. A 3D spline fit recovers z directly (no ``zfit``).
     lateral_transforms : list or None
-        Extra lateral affine corrections (see ``--affine-calibration``),
-        applied to x/y after fitting and, for 3D astigmatism, after ``zfit``
-        applied the ones stored in the 3D calibration. Corrections the
-        spline or astigmatism calibration carries - and therefore applies
-        itself - are skipped rather than applied a second time.
+        Lateral corrections loaded separately from the calibration used
+        for fitting (see ``--affine-calibration``), applied to x/y after
+        fitting and, for 3D astigmatism, after the ones the 3D calibration
+        carries - so loading one separately gives the same coordinates as
+        appending it to the calibration. Corrections the spline or
+        astigmatism calibration carries - and therefore applies itself -
+        are skipped rather than applied a second time.
     region_fit : dict or None
         Set by ``--regions-separately``: fit each ``--roi`` region on its
         own and write one file per region. Holds the per-region fitting
@@ -1375,6 +1377,22 @@ def _localize_regions(
         )
 
 
+def _print_lateral_report(
+    applied: list[str] | None, skipped: list[str] | None
+) -> None:
+    """Report what happened to the lateral corrections, in the console
+    idiom - the same lines whether the fit was 2D or 3D."""
+    if applied:
+        print("Applied lateral correction(s): " + ", ".join(applied))
+    if skipped:
+        print(
+            "Skipping "
+            + ", ".join(skipped)
+            + ": the calibration used for fitting already applies this"
+            " correction itself; applying it again would correct twice."
+        )
+
+
 def _localize_finish(
     locs,
     info: list[dict],
@@ -1387,8 +1405,8 @@ def _localize_finish(
     fitting_method: str | None = None,
 ) -> None:
     """Everything that happens to one set of localizations once it is
-    fitted: the astigmatic z fit, the extra lateral corrections, saving,
-    the quality database and the drift correction.
+    fitted: the astigmatic z fit, the separately loaded lateral
+    corrections, saving, the quality database and the drift correction.
 
     Split out of ``_localize_process_file`` so that a run that fits the
     regions separately (``--regions-separately``) does all of it per region,
@@ -1403,7 +1421,9 @@ def _localize_finish(
         The method this set was fitted with, which decides the noise model
         of the astigmatic z fit. None (the default) uses ``args.fit_method``.
     """
+    import warnings
     from os.path import splitext
+    from . import lib
     from .io import save_locs
     from .localize import add_file_to_db
 
@@ -1416,50 +1436,51 @@ def _localize_finish(
         print("------------------------------------------")
         print("Fitting 3D...")
         method = "gausslq" if "mle" not in method_name else "gaussmle"
-        locs, info = zfit.zfit(
-            locs=locs,
-            info=info,
-            calibration=z_calibration,
-            fitting_method=method,
-            filter=0,
-            multiprocess=not args.fit_z_gpu,
-            gpu=args.fit_z_gpu,
-            progress_callback="console",
-        )
+        # The corrections loaded with --affine-calibration go through zfit
+        # too, which applies them after the ones the 3D calibration carries
+        # and skips any it carries already: loading a correction separately
+        # then gives the same coordinates as appending it to the 3D
+        # calibration. It says so itself through a warning, which the
+        # console message below replaces.
+        with warnings.catch_warnings():
+            warnings.simplefilter(
+                "ignore", lib.DuplicateLateralTransformWarning
+            )
+            locs, info = zfit.zfit(
+                locs=locs,
+                info=info,
+                calibration=z_calibration,
+                fitting_method=method,
+                filter=0,
+                lateral_transforms=lateral_transforms,
+                multiprocess=not args.fit_z_gpu,
+                gpu=args.fit_z_gpu,
+                progress_callback="console",
+            )
         info[-1]["Z Calibration Path"] = zpath
         print("3D fitting complete.")
         print("------------------------------------------")
-
-    if lateral_transforms:
-        from . import lib
-
-        # Corrections the fit already applied on its own - those carried by
-        # the spline calibration (applied by ``localize``) and by the
-        # astigmatism calibration (applied by ``zfit``) - are dropped here.
-        # Passing the very same file to --affine-calibration would otherwise
-        # correct the coordinates twice.
-        applied = lib.lateral_transforms(spline_calibration)
-        if z_params is not None:
-            applied += lib.lateral_transforms(z_params[2])
-        extra, duplicates = lib.drop_duplicate_lateral_transforms(
-            lateral_transforms, applied
+        _print_lateral_report(
+            info[-1].get("Lateral corrections applied"),
+            info[-1].get("Lateral corrections skipped"),
         )
-        if duplicates:
-            print(
-                "Skipping "
-                + ", ".join(lib.describe_lateral_transforms(duplicates))
-                + ": the calibration used for fitting already applies this"
-                " correction itself; applying it again would correct twice."
-            )
+    elif lateral_transforms:
+        # No z fit to fold them into, so apply them here. Corrections the
+        # spline calibration carries were applied by ``localize`` itself;
+        # passing that same file to --affine-calibration would otherwise
+        # correct the coordinates twice.
+        extra, duplicates = lib.drop_duplicate_lateral_transforms(
+            lateral_transforms, spline_calibration
+        )
         if extra:
             locs = lib.apply_lateral_transforms(locs, extra)
-            described = lib.describe_lateral_transforms(extra)
-            # zfit records what it applied in this same entry, so extend the
-            # list rather than replacing it.
-            info[-1]["Lateral corrections applied"] = (
-                info[-1].get("Lateral corrections applied", []) + described
-            )
-            print("Applied lateral correction(s): " + ", ".join(described))
+            info[-1]["Lateral corrections applied"] = info[-1].get(
+                "Lateral corrections applied", []
+            ) + lib.describe_lateral_transforms(extra)
+        _print_lateral_report(
+            lib.describe_lateral_transforms(extra),
+            lib.describe_lateral_transforms(duplicates),
+        )
 
     base, ext = splitext(path)
 

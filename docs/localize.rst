@@ -398,19 +398,36 @@ After the fit, the bead pairing is drawn in the main window as color-coded ident
 The transform is stored as one entry of an ordered ``Lateral transforms`` list in the calibration file you select, which can be:
 
 - an existing Gaussian 3D calibration (``.yaml``) or spline PSF calibration (``.hdf5``) — the transform is appended to it and applied automatically whenever that calibration is used to fit, whether the fit is Gaussian astigmatism or cubic spline;
-- a standalone lateral calibration (``New``, a ``.yaml`` holding only lateral corrections) — for 2D data, where there is no 3D calibration to append to.
+- a standalone lateral calibration (``New``, a ``.yaml`` holding only lateral corrections) — loaded separately at fit time, and the only route for 2D data, where there is no 3D calibration to append to.
 
 Corrections accumulate: calibrating both an astigmatism and a chromatic transform into the same file stores them as a list, and they are applied one after another in that order. Re-running a calibration of the same type replaces its entry rather than adding a second copy.
 
-For **3D data there is nothing to load**: the correction lives in the 3D or spline calibration and is applied automatically whenever that calibration is used to fit.
+Appending or loading separately
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-For **2D data** there is no such calibration to attach it to, so the standalone file is loaded through the ``2D lateral correction (x, y)`` box in the ``Parameters`` dialog: ``Load 2D correction`` takes one or more files (applied in the order listed) and ``Clear`` drops them. The setting belongs to the loaded movie, so several movies opened side by side can each carry their own correction.
+Both routes give the **same coordinates**, so which one to use is a matter of bookkeeping:
 
-A correction is never applied twice. Loading a file whose transform the currently loaded 3D or spline calibration already carries is refused by Picasso.
+- **Appended to the 3D or spline calibration** (recommended) — the correction travels with the calibration it belongs to and is applied automatically whenever that calibration is used to fit. There is nothing to load and nothing to forget.
+- **Loaded separately** — the standalone ``.yaml`` is loaded through the ``Lateral correction (x, y)`` box in the ``Parameters`` dialog: ``Load correction`` takes one or more files (applied in the order listed) and ``Clear`` drops them. The setting belongs to the loaded movie, so several movies opened side by side can each carry their own correction.
 
-**Lateral corrections apply to single-channel data only.** They correct one movie into a reference frame, which is what a 2D or astigmatic 3D measurement of a single channel needs. The multichannel (global) spline fit is a different mechanism: it fits all channels jointly and registers them itself from the per-channel transforms in its own calibration, so a lateral correction on top of that would be applied twice. Picasso therefore refuses to append a lateral transform to a multichannel spline calibration, and ignores loaded lateral corrections when a multichannel fit runs.
+The two mix. With astigmatic 3D fitting, the separately loaded corrections are applied after the z fit, on top of whatever the 3D calibration carries — so a 3D calibration holding the astigmatism correction plus a separately loaded chromatic one applies the astigmatism first and the chromatic second, exactly as if both had been appended to the same file.
 
-On the command line, ``picasso localize`` takes ``--affine-calibration <file>`` (repeat the flag to chain several); whichever model the file stores is used as saved.
+The same correction is never applied twice. A file whose transform the loaded 3D or spline calibration already carries is refused at load time, and one that slips through as a copy saved under another name is skipped at fit time — the transforms themselves are compared, not the file names. Every correction that *was* applied is named in the saved metadata under ``Lateral corrections applied``.
+
+**Lateral corrections apply to single-channel data only.** The multichannel (global) spline fit is a different mechanism: it fits all channels jointly and registers them itself from the per-channel transforms in its own calibration, so a lateral correction on top of that would be applied twice. Picasso therefore refuses to append a lateral transform to a multichannel spline calibration, and ignores loaded lateral corrections when a multichannel fit runs.
+
+On the command line, ``picasso localize`` takes ``--affine-calibration <file>`` (repeat the flag to chain several); whichever model the file stores is used as saved. It combines with ``--zc`` the same way the GUI does::
+
+    picasso localize movie.tif -zc astig_3d_calib.yaml -ac chromatic.yaml
+
+From Python, ``localize.localize`` takes ``affine_calibration`` alongside ``calibration_3d``, and ``zfit.zfit`` takes ``lateral_transforms`` for localizations that are already fitted; both accept a calibration dictionary, a list of entries or a path, and both skip (with a ``DuplicateLateralTransformWarning``) a correction the 3D calibration already carries::
+
+    locs, info = zfit.zfit(
+        locs,
+        info,
+        calibration=z_calibration,
+        lateral_transforms="chromatic.yaml",
+    )
 
 Incorporating calibrations in config file
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
