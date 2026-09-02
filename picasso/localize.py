@@ -167,6 +167,12 @@ LOCALIZATION_COLUMNS = {
         + ["color"]
     ),
 }
+# Column naming the ROI a localization was found in, see ``add_roi_id``.
+# Only a fit restricted to ROIs has it, so it is not in
+# LOCALIZATION_COLUMNS.
+ROI_ID_COLUMN = "roi_id"
+# ``ROI_ID_COLUMN`` for a localization inside none of the ROIs.
+NO_ROI_ID = -1
 # For database:
 MEAN_COLS = LOCALIZATION_COLUMNS["Base"] + LOCALIZATION_COLUMNS["3D only"]
 SET_COLS = [
@@ -502,6 +508,57 @@ def _as_ng_list(
             "ROI(s); give one threshold per ROI or a single shared one."
         )
     return ngs
+
+
+def add_roi_id(
+    locs: pd.DataFrame,
+    roi: tuple[tuple[int, int], tuple[int, int]] | list | None = None,
+) -> pd.DataFrame:
+    """Name the ROI each localization was found in.
+
+    A fit restricted to several ROIs produces one table, so the ROI a
+    localization came from is only recoverable from its coordinates. A
+    ``roi_id`` column is appended holding the index of the rectangle the
+    localization falls in - indexing ``roi`` as given, which is the order
+    ``clip_rois`` returned it in and the order the ``ROI`` entry of a
+    saved file's metadata lists. The rectangles being disjoint (see
+    :func:`clip_rois`), the index is unambiguous; a localization inside
+    none of them gets ``NO_ROI_ID`` (-1), which the sub-pixel result of a
+    fit can be when the spot was detected right at an ROI's edge.
+
+    Call this on the localizations as they come out of the fit: drift
+    correction, lateral corrections and z fitting all move ``x`` and
+    ``y``, which can push a localization near the seam between two ROIs
+    into the neighbouring rectangle.
+
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations with ``x`` and ``y`` columns, in the coordinate
+        frame the ROIs are given in.
+    roi : tuple or list of tuples, optional
+        Region(s) of interest the localizations were identified in, see
+        :func:`identify_in_frame`. None or an empty list means the whole
+        frame was used and no column is added. Default is None.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        A copy with an ``int32`` ``roi_id`` column appended, or ``locs``
+        itself when there is no ROI to name.
+    """
+    rois = _as_roi_list(roi)
+    if rois is None:
+        return locs
+    x = np.asarray(locs["x"], dtype=np.float64)
+    y = np.asarray(locs["y"], dtype=np.float64)
+    roi_id = np.full(len(locs), NO_ROI_ID, dtype=np.int32)
+    for c, ((y0, x0), (y1, x1)) in enumerate(rois):
+        inside = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
+        # first match wins, so overlapping rectangles (which clip_rois
+        # does not produce) still give one index per localization
+        roi_id[inside & (roi_id == NO_ROI_ID)] = c
+    return locs.assign(**{ROI_ID_COLUMN: roi_id})
 
 
 def _temporal_median(
@@ -7461,12 +7518,15 @@ def localize(
         Whether to use multithreading/multiprocessing. Default is True.
     movie_info : list[dict], optional
         Movie metadata. If None, an empty list is used. Default is None.
-    roi : tuple, optional
+    roi : tuple or list of tuples, optional
         Region of interest (ROI) defined as a tuple of two tuples,
         where the first tuple contains the start coordinates
         (y_start, x_start) and the second tuple contains the end
-        coordinates (y_end, x_end). If None, the entire frame is used.
-        Default is None.
+        coordinates (y_end, x_end). A list of such tuples restricts the
+        identification to several (disjoint) regions, and the returned
+        localizations then carry a ``roi_id`` column naming the region
+        each of them came from (see :func:`add_roi_id`). If None, the
+        entire frame is used. Default is None.
     frame_bounds : tuple, optional
         Minimum and maximum frame numbers to consider for the
         identification. If None, all frames are used. Default is None.
@@ -7549,7 +7609,9 @@ def localize(
     Returns
     -------
     locs : pd.DataFrame
-        Data frame containing the localized spots.
+        Data frame containing the localized spots. With ``roi`` given, a
+        ``roi_id`` column naming the ROI each of them came from is
+        appended, see :func:`add_roi_id`.
     info : list[dict], optional
         A list of dictionaries containing metadata about the movie and
         the fitting process. Only returned if `return_info` is True.
@@ -7605,6 +7667,9 @@ def localize(
         multiprocess=threaded,
         progress_callback=fit_progress_callback,
     )
+    # Before the z fit and the lateral corrections below: both move x/y,
+    # which would blur the ROI a localization was detected in.
+    locs = add_roi_id(locs, roi)
     info = io.strip_mm_metadata(movie_info) + [identify_info] + [fit_info]
 
     if fit_z:

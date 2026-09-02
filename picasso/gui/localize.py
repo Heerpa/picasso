@@ -11915,8 +11915,24 @@ class Window(QtWidgets.QMainWindow):
             if sound_path is not None:
                 playsound(sound_path, block=False)
 
+    def attach_roi_id(self) -> None:
+        """Name the ROI each localization was found in, adding a
+        ``roi_id`` column to ``self.locs`` (see
+        ``localize.add_roi_id``).
+
+        Called once per fit, before drift correction moves the
+        coordinates the ids are derived from. Split-FOV mode is
+        excluded: there the regions are separate channels rather than
+        parts of one field, and each is saved to its own file already."""
+        if self.locs is None or self.view.split_fov_mode:
+            return
+        rois = (self.last_identification_info or {}).get("ROI")
+        self.locs = localize.add_roi_id(self.locs, rois)
+
     def save_locs_after_fit(self) -> None:
-        """Save localizations after fitting to an .hdf5 file."""
+        """Save localizations after fitting to an .hdf5 file, naming the
+        ROI each of them came from (see ``attach_roi_id``)."""
+        self.attach_roi_id()
         base = self.channel_output_base()
         self.save_locs(base + "_locs.hdf5")
 
@@ -12293,11 +12309,19 @@ class Window(QtWidgets.QMainWindow):
 
     def select_locs_columns(self) -> None:
         """Select only the columns that are checked in the corresponding
-        dialog."""
+        dialog.
+
+        The ROI id has no checkbox - only a fit restricted to ROIs has
+        it - and is always kept."""
         to_keep = []
         for column, checkbox in self.columns_dialog.column_checkboxes.items():
             if checkbox.isChecked() and column in self.locs.columns:
                 to_keep.append(column)
+        if (
+            localize.ROI_ID_COLUMN in self.locs.columns
+            and localize.ROI_ID_COLUMN not in to_keep
+        ):
+            to_keep.append(localize.ROI_ID_COLUMN)
         self.locs = self.locs[to_keep]
 
 

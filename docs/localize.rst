@@ -117,6 +117,8 @@ By default, Picasso analyzes the whole frame. If you are only interested in cert
 
 To go back to analyzing the whole frame, simply remove all ROIs (double-click them, empty the single-ROI field, or use ``Clear`` in the ``Edit ROIs...`` dialog). If ROIs overlap, Picasso automatically trims them so that no spot is detected twice, so you do not need to draw them precisely. As with the rest of the identification settings, turn on ``Preview`` to check which spots fall inside your ROIs before running the full analysis.
 
+All ROIs are fitted together into one localization file. To keep them apart afterwards, the saved file carries an extra ``roi_id`` column holding the index of the ROI each localization was found in — 0 for the first ROI, 1 for the second, and so on, in the order the ``ROI`` entry of the metadata lists them (-1 marks a localization inside none of them, which a fitted position right at an ROI's edge can be). The ids are computed before drift correction, so they still name the ROI a localization was detected in even after the coordinates have been shifted. Split-FOV mode (``Regions = channels``) adds no ``roi_id``: there each region is a channel of its own and is saved to its own file anyway. The command line and ``picasso.localize.localize`` behave the same way.
+
 Extra features
 --------------
 

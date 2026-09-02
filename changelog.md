@@ -11,6 +11,7 @@ Last change: 01-SEP-2026 CEST
 - New translation transform model (2 DOF, at least 1 bead pair), offered wherever Picasso fits a geometric transform - the lateral astigmatism / chromatic corrections and the multichannel / split-FOV channel registration, in the GUI and on the command line. It fits a pure shift in x and y, for frames known to differ only by an offset: a rotation, scale or shear it cannot represent shows up in the registration residual instead of being absorbed by parameters the optics do not justify.
 - Localize loads z-stack `.nd2` files.
 - Localize's contrast is not set to auto on opening a new movie.
+- ROI id is saved in single-channel localization (if ROIs are used).
 - Fixed empty space in Localize's Parameters dialog.
 - Fixed drawing ROIs in Localize while the temporal median filter is on.
 - Log-scale contrast sliders in Render: in the Display Settings dialogs of the main and of the 3D (rotation) window, and in the Test Clustering dialog.

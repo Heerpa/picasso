@@ -427,6 +427,72 @@ class TestClipRois:
 
 
 # ---------------------------------------------------------------------------
+# add_roi_id
+# ---------------------------------------------------------------------------
+
+
+def _roi_locs() -> pd.DataFrame:
+    """Two localizations in the left half, one in the right, one outside
+    both halves."""
+    return pd.DataFrame(
+        {
+            "frame": np.arange(4, dtype=np.uint32),
+            "x": np.array([1.5, 63.4, 64.6, 200.0], dtype=np.float32),
+            "y": np.array([1.5, 10.0, 10.0, 10.0], dtype=np.float32),
+            "photons": np.full(4, 1000.0, dtype=np.float32),
+        }
+    )
+
+
+class TestAddRoiId:
+    """The ``roi_id`` column of a fit restricted to several ROIs."""
+
+    ROIS = [[[0, 0], [64, 64]], [[0, 64], [64, 128]]]
+
+    def test_the_index_of_the_roi_is_stored(self):
+        out = localize.add_roi_id(_roi_locs(), self.ROIS)
+        assert out.columns[-1] == localize.ROI_ID_COLUMN
+        assert list(out["roi_id"]) == [0, 0, 1, localize.NO_ROI_ID]
+        assert out["roi_id"].dtype == np.int32
+
+    def test_the_other_columns_are_untouched(self):
+        locs = _roi_locs()
+        out = localize.add_roi_id(locs, self.ROIS)
+        pd.testing.assert_frame_equal(out[locs.columns], locs)
+        assert "roi_id" not in locs.columns  # the input is not mutated
+
+    def test_every_localization_gets_exactly_one_index(self):
+        rois = localize.clip_rois([[[0, 0], [64, 128]], [[0, 32], [64, 96]]])
+        out = localize.add_roi_id(_roi_locs(), rois)
+        ids = out["roi_id"]
+        assert ids.between(localize.NO_ROI_ID, len(rois) - 1).all()
+
+    def test_overlapping_rectangles_resolve_to_the_first(self):
+        """``clip_rois`` does not produce overlaps, but a hand-written
+        ``roi`` argument may - one index per localization either way."""
+        out = localize.add_roi_id(
+            _roi_locs(), [[[0, 0], [64, 128]], [[0, 0], [64, 64]]]
+        )
+        assert list(out["roi_id"]) == [0, 0, 0, localize.NO_ROI_ID]
+
+    def test_a_single_rectangle_is_accepted(self):
+        """The whole ``roi`` argument of ``identify``/``localize``, not
+        just its list form."""
+        out = localize.add_roi_id(_roi_locs(), ((0, 0), (64, 64)))
+        assert list(out["roi_id"]) == [0, 0, -1, -1]
+
+    def test_corner_order_does_not_matter(self):
+        out = localize.add_roi_id(_roi_locs(), [((64, 64), (0, 0))])
+        assert list(out["roi_id"]) == [0, 0, -1, -1]
+
+    @pytest.mark.parametrize("roi", [None, []])
+    def test_no_roi_no_column(self, roi):
+        locs = _roi_locs()
+        out = localize.add_roi_id(locs, roi)
+        assert list(out.columns) == list(locs.columns)
+
+
+# ---------------------------------------------------------------------------
 # _to_photons
 # ---------------------------------------------------------------------------
 
