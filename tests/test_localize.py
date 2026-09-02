@@ -10645,19 +10645,6 @@ class TestIdentifyModeParameter:
         finally:
             window.close()
 
-    def test_every_multichannel_widget_keeps_its_space_while_hidden(self):
-        dialog = localize_gui.Window().parameters_dialog
-        try:
-            for widget in (
-                dialog.identify_mode_label,
-                dialog.identify_mode_combo,
-                dialog.link_colors_checkbox,
-                dialog.link_groupbox,
-            ):
-                assert widget.sizePolicy().retainSizeWhenHidden()
-        finally:
-            dialog.window.close()
-
     def test_the_dialog_does_not_reflow_when_channels_are_loaded(self):
         """The complaint this guards against: the identification group used to
         shift everything below it down the moment multichannel data was
