@@ -33,6 +33,7 @@ import time
 import warnings
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future
+from functools import partial
 from itertools import chain
 from typing import Literal, Callable, TypeAlias, Union
 from datetime import datetime
@@ -101,6 +102,12 @@ MovieLike: TypeAlias = Union[
 
 
 MAX_LOCS = int(1e6)
+
+#: How multichannel (or split-FOV) data is fitted: all channels tied into one
+#: global fit, or each channel on its own. Recorded in the metadata of every
+#: independent fit and shown as the ``Fit`` setting in Picasso: Localize.
+FIT_MODE_JOINT = "Jointly (registered channels)"
+FIT_MODE_INDEPENDENT = "Each channel separately"
 
 # Axial multi-start. A single in-focus seed leaves a spline fit z-degenerate at
 # large |z|. Several seeds spanning the calibration stack are run per spot and the
@@ -6876,6 +6883,412 @@ def fit_spline_split_fov(
         max_iterations=max_iterations,
         camera_calibrations=camera_calibrations,
     )
+
+
+# ----------------------------------------------------------------------
+# Independent (per channel / per region) fitting
+#
+# The counterpart of the joint fits above: every channel - a separate movie,
+# or one region of a split field of view - is fitted entirely on its own,
+# with its own fitting method and its own calibrations, and comes out as its
+# own set of localizations. Nothing is shared, nothing is linked and no
+# channel registration is needed; the channels are connected afterwards (e.g.
+# by aligning them in Picasso: Render).
+#
+# The trade-off against the global fit is deliberate: a joint fit reaches a
+# better precision by tying the channels to one position, but it needs a
+# registration, keeps only the molecules detected in *every* channel and
+# exists for two fitting models only. Fitting independently costs that
+# precision and gives back every detection, every fitting method and a
+# per-channel choice of PSF / z calibration.
+# ----------------------------------------------------------------------
+
+
+def _per_channel_arg(value: object, n_channels: int, name: str) -> list:
+    """One value of ``value`` per channel.
+
+    A list or tuple is used as-is (and must have one entry per channel);
+    anything else - including a calibration ``dict`` - is one setting shared
+    by every channel and is broadcast.
+    """
+    if isinstance(value, (list, tuple)):
+        if len(value) != n_channels:
+            raise ValueError(
+                f"{name} has {len(value)} entries but there are "
+                f"{n_channels} channels; pass one per channel or a single "
+                "value for all of them."
+            )
+        return list(value)
+    return [value] * n_channels
+
+
+def _channel_progress(
+    progress_callback: Callable[[int, int], None] | Literal["console"] | None,
+    channel: int,
+) -> Callable[[int], None] | Literal["console"] | None:
+    """One channel's progress callback: the caller's, told which channel is
+    reporting. ``"console"`` is passed straight through, so each channel
+    gets its own progress bar."""
+    if progress_callback is None or progress_callback == "console":
+        return progress_callback
+    return partial(progress_callback, channel)
+
+
+def _check_single_channel_calibration(
+    spline_calibration: dict | None, channel: int
+) -> None:
+    """Reject a joint multichannel calibration in an independent fit.
+
+    A ``spline-3d-multichannel`` calibration describes several channels at
+    once and only means anything to the global fit; fitting one channel
+    against it would silently use the reference channel's PSF everywhere.
+    """
+    if not isinstance(spline_calibration, dict):
+        return
+    if spline_calibration.get("model") == "spline-3d-multichannel":
+        raise ValueError(
+            f"Channel {channel} was given a 'spline-3d-multichannel' "
+            "calibration, which describes all channels at once and belongs "
+            "to the joint "
+            "fit (fit_spline_multichannel / fit_spline_split_fov). Fitting "
+            "the channels independently needs one single-channel spline "
+            "calibration per channel."
+        )
+
+
+def region_label(index: int) -> str:
+    """How a split-FOV region is named on screen and in its output files:
+    the first region is the reference channel, the rest are numbered."""
+    return "ref" if index == 0 else f"ch{index}"
+
+
+def region_movie_info(info: list[dict], region: list) -> list[dict]:
+    """Movie metadata describing one region of a split field of view.
+
+    The region is a movie in its own right once its localizations have been
+    moved into its own coordinates (see
+    :func:`locs_to_region_coordinates`), so its width and height are the
+    region's rather than the sensor's. Where it sat on the sensor is kept in
+    ``"Region"``, so the original position is recoverable.
+
+    Parameters
+    ----------
+    info : list of dict
+        The movie's metadata, as loaded by ``picasso.io.load_movie``.
+    region : list
+        A ``[[y_min, x_min], [y_max, x_max]]`` rectangle, in any corner
+        order.
+
+    Returns
+    -------
+    info : list of dict
+        A copy with the last entry's ``"Width"`` / ``"Height"`` set to the
+        region size and ``"Region"`` recording the rectangle.
+    """
+    (y0, x0), (y1, x1) = _normalize_rect(region)
+    new_info = [dict(_) for _ in info]
+    new_info[-1] = new_info[-1] | {
+        "Width": int(x1 - x0),
+        "Height": int(y1 - y0),
+        "Region": [[y0, x0], [y1, x1]],
+    }
+    return new_info
+
+
+def locs_to_region_coordinates(
+    locs: pd.DataFrame, region: list
+) -> pd.DataFrame:
+    """Move localizations into one region's own coordinate frame.
+
+    Subtracts the region's top-left corner from ``x`` and ``y``, so that a
+    region of a split field of view becomes a stand-alone channel starting at
+    the origin - which is what makes the regions overlay each other when they
+    are loaded side by side in Picasso: Render.
+
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations with ``x`` and ``y`` columns, in sensor coordinates.
+    region : list
+        A ``[[y_min, x_min], [y_max, x_max]]`` rectangle, in any corner
+        order.
+
+    Returns
+    -------
+    locs : pd.DataFrame
+        A copy with ``x`` and ``y`` shifted by the region's origin.
+    """
+    x0, y0 = _region_origin_xy(region)
+    shifted = locs.copy()
+    shifted["x"] = (np.asarray(locs["x"], dtype=np.float64) - x0).astype(
+        np.float32
+    )
+    shifted["y"] = (np.asarray(locs["y"], dtype=np.float64) - y0).astype(
+        np.float32
+    )
+    return shifted
+
+
+def split_locs_by_region(
+    locs: pd.DataFrame, regions: list, to_local: bool = True
+) -> list[pd.DataFrame]:
+    """Split localizations by the region of the sensor they fall in.
+
+    The localization counterpart of :func:`confine_to_region`: a fit run over
+    a whole split-FOV movie is separated into one table per region. Regions
+    are matched in the order given, and a localization in none of them is
+    dropped.
+
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations with ``x`` and ``y`` columns, in sensor coordinates.
+    regions : list
+        One ``[[y_min, x_min], [y_max, x_max]]`` rectangle per region.
+    to_local : bool, optional
+        Move each region's localizations into its own coordinate frame
+        (default True, see :func:`locs_to_region_coordinates`). False keeps
+        them in sensor coordinates.
+
+    Returns
+    -------
+    locs_per_region : list of pd.DataFrame
+        One table per region, in the order the regions were given.
+    """
+    per_region = []
+    for region in regions:
+        region_locs = confine_to_region(locs, region)
+        if to_local:
+            region_locs = locs_to_region_coordinates(region_locs, region)
+        per_region.append(region_locs)
+    return per_region
+
+
+def fit_independent(
+    movies: list,
+    camera_infos: list[dict] | dict,
+    identifications: list[pd.DataFrame],
+    box: int,
+    fitting_method: str | list[str] = "gausslq",
+    *,
+    eps: float | list | None = None,
+    max_it: int | list | None = None,
+    spline_calibration: dict | list | None = None,
+    camera_calibration: dict | list | None = None,
+    multiprocess: bool = True,
+    progress_callback: (
+        Callable[[int, int], None] | Literal["console"] | None
+    ) = None,
+    abort_callback: Callable[[], bool] | None = None,
+) -> list[tuple[pd.DataFrame, dict]] | None:
+    """Fit several channels independently, one single-channel fit each.
+
+    The alternative to the joint fits (:func:`fit_spline_multichannel`,
+    :func:`fit_gauss_multichannel`): no registration is needed, every
+    detection is fitted, and each channel may use a different fitting method
+    and its own calibrations. The channels come out unlinked, in their own
+    coordinates, to be connected afterwards.
+
+    Parameters
+    ----------
+    movies : list
+        One movie per channel, as loaded by ``picasso.io.load_movie``.
+    camera_infos : list of dict or dict
+        One camera-info dict per channel, or a single one shared by all.
+    identifications : list of pd.DataFrame
+        That channel's own detections, one table per channel (e.g. from
+        :func:`identify` run on each movie).
+    box : int
+        Box side length (camera pixels), shared by the channels.
+    fitting_method : str or list of str, optional
+        Any of ``FIT_METHODS``, either one for all channels or one per
+        channel. Default "gausslq".
+    eps, max_it : float, int, list or None, optional
+        Convergence criterion and iteration cap, per channel or shared. See
+        :func:`fit`.
+    spline_calibration : dict, list or None, optional
+        A single-channel spline PSF calibration per channel, or one shared by
+        all. A joint ``"spline-3d-multichannel"`` calibration is rejected -
+        it belongs to :func:`fit_spline_multichannel`.
+    camera_calibration : dict, list or None, optional
+        Per-pixel sCMOS calibration per channel, or one shared by all. Each
+        must match the shape of its own movie.
+    multiprocess : bool, optional
+        Whether to use multiprocessing. Default True.
+    progress_callback : callable, "console" or None, optional
+        Called with ``(channel, n_spots_done)`` as each channel is fitted;
+        ``"console"`` shows one tqdm progress bar per channel.
+    abort_callback : callable or None, optional
+        Called with no arguments; returning True aborts. The whole batch then
+        returns None.
+
+    Returns
+    -------
+    results : list of (pd.DataFrame, dict) or None
+        One ``(locs, info)`` pair per channel, in the order given. None if
+        the fit was aborted.
+    """
+    n_channels = len(movies)
+    if len(identifications) != n_channels:
+        raise ValueError(
+            f"{len(identifications)} identification tables for "
+            f"{n_channels} movies; pass one per channel."
+        )
+    infos = _per_channel_arg(camera_infos, n_channels, "camera_infos")
+    methods = _per_channel_arg(fitting_method, n_channels, "fitting_method")
+    epss = _per_channel_arg(eps, n_channels, "eps")
+    max_its = _per_channel_arg(max_it, n_channels, "max_it")
+    splines = _per_channel_arg(
+        spline_calibration, n_channels, "spline_calibration"
+    )
+    cameras = _per_channel_arg(
+        camera_calibration, n_channels, "camera_calibration"
+    )
+    results = []
+    for c in range(n_channels):
+        _check_single_channel_calibration(splines[c], c)
+        locs, info = fit(
+            movies[c],
+            camera_info=infos[c],
+            identifications=identifications[c],
+            box=box,
+            fitting_method=methods[c],
+            eps=epss[c],
+            max_it=max_its[c],
+            spline_calibration=splines[c],
+            camera_calibration=cameras[c],
+            multiprocess=multiprocess,
+            progress_callback=_channel_progress(progress_callback, c),
+            abort_callback=abort_callback,
+        )
+        if locs is None:  # aborted
+            return None
+        info = info | {
+            "Fit mode": FIT_MODE_INDEPENDENT,
+            "Channel": c,
+            "Channels": n_channels,
+        }
+        results.append((locs, info))
+    return results
+
+
+def fit_split_fov_independent(
+    movie,
+    camera_info: dict,
+    identifications: pd.DataFrame,
+    box: int,
+    regions: list,
+    fitting_method: str | list[str] = "gausslq",
+    *,
+    movie_info: list[dict] | None = None,
+    to_local: bool = True,
+    eps: float | list | None = None,
+    max_it: int | list | None = None,
+    spline_calibration: dict | list | None = None,
+    camera_calibration: dict | None = None,
+    multiprocess: bool = True,
+    progress_callback: (
+        Callable[[int, int], None] | Literal["console"] | None
+    ) = None,
+    abort_callback: Callable[[], bool] | None = None,
+) -> list[tuple[pd.DataFrame, list[dict]]] | None:
+    """Fit each region of a split field of view independently.
+
+    The split-FOV counterpart of :func:`fit_independent`: the regions of one
+    movie are the channels, so each region's detections are fitted on their
+    own - with that region's own fitting method and calibration - and come
+    out as a stand-alone set of localizations in the region's own
+    coordinates.
+
+    Parameters
+    ----------
+    movie : LoadedMovie
+        The movie holding all regions.
+    camera_info : dict
+        Camera information; one camera images every region.
+    identifications : pd.DataFrame
+        Detections over the whole sensor (e.g. from :func:`identify` with
+        the regions as its ROIs); they are split by region here.
+    box : int
+        Box side length (camera pixels).
+    regions : list
+        One ``[[y_min, x_min], [y_max, x_max]]`` rectangle per region, the
+        first being the reference region.
+    fitting_method : str or list of str, optional
+        Any of ``FIT_METHODS``, either one for all regions or one per
+        region. Default "gausslq".
+    movie_info : list of dict or None, optional
+        The movie's metadata, as loaded by ``picasso.io.load_movie``. When
+        given, it is adapted to each region (see :func:`region_movie_info`)
+        and prepended to that region's fit metadata, so that what comes back
+        is ready to save.
+    to_local : bool, optional
+        Move each region's localizations into its own coordinate frame
+        (default True). False keeps them in sensor coordinates.
+    eps, max_it, spline_calibration : optional
+        Per region or shared, as in :func:`fit_independent`.
+    camera_calibration : dict or None, optional
+        Per-pixel sCMOS calibration for the (single) camera, covering the
+        full frame. Default None.
+    multiprocess : bool, optional
+        Whether to use multiprocessing. Default True.
+    progress_callback : callable, "console" or None, optional
+        Called with ``(region, n_spots_done)`` as each region is fitted;
+        ``"console"`` shows one tqdm progress bar per region.
+    abort_callback : callable or None, optional
+        Called with no arguments; returning True aborts. The whole batch then
+        returns None.
+
+    Returns
+    -------
+    results : list of (pd.DataFrame, list of dict) or None
+        One ``(locs, info)`` pair per region, in the order the regions were
+        given. ``info`` ends with that region's fit metadata and, when
+        ``movie_info`` was passed, starts with the region's movie metadata.
+        None if the fit was aborted.
+    """
+    n_regions = len(regions)
+    if not n_regions:
+        raise ValueError("fit_split_fov_independent needs at least one region")
+    methods = _per_channel_arg(fitting_method, n_regions, "fitting_method")
+    epss = _per_channel_arg(eps, n_regions, "eps")
+    max_its = _per_channel_arg(max_it, n_regions, "max_it")
+    splines = _per_channel_arg(
+        spline_calibration, n_regions, "spline_calibration"
+    )
+    results = []
+    for c, region in enumerate(regions):
+        _check_single_channel_calibration(splines[c], c)
+        locs, fit_info = fit(
+            movie,
+            camera_info=camera_info,
+            identifications=confine_to_region(identifications, region),
+            box=box,
+            fitting_method=methods[c],
+            eps=epss[c],
+            max_it=max_its[c],
+            spline_calibration=splines[c],
+            camera_calibration=camera_calibration,
+            multiprocess=multiprocess,
+            progress_callback=_channel_progress(progress_callback, c),
+            abort_callback=abort_callback,
+        )
+        if locs is None:  # aborted
+            return None
+        if to_local:
+            locs = locs_to_region_coordinates(locs, region)
+        fit_info = fit_info | {
+            "Fit mode": FIT_MODE_INDEPENDENT,
+            "Channel": c,
+            "Channels": n_regions,
+            "Region": _normalize_rect(region),
+            "Region coordinates": "region" if to_local else "sensor",
+        }
+        info = [fit_info]
+        if movie_info is not None:
+            info = region_movie_info(movie_info, region) + info
+        results.append((locs, info))
+    return results
 
 
 def _fit2d_avg(

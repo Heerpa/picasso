@@ -502,14 +502,14 @@ Fitting with the spline PSF
 2. In the **Experimental PSF (spline)** box, click ``Load calibration`` and choose your ``.hdf5``. The last-used calibration is remembered between sessions, and calibrations can be loaded automatically per camera and emission wavelength via the ``spline-calibrations`` config field described above.
 3. Choose the **Optimizer**: ``Least squares`` or ``MLE`` (Poisson maximum likelihood). ``MLE`` is recommended.
 4. Tick **Use GPU** to run the fit on the GPU; leave it unticked to fit on the CPU. The checkbox is only available when a CUDA GPU is detected.
-6. Run ``Analyze`` > ``Localize (Identify & Fit)`` (or ``Fit`` for already-identified spots).
+5. Run ``Analyze`` > ``Localize (Identify & Fit)`` (or ``Fit`` for already-identified spots).
 
 In addition to the usual columns, spline fits report per-localization precisions (``lpx``, ``lpy``, and ``lpz`` for 3D, in nm), ``photons`` and ``bg`` with their uncertainties (``photons_unc``, ``bg_unc``), and, for MLE, ``log_likelihood`` and ``iterations``. A 3D calibration adds the recovered ``z`` (and ``lpz``). The accompanying ``_locs.yaml`` records the spline calibration model and file path used, and which device performed the fit.
 
 Multichannel spline PSF (e.g. biplane)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Several spatially-registered channels (e.g. biplane setups) can be fit simultaneously, sharing one ``x``, ``y`` and ``z`` per molecule. The calibration needs one bead z-stack per channel, all scanned over the same z range with the same number of frames.
+Several spatially-registered channels (e.g. biplane setups) can be fit simultaneously, sharing one ``x``, ``y`` and ``z`` per molecule. (To fit the channels one at a time instead, each with its own PSF, see `Analyzing each channel on its own`_ below.) The calibration needs one bead z-stack per channel, all scanned over the same z range with the same number of frames.
 
 This implements the global-fitting (globLoc) approach of `Li et al., Nature Communications 13, 3133 (2022) <https://doi.org/10.1038/s41467-022-30719-4>`_ — one experimental PSF per channel, the channels registered to a reference channel, and all channels fitted jointly with linked parameters. Please cite that work when using multichannel spline fitting.
 
@@ -608,7 +608,7 @@ Fitting
 
 Only molecules detected in *every* channel are fitted, so identify each channel first — with several channels loaded, ``Identify`` (Ctrl+I) analyzes all of them in turn. In split-FOV mode the whole movie is identified at once and the detections are split by region, so nothing extra is needed; they are confined to the reference region automatically, and one localization comes out per molecule. When one channel is much dimmer than the others, identify on the channel sum instead; see `Identifying on the sum of the channels`_ above, which works from a loaded channel registration exactly as it does from a spline calibration.
 
-**With no registration loaded, nothing changes:** the spherical Gaussian fits the active channel alone, as before. The joint fit runs only when a registration is loaded *and* the data actually has several channels — either several movies open, or ``Regions = channels`` with a split-FOV registration.
+**With no registration loaded, nothing changes:** the spherical Gaussian fits the active channel alone, as before. The joint fit runs only when a registration is loaded *and* the data actually has several channels — either several movies open, or ``Regions = channels`` with a split-FOV registration. To fit every channel on its own instead — with any model, and without a registration — set ``Fit`` to ``Each channel separately``; see `Analyzing each channel on its own`_ below.
 
 Linking the photon counts
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -629,3 +629,68 @@ So, unless the channels are known to be balanced:
 - **Linked** — one photon count and background shared across the channels.
 
 In both modes ``photons`` and ``bg`` are the **totals across all channels**, so the two are directly comparable with each other and with the spline fit.
+
+Analyzing each channel on its own
+---------------------------------
+
+The two multichannel fits above tie the channels together: they need a registration (or a measured multichannel PSF), they fit one shared position per molecule, they keep only the molecules detected in *every* channel, and they exist for the spherical Gaussian and the spline PSF only. This section describes how to fit each channel independently of one another.
+
+The ``Fit`` setting in the ``Parameters`` dialog chooses between the two:
+
+- **Jointly (registered channels)** — the default: a loaded multichannel spline calibration or channel registration runs the global fit described above, and with none loaded the active channel is fitted by itself.
+- **Each channel separately** — every loaded channel (or every split-FOV region) is fitted on its own, one after another, with **its own** fitting model, optimizer and calibrations, and each is saved to its own file. No registration is needed, nothing is dropped, and the channels come out independent.
+
+*This feature is experimental — please report any unexpected behavior on our* `GitHub issues page <https://github.com/jungmannlab/picasso/issues>`_.
+
+Running it
+~~~~~~~~~~
+
+1. Load the channels, in either layout: ``File`` > ``Open channels from several movies`` (or ``Open one multichannel movie``), or — for channels imaged side by side on one sensor — load the single movie, tick **Regions = channels** in the ``Parameters`` dialog and drag one ROI onto each channel, as described above for multichannel fitting.
+2. Open ``Analyze`` > ``Parameters`` and set **Fit** to ``Each channel separately``.
+3. Set up each channel: select it (the channel selector below the image, or the region in the image) and choose its ``Model``, ``Optimizer``, ``Min. net gradient`` and calibrations. See *What each channel carries* below.
+4. Run ``Analyze`` > ``Identify`` (Ctrl+I), which analyzes every channel in turn, and then ``Analyze`` > ``Fit`` — or ``Localize (Identify & Fit)`` for both at once.
+5. The status bar reports each channel as it is fitted and, at the end, how many spots were fitted in how many channels. ``Analyze`` > ``Abort`` stops the whole batch.
+
+What each channel carries
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Fitted separately, a channel is a dataset of its own, so these settings are kept per channel and swapped in when the channel is selected:
+
+- **Model and optimizer** — every model is available, together with its convergence criterion, maximum iterations and the ``Use GPU`` choice.
+- **Min. net gradient** — as before: per channel for separate movies, and per region in split-FOV mode (select a region and the slider tunes that region alone).
+- **Experimental PSF (spline) calibration** — the PSF is measured per channel, so each channel usually needs its own. For separate movies, untick **PSF calibration** under ``Same settings across channels`` and load one calibration per channel; ticked (the default) one calibration is shared, which is what the joint fit needs. In split-FOV mode each region always keeps its own.
+- **3D via astigmatism** — the z calibration and the ``Fit Z`` checkbox, likewise per channel: astigmatism is calibrated per optical path.
+- **Camera settings** — baseline, sensitivity, gain and pixel size, unless ``Camera settings`` is ticked under ``Same settings across channels``.
+
+The box size, the frame range and the identification filters (temporal median, Gaussian filter) stay shared: they describe the acquisition rather than the channel. In split-FOV mode the ``Edit ROIs...`` table lists each region's model and PSF calibration alongside its coordinates and threshold, so the whole setup can be checked at a glance.
+
+A **multichannel** spline calibration cannot be used here. Picasso refuses it and asks for one single-channel calibration per channel rather than silently fitting every channel with the reference channel's PSF.
+
+The resulting file
+~~~~~~~~~~~~~~~~~~
+
+One file per channel, saved next to its movie exactly as a single-channel run saves its own:
+
+- **Separate movies** — ``<movie>_locs.hdf5`` per channel; when several channels come from one file, the channel name is appended (``<movie>_<channel>_locs.hdf5``).
+- **Split field of view** — ``<movie>_ref_locs.hdf5``, ``<movie>_ch1_locs.hdf5``, ... , one per region, named after the labels drawn beside the regions.
+
+Each split-FOV file holds **that region's own coordinates**: the region's top-left corner is subtracted from ``x`` and ``y``, and the metadata gives the region's width and height (with the region's position on the sensor recorded under ``Region``). A region is therefore a stand-alone channel, and loading the files side by side in Picasso: Render overlays them, rather than placing them next to each other as they sat on the camera. The metadata also records ``Fit mode: Each channel separately`` and which channel or region the file came from, so a file from this mode can always be told from one the joint fit produced.
+
+Everything a single-channel run does afterwards is done per channel: the astigmatic z fit when ``Fit Z`` is ticked, and the drift correction when ``AIM`` or the fiducial-based correction is selected — each channel writing its own ``_locs_undrifted.hdf5`` and drift file.
+
+From the command line
+~~~~~~~~~~~~~~~~~~~~~
+
+Separate movies are already independent runs — ``picasso localize`` processes each file on its own. For a split field of view, add ``--regions-separately`` (``-rs``) to a run with several ``--roi`` regions::
+
+    picasso localize movie.tif -b 7 --regions-separately \
+        --roi 0 0 256 256 --gradient 5000 --fit-method lq \
+        --roi 0 256 256 512 --gradient 2000 --fit-method spline \
+        --spline-calibration ref_psf.hdf5 --spline-calibration ch1_psf.hdf5
+
+Each region is fitted on its own and written to ``movie_ref_locs.hdf5``, ``movie_ch1_locs.hdf5``, ... in that region's own coordinates. ``--gradient``, ``--fit-method`` and ``--spline-calibration`` may be given once per ``--roi`` (in the same order as the regions) or once for all of them; ``--gradient`` accepts per-region values in an ordinary run too, since regions imaged through different optics need not share a brightness scale.
+
+From a script
+~~~~~~~~~~~~~
+
+The same is available from Python: :func:`picasso.localize.fit_independent` fits one set of detections per movie, and :func:`picasso.localize.fit_split_fov_independent` fits the regions of one movie, returning each region's localizations in its own coordinates together with its metadata. Both take the fitting method, the convergence settings and the spline calibration either once for all channels or once per channel. :func:`picasso.localize.split_locs_by_region` splits an existing set of localizations by region in the same way.

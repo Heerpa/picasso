@@ -25,8 +25,9 @@ The reconstruction parameters can be specified by adding respective arguments. I
 ::
 
    '-b', '--box-side-length', type=int, default=7, help='box side length'
-   '-a', '--fit-method', choices=["mle", "mle-gpu", "mle-spherical", "mle-spherical-gpu", "mle-rotated", "mle-rotated-gpu", "lq", "lq-spherical", "lq-spherical-gpu", "lq-rotated", "lq-rotated-gpu", "lq-gpu", "lq-3d", "lq-gpu-3d", "mle-3d", "spline", "spline-mle", "spline-gpu", "spline-mle-gpu", "avg"], default='mle', help='fitting method'
-   '-g', '--gradient', type=int, default=5000, help='minimum net gradient'
+   '-a', '--fit-method', choices=["mle", "mle-gpu", "mle-spherical", "mle-spherical-gpu", "mle-rotated", "mle-rotated-gpu", "lq", "lq-spherical", "lq-spherical-gpu", "lq-rotated", "lq-rotated-gpu", "lq-gpu", "lq-3d", "lq-gpu-3d", "mle-3d", "spline", "spline-mle", "spline-gpu", "spline-mle-gpu", "avg"], action='append', default='mle', help='fitting method; may be given once per --roi with --regions-separately'
+   '-g', '--gradient', type=int, action='append', default=5000, help='minimum net gradient; may be given once per --roi'
+   '-rs', '--regions-separately', action='store_true', help='fit each --roi region on its own and save one file per region, in that region\'s own coordinates'
    '-tm', '--temporal-median', type=int, default=0, help='window length (frames) of the temporal median filter applied before identification, 0 to deactivate'
    '-gf', '--gaussian-filter', type=float, default=0.0, help='sigma (camera pixels) of the spatial Gaussian filter applied before identification, 0 to deactivate'
    '-d', '--drift', type=int, default=1000, help='segmentation size for subsequent RCC, 0 to deactivate'
@@ -36,7 +37,7 @@ The reconstruction parameters can be specified by adding respective arguments. I
    '-s', '--sensitivity', type=float, default=1, help='camera sensitivity'
    '-ga', '--gain', type=int, default=1, help='camera gain'
    '-px', '--pixelsize', type=int, default=130, help='pixel size in nm'
-   '-sc', '--spline-calibration', type=str, default='', help='path to a cubic-spline PSF calibration (.hdf5), required by the spline fit methods'
+   '-sc', '--spline-calibration', type=str, action='append', default='', help='path to a cubic-spline PSF calibration (.hdf5), required by the spline fit methods; may be given once per --roi with --regions-separately'
    '-mf', '--mf', type=float, default=0, help='magnification factor (3D only)'
    '-zc', '--zc', type=str, default='', help='path to 3D calibration file (3D only)'
    '-sf', '--suffix', type=str, default='', help='suffix to add to output files'
@@ -52,6 +53,12 @@ Make sure to set the camera settings correctly; otherwise photon counts are wron
 ``--gaussian-filter`` smooths each frame with a Gaussian of the given standard deviation before spots are identified. Spot identification looks for a single local maximum per spot, so a PSF that is not Gaussian-shaped may break into several maxima and is detected several times; smoothing merges them into one. It affects identification only — fitting always uses the raw movie — and since smoothing lowers gradient magnitudes, ``-g`` needs re-tuning when it is changed. It can be combined with ``--temporal-median``, which is applied first.
 
 ``--concat`` accumulates movies found in the folder specified as on concatenated movie. Given a folder, Picasso searches it and all of its sub-folders; given a pattern (e.g. ``"experiment_folder/*/*.tif"``), it uses the matching files. In both cases the files are ordered by folder and file name with numbers compared numerically, so ``run_2`` comes before ``run_10``, and the full order is printed before the analysis starts — check it, since a wrong order is only noticeable afterwards. Each entry is one whole movie: the continuation files of a split OME-TIFF stack (``*_1.ome.tif``, ...) and the individual frames of a MicroManager "separate image files" folder are read together with the movie they belong to, so no frames are repeated.
+
+``--regions-separately`` treats the ``--roi`` regions as channels imaged side by side on one sensor and fits each of them on its own, writing ``<movie>_ref_locs.hdf5``, ``<movie>_ch1_locs.hdf5``, ... — one file per region, each in that region's own coordinates (the region's corner subtracted from ``x`` and ``y``, and its size in the metadata), so the files overlay each other when loaded as channels in Render. ``--fit-method``, ``--gradient`` and ``--spline-calibration`` may then be given once per ``--roi``, in the same order as the regions, or once for all of them::
+
+   picasso localize movie.tif -b 7 --regions-separately --roi 0 0 256 256 --roi 0 256 256 512 -g 5000 -g 2000 -a lq -a mle
+
+Separate movies need no flag: ``picasso localize`` already analyzes each file on its own. See *Analyzing each channel on its own* in the Localize documentation.
 
 If you select one of the 3D algorithms (``lq-3d``, ``lq-gpu-3d`` or ``mle-3d``) you must supply both the magnification factor (``-mf``) and the path to the 3D calibration file (``-zc``). If either is omitted, the program will prompt you for it interactively.
 

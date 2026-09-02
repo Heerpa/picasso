@@ -1135,6 +1135,7 @@ def _localize_process_file(
     spline_calibration: dict | None = None,
     camera_calibration: dict | None = None,
     lateral_transforms: list | None = None,
+    region_fit: dict | None = None,
 ) -> None:
     """Identify, fit, save and optionally undrift one movie.
 
@@ -1156,10 +1157,13 @@ def _localize_process_file(
         applied the ones stored in the 3D calibration. Corrections the
         spline or astigmatism calibration carries - and therefore applies
         itself - are skipped rather than applied a second time.
+    region_fit : dict or None
+        Set by ``--regions-separately``: fit each ``--roi`` region on its
+        own and write one file per region. Holds the per-region fitting
+        methods and spline calibrations (see ``_localize_regions``).
     """
-    from os.path import splitext
-    from .io import load_movie, load_tif_concatenated, save_locs
-    from .localize import localize, add_file_to_db
+    from .io import load_movie, load_tif_concatenated
+    from .localize import localize
 
     if isinstance(paths, str):
         paths = [paths]
@@ -1185,6 +1189,25 @@ def _localize_process_file(
     fitting_method = _FIT_METHOD_MAP[args.fit_method]
     cam_info = dict(camera_info)
     cam_info["Pixelsize"] = args.pixelsize
+    if region_fit is not None:
+        _localize_regions(
+            movie,
+            info,
+            path,
+            args,
+            box,
+            min_net_gradient,
+            roi,
+            frame_bounds,
+            cam_info,
+            convergence,
+            max_iterations,
+            z_params,
+            region_fit,
+            camera_calibration=camera_calibration,
+            lateral_transforms=lateral_transforms,
+        )
+        return
     parameters = {
         "Min. Net Gradient": min_net_gradient,
         "Box Size": box,
@@ -1210,6 +1233,181 @@ def _localize_process_file(
         return_info=True,
     )
 
+    _localize_finish(
+        locs,
+        info,
+        path,
+        args,
+        z_params,
+        lateral_transforms,
+        spline_calibration,
+    )
+
+
+def _localize_region_fit(
+    fit_methods: list[str],
+    spline_calibrations: list[dict],
+    n_regions: int,
+) -> dict:
+    """The per-region fitting methods and spline calibrations of a
+    ``--regions-separately`` run, one entry per region.
+
+    A single ``--fit-method`` / ``--spline-calibration`` applies to every
+    region; several must match the ``--roi`` count, so that it is clear
+    which region gets which."""
+    if n_regions < 1:
+        raise Exception(
+            "--regions-separately fits each --roi region on its own, so at "
+            "least one --roi is needed. Pass the regions, e.g. "
+            "--roi 0 0 256 256 --roi 0 256 256 512."
+        )
+    methods = [_FIT_METHOD_MAP[method] for method in fit_methods]
+    if len(methods) not in (1, n_regions):
+        raise Exception(
+            f"{len(methods)} fitting methods were given but {n_regions} "
+            "ROIs; pass one --fit-method per --roi, or a single one for all "
+            "of them."
+        )
+    if len(methods) == 1:
+        methods = methods * n_regions
+    calibrations = list(spline_calibrations)
+    if calibrations and len(calibrations) not in (1, n_regions):
+        raise Exception(
+            f"{len(calibrations)} spline calibrations were given but "
+            f"{n_regions} ROIs; pass one --spline-calibration per --roi, or "
+            "a single one for all of them."
+        )
+    if len(calibrations) == 1:
+        calibrations = calibrations * n_regions
+    if not calibrations:
+        calibrations = [None] * n_regions
+    return {"methods": methods, "spline_calibrations": calibrations}
+
+
+def _localize_regions(
+    movie,
+    info: list[dict],
+    path: str,
+    args: argparse.Namespace,
+    box: int,
+    min_net_gradient,
+    roi: list,
+    frame_bounds,
+    cam_info: dict,
+    convergence: float,
+    max_iterations: int,
+    z_params,
+    region_fit: dict,
+    camera_calibration: dict | None = None,
+    lateral_transforms: list | None = None,
+) -> None:
+    """Fit each ``--roi`` region of one movie on its own
+    (``--regions-separately``).
+
+    The regions are channels imaged side by side on one sensor, so the spots
+    are identified once over the whole frame and then fitted region by
+    region - each with its own fitting method and spline calibration, each
+    saved to its own file, in its own coordinates. Nothing is registered or
+    linked across the regions; they are connected afterwards (e.g. by
+    aligning them in Picasso: Render).
+    """
+    from .localize import (
+        fit_split_fov_independent,
+        identify,
+        region_label,
+    )
+
+    identifications, identify_info = identify(
+        movie,
+        min_net_gradient,
+        box,
+        roi=roi,
+        frame_bounds=frame_bounds,
+        threaded=True,
+        temporal_median_window=args.temporal_median,
+        gaussian_filter_sigma=args.gaussian_filter,
+        progress_callback="console",
+    )
+    print(
+        f"Identified {len(identifications):,} spots in {len(roi)} regions. "
+        "Fitting each region on its own..."
+    )
+    results = fit_split_fov_independent(
+        movie,
+        cam_info,
+        identifications,
+        box,
+        roi,
+        region_fit["methods"],
+        movie_info=info,
+        eps=convergence if convergence > 0 else None,
+        max_it=max_iterations if max_iterations > 0 else None,
+        spline_calibration=region_fit["spline_calibrations"],
+        camera_calibration=camera_calibration,
+        multiprocess=True,
+        progress_callback="console",
+    )
+    for c, (locs, region_info) in enumerate(results):
+        label = region_label(c)
+        print("------------------------------------------")
+        if not len(locs):
+            # an empty file would say nothing; the missing one, with this
+            # line, says the threshold found nothing in that region
+            print(
+                f"Region {label}: no spots identified in it, nothing saved. "
+                "Lower its --gradient to detect any."
+            )
+            continue
+        print(f"Region {label}: {len(locs):,} localizations")
+        # as ``localize`` builds it: the movie's metadata, then the
+        # identification, then the fit
+        region_info = region_info[:-1] + [identify_info] + [region_info[-1]]
+        _localize_finish(
+            locs,
+            region_info,
+            path,
+            args,
+            z_params,
+            lateral_transforms,
+            region_fit["spline_calibrations"][c],
+            suffix=f"_{label}",
+            fitting_method=region_fit["methods"][c],
+        )
+
+
+def _localize_finish(
+    locs,
+    info: list[dict],
+    path: str,
+    args: argparse.Namespace,
+    z_params,
+    lateral_transforms: list | None,
+    spline_calibration: dict | None,
+    suffix: str = "",
+    fitting_method: str | None = None,
+) -> None:
+    """Everything that happens to one set of localizations once it is
+    fitted: the astigmatic z fit, the extra lateral corrections, saving,
+    the quality database and the drift correction.
+
+    Split out of ``_localize_process_file`` so that a run that fits the
+    regions separately (``--regions-separately``) does all of it per region,
+    each region writing its own file.
+
+    Parameters
+    ----------
+    suffix : str, optional
+        Inserted into the output name before ``_locs``, e.g. ``"_ref"`` for
+        one region of a split field of view. Default "" (one file per movie).
+    fitting_method : str or None, optional
+        The method this set was fitted with, which decides the noise model
+        of the astigmatic z fit. None (the default) uses ``args.fit_method``.
+    """
+    from os.path import splitext
+    from .io import save_locs
+    from .localize import add_file_to_db
+
+    method_name = fitting_method or args.fit_method
     if z_params is not None:
         from . import zfit
 
@@ -1217,7 +1415,7 @@ def _localize_process_file(
         z_calibration["Magnification Factor"] = magnification_factor
         print("------------------------------------------")
         print("Fitting 3D...")
-        method = "gausslq" if "mle" not in args.fit_method else "gaussmle"
+        method = "gausslq" if "mle" not in method_name else "gaussmle"
         locs, info = zfit.zfit(
             locs=locs,
             info=info,
@@ -1270,7 +1468,7 @@ def _localize_process_file(
     except Exception:
         sfx = ""
 
-    out_path = f"{base}{sfx}_locs.hdf5"
+    out_path = f"{base}{sfx}{suffix}_locs.hdf5"
     save_locs(out_path, locs, info)
     print("File saved to {}".format(out_path))
 
@@ -1338,6 +1536,16 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     print("Localize - Parameters:")
     print("{:<8} {:<15} {:<10}".format("No", "Label", "Value"))
 
+    # The repeatable options collapse to their single value unless the
+    # regions are fitted separately, where they are one per region; the
+    # first one stands for the run as a whole (the GPU check, the 3D and
+    # spline branches below).
+    fit_methods = args.fit_method or ["mle"]
+    args.fit_method = fit_methods[0]
+    gradients = args.gradient or [5000]
+    args.gradient = gradients[0]
+    spline_paths = args.spline_calibration or []
+    args.spline_calibration = spline_paths[0] if spline_paths else ""
     if _FIT_METHOD_MAP[args.fit_method].endswith("-gpu"):
         if localize.CUDA_AVAILABLE:
             print("CUDA GPU found")
@@ -1380,7 +1588,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
 
     print(args)
     box = args.box_side_length
-    min_net_gradient = args.gradient
+    min_net_gradient = gradients[0] if len(gradients) == 1 else gradients
     roi = args.roi
     if roi is not None:
         # argparse (action="append", nargs=4) yields a list of 4-int
@@ -1393,6 +1601,13 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             for y_min, x_min, y_max, x_max in roi
         ]
         roi = clip_rois(rois, min_size=box)
+    n_regions = len(roi) if roi else 0
+    if len(gradients) > 1 and len(gradients) != n_regions:
+        raise Exception(
+            f"{len(gradients)} minimum net gradients were given but "
+            f"{n_regions} ROIs; pass one --gradient per --roi, or a single "
+            "one for all of them."
+        )
     frame_bounds = args.frame_bounds
     camera_info = {
         "Baseline": args.baseline,
@@ -1422,20 +1637,29 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
                 )
                 args.fit_z_gpu = False
 
-    spline_calibration = None
-    if args.fit_method.startswith("spline"):
+    spline_calibrations = []
+    if any(method.startswith("spline") for method in fit_methods):
         from .io import load_spline_calibration
 
-        if not args.spline_calibration:
+        if not spline_paths:
             raise Exception(
                 "Spline fitting requires --spline-calibration <file.hdf5>. "
                 "Build one with 'picasso spline-calibrate'."
             )
-        spline_calibration = load_spline_calibration(args.spline_calibration)
-        print(
-            "Loaded spline PSF calibration "
-            f"({spline_calibration.get('model')}) from "
-            f"{args.spline_calibration}"
+        for calibration_path in spline_paths:
+            calibration = load_spline_calibration(calibration_path)
+            print(
+                "Loaded spline PSF calibration "
+                f"({calibration.get('model')}) from {calibration_path}"
+            )
+            spline_calibrations.append(calibration)
+    spline_calibration = (
+        spline_calibrations[0] if spline_calibrations else None
+    )
+    region_fit = None
+    if args.regions_separately:
+        region_fit = _localize_region_fit(
+            fit_methods, spline_calibrations, n_regions
         )
 
     # Extra lateral affine corrections, applied after fitting on top of any
@@ -1511,6 +1735,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             spline_calibration=spline_calibration,
             lateral_transforms=lateral_transforms,
             camera_calibration=camera_calibration,
+            region_fit=region_fit,
         )
 
 
@@ -3068,24 +3293,29 @@ def main():  # noqa: C901
             "spline-mle-gpu",
             "avg",
         ],
-        default="mle",
+        action="append",
+        default=None,
         help=(
-            "fitting method. 'spline'/'spline-mle' fit an experimental "
-            "cubic-spline PSF on the CPU by least squares / maximum "
-            "likelihood, 'spline-gpu'/'spline-mle-gpu' do the same on the "
-            "GPU (needs a CUDA-capable GPU); all four need "
-            "--spline-calibration"
+            "fitting method (default 'mle'). 'spline'/'spline-mle' fit an "
+            "experimental cubic-spline PSF on the CPU by least squares / "
+            "maximum likelihood, 'spline-gpu'/'spline-mle-gpu' do the same "
+            "on the GPU (needs a CUDA-capable GPU); all four need "
+            "--spline-calibration. With --regions-separately it may be "
+            "given once per --roi, to fit each region its own way"
         ),
     )
     localize_parser.add_argument(
         "-sc",
         "--spline-calibration",
         type=str,
-        default="",
+        action="append",
+        default=None,
         help=(
             "path to a cubic-spline PSF calibration (.hdf5) for the "
             "'spline', 'spline-mle', 'spline-gpu' and 'spline-mle-gpu' "
-            "fit methods"
+            "fit methods. With --regions-separately it may be given once "
+            "per --roi: the PSF is measured per channel, so regions "
+            "fitted separately usually need one calibration each"
         ),
     )
     localize_parser.add_argument(
@@ -3120,7 +3350,29 @@ def main():  # noqa: C901
         ),
     )
     localize_parser.add_argument(
-        "-g", "--gradient", type=int, default=5000, help="minimum net gradient"
+        "-g",
+        "--gradient",
+        type=int,
+        action="append",
+        default=None,
+        help=(
+            "minimum net gradient (default 5000). May be given once per "
+            "--roi, since regions imaged through different optics need not "
+            "share a brightness scale"
+        ),
+    )
+    localize_parser.add_argument(
+        "-rs",
+        "--regions-separately",
+        action="store_true",
+        help=(
+            "fit each --roi region on its own and save one file per region "
+            "(<movie>_ref_locs.hdf5, <movie>_ch1_locs.hdf5, ...), in that "
+            "region's own coordinates. Use it when the regions are channels "
+            "imaged side by side on one sensor and are to be analyzed - and "
+            "connected - as separate channels. --fit-method, --gradient and "
+            "--spline-calibration may then be given once per region"
+        ),
     )
     localize_parser.add_argument(
         "-tm",
