@@ -7575,14 +7575,19 @@ def localize(
         axes, whereas the astigmatism calibration assumes the camera
         axes, so use them for z fitting with care. Default is None (2D
         localization).
-    affine_calibration : dict or list or None, optional
-        Additional lateral (x, y) affine corrections to apply after
-        fitting, e.g. a standalone chromatic-aberration calibration used
-        on its own in a 2D experiment. Either a calibration dictionary
-        carrying an ``"Affine transforms"`` list or the list itself; they
-        are applied in order. Corrections stored in ``spline_calibration``
-        or ``calibration_3d`` are applied by the fit itself, so they must
-        not be repeated here. Default is None.
+    affine_calibration : dict, list, str or None, optional
+        Lateral (x, y) corrections to apply after fitting, held outside
+        the calibration used for fitting - e.g. a chromatic-aberration
+        calibration kept in its own file, whether or not the fit is 3D.
+        A calibration dictionary carrying a ``"Lateral transforms"``
+        list, the list itself, or the path of a calibration file to read
+        them from; several are applied in list order. With
+        ``calibration_3d`` these run after the corrections that
+        calibration carries, so keeping one separate gives the same
+        coordinates as appending it to the 3D calibration. A correction
+        ``calibration_3d`` or ``spline_calibration`` already carries is
+        skipped (with a warning) rather than applied twice. Default is
+        None.
     camera_calibration : dict or None, optional
         Per-pixel sCMOS camera calibration (see
         ``io.load_camera_calibration`` and ``scmos.calibrate_scmos``),
@@ -7631,6 +7636,8 @@ def localize(
         identification_parameters, dict
     ), "identification_parameters must be a dict"
     fit_z = _validate_calibration_3d(calibration_3d, fitting_method)
+    if fit_z and isinstance(calibration_3d, str):
+        calibration_3d = io.load_calibration(calibration_3d)
 
     # Use empty list as default for movie_info
     if movie_info is None:
@@ -7686,23 +7693,21 @@ def localize(
                 else "gausslq"
             ),
             filter=0,
+            lateral_transforms=affine_calibration,
             multiprocess=threaded,
             progress_callback=fit_z_progress_callback,
         )
-        # The astigmatism calibration's own affine corrections were applied
-        # by zfit, so they are not repeated here.
-        return _localize_return(
-            *_apply_extra_affine(
-                locs, info, affine_calibration, applied=calibration_3d
-            ),
-            return_info=return_info,
-        )
+        # zfit applies both the calibration's own lateral corrections and
+        # the separately loaded ones, in that order, and records them - so
+        # a correction kept in its own file gives the same coordinates as
+        # one appended to the 3D calibration.
+        return _localize_return(locs, info, return_info=return_info)
 
     # Standalone affine corrections (e.g. a chromatic one used without a 3D
     # calibration); those carried by the spline calibration were already
     # applied by the fit, so they are dropped here rather than applied twice.
     extra, duplicates = lib.drop_duplicate_lateral_transforms(
-        affine_calibration, spline_calibration
+        lib.resolve_lateral_transforms(affine_calibration), spline_calibration
     )
     _warn_duplicate_affine(duplicates)
     if extra:
@@ -8168,6 +8173,7 @@ def _warn_duplicate_affine(duplicates: list) -> None:
             + ": the calibration used for fitting already carries this "
             "affine correction and applies it itself. Applying it again "
             "would correct the coordinates twice.",
+            lib.DuplicateLateralTransformWarning,
             stacklevel=3,
         )
 
@@ -8183,7 +8189,7 @@ def _apply_extra_affine(
     metadata. Corrections ``applied`` already covers are dropped instead of
     applied a second time. A no-op when there are none."""
     extra, duplicates = lib.drop_duplicate_lateral_transforms(
-        affine_calibration, applied
+        lib.resolve_lateral_transforms(affine_calibration), applied
     )
     _warn_duplicate_affine(duplicates)
     if not extra:
