@@ -10811,6 +10811,31 @@ class View(QtWidgets.QLabel):
             self.index_locs(channel)
         return self.index_blocks[channel]
 
+    def invalidate_locs_index(self, channel: int | None = None) -> None:
+        """Drop the cached spatial indices of one or all channels.
+
+        Both ``index_blocks`` (pick lookups, see ``self.index_locs``)
+        and ``render_index`` (the viewport pyramid used when zoomed in,
+        see ``self._ensure_render_index``) store positions into
+        ``self.locs[channel]``, so both are invalidated by any change to
+        a channel's localizations -- moved coordinates as well as added,
+        removed or reordered rows. Call this whenever ``self.locs`` is
+        mutated; ``update_scene(resample_locs=True)`` does it for every
+        channel already.
+
+        Parameters
+        ----------
+        channel : int, optional
+            Channel to invalidate. If None, all channels are
+            invalidated. Default is None.
+        """
+        if channel is None:
+            self.index_blocks = [None] * len(self.locs)
+            self.render_index = [None] * len(self.locs)
+        else:
+            self.index_blocks[channel] = None
+            self.render_index[channel] = None
+
     @check_pick
     def pick_areas(self) -> FloatArray1D:
         """Find areas of all selected picks in um^2.
@@ -12091,8 +12116,7 @@ class View(QtWidgets.QLabel):
         locs = lib.ensure_sanity(locs, info)
         self.locs[channel] = locs
         self.infos[channel] = new_info
-        self.index_blocks[channel] = None
-        self.render_index[channel] = None
+        self.invalidate_locs_index(channel)
         self.add_drift(channel, drift)
         self.update_scene(resample_locs=True)
 
@@ -12150,8 +12174,7 @@ class View(QtWidgets.QLabel):
                 rcc_progress.set_value,
             )
             # sanity check and assign attributes
-            self.index_blocks[channel] = None
-            self.render_index[channel] = None
+            self.invalidate_locs_index(channel)
             self.add_drift(channel, drift)
             # ignore undrift_locs since we use _apply_drift to
             # assign attributes
@@ -12226,8 +12249,7 @@ class View(QtWidgets.QLabel):
         self.locs[channel] = undrifted_locs
         self.infos[channel] = new_info
         # Cleanup
-        self.index_blocks[channel] = None
-        self.render_index[channel] = None
+        self.invalidate_locs_index(channel)
         self.add_drift(channel, drift)
         status.close()
         self.update_scene(resample_locs=True)
@@ -12254,8 +12276,7 @@ class View(QtWidgets.QLabel):
         self.locs[channel] = postprocess.apply_drift(
             self.locs[channel], self.infos[channel], drift=drift
         )
-        self.index_blocks[channel] = None
-        self.render_index[channel] = None
+        self.invalidate_locs_index(channel)
         self.add_drift(channel, drift)
         self.update_scene(resample_locs=True)
 
@@ -12313,8 +12334,7 @@ class View(QtWidgets.QLabel):
         )
         self._drift[channel] = drift
         self.currentdrift[channel] = copy.copy(drift)
-        self.index_blocks[channel] = None
-        self.render_index[channel] = None
+        self.invalidate_locs_index(channel)
         self.update_scene(resample_locs=True)
 
     def sync_groups(self) -> None:
@@ -12584,8 +12604,8 @@ class View(QtWidgets.QLabel):
     def _resample_fast_render(self) -> None:
         """Refresh ``self.fast_render_indices`` from the fractions stored
         on the fast-render dialog, refresh ``group_color`` if needed,
-        reset ``index_blocks``, and adjust contrast accordingly. Does not
-        redraw on its own — call ``update_scene`` for that."""
+        and adjust contrast accordingly. Does not redraw on its own —
+        call ``update_scene`` for that."""
         dlg = self.window.fast_render_dialog
         idx = dlg.channel.currentIndex()
         if idx == 0:  # all channels share the same fraction
@@ -12601,8 +12621,6 @@ class View(QtWidgets.QLabel):
             factor = np.mean(factors)  # to adjust contrast
         if len(dlg.fractions) == 2 and "group" in self.locs[0].columns:
             self.group_color = render.get_group_color(self.locs[0])
-        self.index_blocks = [None] * len(self.locs)
-        self.render_index = [None] * len(self.locs)
         self.window.display_settings_dlg.silent_maximum_update(
             factor * self.window.display_settings_dlg.maximum.value()
         )
@@ -12632,14 +12650,18 @@ class View(QtWidgets.QLabel):
             True if only picks and points are to be rendered. Default is
             False.
         resample_locs : bool, optional
-            True if the fast-render subsample should be refreshed before
-            redrawing. Use after operations that mutate ``self.locs``
-            (link, undrift, remove pick, etc.). Default is False.
+            True if ``self.locs`` changed: the cached spatial indices of
+            every channel are dropped (see
+            ``self.invalidate_locs_index``) and the fast-render
+            subsample is refreshed before redrawing. Use after
+            operations that mutate ``self.locs`` (link, undrift, remove
+            pick, etc.). Default is False.
         """
         # Clear slicer cache
         self.window.slicer_dialog.slicer_cache = {}
         if len(self.locs):
             if resample_locs:
+                self.invalidate_locs_index()
                 self._resample_fast_render()
             viewport = viewport or self.viewport
             self.draw_scene(
@@ -13909,7 +13931,7 @@ class Window(QtWidgets.QMainWindow):
             vars = self.view.locs[channel].columns.to_list()
             exec(cmd, {k: self.view.locs[channel][k] for k in vars})
         lib.ensure_sanity(self.view.locs[channel], self.view.infos[channel])
-        self.view.index_blocks[channel] = None
+        self.view.invalidate_locs_index(channel)
         self.view.update_scene()
 
     def open_file_dialog(self) -> None:
