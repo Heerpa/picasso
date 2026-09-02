@@ -22,6 +22,7 @@ import types
 import pytest
 
 from picasso import io
+from picasso import plugins as plugins_api
 from picasso.gui import plugins_loader
 
 
@@ -297,7 +298,7 @@ class TestValidation:
             ]
         }
         monkeypatch.setattr(
-            plugins_loader,
+            plugins_api,
             "_get",
             lambda url: json.dumps(manifest).encode(),
         )
@@ -348,7 +349,7 @@ class TestInstallIntegrity:
     ):
         _point_loader_at(monkeypatch, str(tmp_path))
         content = b"# demo plugin\n"
-        monkeypatch.setattr(plugins_loader, "_get", lambda url: content)
+        monkeypatch.setattr(plugins_api, "_get", lambda url: content)
         state = plugins_loader.load_state()
 
         plugins_loader.install(_entry(content), state)
@@ -369,7 +370,7 @@ class TestInstallIntegrity:
         _point_loader_at(monkeypatch, str(tmp_path))
         entry = _entry(b"# what was published\n")
         monkeypatch.setattr(
-            plugins_loader, "_get", lambda url: b"# what was served\n"
+            plugins_api, "_get", lambda url: b"# what was served\n"
         )
         state = plugins_loader.load_state()
 
@@ -385,7 +386,7 @@ class TestInstallIntegrity:
     ):
         _point_loader_at(monkeypatch, str(tmp_path))
         content = b"# demo\n"
-        monkeypatch.setattr(plugins_loader, "_get", lambda url: content)
+        monkeypatch.setattr(plugins_api, "_get", lambda url: content)
         entry = _entry(content, sha256=digest)
         if digest is None:
             del entry["sha256"]

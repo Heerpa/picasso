@@ -300,3 +300,9 @@ Combines the localizations in each cluster of a group (to be deprecated in 1.0).
 cluster_combine_dist
 --------------------
 Calculate the nearest neighbor for each combined cluster (to be deprecated in 1.0).
+
+plugins
+-------
+Manage Picasso plugins without opening a GUI. ``picasso plugins list`` shows every plugin file in ``~/.picasso/plugins``, whether it is enabled, and what each enabled one contributes (a GUI menu entry, command line commands, API names). ``picasso plugins enable <file.py>`` and ``disable <file.py>`` control whether a file is loaded and run at all, and ``install``, ``update`` and ``uninstall`` work against the online registry with the same hash verification as the plugin browser. ``picasso plugins path`` prints the plugins folder.
+
+Plugins can add their own commands here: an enabled plugin that defines ``register_cli`` contributes subcommands that appear in ``picasso -h`` and behave like the built-in ones. See :doc:`plugins` for how to write one.

@@ -3221,6 +3221,216 @@ def _g5m(
         save_locs(new_path, mols, g5m_info)
 
 
+# =============================================================================
+# Plugins
+# =============================================================================
+
+
+def _run_plugin_command(args) -> None:
+    """Run the handler a plugin subcommand named via ``set_defaults``.
+
+    Kept separate from the built-in dispatch so that a plugin that forgot
+    the ``func`` default gets a clear message instead of an
+    ``AttributeError`` traceback.
+    """
+    func = getattr(args, "func", None)
+    if func is None:
+        print(
+            f"The plugin command '{args.command}' does not name a handler. "
+            "The plugin must call parser.set_defaults(func=...) when it "
+            "registers the command."
+        )
+        return
+    func(args)
+
+
+def _plugins_confirm(question: str, assume_yes: bool) -> bool:
+    """Ask for confirmation on the terminal unless ``--yes`` was given."""
+    if assume_yes:
+        return True
+    try:
+        answer = input(f"{question} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
+_PLUGIN_TRUST_WARNING = (
+    "Plugins are Python files that run with full access to your computer "
+    "every time Picasso starts. Only enable files you have reviewed or "
+    "whose author you trust."
+)
+
+
+def _plugins_list() -> None:
+    """Print every plugin file found, with what it contributes."""
+    from . import io, plugins
+
+    directory = io.plugins_directory()
+    state = plugins.load_state()
+    files = plugins._discover_plugin_files()
+    if not files:
+        print(f"No plugin files in {directory}")
+        return
+
+    by_file = {
+        record.get("file"): (pid, record)
+        for pid, record in state["plugins"].items()
+        if record.get("file")
+    }
+
+    print(f"Plugins in {directory}:\n")
+    for path in files:
+        name = os.path.basename(path)
+        enabled = plugins.is_enabled(state, name)
+        installed = by_file.get(name)
+        origin = "local file"
+        if installed is not None:
+            pid, record = installed
+            version = record.get("version") or "?"
+            origin = f"registry: {pid} {version}"
+        print(f"  {'[x]' if enabled else '[ ]'} {name}  ({origin})")
+
+        if not enabled:
+            continue
+        # Only an enabled plugin may be imported, so only an enabled one
+        # can be asked what it provides.
+        try:
+            module = plugins._load_module_from_path(path)
+        except Exception as exc:  # noqa: BLE001 - reported, not fatal
+            print(f"        failed to load: {exc}")
+            continue
+        details = []
+        if getattr(module, "Plugin", None) is not None:
+            details.append("GUI menu entry")
+        commands = plugins.plugin_cli_commands(module)
+        if commands:
+            details.append("commands: " + ", ".join(commands))
+        try:
+            exports = plugins._api_names(module)
+        except Exception:  # noqa: BLE001
+            exports = {}
+        if exports:
+            details.append("API: " + ", ".join(sorted(exports)))
+        for detail in details:
+            print(f"        {detail}")
+
+    disabled = plugins.disabled_plugin_files(state)
+    if disabled:
+        print(
+            f"\n{len(disabled)} file(s) not enabled. Review one, then run "
+            "'picasso plugins enable <file.py>'."
+        )
+
+
+def _plugins_set_enabled(filename: str, value: bool, assume_yes: bool) -> None:
+    """Enable or disable one plugin file by name."""
+    from . import plugins
+
+    if not plugins.is_safe_filename(filename):
+        print(f"Not a plugin file name: {filename!r} (expected e.g. 'my.py')")
+        return
+    path = plugins.plugin_path(filename)
+    if not os.path.exists(path):
+        print(f"No such plugin file: {path}")
+        return
+
+    if value:
+        print(_PLUGIN_TRUST_WARNING)
+        print(f"\nThe file is at {path}")
+        if not _plugins_confirm(f"Enable '{filename}'?", assume_yes):
+            print("Nothing was changed.")
+            return
+
+    state = plugins.load_state()
+    plugins.set_enabled(state, filename, value)
+    print(f"{'Enabled' if value else 'Disabled'} {filename}")
+
+
+def _plugins_install(plugin_id: str, assume_yes: bool) -> None:
+    """Download, verify and enable a plugin from the online registry."""
+    from . import plugins
+
+    try:
+        manifest = plugins.fetch_manifest()
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user
+        print(f"Could not reach the online plugin registry: {exc}")
+        return
+    entry = next((e for e in manifest if e["id"] == plugin_id), None)
+    if entry is None:
+        print(
+            f"No plugin with id {plugin_id!r} in the registry. "
+            f"Available: {', '.join(sorted(e['id'] for e in manifest))}"
+        )
+        return
+    if not plugins.is_compatible(entry):
+        print(
+            f"{plugin_id!r} requires Picasso "
+            f"{entry.get('min_picasso_version')} or newer."
+        )
+        return
+
+    print(f"{entry.get('display_name', plugin_id)} {entry.get('version', '')}")
+    if entry.get("description"):
+        print(entry["description"])
+    print(f"\n{_PLUGIN_TRUST_WARNING}")
+    print(
+        "The download is checked against the hash published in the registry, "
+        "but that only proves the file is the published one — not that it is "
+        f"safe. Source: {plugins.REPO_URL}/blob/{plugins.BRANCH}/"
+        f"{entry['file']}"
+    )
+    if not _plugins_confirm(f"Install and enable {plugin_id!r}?", assume_yes):
+        print("Nothing was installed.")
+        return
+
+    state = plugins.load_state()
+    try:
+        plugins.install(entry, state)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user
+        print(f"Install failed: {exc}")
+        return
+    print(f"Installed and enabled {plugin_id!r}.")
+
+
+def _plugins_uninstall(plugin_id: str) -> None:
+    """Delete an installed plugin's file and forget it."""
+    from . import plugins
+
+    state = plugins.load_state()
+    if plugin_id not in state["plugins"]:
+        print(f"{plugin_id!r} is not installed from the registry.")
+        return
+    plugins.uninstall(plugin_id, state)
+    print(f"Uninstalled {plugin_id!r}.")
+
+
+def _plugins(args) -> None:
+    """Dispatch the ``picasso plugins`` subcommands."""
+    from . import io, plugins
+
+    action = args.plugins_action
+    if action == "list":
+        _plugins_list()
+    elif action == "path":
+        print(io.plugins_directory())
+    elif action == "enable":
+        _plugins_set_enabled(args.file, True, args.yes)
+    elif action == "disable":
+        _plugins_set_enabled(args.file, False, args.yes)
+    elif action in ("install", "update"):
+        _plugins_install(args.id, args.yes)
+    elif action == "uninstall":
+        _plugins_uninstall(args.id)
+    else:
+        print(
+            "Usage: picasso plugins {list,path,enable,disable,install,"
+            "update,uninstall}"
+        )
+        print(f"\nPlugins folder: {io.plugins_directory()}")
+        print(f"Online registry: {plugins.REPO_URL}")
+
+
 def main():  # noqa: C901
     """Entry point of the ``picasso`` command line interface.
 
@@ -4553,6 +4763,58 @@ def main():  # noqa: C901
         ),
     )
 
+    # plugins
+    plugins_parser = subparsers.add_parser(
+        "plugins", help="manage Picasso plugins"
+    )
+    plugins_actions = plugins_parser.add_subparsers(dest="plugins_action")
+    plugins_actions.add_parser(
+        "list", help="list the plugin files found and what they provide"
+    )
+    plugins_actions.add_parser("path", help="print the plugins folder")
+    plugins_enable_parser = plugins_actions.add_parser(
+        "enable", help="allow a plugin file to be loaded and run"
+    )
+    plugins_enable_parser.add_argument(
+        "file", help="the plugin file name, e.g. my_plugin.py"
+    )
+    plugins_disable_parser = plugins_actions.add_parser(
+        "disable", help="stop loading a plugin file, without deleting it"
+    )
+    plugins_disable_parser.add_argument(
+        "file", help="the plugin file name, e.g. my_plugin.py"
+    )
+    plugins_install_parser = plugins_actions.add_parser(
+        "install", help="download a plugin from the online registry"
+    )
+    plugins_install_parser.add_argument("id", help="the plugin id")
+    plugins_update_parser = plugins_actions.add_parser(
+        "update", help="re-download an installed plugin at its latest version"
+    )
+    plugins_update_parser.add_argument("id", help="the plugin id")
+    plugins_uninstall_parser = plugins_actions.add_parser(
+        "uninstall", help="delete an installed plugin"
+    )
+    plugins_uninstall_parser.add_argument("id", help="the plugin id")
+    for _p in (
+        plugins_enable_parser,
+        plugins_disable_parser,
+        plugins_install_parser,
+        plugins_update_parser,
+    ):
+        _p.add_argument(
+            "--yes",
+            action="store_true",
+            help="skip the confirmation prompt",
+        )
+
+    # Plugins may add their own subcommands. Done last so that a plugin can
+    # never shadow a built-in command, and skipped entirely when no plugin is
+    # enabled, so the common case costs one directory listing.
+    from .plugins import register_cli_plugins
+
+    plugin_commands = register_cli_plugins(subparsers)
+
     # Parse
     args = parser.parse_args()
     if args.command:
@@ -4579,7 +4841,11 @@ def main():  # noqa: C901
         if cli_update_check:
             update_thread = check_and_notify(cli_notify_update)
 
-        if args.command == "localize":
+        if args.command in plugin_commands:
+            _run_plugin_command(args)
+        elif args.command == "plugins":
+            _plugins(args)
+        elif args.command == "localize":
             if args.files:
                 _localize(args)
             else:

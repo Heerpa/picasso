@@ -1,8 +1,9 @@
 # Changelog
 
-Last change: 01-SEP-2026 CEST
+Last change: 02-SEP-2026 CEST
 
 ## 0.11.1
+- Plugins can now extend Picasso's [Python API and command line](https://picassosr.readthedocs.io/en/latest/plugins.html#for-developers), not only the GUIs, and can be [installed and enabled without ever opening one](https://picassosr.readthedocs.io/en/latest/plugins.html#managing-plugins-without-a-gui) using the new [`picasso plugins`](https://picassosr.readthedocs.io/en/latest/cmd.html#plugins) command.
 - Errors are no longer silently swallowed in the one-click installers. Picasso now redirects errors to a log file (`~/.picasso/logs/picasso.log`), logs every uncaught exception (main thread, worker threads and unraisable ones) there, and shows it in a message box - whose *Show Details...* holds the full traceback.
 - Every GUI now starts through the shared `picasso.gui.app.run_gui`. Error reporting is installed *first*, so a failure while the main window is being built - a missing bundled library, a broken `settings.yaml` - is now shown and logged instead of killing the app without a word.
 - Clear error message in case opened localizations are not fully downloaded/copied.
