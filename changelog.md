@@ -7,7 +7,7 @@ Last change: 01-SEP-2026 CEST
 - Every GUI now starts through the shared `picasso.gui.app.run_gui`. Error reporting is installed *first*, so a failure while the main window is being built - a missing bundled library, a broken `settings.yaml` - is now shown and logged instead of killing the app without a word.
 - Clear error message in case opened localizations are not fully downloaded/copied.
 - Fixed progress dialog closing faster than within 0.5 s ([#700](https://github.com/jungmannlab/picasso/issues/700)).
-- Localize can fit multichannel data one channel at a time, see the [documentation](https://picassosr.readthedocs.io/en/latest/localize.html).
+- Localize can fit multichannel data one channel at a time, see the [documentation](https://picassosr.readthedocs.io/en/latest/localize.html#analyzing-each-channel-on-its-own).
 - New translation transform model (2 DOF, at least 1 bead pair), offered wherever Picasso fits a geometric transform - the lateral astigmatism / chromatic corrections and the multichannel / split-FOV channel registration, in the GUI and on the command line. It fits a pure shift in x and y, for frames known to differ only by an offset: a rotation, scale or shear it cannot represent shows up in the registration residual instead of being absorbed by parameters the optics do not justify.
 - Localize loads z-stack `.nd2` files.
 - Localize's contrast is not set to auto on opening a new movie.

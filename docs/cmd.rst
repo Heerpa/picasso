@@ -5,65 +5,65 @@ CMD
    :scale: 50 %
    :alt: UML Picasso cmd
 
-Here is a list of command-line commands that can be used with picasso. Each command can be run by typing ``picasso command args`` in a terminal or command prompt, where ``command`` is one of the commands listed below and ``args`` are the respective arguments for that command. For more information, type ``picasso -h`` or ``picasso command -h`` for specific commands.
+Here is a list of command-line commands that can be used with picasso. Each command can be run by typing ``picasso command args`` in a terminal or command prompt, where ``command`` is one of the commands listed below and ``args`` are the respective arguments for that command. For more information, type ``picasso -h`` for the list of commands, or ``picasso command -h`` for the arguments of one command. That help text is generated from the code, so it is the authoritative and always up-to-date list of what each command accepts; the sections below describe behavior that does not fit into a one-line help string.
 
 If you wish to open a module (GUI), simply type ``picasso module_name``, for example, ``picasso render``.
 
 localize
 --------
-Reconstructing images via command line is possible. Type: ``picasso localize args`` within an environment where Picasso is installed. Type ``picasso localize`` to open the GUI module.
+Localize identifies and fits single-molecule spots in a movie. Type ``picasso localize`` to open the GUI module, or ``picasso localize path args`` to run the analysis from the command line, where ``path`` is a movie file, a folder or a file pattern.
+
+Finding out which arguments exist
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``picasso localize -h`` prints every argument with its short and long name, its type, its default value and a one-line description. That text is generated from the code itself, so it is always complete and up to date — use it as the reference for what can be set. Arguments that are not given keep their defaults, so the shortest possible run is just ``picasso localize foldername``.
+
+The arguments fall into a few groups:
+
+* **Spot identification** — box side length, minimum net gradient, and the pre-filters ``--temporal-median`` and ``--gaussian-filter``.
+* **Fitting** — the fit method and the calibration files that some methods require (a spline PSF calibration for the spline fits, a magnification factor and a 3D calibration for the astigmatism fits).
+* **Camera** — baseline, sensitivity, gain and pixel size.
+* **What is analyzed** — region of interest, frame bounds, and the flags that change how several movies or several regions are grouped (``--concat``, ``--regions-separately``).
+* **Output** — drift correction segmentation, a suffix for the output files, and whether the run is added to the local database.
+
+The rest of this section explains only those options whose behavior needs more than the one line that ``-h`` gives.
 
 Batch process a folder
 ~~~~~~~~~~~~~~~~~~~~~~
-To batch process a folder simply type the folder name (or drag in drop into the console), e.g. ``picasso localize foldername``. Picasso will analyze the folder and process all *.ome.tif in files in the folder. If the files have consecutive names (e.g., File.ome.tif, File_1.ome.tif, File_2.ome.tif), they will be treated as one.
+To batch process a folder simply type the folder name (or drag and drop it into the console), e.g. ``picasso localize foldername``. Picasso will analyze the folder and process all *.ome.tif files in it. If the files have consecutive names (e.g., File.ome.tif, File_1.ome.tif, File_2.ome.tif), they will be treated as one.
 If you want to analyze *.raw files, Picasso will check whether a *.raw file has a corresponding *.yaml file. If none is found, you can enter the specifications for each raw file. It is possible to use the same specifications for all *.raw files in that run.
 
-Adding additional arguments
-^^^^^^^^^^^^^^^^^^^^^^^^^^^
-The reconstruction parameters can be specified by adding respective arguments. If they are not specified the default values are chosen.
+Drift correction
+~~~~~~~~~~~~~~~~
+Localize will automatically try to perform an RCC drift correction on the dataset. As this will not always work with the default settings, after an unsuccessful attempt the program will continue with the next file. If the drift correction succeeds, another hdf5 file with the drift corrected locs will be created.
 
-::
-
-   '-b', '--box-side-length', type=int, default=7, help='box side length'
-   '-a', '--fit-method', choices=["mle", "mle-gpu", "mle-spherical", "mle-spherical-gpu", "mle-rotated", "mle-rotated-gpu", "lq", "lq-spherical", "lq-spherical-gpu", "lq-rotated", "lq-rotated-gpu", "lq-gpu", "lq-3d", "lq-gpu-3d", "mle-3d", "spline", "spline-mle", "spline-gpu", "spline-mle-gpu", "avg"], action='append', default='mle', help='fitting method; may be given once per --roi with --regions-separately'
-   '-g', '--gradient', type=int, action='append', default=5000, help='minimum net gradient; may be given once per --roi'
-   '-rs', '--regions-separately', action='store_true', help='fit each --roi region on its own and save one file per region, in that region\'s own coordinates'
-   '-tm', '--temporal-median', type=int, default=0, help='window length (frames) of the temporal median filter applied before identification, 0 to deactivate'
-   '-gf', '--gaussian-filter', type=float, default=0.0, help='sigma (camera pixels) of the spatial Gaussian filter applied before identification, 0 to deactivate'
-   '-d', '--drift', type=int, default=1000, help='segmentation size for subsequent RCC, 0 to deactivate'
-   '-r', '--roi', type=int, nargs=4, default=None, help='ROI (y_min, x_min, y_max, x_max) in camera pixels'
-   '-fb', '--frame-bounds', type=int, nargs=2, default=None, help='frame bounds (start_frame, end_frame), 0-indexed'
-   '-bl', '--baseline', type=int, default=0, help='camera baseline'
-   '-s', '--sensitivity', type=float, default=1, help='camera sensitivity'
-   '-ga', '--gain', type=int, default=1, help='camera gain'
-   '-px', '--pixelsize', type=int, default=130, help='pixel size in nm'
-   '-sc', '--spline-calibration', type=str, action='append', default='', help='path to a cubic-spline PSF calibration (.hdf5), required by the spline fit methods; may be given once per --roi with --regions-separately'
-   '-mf', '--mf', type=float, default=0, help='magnification factor (3D only)'
-   '-zc', '--zc', type=str, default='', help='path to 3D calibration file (3D only)'
-   '-sf', '--suffix', type=str, default='', help='suffix to add to output files'
-   '-db', '--database', action='store_true', help='add the run to the local database'
-   '--concat', action='store_true', help='treat all TIFF movies found as one movie, with their frames concatenated in order'
-
-Localize will automatically try to perform an RCC drift correction on the dataset. As this will not always work with the default settings after an unsuccessful attempt, the program will continue with the next file. If the drift correction succeeds, another hdf5 file with the drift corrected locs will be created.
-
+Camera settings
+~~~~~~~~~~~~~~~
 Make sure to set the camera settings correctly; otherwise photon counts are wrong plus the MLE might have problems.
 
+Pre-filters
+~~~~~~~~~~~
 ``--temporal-median`` subtracts a rolling per-pixel median background before spots are identified, which suppresses uneven background and static structures. It affects identification only. See Martens KJA, Turkowyd B, Endesfelder U, `Raw data to results: a hands-on introduction and overview of computational analysis for single-molecule localization microscopy <https://doi.org/10.3389/fbinf.2021.817254>`_, *Frontiers in Bioinformatics* 1, 817254 (2022).
 
-``--gaussian-filter`` smooths each frame with a Gaussian of the given standard deviation before spots are identified. Spot identification looks for a single local maximum per spot, so a PSF that is not Gaussian-shaped may break into several maxima and is detected several times; smoothing merges them into one. It affects identification only — fitting always uses the raw movie — and since smoothing lowers gradient magnitudes, ``-g`` needs re-tuning when it is changed. It can be combined with ``--temporal-median``, which is applied first.
+``--gaussian-filter`` smooths each frame with a Gaussian of the given standard deviation before spots are identified. Spot identification looks for a single local maximum per spot, so a PSF that is not Gaussian-shaped may break into several maxima and is detected several times; smoothing merges them into one. It affects identification only — fitting always uses the raw movie — and since smoothing lowers gradient magnitudes, the minimum net gradient needs re-tuning when it is changed. It can be combined with ``--temporal-median``, which is applied first.
 
-``--concat`` accumulates movies found in the folder specified as on concatenated movie. Given a folder, Picasso searches it and all of its sub-folders; given a pattern (e.g. ``"experiment_folder/*/*.tif"``), it uses the matching files. In both cases the files are ordered by folder and file name with numbers compared numerically, so ``run_2`` comes before ``run_10``, and the full order is printed before the analysis starts — check it, since a wrong order is only noticeable afterwards. Each entry is one whole movie: the continuation files of a split OME-TIFF stack (``*_1.ome.tif``, ...) and the individual frames of a MicroManager "separate image files" folder are read together with the movie they belong to, so no frames are repeated.
+Analyzing several movies as one
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``--concat`` accumulates the movies found into one concatenated movie. Given a folder, Picasso searches it and all of its sub-folders; given a pattern (e.g. ``"experiment_folder/*/*.tif"``), it uses the matching files. In both cases the files are ordered by folder and file name with numbers compared numerically, so ``run_2`` comes before ``run_10``, and the full order is printed before the analysis starts — check it, since a wrong order is only noticeable afterwards. Each entry is one whole movie: the continuation files of a split OME-TIFF stack (``*_1.ome.tif``, ...) and the individual frames of a MicroManager "separate image files" folder are read together with the movie they belong to, so no frames are repeated.
 
-``--regions-separately`` treats the ``--roi`` regions as channels imaged side by side on one sensor and fits each of them on its own, writing ``<movie>_ref_locs.hdf5``, ``<movie>_ch1_locs.hdf5``, ... — one file per region, each in that region's own coordinates (the region's corner subtracted from ``x`` and ``y``, and its size in the metadata), so the files overlay each other when loaded as channels in Render. ``--fit-method``, ``--gradient`` and ``--spline-calibration`` may then be given once per ``--roi``, in the same order as the regions, or once for all of them::
+Analyzing regions of one movie separately
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``--regions-separately`` treats the ``--roi`` regions as channels imaged side by side on one sensor and fits each of them on its own, writing ``<movie>_ref_locs.hdf5``, ``<movie>_ch1_locs.hdf5``, ... — one file per region, each in that region's own coordinates (the region's corner subtracted from ``x`` and ``y``, and its size in the metadata), so the files overlay each other when loaded as channels in Render. The fit method, the minimum net gradient and the spline calibration may then be given once per ``--roi``, in the same order as the regions, or once for all of them::
 
    picasso localize movie.tif -b 7 --regions-separately --roi 0 0 256 256 --roi 0 256 256 512 -g 5000 -g 2000 -a lq -a mle
 
 Separate movies need no flag: ``picasso localize`` already analyzes each file on its own. See *Analyzing each channel on its own* in the Localize documentation.
 
-If you select one of the 3D algorithms (``lq-3d``, ``lq-gpu-3d`` or ``mle-3d``) you must supply both the magnification factor (``-mf``) and the path to the 3D calibration file (``-zc``). If either is omitted, the program will prompt you for it interactively.
+3D fitting
+~~~~~~~~~~
+If you select one of the astigmatism-based 3D algorithms (``lq-3d``, ``lq-gpu-3d`` or ``mle-3d``) you must supply both the magnification factor (``-mf``) and the path to the 3D calibration file (``-zc``). If either is omitted, the program will prompt you for it interactively. The spline fit methods instead need a cubic-spline PSF calibration passed with ``--spline-calibration``.
 
 Example
-^^^^^^^
+~~~~~~~
 This example shows the batch process of a folder, with movie ome.tifs that are supposed to be reconstructed and drift corrected with the ``lq`` algorithm and a min. net gradient of 4000.
 
 ``picasso localize foldername -a lq -g 4000``
