@@ -3278,6 +3278,7 @@ def _plugins_list() -> None:
         for pid, record in state["plugins"].items()
         if record.get("file")
     }
+    failed = False
 
     print(f"Plugins in {directory}:\n")
     for path in files:
@@ -3297,8 +3298,13 @@ def _plugins_list() -> None:
         # can be asked what it provides.
         try:
             module = plugins._load_module_from_path(path)
-        except Exception as exc:  # noqa: BLE001 - reported, not fatal
-            print(f"        failed to load: {exc}")
+        except Exception:  # noqa: BLE001 - reported, not fatal
+            import traceback
+
+            failed = True
+            print("        failed to load:")
+            for line in traceback.format_exc().rstrip().splitlines():
+                print(f"          {line}")
             continue
         details = []
         if getattr(module, "Plugin", None) is not None:
@@ -3320,6 +3326,12 @@ def _plugins_list() -> None:
         print(
             f"\n{len(disabled)} file(s) not enabled. Review one, then run "
             "'picasso plugins enable <file.py>'."
+        )
+    if failed:
+        print(
+            "\nA plugin that fails to load is skipped; the rest of Picasso "
+            "is unaffected. Fix the file, or run 'picasso plugins disable "
+            "<file.py>' to stop loading it."
         )
 
 
@@ -4811,16 +4823,24 @@ def main():  # noqa: C901
     # Plugins may add their own subcommands. Done last so that a plugin can
     # never shadow a built-in command, and skipped entirely when no plugin is
     # enabled, so the common case costs one directory listing.
-    from .plugins import register_cli_plugins
+    #
+    # "picasso plugins ..." is skipped too: it needs no plugin-contributed
+    # command, and it reports a plugin that will not load in full itself, so
+    # importing here would only precede that report with a terse warning
+    # about the very thing it is about to explain.
+    import sys
 
-    plugin_commands = register_cli_plugins(subparsers)
+    plugin_commands: set[str] = set()
+    if sys.argv[1:2] != ["plugins"]:
+        from .plugins import register_cli_plugins
+
+        plugin_commands = register_cli_plugins(subparsers)
 
     # Parse
     args = parser.parse_args()
     if args.command:
         # check for updates and print in the console if available
         from .updater import cli_notify_update, check_and_notify
-        import sys
 
         cli_update_check = True
         update_thread = None

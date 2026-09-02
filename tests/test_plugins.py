@@ -217,7 +217,7 @@ class TestApiPlugins:
         _enable("good.py")
 
         assert sorted(plugins.load_api_plugins()) == ["double"]
-        assert "boom.py" in capsys.readouterr().out
+        assert "boom.py" in capsys.readouterr().err
 
     def test_api_namespace_resolves_and_refreshes(self, _isolated_plugins_dir):
         _write(_isolated_plugins_dir, "api.py", API_PLUGIN)
@@ -342,6 +342,63 @@ class TestCliPlugins:
 
 
 # ---------------------------------------------------------------------------
+# Reporting a plugin that will not load
+# ---------------------------------------------------------------------------
+
+
+class TestFailureReporting:
+    """A broken plugin must not bury every command's output in a traceback."""
+
+    def test_default_is_one_line_on_stderr(
+        self, _isolated_plugins_dir, capsys
+    ):
+        _write(_isolated_plugins_dir, "boom.py", "raise RuntimeError('boom')")
+        _enable("boom.py")
+
+        plugins.load_enabled_modules()
+
+        captured = capsys.readouterr()
+        assert captured.out == ""  # stdout stays clean for piping
+        assert len(captured.err.strip().splitlines()) == 1
+        assert "boom.py" in captured.err
+        assert "RuntimeError: boom" in captured.err
+        assert "picasso plugins list" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_reported_once_per_process(self, _isolated_plugins_dir, capsys):
+        """A failed import is not cached, so the report must dedup itself."""
+        _write(_isolated_plugins_dir, "boom.py", "raise RuntimeError('boom')")
+        _enable("boom.py")
+
+        plugins.load_enabled_modules()
+        capsys.readouterr()
+        plugins.load_enabled_modules()
+
+        assert capsys.readouterr().err == ""
+
+    def test_verbose_prints_the_traceback(self, _isolated_plugins_dir, capsys):
+        _write(_isolated_plugins_dir, "boom.py", "raise RuntimeError('boom')")
+        _enable("boom.py")
+
+        plugins.load_enabled_modules(verbose=True)
+
+        captured = capsys.readouterr()
+        assert "Failed to load plugin" in captured.out
+        assert "Traceback" in captured.err
+
+    def test_a_reload_reports_again(self, _isolated_plugins_dir, capsys):
+        _write(_isolated_plugins_dir, "boom.py", "raise RuntimeError('boom')")
+        _enable("boom.py")
+        plugins.load_enabled_modules()
+        capsys.readouterr()
+
+        plugins.clear_module_cache()
+        plugins.load_enabled_modules()
+
+        assert "boom.py" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
 # All three hooks in one file
 # ---------------------------------------------------------------------------
 
@@ -421,6 +478,72 @@ class TestModuleCache:
         plugins._load_module_from_path(path)
 
         assert open(marker).read() == "x"
+
+    def test_module_is_registered_in_sys_modules(self, _isolated_plugins_dir):
+        """Classes must be able to find their own module while being built.
+
+        ``@dataclass``, ``typing.get_type_hints``, ``pickle`` and ``enum``
+        all look ``sys.modules[cls.__module__]`` up, and fail on ``None``
+        if the plugin module was never registered there.
+        """
+        path = _write(
+            _isolated_plugins_dir,
+            "dc.py",
+            """
+            from __future__ import annotations
+
+            import dataclasses
+            import typing
+
+            @dataclasses.dataclass
+            class Point:
+                x: float
+                y: float = 0.0
+
+            PICASSO_API = {
+                "make": lambda: Point(1.0, 2.0),
+                "hints": lambda: sorted(typing.get_type_hints(Point)),
+            }
+            """,
+        )
+        _enable("dc.py")
+
+        module = plugins._load_module_from_path(path)
+
+        assert sys.modules[module.__name__] is module
+        exports = plugins.load_api_plugins()
+        assert exports["make"]() == module.Point(1.0, 2.0)
+        assert exports["hints"]() == ["x", "y"]
+
+    def test_a_failed_load_leaves_no_module_behind(
+        self, _isolated_plugins_dir
+    ):
+        path = _write(
+            _isolated_plugins_dir,
+            "boom.py",
+            """
+            SOMETHING = 1
+            raise RuntimeError("boom")
+            """,
+        )
+        _enable("boom.py")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            plugins._load_module_from_path(path)
+
+        assert "picasso_plugin_boom" not in sys.modules
+
+    def test_clearing_the_cache_unregisters_the_module(
+        self, _isolated_plugins_dir
+    ):
+        path = _write(_isolated_plugins_dir, "api.py", API_PLUGIN)
+        _enable("api.py")
+        name = plugins._load_module_from_path(path).__name__
+        assert name in sys.modules
+
+        plugins.clear_module_cache()
+
+        assert name not in sys.modules
 
     def test_edited_file_is_reloaded(self, _isolated_plugins_dir):
         """Same length, same second: only a real recompile picks this up."""

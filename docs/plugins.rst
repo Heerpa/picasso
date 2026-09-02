@@ -65,6 +65,8 @@ Everything the plugin browser does is also available from the command line, so p
 
 To install a plugin on a machine with no GUI at all, either use ``picasso plugins install`` or copy the ``.py`` file into ``~/.picasso/plugins`` and run ``picasso plugins enable``.
 
+If a plugin cannot be loaded, it is skipped and the rest of Picasso is unaffected. Every ``picasso`` command then prints a one-line warning naming the file; ``picasso plugins list`` shows the full traceback, and ``picasso plugins disable <file.py>`` stops it being loaded at all.
+
 The enable flag is one shared setting: whether a plugin runs in a GUI, on the command line or inside a script, it runs only after you have enabled it, and disabling it stops all three. Enabling from the command line and from the plugin browser is the same act, recorded in the same place.
 
 For developers

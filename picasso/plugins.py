@@ -68,6 +68,7 @@ import importlib.util
 import json
 import os
 import re
+import sys
 import traceback
 import urllib.request
 from types import ModuleType
@@ -167,6 +168,11 @@ def plugin_path(filename: str) -> str:
 # side effects repeatedly and hand out duplicate class objects.
 _module_cache: dict[str, tuple[tuple, ModuleType]] = {}
 
+# Plugin files already reported as failing to import. A failed import is not
+# cached (the next load should retry the file), so without this a broken
+# plugin would print its warning once per consumer within a single command.
+_reported_failures: set[str] = set()
+
 
 def _discover_plugin_files() -> list[str]:
     """Return sorted ``.py`` files in the user plugins directory, skipping
@@ -183,8 +189,17 @@ def _module_signature(path: str) -> tuple:
 
 
 def clear_module_cache() -> None:
-    """Forget every imported plugin module so the next load re-executes it."""
+    """Forget every imported plugin module so the next load re-executes it.
+
+    Drops the ``sys.modules`` entries as well, so that a reload really
+    starts from the file rather than from what a previous load left behind.
+    """
+    for _, module in _module_cache.values():
+        name = getattr(module, "__name__", None)
+        if name and sys.modules.get(name) is module:
+            del sys.modules[name]
     _module_cache.clear()
+    _reported_failures.clear()
 
 
 def _load_module_from_path(path: str) -> ModuleType:
@@ -193,6 +208,14 @@ def _load_module_from_path(path: str) -> ModuleType:
     The imported module is cached here, so loading the same unchanged file
     again in the same process returns the module already executed; a file
     edited on disk (a different mtime or size) is executed afresh.
+
+    The module is registered in ``sys.modules`` under a
+    ``picasso_plugin_`` name *before* it is executed. Plenty of ordinary
+    Python looks a class's own module up there while the class statement is
+    still running — ``@dataclass`` does, and so do ``typing.get_type_hints``,
+    ``pickle`` and ``enum`` — and all of it fails with a confusing
+    ``AttributeError`` on ``None`` if the module cannot be found. Registering
+    first also lets a plugin split itself over helper imports.
 
     The source is compiled directly rather than through
     ``loader.exec_module``, which would go via ``__pycache__``. That cache
@@ -219,7 +242,14 @@ def _load_module_from_path(path: str) -> ModuleType:
     if source is None:
         raise ImportError(f"Could not read the source of {path!r}")
     module = importlib.util.module_from_spec(spec)
-    exec(compile(source, path, "exec"), module.__dict__)
+    sys.modules[name] = module
+    try:
+        exec(compile(source, path, "exec"), module.__dict__)
+    except BaseException:
+        # Leave no half-executed module behind for the next importer to
+        # find and believe.
+        sys.modules.pop(name, None)
+        raise
     if signature is not None:
         _module_cache[path] = (signature, module)
     return module
@@ -245,14 +275,25 @@ def disabled_plugin_files(state: dict | None = None) -> list[str]:
     ]
 
 
-def load_enabled_modules() -> list[tuple[str, ModuleType]]:
+def load_enabled_modules(
+    verbose: bool = False,
+) -> list[tuple[str, ModuleType]]:
     """Import every enabled plugin file and return ``(path, module)`` pairs.
 
     Only files that have been explicitly enabled are imported; a ``.py``
     file that has merely been copied into the plugins folder is discovered
     but not run until the user enables it, because importing it means
-    running it. A plugin that fails to import prints a traceback and is
-    skipped, so one broken file never takes down the rest.
+    running it. A plugin that fails to import is skipped, so one broken
+    file never takes down the rest.
+
+    Parameters
+    ----------
+    verbose : bool, optional
+        Print the full traceback of a failing plugin instead of a one-line
+        warning. This runs on every ``picasso`` command, so the default is
+        the short form: a single broken plugin must not bury the output of
+        every command the user runs in a traceback they did not ask for.
+        ``picasso plugins list`` is where the details belong.
 
     Returns
     -------
@@ -263,10 +304,26 @@ def load_enabled_modules() -> list[tuple[str, ModuleType]]:
     for path in enabled_plugin_files():
         try:
             modules.append((path, _load_module_from_path(path)))
-        except Exception:
-            print(f"Failed to load plugin {path!r}:")
-            traceback.print_exc()
+        except Exception as exc:
+            _report_load_failure(path, exc, verbose)
     return modules
+
+
+def _report_load_failure(path: str, exc: BaseException, verbose: bool) -> None:
+    """Report a plugin that would not import, once per file per process."""
+    if verbose:
+        print(f"Failed to load plugin {path!r}:")
+        traceback.print_exc()
+        return
+    if path in _reported_failures:
+        return
+    _reported_failures.add(path)
+    print(
+        f"Warning: plugin {os.path.basename(path)!r} failed to load "
+        f"({type(exc).__name__}: {exc}); run 'picasso plugins list' for "
+        "the full error.",
+        file=sys.stderr,
+    )
 
 
 # =============================================================================
