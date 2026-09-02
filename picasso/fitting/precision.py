@@ -599,6 +599,8 @@ def _gauss_crlb(
         bad = ~finite[sl] | ~np.isfinite(fisher).all(axis=(1, 2))
         fisher[bad] = np.eye(n_params)
         with np.errstate(invalid="ignore", divide="ignore"):
+            _bad = ~np.isfinite(fisher).all(axis=(1, 2))
+            fisher[_bad] = np.eye(fisher.shape[-1])
             cov = np.linalg.pinv(fisher)
             var = np.diagonal(cov, axis1=1, axis2=2).copy()
         var[bad] = np.nan
@@ -1036,6 +1038,8 @@ def _gauss_crlb_multichannel(
         bread[bad] = np.eye(bread.shape[-1])
         meat[bad] = 0.0
     with np.errstate(invalid="ignore", divide="ignore"):
+        _bad = ~np.isfinite(bread).all(axis=(1, 2))
+        bread[_bad] = np.eye(bread.shape[-1])
         bread_inv = np.linalg.pinv(bread)
         cov = bread_inv if mle else bread_inv @ meat @ bread_inv
         crlb = np.diagonal(cov, axis1=1, axis2=2).copy()
@@ -2731,6 +2735,8 @@ def _spline_link_xyz_crlb_cpu(
             bread[bad] = np.eye(bread.shape[-1])
             meat[bad] = 0.0
         with np.errstate(invalid="ignore", divide="ignore"):
+            _bad = ~np.isfinite(bread).all(axis=(1, 2))
+            bread[_bad] = np.eye(bread.shape[-1])
             bread_inv = np.linalg.pinv(bread)
             cov = bread_inv if mle else bread_inv @ meat @ bread_inv
             var = np.diagonal(cov, axis1=1, axis2=2).copy()
