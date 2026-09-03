@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://picassosr.readthedocs.io/en/latest/
+    about: >
+      How to use Picasso, module by module. Please check the docs before
+      opening an issue - many questions are answered there.
+  - name: Usage question
+    url: https://github.com/jungmannlab/picasso/discussions
+    about: >
+      Questions about how to use Picasso for your data belong in Discussions
+      rather than in the issue tracker.
