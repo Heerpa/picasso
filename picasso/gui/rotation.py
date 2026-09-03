@@ -2264,6 +2264,17 @@ class RotationWindow(QtWidgets.QMainWindow):
                 new_pick.append((point[0] + dx, point[1] + dy))
             self.window.view._picks = [new_pick] + []  # main window
             self.view_rot.pick = new_pick  # view rotation
+        elif self.view_rot.pick_shape == "Brush":
+            # shift every point of every stroke, keeping their widths
+            new_pick = [
+                (
+                    stroke[0],
+                    [(x + dx, y + dy) for x, y in stroke[1]],
+                )
+                for stroke in self.window.view._picks[0]
+            ]
+            self.window.view._picks = [new_pick]  # main window
+            self.view_rot.pick = new_pick  # view rotation
 
         self.window.view.update_scene()  # update scene in main window
 
@@ -2285,6 +2296,15 @@ class RotationWindow(QtWidgets.QMainWindow):
             elif self.view_rot.pick_shape in ["Rectangle", "Box"]:
                 (x0, y0), (x1, y1) = self.view_rot.pick
                 pick = [[float(x0), float(y0)], [float(x1), float(y1)]]
+            elif self.view_rot.pick_shape == "Brush":
+                # same stroke form as the picks file, widths in nm
+                pick = [
+                    {
+                        "Width (nm)": float(stroke[0] * pixelsize),
+                        "Path": [[float(x), float(y)] for x, y in stroke[1]],
+                    }
+                    for stroke in self.view_rot.pick
+                ]
             else:  # polygon - an arbitrary number of vertices
                 pick = [[float(x), float(y)] for x, y in self.view_rot.pick]
             size = self.view_rot.pick_size

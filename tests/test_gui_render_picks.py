@@ -1,10 +1,12 @@
-"""The "Box" pick shape of ``picasso.gui.render``.
+"""The "Box" and "Brush" pick shapes of ``picasso.gui.render``.
 
-A box is dragged out rather than clicked into place, and unlike the
-click-placed shapes it carries its own extent, so ``_pick_size`` is None
-for it. These tests drive the real mouse handlers of a ``View`` to cover
-the drag, the removal, the YAML round trip and the metadata, which is
-where the None size would otherwise surface as a ``TypeError``.
+Both are drawn by dragging rather than clicked into place, and both
+carry their own extent instead of a shared size, so ``_pick_size`` is
+None for them. These tests drive the real mouse handlers of a ``View``
+to cover the drag, the removal, the YAML round trip and the metadata,
+which is where the None size would otherwise surface as a
+``TypeError``. For the brush they also cover the merging of overlapping
+strokes and the undo of the last one.
 
 :author: Rafal Kowalewski, 2026
 :copyright: Copyright (c) 2026 Jungmann Lab, MPI of Biochemistry
@@ -86,6 +88,14 @@ def _drag(view, x0, y0, x1, y1):
     view.mousePressEvent(_Event(x0, y0))
     view.mouseMoveEvent(_Event(x1, y1))
     view.mouseReleaseEvent(_Event(x1, y1))
+
+
+def _paint(view, points):
+    """Paint a brush stroke through the given screen positions."""
+    view.mousePressEvent(_Event(*points[0]))
+    for point in points[1:]:
+        view.mouseMoveEvent(_Event(*point))
+    view.mouseReleaseEvent(_Event(*points[-1]))
 
 
 @pytest.fixture
@@ -375,3 +385,212 @@ class TestFilterPicksAcrossShapes:
         assert len(counts) == 3
         assert counts[1] == 0
         assert counts[0] > 0 and counts[0] == counts[2]
+
+
+# ---------------------------------------------------------------------------
+# The brush
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def brush_view(window):
+    """The view of ``window``, in Pick mode with the Brush shape."""
+    view = window.view
+    window.tools_settings_dialog.pick_shape.setCurrentText("Brush")
+    view._mode = "Pick"
+    assert view._pick_shape == "Brush"
+    return view
+
+
+# two horizontal strokes far apart, and one that bridges them
+STROKE_A = [(60, 60), (100, 60), (140, 60)]
+STROKE_B = [(60, 200), (100, 200), (140, 200)]
+BRIDGE = [(100, 60), (100, 130), (100, 200)]
+
+
+class TestBrushPickTool:
+    def test_brush_is_registered_as_a_pick_shape(self):
+        assert "Brush" in lib.PICK_SHAPES
+        assert "Brush" in lib.PICK_SHAPES_WITHOUT_SIZE
+
+    def test_pick_size_is_none(self, brush_view):
+        assert brush_view._pick_size is None
+
+    def test_brush_width_follows_the_spin_box(self, brush_view, window):
+        window.tools_settings_dialog.brush_width.setValue(260.0)
+        assert brush_view._brush_width == pytest.approx(
+            260.0 / brush_view.pixelsize
+        )
+
+    def test_one_stroke_makes_one_pick(self, brush_view):
+        _paint(brush_view, STROKE_A)
+        assert len(brush_view._picks) == 1
+        assert len(brush_view._picks[0]) == 1
+
+    def test_a_stroke_records_the_swept_path(self, brush_view):
+        _paint(brush_view, STROKE_A)
+        width, path = brush_view._picks[0][0]
+        assert width == pytest.approx(brush_view._brush_width)
+        assert len(path) >= 2
+        assert path[0] == pytest.approx(
+            brush_view.map_to_movie(QtCore.QPoint(*STROKE_A[0]))
+        )
+
+    def test_a_click_without_a_drag_paints_a_dot(self, brush_view):
+        _paint(brush_view, [(80, 80)])
+        assert len(brush_view._picks) == 1
+        assert len(brush_view._picks[0][0][1]) == 1
+
+    def test_separate_strokes_stay_separate(self, brush_view):
+        _paint(brush_view, STROKE_A)
+        _paint(brush_view, STROKE_B)
+        assert len(brush_view._picks) == 2
+
+    def test_a_bridging_stroke_merges_the_picks(self, brush_view):
+        _paint(brush_view, STROKE_A)
+        _paint(brush_view, STROKE_B)
+        _paint(brush_view, BRIDGE)
+        assert len(brush_view._picks) == 1
+        assert len(brush_view._picks[0]) == 3
+
+    def test_the_newest_stroke_is_last(self, brush_view):
+        _paint(brush_view, STROKE_A)
+        _paint(brush_view, STROKE_B)
+        _paint(brush_view, BRIDGE)
+        first_point = brush_view._picks[-1][-1][1][0]
+        assert first_point == pytest.approx(
+            brush_view.map_to_movie(QtCore.QPoint(*BRIDGE[0]))
+        )
+
+    def test_right_click_undoes_the_last_stroke(self, brush_view):
+        _paint(brush_view, STROKE_A)
+        _paint(brush_view, STROKE_B)
+        brush_view.mouseReleaseEvent(
+            _Event(300, 300, QtCore.Qt.MouseButton.RightButton)
+        )
+        assert len(brush_view._picks) == 1
+
+    def test_undoing_a_bridge_splits_the_pick_again(self, brush_view):
+        _paint(brush_view, STROKE_A)
+        _paint(brush_view, STROKE_B)
+        _paint(brush_view, BRIDGE)
+        assert len(brush_view._picks) == 1
+        # the position of the right click does not matter for the brush
+        brush_view.mouseReleaseEvent(
+            _Event(500, 500, QtCore.Qt.MouseButton.RightButton)
+        )
+        assert len(brush_view._picks) == 2
+
+    def test_right_click_with_no_picks_is_harmless(self, brush_view):
+        brush_view.mouseReleaseEvent(
+            _Event(300, 300, QtCore.Qt.MouseButton.RightButton)
+        )
+        assert brush_view._picks == []
+
+    def test_the_stroke_overlay_is_cleared_on_release(self, brush_view):
+        brush_view.mousePressEvent(_Event(*STROKE_A[0]))
+        assert brush_view._brush_stroke_ongoing
+        brush_view.mouseMoveEvent(_Event(*STROKE_A[1]))
+        assert brush_view._brush_stroke
+        brush_view.mouseReleaseEvent(_Event(*STROKE_A[-1]))
+        assert not brush_view._brush_stroke_ongoing
+        assert not brush_view._brush_stroke
+
+    def test_the_overlay_paints(self, brush_view):
+        brush_view.mousePressEvent(_Event(*STROKE_A[0]))
+        brush_view.mouseMoveEvent(_Event(*STROKE_A[1]))
+        image = brush_view.draw_brush_stroke_ongoing(
+            brush_view.qimage_no_picks.copy()
+        )
+        assert image is not None
+
+    def test_changing_the_width_leaves_drawn_strokes_alone(
+        self, brush_view, window
+    ):
+        _paint(brush_view, STROKE_A)
+        drawn = brush_view._picks[0][0][0]
+        window.tools_settings_dialog.brush_width.setValue(30.0)
+        assert brush_view._picks[0][0][0] == drawn
+        _paint(brush_view, STROKE_B)
+        assert brush_view._picks[-1][-1][0] < drawn
+
+    def test_picked_locs_are_inside_the_stroke(self, brush_view):
+        _paint(brush_view, STROKE_A)
+        picked = brush_view.picked_locs(0)[0]
+        assert len(picked) > 0
+        width, path = brush_view._picks[0][0]
+        X = np.array([p[0] for p in path])
+        Y = np.array([p[1] for p in path])
+        assert lib.check_if_in_brush_stroke(
+            picked["x"].to_numpy(), picked["y"].to_numpy(), X, Y, width / 2
+        ).all()
+
+    def test_pick_areas_are_per_pick(self, brush_view):
+        _paint(brush_view, STROKE_A)
+        _paint(brush_view, [(300, 300), (320, 300)])
+        areas = brush_view.pick_areas()
+        assert len(areas) == 2
+        assert areas[0] > areas[1] > 0
+
+    def test_the_scene_draws_with_a_none_pick_size(self, brush_view):
+        _paint(brush_view, STROKE_A)
+        brush_view.update_scene()
+        assert brush_view.qimage is not None
+
+    def test_saved_yaml_round_trips(self, brush_view, tmp_path, window):
+        _paint(brush_view, STROKE_A)
+        _paint(brush_view, STROKE_B)
+        _paint(brush_view, BRIDGE)  # merges the two into one pick
+        path = str(tmp_path / "picks.yaml")
+        brush_view.save_picks(path)
+
+        regions = yaml.full_load(open(path))
+        assert regions["Shape"] == "Brush"
+        # a flat, ordered stroke list, each with its own width
+        assert len(regions["Strokes"]) == 3
+        assert set(regions["Strokes"][0]) == {"Width (nm)", "Path"}
+        assert "Diameter (nm)" not in regions
+
+        brush_view.clear_picks()
+        brush_view.load_picks(path)
+        # the merged grouping is re-derived from the strokes
+        assert len(brush_view._picks) == 1
+        assert len(brush_view._picks[0]) == 3
+        assert window.tools_settings_dialog.brush_width.value() > 0
+
+    def test_pick_metadata_has_no_size_entry(self, brush_view):
+        _paint(brush_view, STROKE_A)
+        pick_info = brush_view._build_base_pick_info()
+        assert pick_info["Pick Shape"] == "Brush"
+        assert pick_info["Number of picks"] == 1
+        assert not any("Pick Diameter" in key for key in pick_info)
+        assert len(pick_info["Pick Areas (um^2)"]) == 1
+
+    def test_index_blocks_are_not_built(self, brush_view):
+        _paint(brush_view, STROKE_A)
+        assert brush_view.get_index_blocks(0) is None
+
+    def test_pick_similar_is_refused(self, brush_view, monkeypatch):
+        _paint(brush_view, STROKE_A)
+        _paint(brush_view, STROKE_B)
+        warned = []
+        monkeypatch.setattr(
+            gui_render.QtWidgets.QMessageBox,
+            "warning",
+            lambda *a, **k: warned.append(a),
+        )
+        brush_view.pick_similar()
+        assert warned  # a painted region has no template to replicate
+
+
+class TestBrushRotationWindow:
+    def test_viewport_spans_the_painted_region(self):
+        pick = [(2.0, [(0.0, 0.0), (10.0, 0.0)])]
+        (y_min, x_min), (y_max, x_max) = (
+            rotation.ViewRotation.fit_in_view_rotated(
+                TestRotationWindowShapes._Stub(pick, "Brush", None),
+                get_viewport=True,
+            )
+        )
+        assert (x_min, x_max) == pytest.approx((-1.0, 11.0))
+        assert (y_min, y_max) == pytest.approx((-1.0, 1.0))

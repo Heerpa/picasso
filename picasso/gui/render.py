@@ -79,6 +79,9 @@ POLYGON_POINTER_SIZE = 16  # must be even
 # shortest drag (display pixels, in x and y) that still yields a box
 # pick, so that a stray click does not create one of zero area
 MIN_BOX_PICK_DRAG = 3
+# how far (display pixels) the cursor must travel before another point
+# is appended to the brush stroke being painted
+MIN_BRUSH_POINT_SPACING = 2
 # empty space kept around a pick by "Move to pick", as a fraction of the
 # pick's extent on each side
 MOVE_TO_PICK_MARGIN = 0.2
@@ -6110,6 +6113,38 @@ class PickToolSquareSettings(QtWidgets.QWidget):
         self.grid.setRowStretch(1, 1)
 
 
+class PickToolBrushSettings(QtWidgets.QWidget):
+    """Choose parameters for brush picks."""
+
+    def __init__(
+        self,
+        window: QtWidgets.QMainWindow,
+        tools_settings_dialog: ToolsSettingsDialog,
+    ) -> None:
+        super().__init__()
+        self.window = window
+        self.grid = QtWidgets.QGridLayout(self)
+        width_label = QtWidgets.QLabel("Stroke width (nm):")
+        width_label.setToolTip(
+            "Width of the next brush stroke.\n\n"
+            "Every stroke keeps the width it was painted with, so\n"
+            "changing this does not reshape the picks already drawn."
+        )
+        self.grid.addWidget(width_label, 0, 0)
+        self.brush_width = QtWidgets.QDoubleSpinBox()
+        self.brush_width.setRange(0.1, 99999999.0)
+        self.brush_width.setValue(100.0)
+        self.brush_width.setSingleStep(5.0)
+        self.brush_width.setDecimals(1)
+        self.brush_width.setKeyboardTracking(False)
+        # only the cursor depends on it; the drawn strokes do not
+        self.brush_width.valueChanged.connect(
+            tools_settings_dialog.on_brush_width_changed
+        )
+        self.grid.addWidget(self.brush_width, 0, 1)
+        self.grid.setRowStretch(1, 1)
+
+
 class ToolsSettingsDialog(lib.Dialog):
     """Customize picks - shape and size, annotate, change std for
     picking similar.
@@ -6118,13 +6153,15 @@ class ToolsSettingsDialog(lib.Dialog):
 
     Attributes
     ----------
+    brush_width : QDoubleSpinBox
+        Contains the width of the next brush stroke (nm).
     pick_annotation : QCheckBox
         Tick to display picks' indeces.
     pick_diameter : QDoubleSpinBox
         Contains the diameter of circular picks (nm)).
     pick_shape : QComboBox
         Contains the str with the shape of picks (circle, rectangle,
-        polygon, square or box).
+        polygon, square, box or brush).
     pick_side_length : QDoubleSpinBox
         Contains the side length of square picks (nm).
     pick_similar_range : QDoubleSpinBox
@@ -6188,6 +6225,11 @@ class ToolsSettingsDialog(lib.Dialog):
         self.pick_box_settings = QtWidgets.QWidget()
         pick_stack.addWidget(self.pick_box_settings)
 
+        # Brush - each stroke keeps the width it was painted with
+        self.pick_brush_settings = PickToolBrushSettings(window, self)
+        pick_stack.addWidget(self.pick_brush_settings)
+        self.brush_width = self.pick_brush_settings.brush_width
+
         # Pick similar works for all shapes but polygons, so its
         # settings live below the shape-specific pages
         range_label = QtWidgets.QLabel("Pick similar +/- range (std):")
@@ -6207,14 +6249,15 @@ class ToolsSettingsDialog(lib.Dialog):
         pick_grid.addWidget(self.pick_similar_range, 2, 1)
         self.pick_shape.currentTextChanged.connect(
             lambda shape: self.pick_similar_range.setEnabled(
-                shape != "Polygon"
+                shape not in ("Polygon", "Brush")
             )
         )
         self.pick_shape.setToolTip(
             "Circle and Square are placed with a single click and share\n"
             "one size; Rectangle is a band of a fixed width drawn along\n"
             "its center axis; Polygon is drawn vertex by vertex; Box is\n"
-            "dragged out to any size."
+            "dragged out to any size; Brush is painted freehand, and\n"
+            "overlapping strokes merge into one pick."
         )
 
         self.pick_annotation = QtWidgets.QCheckBox("Annotate picks")
@@ -6230,6 +6273,15 @@ class ToolsSettingsDialog(lib.Dialog):
         self.point_picks.setToolTip("Display circular picks as points?")
         self.point_picks.stateChanged.connect(self.update_scene_with_cache)
         pick_grid.addWidget(self.point_picks, 4, 0)
+
+    def on_brush_width_changed(self, *args) -> None:
+        """Update the cursor to the new brush width.
+
+        Unlike the other pick sizes this does not touch the scene or the
+        spatial index: every brush stroke keeps the width it was painted
+        with, so the picks already drawn are unaffected.
+        """
+        self.window.view.update_cursor()
 
     def on_pick_dimension_changed(self, *args) -> None:
         """Reset index_blocks in self.window.view and update the
@@ -7553,13 +7605,14 @@ class View(QtWidgets.QLabel):
         Contains the coordinates of current picks. Each pick is
         ``(x, y)`` for circles and squares, ``((x_start, y_start),
         (x_end, y_end))`` center-axis points for rectangles, a list of
-        vertices for polygons and the two opposite corners
-        ``((x0, y0), (x1, y1))`` for boxes.
-    _pick_shape : {"Circle", "Rectangle", "Polygon", "Square", "Box"}
+        vertices for polygons, the two opposite corners
+        ``((x0, y0), (x1, y1))`` for boxes, and a list of
+        ``(width, path)`` strokes for brush picks.
+    _pick_shape : {"Circle", "Rectangle", "Polygon", "Square", "Box", "Brush"}
         Current shape of picks.
     _pick_size : float or None
-        Size of picks in camera pixels; None for polygonal and box
-        picks, which carry their own extent. Diameter for circular
+        Size of picks in camera pixels; None for polygonal, box and
+        brush picks, which carry their own extent. Diameter for circular
         picks, side length for square picks and width for rectangular
         picks.
     pixelsize : float
@@ -7633,6 +7686,9 @@ class View(QtWidgets.QLabel):
         self._pan = False
         self._rectangle_pick_ongoing = False
         self._box_pick_ongoing = False
+        self._brush_stroke_ongoing = False
+        self._brush_stroke = []  # path being painted, in camera pixels
+        self._brush_last_pos = None  # last point added, in display px
         self._size_hint = (768, 768)
         self.n_locs = 0
         self._picks = []
@@ -8110,6 +8166,85 @@ class View(QtWidgets.QLabel):
                 (max(x_start, x_end), max(y_start, y_end)),
             )
         )
+
+    def extend_brush_stroke(self, position: QtCore.QPoint) -> None:
+        """Append a point to the brush stroke being painted.
+
+        Points are only added once the cursor has travelled
+        ``MIN_BRUSH_POINT_SPACING`` display pixels, which keeps a slow
+        drag from filling the stroke - and the saved file - with
+        near-identical points. They are stored in camera pixels, so the
+        stroke is independent of the zoom it was painted at.
+
+        Parameters
+        ----------
+        position : QPoint
+            Current cursor position.
+        """
+        moved = abs(position.x() - self._brush_last_pos.x()) + abs(
+            position.y() - self._brush_last_pos.y()
+        )
+        if moved < MIN_BRUSH_POINT_SPACING:
+            return
+        self._brush_last_pos = position
+        self._brush_stroke.append(self.map_to_movie(position))
+        self.update_scene(picks_only=True)
+
+    def add_brush_stroke(self, end_position: QtCore.QPoint) -> None:
+        """Finish the brush stroke being painted and merge it into the
+        picks.
+
+        The strokes of every pick the new one touches are pulled into a
+        single pick, which is appended last so that the newest stroke is
+        always ``self._picks[-1][-1]``. A press and release without a
+        drag paints a dot.
+
+        Parameters
+        ----------
+        end_position : QPoint
+            Position of the cursor when the mouse button was released.
+        """
+        self._brush_stroke_ongoing = False
+        if not self._brush_stroke:
+            return
+        end = self.map_to_movie(end_position)
+        if end != self._brush_stroke[-1]:
+            self._brush_stroke.append(end)
+        stroke = (self._brush_width, self._brush_stroke)
+        self._brush_stroke = []
+
+        width, X, Y = lib.brush_stroke_arrays(stroke)
+        merged = []
+        kept = []
+        for pick in self._picks:
+            overlaps = any(
+                lib.brush_strokes_overlap(X, Y, X_, Y_, (width + width_) / 2)
+                for width_, X_, Y_ in map(lib.brush_stroke_arrays, pick)
+            )
+            if overlaps:
+                merged.extend(pick)
+            else:
+                kept.append(pick)
+        merged.append(stroke)
+        kept.append(merged)
+        self._picks = kept
+
+        self.update_pick_info_short()
+        self.update_scene(picks_only=True)
+
+    def remove_last_brush_stroke(self) -> None:
+        """Remove the brush stroke painted last.
+
+        Dropping a stroke can break a pick apart again - it may have
+        been the only thing joining two painted regions - so the
+        remaining strokes are re-merged from scratch.
+        """
+        if not len(self._picks):
+            return
+        strokes = self._picks.pop()[:-1]
+        self._picks.extend(lib.merge_brush_strokes(strokes))
+        self.update_pick_info_short()
+        self.update_scene(picks_only=True)
 
     def add_point(
         self,
@@ -9050,6 +9185,33 @@ class View(QtWidgets.QLabel):
         painter.end()
         return image
 
+    def draw_brush_stroke_ongoing(self, image: QtGui.QImage) -> QtGui.QImage:
+        """Draw the brush stroke being painted onto image.
+
+        Parameters
+        ----------
+        image : QImage
+            Image containing rendered localizations.
+
+        Returns
+        -------
+        image : QImage
+            Image with the drawn stroke.
+        """
+        if not self._brush_stroke:
+            return image
+        stroke = (self._brush_width, self._brush_stroke)
+        region = render.brush_pick_path([stroke], image.size(), self.viewport)
+        fill = QtGui.QColor("green")
+        fill.setAlpha(render.BRUSH_FILL_ALPHA)
+        painter = QtGui.QPainter(image)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.setPen(QtGui.QColor("green"))
+        painter.fillPath(region, QtGui.QBrush(fill))
+        painter.drawPath(region)
+        painter.end()
+        return image
+
     def draw_points(self, image: QtGui.QImage) -> QtGui.QImage:
         """Draw points, lines and distances between them onto image.
 
@@ -9243,6 +9405,8 @@ class View(QtWidgets.QLabel):
             self.qimage = self.draw_rectangle_pick_ongoing(self.qimage)
         if self._box_pick_ongoing:
             self.qimage = self.draw_box_pick_ongoing(self.qimage)
+        if self._brush_stroke_ongoing:
+            self.qimage = self.draw_brush_stroke_ongoing(self.qimage)
 
         # convert to pixmap
         self.pixmap = QtGui.QPixmap.fromImage(self.qimage)
@@ -9726,6 +9890,11 @@ class View(QtWidgets.QLabel):
             tools_dlg.pick_width.setValue(size * pixelsize)
         elif self._pick_shape == "Square":
             tools_dlg.pick_side_length.setValue(size * pixelsize)
+        elif self._pick_shape == "Brush" and len(self._picks):
+            # brush strokes keep their own widths; seed the spin box
+            # with the widest one so the next stroke matches the picks
+            widest = max(stroke[0] for pick in self._picks for stroke in pick)
+            tools_dlg.brush_width.setValue(widest * pixelsize)
 
         # update Info Dialog
         self.update_pick_info_short()
@@ -9880,6 +10049,9 @@ class View(QtWidgets.QLabel):
                     self.box_pick_current_x = event.pos().x()
                     self.box_pick_current_y = event.pos().y()
                     self.update_scene(picks_only=True)
+            elif self._pick_shape == "Brush":
+                if self._brush_stroke_ongoing:
+                    self.extend_brush_stroke(event.pos())
         # live update of the measuring cross and distance
         elif self._mode == "Measure" and self._measure_following:
             self._measure_cursor = self.map_to_movie(event.pos())
@@ -9934,6 +10106,10 @@ class View(QtWidgets.QLabel):
                     self.box_pick_current_x = event.pos().x()
                     self.box_pick_current_y = event.pos().y()
                     self.box_pick_start = self.map_to_movie(event.pos())
+                elif self._pick_shape == "Brush":
+                    self._brush_stroke_ongoing = True
+                    self._brush_stroke = [self.map_to_movie(event.pos())]
+                    self._brush_last_pos = event.pos()
 
     def _mouse_release_zoom(self, event: QtCore.QEvent) -> None:
         """Zooms in (left click) if the zoom-in rectangle is visible,
@@ -10014,6 +10190,17 @@ class View(QtWidgets.QLabel):
                 # remove pick
                 x, y = self.map_to_movie(event.pos())
                 self.remove_picks((x, y))
+                event.accept()
+            else:
+                event.ignore()
+        elif self._pick_shape == "Brush":
+            # finish painting the stroke and merge it into the picks
+            if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                self.add_brush_stroke(event.pos())
+                event.accept()
+            # undo the last stroke, like the polygon's last vertex
+            elif event.button() == QtCore.Qt.MouseButton.RightButton:
+                self.remove_last_brush_stroke()
                 event.accept()
             else:
                 event.ignore()
@@ -10369,8 +10556,9 @@ class View(QtWidgets.QLabel):
         """Return the size of the pick in camera pixels. For circle this
         is the diameter. For square this is the side length. For
         rectangle this is the width (perpendicular to the drawing
-        direction). For polygon and box this is None: they carry their
-        own extent."""
+        direction). For polygon, box and brush this is None: they carry
+        their own extent. For the width of the next brush stroke, see
+        ``_brush_width``."""
         tools_dialog = self.window.tools_settings_dialog
         pixelsize = self.pixelsize
         if self._pick_shape == "Circle":
@@ -10382,6 +10570,16 @@ class View(QtWidgets.QLabel):
         else:
             pick_size = None
         return pick_size
+
+    @property
+    def _brush_width(self) -> float:
+        """Return the width of the next brush stroke in camera pixels.
+
+        Only new strokes use it: every stroke already painted keeps the
+        width it was drawn with, so this is not the size of any existing
+        pick (see ``_pick_size``, which is None for brush picks)."""
+        tools_dialog = self.window.tools_settings_dialog
+        return tools_dialog.brush_width.value() / self.pixelsize
 
     def _draw_pick_scatter(
         self,
@@ -11732,6 +11930,17 @@ class View(QtWidgets.QLabel):
                 ]
                 for c0, c1 in picks
             ]
+        elif self._pick_shape == "Brush":
+            # a flat, ordered stroke list: which strokes form one pick
+            # follows from their geometry and is re-derived on loading
+            regions["Strokes"] = [
+                {
+                    "Width (nm)": float(stroke[0] * pixelsize),
+                    "Path": [[float(x), float(y)] for x, y in stroke[1]],
+                }
+                for pick in picks
+                for stroke in pick
+            ]
         regions["Shape"] = self._pick_shape
         return regions
 
@@ -12084,6 +12293,9 @@ class View(QtWidgets.QLabel):
                 return
         self._pick_shape = current_text
         self._picks = []
+        # a stroke half-painted with the old shape must not survive
+        self._brush_stroke_ongoing = False
+        self._brush_stroke = []
         self.update_cursor()
         self.update_scene(picks_only=True)
         self.update_pick_info_short()
@@ -12494,13 +12706,17 @@ class View(QtWidgets.QLabel):
         self.update_scene(resample_locs=True)
         self.fit_in_view()
 
-    def _update_cursor_circle(self) -> None:
-        """Set circular cursor according to the diameter defined in
-        ``ToolsSettingsDialog``."""
+    def _update_cursor_circle(self, size: float) -> None:
+        """Set a circular cursor of the given size.
+
+        Parameters
+        ----------
+        size : float
+            Diameter of the cursor in camera pixels: the pick diameter
+            for circular picks, the stroke width for brush picks.
+        """
         diameter = int(
-            self.width()
-            * self._pick_size
-            / render.viewport_width(self.viewport)
+            self.width() * size / render.viewport_width(self.viewport)
         )
         # remote desktop crashes sometimes for high diameter
         if diameter < 100:
@@ -12572,7 +12788,7 @@ class View(QtWidgets.QLabel):
                 self.unsetCursor()
         elif self._mode == "Pick":
             if self._pick_shape == "Circle":  # circle
-                self._update_cursor_circle()
+                self._update_cursor_circle(self._pick_size)
             elif self._pick_shape == "Rectangle":
                 self.unsetCursor()
             elif self._pick_shape == "Polygon":
@@ -12583,6 +12799,10 @@ class View(QtWidgets.QLabel):
                 # the box has no size until it is dragged out, so the
                 # cursor marks the corner rather than the pick
                 self.setCursor(QtCore.Qt.CursorShape.CrossCursor)
+            elif self._pick_shape == "Brush":
+                # the cursor is the brush tip, i.e., the width the next
+                # stroke will be painted with
+                self._update_cursor_circle(self._brush_width)
             else:
                 self.unsetCursor()
 
@@ -14059,8 +14279,19 @@ class Window(QtWidgets.QMainWindow):
         info = self.view.infos[0][-1]
         if "Pick" not in info:
             return
-        self.view._picks = [info["Pick"]]
         self.view._pick_shape = info["Pick shape"]
+        if self.view._pick_shape == "Brush":
+            # stored as stroke dicts with widths in nm, see
+            # ``RotationWindow.save_locs_rotated``
+            pixelsize = self.view.pixelsize
+            self.view._picks = [
+                [
+                    (stroke["Width (nm)"] / pixelsize, stroke["Path"])
+                    for stroke in info["Pick"]
+                ]
+            ]
+        else:
+            self.view._picks = [info["Pick"]]
         # keep the shape selector in sync; assigning _pick_shape first
         # makes ``on_pick_shape_changed`` a no-op, so the pick survives
         self.tools_settings_dialog.pick_shape.setCurrentText(

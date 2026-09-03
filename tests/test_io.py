@@ -659,6 +659,42 @@ class TestLoadPicks:
         # each box carries its own extent
         assert size is None
 
+    def test_brush_picks(self, tmp_path):
+        regions = {
+            "Shape": "Brush",
+            "Strokes": [
+                {"Width (nm)": 130.0, "Path": [[1.0, 1.0], [5.0, 1.0]]},
+                {"Width (nm)": 260.0, "Path": [[20.0, 20.0]]},
+            ],
+        }
+        path = tmp_path / "picks.yaml"
+        with open(path, "w") as f:
+            yaml.dump(regions, f)
+        picks, shape, size = io.load_picks(str(path), pixelsize=130.0)
+        assert shape == "Brush"
+        # each stroke carries its own width, so there is no pick size
+        assert size is None
+        assert len(picks) == 2  # the two strokes do not touch
+        assert picks[0][0][0] == pytest.approx(1.0)  # 130 nm -> 1 px
+        assert picks[1][0][0] == pytest.approx(2.0)
+        assert picks[0][0][1] == [[1.0, 1.0], [5.0, 1.0]]
+
+    def test_brush_overlapping_strokes_load_as_one_pick(self, tmp_path):
+        # the file stores a flat stroke list; the grouping is re-derived
+        regions = {
+            "Shape": "Brush",
+            "Strokes": [
+                {"Width (nm)": 130.0, "Path": [[1.0, 1.0], [5.0, 1.0]]},
+                {"Width (nm)": 130.0, "Path": [[4.0, 1.0], [9.0, 1.0]]},
+            ],
+        }
+        path = tmp_path / "picks.yaml"
+        with open(path, "w") as f:
+            yaml.dump(regions, f)
+        picks, _, _ = io.load_picks(str(path), pixelsize=130.0)
+        assert len(picks) == 1
+        assert len(picks[0]) == 2
+
     def test_unrecognized_format_raises(self, tmp_path):
         path = tmp_path / "picks.yaml"
         with open(path, "w") as f:

@@ -312,6 +312,57 @@ class TestPickedLocs:
         )[0]
         assert len(with_size) == len(without)
 
+    def test_brush_pick_within_the_painted_region(self, locs, info):
+        stroke = (1.0, [(14.0, 15.5), (17.0, 15.5)])
+        out = postprocess.picked_locs(
+            locs, info, [[stroke]], pick_shape="Brush"
+        )[0]
+        assert len(out) > 0
+        # every loc is within half the stroke width of the path
+        assert (np.abs(out["y"] - 15.5) <= 0.5 + 1e-9).all()
+        assert (out["x"] > 13.5).all() and (out["x"] < 17.5).all()
+
+    def test_brush_pick_width_changes_what_is_picked(self, locs, info):
+        path = [(14.0, 15.5), (17.0, 15.5)]
+        wide = postprocess.picked_locs(
+            locs, info, [[(2.0, path)]], pick_shape="Brush"
+        )[0]
+        narrow = postprocess.picked_locs(
+            locs, info, [[(0.2, path)]], pick_shape="Brush"
+        )[0]
+        assert len(wide) > len(narrow) > 0
+
+    def test_brush_pick_unions_its_strokes(self, locs, info):
+        a = (1.0, [(5.0, 5.5), (6.0, 5.5)])
+        b = (1.0, [(15.0, 15.5), (16.0, 15.5)])
+        separate = postprocess.picked_locs(
+            locs, info, [[a], [b]], pick_shape="Brush"
+        )
+        together = postprocess.picked_locs(
+            locs, info, [[a, b]], pick_shape="Brush"
+        )
+        assert len(together) == 1
+        assert len(together[0]) == len(separate[0]) + len(separate[1])
+
+    def test_brush_pick_ignores_pick_size(self, locs, info):
+        pick = [(1.0, [(14.0, 15.5), (17.0, 15.5)])]
+        with_size = postprocess.picked_locs(
+            locs, info, [pick], pick_shape="Brush", pick_size=99.0
+        )[0]
+        without = postprocess.picked_locs(
+            locs, info, [pick], pick_shape="Brush"
+        )[0]
+        assert len(with_size) == len(without)
+
+    def test_brush_pick_adds_group(self, locs, info):
+        picks = [
+            [(1.0, [(5.0, 5.5), (6.0, 5.5)])],
+            [(1.0, [(15.0, 15.5), (16.0, 15.5)])],
+        ]
+        out = postprocess.picked_locs(locs, info, picks, pick_shape="Brush")
+        assert out[0]["group"].unique().tolist() == [0]
+        assert out[1]["group"].unique().tolist() == [1]
+
     def test_box_pick_adds_group(self, locs, info):
         picks = [
             ((5.0, 5.0), (6.0, 6.0)),
@@ -575,6 +626,12 @@ class TestPickSimilarBox:
 
     def test_empty_picks(self, locs, info):
         assert postprocess.pick_similar(locs, info, [], "Box") == []
+
+    def test_brush_is_rejected(self, locs, info):
+        # a painted region has no size or canonical form to replicate
+        pick = [(1.0, [(5.0, 5.5), (6.0, 5.5)])]
+        with pytest.raises(AssertionError):
+            postprocess.pick_similar(locs, info, [pick], "Brush")
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +913,21 @@ class TestRemoveLocsInPicks:
             info,
             picks=[box],
             pick_shape="Box",
+        )
+        assert len(out) == len(locs) - n_inside
+
+    def test_brush_pick_size_ignored(self, locs, info):
+        pick = [(1.5, [(14.5, 15.5), (16.5, 15.5)])]
+        n_inside = len(
+            postprocess.picked_locs(locs, info, [pick], pick_shape="Brush")[0]
+        )
+        assert n_inside > 0
+        # a brush stroke carries its own width, so no pick_size
+        out = postprocess.remove_locs_in_picks(
+            locs.copy(),
+            info,
+            picks=[pick],
+            pick_shape="Brush",
         )
         assert len(out) == len(locs) - n_inside
 
@@ -1245,6 +1317,19 @@ class TestCombineLocsInPicks:
         )
         assert combined["n"].sum() == sum(len(p) for p in picked)
 
+    def test_brush_picks_need_no_size(self, locs, info, origami_picks):
+        picks = [
+            [(PICK_SIZE, [(x - 0.2, y), (x + 0.2, y)])]
+            for x, y in origami_picks
+        ]
+        combined = postprocess.combine_locs_in_picks(
+            locs.copy(),
+            info,
+            picks=picks,
+            pick_shape="Brush",
+        )
+        assert len(combined) >= len(picks)
+
     def test_box_picks_need_no_size(self, locs, info, origami_picks):
         boxes = [
             (
@@ -1581,6 +1666,25 @@ class TestAlign:
             [info, info],
             picks=boxes,
             pick_shape="Box",
+            return_shifts=True,
+        )
+        assert abs(shifts[1][1] - 0.1) < 0.05
+
+    def test_align_from_picked_brush_recovers_known_shift(
+        self, locs_copy, info, origami_picks
+    ):
+        a = locs_copy
+        b = a.copy()
+        b["x"] += 0.1
+        picks = [
+            [(PICK_SIZE, [(x - 0.2, y), (x + 0.2, y)])]
+            for x, y in origami_picks
+        ]
+        _, shifts = postprocess.align_from_picked(
+            [a, b],
+            [info, info],
+            picks=picks,
+            pick_shape="Brush",
             return_shifts=True,
         )
         assert abs(shifts[1][1] - 0.1) < 0.05
