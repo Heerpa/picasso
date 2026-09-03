@@ -1609,6 +1609,53 @@ class TestDrawing:
         )
         assert np.array_equal(before, _qimage_to_array(out))
 
+    def test_draw_picks_brush(self):
+        canvas = _fresh_canvas()
+        before = _qimage_to_array(canvas)
+        out = render.draw_picks(
+            canvas,
+            ((0, 0), (32, 32)),
+            "Brush",
+            [[(2.0, [(8.0, 8.0), (24.0, 24.0)])]],
+            pick_size=None,
+        )
+        assert isinstance(out, QtGui.QImage)
+        assert out.width() == 120 and out.height() == 120
+        assert not np.array_equal(before, _qimage_to_array(out))
+
+    def test_draw_picks_brush_outside_viewport_is_culled(self):
+        canvas = _fresh_canvas()
+        before = _qimage_to_array(canvas)
+        out = render.draw_picks(
+            canvas,
+            ((0, 0), (32, 32)),
+            "Brush",
+            [[(2.0, [(100.0, 100.0), (110.0, 110.0)])]],
+            pick_size=None,
+        )
+        assert np.array_equal(before, _qimage_to_array(out))
+
+    def test_draw_picks_brush_fills_overlaps_once(self):
+        # the strokes of a merged pick always overlap, so filling them
+        # one by one would leave a darker seam where they cross
+        canvas = _fresh_canvas()
+        out = render.draw_picks(
+            canvas,
+            ((0, 0), (32, 32)),
+            "Brush",
+            [
+                [
+                    (4.0, [(4.0, 16.0), (28.0, 16.0)]),
+                    (4.0, [(16.0, 4.0), (16.0, 28.0)]),
+                ]
+            ],
+            pick_size=None,
+        )
+        pixels = _qimage_to_array(out)
+        centre = pixels[60, 60, :3]  # where the two strokes cross
+        arm = pixels[60, 30, :3]  # only the horizontal stroke
+        np.testing.assert_array_equal(centre, arm)
+
     def test_draw_picks_unknown_shape_raises(self):
         with pytest.raises(ValueError):
             render.draw_picks(

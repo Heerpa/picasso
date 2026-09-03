@@ -19,7 +19,7 @@ import json
 import os
 import threading
 import warnings
-from typing import Callable, Literal, TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 import tifffile
 import yaml
@@ -1238,9 +1238,7 @@ def load_mask(
 
 def load_picks(  # noqa: C901
     path: str, pixelsize: float | None = None
-) -> tuple[
-    list, Literal["Circle", "Rectangle", "Polygon", "Square", "Box"], float
-]:
+) -> tuple[list, str, float]:
     """Load picks generated with the Picasso GUI.
 
     Parameters
@@ -1256,14 +1254,14 @@ def load_picks(  # noqa: C901
     -------
     picks : list
         A list of picks.
-    shape : {"Circle", "Rectangle", "Polygon", "Square", "Box"}
-        The shape of the picks.
+    shape : str
+        The shape of the picks, one of ``lib.PICK_SHAPES``.
     size : float
         The size of the picks in camera pixels (if `pixelsize` is
         provided, otherwise in original units). For circular picks, the
         size is the diameter; for rectangular picks, the size is the
         width; for square picks, the size is the side length. None for
-        polygonal and box picks (size not defined).
+        polygonal, box and brush picks (size not defined).
 
     Raises
     ------
@@ -1306,6 +1304,16 @@ def load_picks(  # noqa: C901
     elif shape == "Box":
         # each box carries its own extent, so there is no size
         picks = regions["Corners"]
+        size = None
+    elif shape == "Brush":
+        # the file holds a flat, ordered list of strokes; which of them
+        # form one pick follows from their geometry, so the grouping is
+        # re-derived rather than stored
+        strokes = [
+            (stroke["Width (nm)"] / pixelsize, stroke["Path"])
+            for stroke in regions["Strokes"]
+        ]
+        picks = lib.merge_brush_strokes(strokes)
         size = None
     else:
         raise ValueError(f"Unrecognized pick shape: {shape}")
