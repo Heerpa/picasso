@@ -720,9 +720,180 @@ class TestPickAreas:
         areas = lib.pick_areas(picks, "Square", pick_size=3.0)
         assert areas[0] == 9.0
 
+    def test_box(self):
+        picks = [((1.0, 2.0), (4.0, 6.0)), ((0.0, 0.0), (2.0, 2.0))]
+        areas = lib.pick_areas(picks, "Box", pick_size=None)
+        assert areas.tolist() == [12.0, 4.0]
+
+    def test_box_ignores_corner_order(self):
+        areas = lib.pick_areas(
+            [((4.0, 6.0), (1.0, 2.0))], "Box", pick_size=None
+        )
+        assert areas[0] == 12.0
+
     def test_unknown_shape_raises(self):
         with pytest.raises(ValueError):
             lib.pick_areas([(0.0, 0.0)], "Triangle", pick_size=1.0)
+
+
+class TestPickBoxCorners:
+    def test_orders_corners(self):
+        X, Y = lib.get_pick_box_corners(((4.0, 6.0), (1.0, 2.0)))
+        assert X == [1.0, 4.0, 4.0, 1.0]
+        assert Y == [2.0, 2.0, 6.0, 6.0]
+
+    def test_matches_input_when_already_ordered(self):
+        pick = ((1.0, 2.0), (4.0, 6.0))
+        assert lib.get_pick_box_corners(pick) == lib.get_pick_box_corners(
+            (pick[1], pick[0])
+        )
+
+
+class TestBoxContainment:
+    PICK = ((1.0, 2.0), (5.0, 4.0))  # 4 wide, 2 high, centered (3, 3)
+
+    def test_inside(self):
+        assert lib.is_loc_in_box_numba(
+            3.0, 3.0, np.array([[3.0], [3.0]]), 4.0, 2.0
+        )[0]
+
+    def test_outside_in_y_only(self):
+        # inside the 4-wide extent (1..5) but outside the 2-high one
+        # (2..4), so a square test of the longer side would wrongly
+        # accept it
+        assert not lib.is_loc_in_box_numba(
+            3.0, 3.0, np.array([[3.0], [4.5]]), 4.0, 2.0
+        )[0]
+
+    def test_bounds_are_exclusive(self):
+        # matches postprocess._picked_box_locs
+        assert not lib.is_loc_in_box_numba(
+            3.0, 3.0, np.array([[5.0], [3.0]]), 4.0, 2.0
+        )[0]
+
+    def test_locs_in_box_numba_filters(self):
+        locs_xy = np.array([[3.0, 9.0, 2.0], [3.0, 9.0, 2.5]])
+        out = lib.locs_in_box_numba(3.0, 3.0, locs_xy, 4.0, 2.0)
+        assert out.shape == (2, 2)
+
+
+# ---------------------------------------------------------------------------
+# Pick bounds and containment dispatch (all shapes)
+# ---------------------------------------------------------------------------
+
+CLOSED_POLYGON = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0), (0.0, 0.0)]
+
+
+class TestPickBounds:
+    def test_circle(self):
+        assert lib.pick_bounds((5.0, 5.0), "Circle", 2.0) == (
+            4.0,
+            6.0,
+            4.0,
+            6.0,
+        )
+
+    def test_square(self):
+        assert lib.pick_bounds((5.0, 5.0), "Square", 2.0) == (
+            4.0,
+            6.0,
+            4.0,
+            6.0,
+        )
+
+    def test_rectangle_spans_its_corners(self):
+        pick = ((5.0, 5.0), (5.0, 15.0))  # vertical band of width 2
+        x_min, x_max, y_min, y_max = lib.pick_bounds(pick, "Rectangle", 2.0)
+        assert (x_min, x_max) == (4.0, 6.0)
+        assert (y_min, y_max) == (5.0, 15.0)
+
+    def test_polygon(self):
+        assert lib.pick_bounds(CLOSED_POLYGON, "Polygon", None) == (
+            0.0,
+            4.0,
+            0.0,
+            4.0,
+        )
+
+    def test_open_polygon_falls_back_to_its_vertices(self):
+        assert lib.pick_bounds(CLOSED_POLYGON[:-1], "Polygon", None) == (
+            0.0,
+            4.0,
+            0.0,
+            4.0,
+        )
+
+    def test_empty_polygon_raises(self):
+        with pytest.raises(ValueError):
+            lib.pick_bounds([], "Polygon", None)
+
+    def test_box(self):
+        assert lib.pick_bounds(((4.0, 6.0), (1.0, 2.0)), "Box", None) == (
+            1.0,
+            4.0,
+            2.0,
+            6.0,
+        )
+
+    def test_unknown_shape_raises(self):
+        with pytest.raises(ValueError):
+            lib.pick_bounds((0.0, 0.0), "Triangle", 1.0)
+
+
+class TestPointInPick:
+    def test_circle(self):
+        pick = (5.0, 5.0)
+        assert lib.point_in_pick(5.5, 5.0, pick, "Circle", 2.0)
+        # outside the radius but inside the bounding box corner
+        assert not lib.point_in_pick(5.9, 5.9, pick, "Circle", 2.0)
+
+    def test_square(self):
+        pick = (5.0, 5.0)
+        assert lib.point_in_pick(5.4, 5.4, pick, "Square", 1.0)
+        assert not lib.point_in_pick(5.6, 5.0, pick, "Square", 1.0)
+
+    def test_vertical_rectangle(self):
+        # ray casting over the corners divides by zero here, which is
+        # why point_in_pick rotates into the rectangle's frame instead
+        pick = ((5.0, 5.0), (5.0, 15.0))
+        assert lib.point_in_pick(5.5, 10.0, pick, "Rectangle", 2.0)
+        assert not lib.point_in_pick(6.5, 10.0, pick, "Rectangle", 2.0)
+
+    def test_oriented_rectangle_agrees_with_ray_casting(self):
+        pick = ((0.0, 0.0), (10.0, 6.0))
+        X, Y = lib.get_pick_rectangle_corners(0.0, 0.0, 10.0, 6.0, 3.0)
+        rng = np.random.default_rng(0)
+        points = rng.uniform(-4, 12, size=(2, 200))
+        expected = lib.check_if_in_rectangle(
+            points[0], points[1], np.array(X), np.array(Y)
+        )
+        got = [
+            lib.point_in_pick(x, y, pick, "Rectangle", 3.0)
+            for x, y in zip(*points)
+        ]
+        assert np.array_equal(np.array(got), expected)
+
+    def test_polygon(self):
+        assert lib.point_in_pick(2.0, 2.0, CLOSED_POLYGON, "Polygon", None)
+        assert not lib.point_in_pick(5.0, 2.0, CLOSED_POLYGON, "Polygon", None)
+
+    def test_open_polygon_contains_nothing(self):
+        assert not lib.point_in_pick(
+            2.0, 2.0, CLOSED_POLYGON[:-1], "Polygon", None
+        )
+
+    def test_box(self):
+        pick = ((1.0, 2.0), (5.0, 4.0))
+        assert lib.point_in_pick(3.0, 3.0, pick, "Box", None)
+        assert not lib.point_in_pick(3.0, 4.5, pick, "Box", None)
+
+    def test_box_ignores_corner_order(self):
+        pick = ((5.0, 4.0), (1.0, 2.0))
+        assert lib.point_in_pick(3.0, 3.0, pick, "Box", None)
+
+    def test_unknown_shape_raises(self):
+        with pytest.raises(ValueError):
+            lib.point_in_pick(0.0, 0.0, (0.0, 0.0), "Triangle", 1.0)
 
 
 # ---------------------------------------------------------------------------

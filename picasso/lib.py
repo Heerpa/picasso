@@ -49,6 +49,16 @@ SOUND_NOTIFICATION_DURATION = 60  # seconds
 # Columns that are required for Picasso
 REQUIRED_COLUMNS = ["frame", "x", "y", "z", "lpx", "lpy", "lpz"]
 
+#: Shapes that a pick region can take. "Circle" and "Square" are placed
+#: by a single click and share one global size; "Rectangle" is an
+#: oriented band of a global width drawn along its center axis;
+#: "Polygon" and "Box" carry their own extent and have no global size.
+PICK_SHAPES = ("Circle", "Rectangle", "Polygon", "Square", "Box")
+
+#: Pick shapes whose extent is defined per pick rather than by a single
+#: global size, i.e., those for which ``pick_size`` is None.
+PICK_SHAPES_WITHOUT_SIZE = ("Polygon", "Box")
+
 # Type alias
 IntArray1D: TypeAlias = np.ndarray[tuple[int], np.dtype[np.integer[Any]]]
 IntArray2D: TypeAlias = np.ndarray[tuple[int, int], np.dtype[np.integer[Any]]]
@@ -1679,6 +1689,71 @@ def locs_in_square_numba(
 
 
 @numba.jit(nopython=True, nogil=True, cache=True)
+def is_loc_in_box_numba(
+    x: float,
+    y: float,
+    locs_xy: FloatArray2D,
+    w: float,
+    h: float,
+) -> BoolArray1D:
+    """Check which localizations are within the axis-aligned box of
+    width ``w`` and height ``h`` centered at ``(x, y)``.
+
+    Generalization of ``is_loc_in_square_numba`` to independent side
+    lengths. The bounds are exclusive, matching
+    ``postprocess._picked_box_locs``.
+
+    Parameters
+    ----------
+    x, y : float
+        Center of the box.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+    w, h : float
+        Width (x) and height (y) of the box.
+
+    Returns
+    -------
+    is_picked : BoolArray1D
+        True if a localization is within the box.
+    """
+    dx = np.abs(locs_xy[0] - x)
+    dy = np.abs(locs_xy[1] - y)
+    is_picked = (dx < 0.5 * w) & (dy < 0.5 * h)
+    return is_picked
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def locs_in_box_numba(
+    x: float,
+    y: float,
+    locs_xy: FloatArray2D,
+    w: float,
+    h: float,
+) -> FloatArray2D:
+    """Return localizations within the axis-aligned box of width ``w``
+    and height ``h`` centered at ``(x, y)``.
+
+    Parameters
+    ----------
+    x, y : float
+        Center of the box.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+    w, h : float
+        Width (x) and height (y) of the box.
+
+    Returns
+    -------
+    picked_xy : FloatArray2D
+        ``(2, n_picked)`` coordinates inside the box. See
+        ``is_loc_in_box_numba``.
+    """
+    is_picked = is_loc_in_box_numba(x, y, locs_xy, w, h)
+    return locs_xy[:, is_picked]
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
 def is_loc_in_rectangle_numba(
     xc: float,
     yc: float,
@@ -2259,6 +2334,37 @@ def get_pick_rectangle_corners(
     return corners
 
 
+def get_pick_box_corners(
+    pick: tuple[tuple[float, float], tuple[float, float]],
+) -> tuple[list[float], list[float]]:
+    """Find the positions of corners of a box pick.
+
+    A box pick is defined by two opposite corners:
+        ``((x0, y0), (x1, y1))``
+    (all values in camera pixels). The corners are returned in the same
+    order as ``get_pick_rectangle_corners``, i.e., counter-clockwise
+    starting from the corner with the smaller x and y.
+
+    Parameters
+    ----------
+    pick : tuple of tuples
+        The two opposite corners of the box.
+
+    Returns
+    -------
+    corners : tuple
+        Contains corners' x and y coordinates in two lists.
+    """
+    (x0, y0), (x1, y1) = pick
+    x_min, x_max = (x0, x1) if x0 <= x1 else (x1, x0)
+    y_min, y_max = (y0, y1) if y0 <= y1 else (y1, y0)
+    corners = (
+        [x_min, x_max, x_max, x_min],
+        [y_min, y_min, y_max, y_max],
+    )
+    return corners
+
+
 def polygon_area(X: FloatArray1D, Y: FloatArray1D) -> float:
     """Find the area of a polygon defined by corners X and Y.
 
@@ -2334,9 +2440,31 @@ def _pick_areas_rectangle(
     return areas
 
 
+def _pick_areas_box(
+    picks: list[tuple[tuple[float, float], tuple[float, float]]],
+) -> FloatArray1D:
+    """Return pick areas for each box pick in picks.
+
+    Parameters
+    ----------
+    picks : list of tuples
+        List of picks, each pick holds the two opposite corners of the
+        box.
+
+    Returns
+    -------
+    areas : FloatArray1D
+        Pick areas.
+    """
+    areas = np.zeros(len(picks))
+    for i, ((x0, y0), (x1, y1)) in enumerate(picks):
+        areas[i] = abs(x1 - x0) * abs(y1 - y0)
+    return areas
+
+
 def pick_areas(
     picks: list[tuple],
-    pick_shape: Literal["Circle", "Rectangle", "Polygon", "Square"],
+    pick_shape: Literal["Circle", "Rectangle", "Polygon", "Square", "Box"],
     pick_size: float | None,
 ) -> FloatArray1D:
     """Get pick areas for each pick in picks.
@@ -2345,12 +2473,12 @@ def pick_areas(
     ----------
     picks : list of tuples
         Coordinates of picks in camera pixels.
-    pick_shape : {"Circle", "Rectangle", "Polygon", "Square"}
+    pick_shape : {"Circle", "Rectangle", "Polygon", "Square", "Box"}
         Shape of picks.
     pick_size : float or None
         Size of picks in camera pixels. For circles - diameters. For
-        rectangles - width. For squares - side length. For polygons -
-        ignored.
+        rectangles - width. For squares - side length. For polygons and
+        boxes - ignored.
 
     Returns
     -------
@@ -2368,9 +2496,140 @@ def pick_areas(
     elif pick_shape == "Square":
         # same area for all picks
         areas = pick_size**2 * np.ones(len(picks))
+    elif pick_shape == "Box":
+        areas = _pick_areas_box(picks)
     else:
         raise ValueError(f"Unknown pick shape: {pick_shape}")
     return areas
+
+
+def pick_bounds(
+    pick: tuple,
+    pick_shape: Literal["Circle", "Rectangle", "Polygon", "Square", "Box"],
+    pick_size: float | None,
+) -> tuple[float, float, float, float]:
+    """Return the axis-aligned bounding box of a single pick.
+
+    Used wherever a pick has to be framed rather than tested against,
+    e.g., to build a viewport around it or to set plot limits.
+
+    Parameters
+    ----------
+    pick : tuple
+        Coordinates of one pick in camera pixels. Must match the format
+        of ``pick_shape``.
+    pick_shape : {"Circle", "Rectangle", "Polygon", "Square", "Box"}
+        Shape of the pick.
+    pick_size : float or None
+        Size of the pick in camera pixels. For circles - diameter. For
+        rectangles - width. For squares - side length. For polygons and
+        boxes - ignored.
+
+    Returns
+    -------
+    bounds : tuple
+        ``(x_min, x_max, y_min, y_max)`` in camera pixels. For an open
+        polygon (fewer than three vertices or not closed), the bounding
+        box of its vertices is returned; an empty polygon raises
+        ``ValueError``.
+    """
+    if pick_shape in ("Circle", "Square"):
+        # a circle of diameter d and a square of side d have the same
+        # bounding box
+        half = pick_size / 2
+        x, y = pick
+        return x - half, x + half, y - half, y + half
+    elif pick_shape == "Rectangle":
+        (xs, ys), (xe, ye) = pick
+        X, Y = get_pick_rectangle_corners(xs, ys, xe, ye, pick_size)
+    elif pick_shape == "Polygon":
+        X, Y = get_pick_polygon_corners(pick)
+        if X is None:  # not closed yet, fall back to the drawn vertices
+            if not len(pick):
+                raise ValueError("Cannot bound an empty polygon pick.")
+            X = [_[0] for _ in pick]
+            Y = [_[1] for _ in pick]
+    elif pick_shape == "Box":
+        X, Y = get_pick_box_corners(pick)
+    else:
+        raise ValueError(f"Unknown pick shape: {pick_shape}")
+    return min(X), max(X), min(Y), max(Y)
+
+
+def point_in_pick(
+    x: float,
+    y: float,
+    pick: tuple,
+    pick_shape: Literal["Circle", "Rectangle", "Polygon", "Square", "Box"],
+    pick_size: float | None,
+) -> bool:
+    """Check whether the point ``(x, y)`` lies inside a single pick.
+
+    Parameters
+    ----------
+    x, y : float
+        Position to test, in camera pixels.
+    pick : tuple
+        Coordinates of one pick in camera pixels. Must match the format
+        of ``pick_shape``.
+    pick_shape : {"Circle", "Rectangle", "Polygon", "Square", "Box"}
+        Shape of the pick.
+    pick_size : float or None
+        Size of the pick in camera pixels. For circles - diameter. For
+        rectangles - width. For squares - side length. For polygons and
+        boxes - ignored.
+
+    Returns
+    -------
+    is_inside : bool
+        True if the point is inside the pick. An open polygon (fewer
+        than three vertices or not closed) never contains a point.
+    """
+    point_xy = np.array([[float(x)], [float(y)]])
+    if pick_shape == "Circle":
+        r = pick_size / 2
+        return bool((x - pick[0]) ** 2 + (y - pick[1]) ** 2 < r**2)
+    elif pick_shape == "Square":
+        return bool(
+            is_loc_in_square_numba(pick[0], pick[1], point_xy, pick_size)[0]
+        )
+    elif pick_shape == "Rectangle":
+        (xs, ys), (xe, ye) = pick
+        # the oriented test rotates the point into the rectangle's
+        # frame, which - unlike ray casting over the corners - is well
+        # defined for axis-aligned rectangles
+        return bool(
+            is_loc_in_rectangle_numba(
+                0.5 * (xs + xe),
+                0.5 * (ys + ye),
+                np.arctan2(ye - ys, xe - xs),
+                np.hypot(xe - xs, ye - ys),
+                pick_size,
+                point_xy,
+            )[0]
+        )
+    elif pick_shape == "Polygon":
+        X, Y = get_pick_polygon_corners(pick)
+        if X is None:  # not a closed polygon
+            return False
+        return bool(
+            check_if_in_polygon(
+                point_xy[0], point_xy[1], np.array(X), np.array(Y)
+            )[0]
+        )
+    elif pick_shape == "Box":
+        (x0, y0), (x1, y1) = pick
+        return bool(
+            is_loc_in_box_numba(
+                0.5 * (x0 + x1),
+                0.5 * (y0 + y1),
+                point_xy,
+                abs(x1 - x0),
+                abs(y1 - y0),
+            )[0]
+        )
+    else:
+        raise ValueError(f"Unknown pick shape: {pick_shape}")
 
 
 def permutation_test(

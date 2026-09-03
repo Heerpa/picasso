@@ -192,10 +192,8 @@ class TestSaveLoadLocs:
         np.testing.assert_allclose(
             loaded["x"].to_numpy(), locs["x"].to_numpy()
         )
-    
-    def test_load_locs_falls_back_for_hdf5_group(
-        self, tmp_path, locs, info
-    ):
+
+    def test_load_locs_falls_back_for_hdf5_group(self, tmp_path, locs, info):
         # Regression test for HDF5 files where /locs is an h5py.Group
         # rather than a Picasso compound Dataset. The h5py reader must
         # not access .dtype on the Group and should fall back to pandas.
@@ -644,11 +642,43 @@ class TestLoadPicks:
         assert shape == "Circle"
         assert size == 1.5
 
+    def test_box_picks(self, tmp_path):
+        regions = {
+            "Shape": "Box",
+            "Corners": [
+                [[1.0, 2.0], [4.0, 6.0]],
+                [[10.0, 10.0], [12.0, 11.0]],
+            ],
+        }
+        path = tmp_path / "picks.yaml"
+        with open(path, "w") as f:
+            yaml.dump(regions, f)
+        picks, shape, size = io.load_picks(str(path), pixelsize=130.0)
+        assert shape == "Box"
+        assert picks == regions["Corners"]
+        # each box carries its own extent
+        assert size is None
+
     def test_unrecognized_format_raises(self, tmp_path):
         path = tmp_path / "picks.yaml"
         with open(path, "w") as f:
             yaml.dump({"Foo": "Bar"}, f)
         with pytest.raises(ValueError, match="Unrecognized picks file"):
+            io.load_picks(str(path))
+
+    def test_unrecognized_shape_raises(self, tmp_path):
+        path = tmp_path / "picks.yaml"
+        with open(path, "w") as f:
+            yaml.dump({"Shape": "Hexagon", "Centers": [[1.0, 1.0]]}, f)
+        with pytest.raises(ValueError, match="Unrecognized pick shape"):
+            io.load_picks(str(path))
+
+    def test_missing_size_raises(self, tmp_path):
+        # neither "Side Length (nm)" nor a legacy bare key is present
+        path = tmp_path / "picks.yaml"
+        with open(path, "w") as f:
+            yaml.dump({"Shape": "Square", "Centers": [[1.0, 1.0]]}, f)
+        with pytest.raises(ValueError, match="missing the pick size"):
             io.load_picks(str(path))
 
     def test_non_yaml_extension_asserts(self, tmp_path):

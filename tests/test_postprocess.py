@@ -280,6 +280,48 @@ class TestPickedLocs:
         assert (out["x"] > 14.5).all() and (out["x"] < 16.5).all()
         assert (out["y"] > 14.5).all() and (out["y"] < 16.5).all()
 
+    def test_box_pick_within_bounds(self, locs, info):
+        # 3 wide, 1 high, so a square test would give a different answer
+        pick = ((14.0, 15.0), (17.0, 16.0))
+        out = postprocess.picked_locs(
+            locs,
+            info,
+            [pick],
+            pick_shape="Box",
+        )[0]
+        assert len(out) > 0
+        assert (out["x"] > 14.0).all() and (out["x"] < 17.0).all()
+        assert (out["y"] > 15.0).all() and (out["y"] < 16.0).all()
+
+    def test_box_pick_ignores_corner_order(self, locs, info):
+        ordered = postprocess.picked_locs(
+            locs, info, [((14.0, 15.0), (17.0, 16.0))], pick_shape="Box"
+        )[0]
+        reversed_ = postprocess.picked_locs(
+            locs, info, [((17.0, 16.0), (14.0, 15.0))], pick_shape="Box"
+        )[0]
+        assert len(ordered) == len(reversed_)
+
+    def test_box_pick_ignores_pick_size(self, locs, info):
+        pick = ((14.0, 15.0), (17.0, 16.0))
+        with_size = postprocess.picked_locs(
+            locs, info, [pick], pick_shape="Box", pick_size=99.0
+        )[0]
+        without = postprocess.picked_locs(
+            locs, info, [pick], pick_shape="Box"
+        )[0]
+        assert len(with_size) == len(without)
+
+    def test_box_pick_adds_group(self, locs, info):
+        picks = [
+            ((5.0, 5.0), (6.0, 6.0)),
+            ((15.0, 15.0), (16.0, 16.0)),
+        ]
+        out = postprocess.picked_locs(locs, info, picks, pick_shape="Box")
+        assert len(out) == 2
+        assert out[0]["group"].unique().tolist() == [0]
+        assert out[1]["group"].unique().tolist() == [1]
+
 
 def _matches_origamis(new_picks, tolerance=0.5):
     """Return True if the found picks map one-to-one onto the known
@@ -426,6 +468,113 @@ class TestPickSimilarSquare:
             index_blocks=wrong,
         )
         assert _matches_origamis(new_picks)
+
+
+# ---------------------------------------------------------------------------
+# Pick similar for boxes
+# ---------------------------------------------------------------------------
+
+
+def _box(cx, cy, w, h):
+    """Return a box pick of the given size, centered at (cx, cy)."""
+    return ((cx - w / 2, cy - h / 2), (cx + w / 2, cy + h / 2))
+
+
+def _box_centers(picks):
+    """Return the centers of box picks as an (n, 2) array."""
+    return np.array(
+        [(0.5 * (p[0][0] + p[1][0]), 0.5 * (p[0][1] + p[1][1])) for p in picks]
+    )
+
+
+class TestPickSimilarBox:
+    def test_finds_remaining_origamis(self, locs, info):
+        seed_picks = [
+            _box(5.5, 5.5, PICK_SIZE, PICK_SIZE),
+            _box(5.5, 15.5, PICK_SIZE, PICK_SIZE),
+        ]
+        new_picks = postprocess.pick_similar(
+            locs, info, seed_picks, "Box", std_range=123.0
+        )
+        assert _matches_origamis(_box_centers(new_picks))
+
+    def test_matches_square_of_the_same_side(self, locs, info):
+        # a box of equal sides must behave exactly like a square
+        centers = [[5.5, 5.5], [5.5, 15.5]]
+        squares = postprocess.pick_similar(
+            locs, info, centers, "Square", PICK_SIZE, std_range=123.0
+        )
+        boxes = postprocess.pick_similar(
+            locs,
+            info,
+            [_box(x, y, PICK_SIZE, PICK_SIZE) for x, y in centers],
+            "Box",
+            std_range=123.0,
+        )
+        np.testing.assert_allclose(
+            np.sort(_box_centers(boxes), axis=0),
+            np.sort(np.array(squares), axis=0),
+            atol=1e-6,
+        )
+
+    def test_found_boxes_do_not_overlap(self, locs, info):
+        seed_picks = [
+            _box(5.5, 5.5, PICK_SIZE, PICK_SIZE),
+            _box(5.5, 15.5, PICK_SIZE, PICK_SIZE),
+        ]
+        new_picks = postprocess.pick_similar(
+            locs, info, seed_picks, "Box", std_range=123.0
+        )
+        found = _box_centers(new_picks)
+        for i, (x, y) in enumerate(found):
+            others = np.delete(found, i, axis=0)
+            chebyshev = np.maximum(
+                np.abs(others[:, 0] - x), np.abs(others[:, 1] - y)
+            )
+            assert (chebyshev > PICK_SIZE).all()
+
+    def test_new_picks_take_the_median_size(self, locs, info):
+        # a 2:1 aspect ratio must survive into every found pick
+        seed_picks = [
+            _box(5.5, 5.5, 2.0, 1.0),
+            _box(5.5, 15.5, 2.0, 1.0),
+        ]
+        new_picks = postprocess.pick_similar(
+            locs, info, seed_picks, "Box", std_range=123.0
+        )
+        assert len(new_picks) > len(seed_picks)
+        for (x0, y0), (x1, y1) in new_picks[len(seed_picks) :]:
+            assert x1 - x0 == pytest.approx(2.0)
+            assert y1 - y0 == pytest.approx(1.0)
+
+    def test_seed_picks_are_returned_as_drawn(self, locs, info):
+        seed_picks = [
+            _box(5.5, 5.5, 3.0, 1.0),  # deliberately larger than the rest
+            _box(5.5, 15.5, 1.0, 1.0),
+        ]
+        new_picks = postprocess.pick_similar(
+            locs, info, seed_picks, "Box", std_range=123.0
+        )
+        assert list(new_picks[: len(seed_picks)]) == seed_picks
+
+    def test_wrong_sized_index_blocks_are_rebuilt(self, locs, info):
+        seed_picks = [
+            _box(5.5, 5.5, PICK_SIZE, PICK_SIZE),
+            _box(5.5, 15.5, PICK_SIZE, PICK_SIZE),
+        ]
+        wrong = postprocess.get_index_blocks(locs, info, 5.0)
+        new_picks = postprocess.pick_similar(
+            locs,
+            info,
+            seed_picks,
+            "Box",
+            std_range=123.0,
+            index_blocks=wrong,
+        )
+        assert _matches_origamis(_box_centers(new_picks))
+
+    def test_empty_picks(self, locs, info):
+        assert postprocess.pick_similar(locs, info, [], "Box") == []
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +843,21 @@ class TestRemoveLocsInPicks:
             pick_shape="Polygon",
         )
         assert len(out) < len(locs)
+
+    def test_box_pick_size_ignored(self, locs, info):
+        box = ((14.5, 14.5), (16.5, 16.5))
+        n_inside = len(
+            postprocess.picked_locs(locs, info, [box], pick_shape="Box")[0]
+        )
+        assert n_inside > 0
+        # a box carries its own extent, so pick_size is not required
+        out = postprocess.remove_locs_in_picks(
+            locs.copy(),
+            info,
+            picks=[box],
+            pick_shape="Box",
+        )
+        assert len(out) == len(locs) - n_inside
 
     def test_invalid_shape_raises(self, locs, info):
         with pytest.raises(AssertionError):
@@ -1081,6 +1245,22 @@ class TestCombineLocsInPicks:
         )
         assert combined["n"].sum() == sum(len(p) for p in picked)
 
+    def test_box_picks_need_no_size(self, locs, info, origami_picks):
+        boxes = [
+            (
+                (x - PICK_SIZE / 2, y - PICK_SIZE / 2),
+                (x + PICK_SIZE / 2, y + PICK_SIZE / 2),
+            )
+            for x, y in origami_picks
+        ]
+        combined = postprocess.combine_locs_in_picks(
+            locs.copy(),
+            info,
+            picks=boxes,
+            pick_shape="Box",
+        )
+        assert len(combined) == len(boxes)
+
 
 class TestPickKinetics:
     def test_per_pick_arrays_and_out_locs(self, locs, info, origami_picks):
@@ -1213,6 +1393,54 @@ class TestUndrift:
                 pick_size=None,
             )
 
+    def test_undrift_from_fiducials_honours_pick_shape(
+        self, locs, info, origami_picks
+    ):
+        # a box pick must be picked as a box, not silently as a circle:
+        # a wide, flat box and a circle over the same center enclose
+        # different localizations, so the drift they report differs
+        boxes = [
+            ((x - 1.0, y - 0.2), (x + 1.0, y + 0.2)) for x, y in origami_picks
+        ]
+        _, new_info, box_drift = postprocess.undrift_from_fiducials(
+            locs.copy(),
+            info,
+            picks=boxes,
+            pick_shape="Box",
+            undrift_z=False,
+        )
+        assert new_info[-1]["Pick shape"] == "Box"
+        # boxes carry their own extent, so no radius is reported
+        assert "Pick radius (nm)" not in new_info[-1]
+
+        _, _, circle_drift = postprocess.undrift_from_fiducials(
+            locs.copy(),
+            info,
+            picks=origami_picks,
+            pick_size=PICK_SIZE / 2,
+            undrift_z=False,
+        )
+        assert not np.allclose(
+            box_drift["x"].to_numpy(), circle_drift["x"].to_numpy()
+        )
+
+    def test_undrift_from_fiducials_box_needs_no_size(
+        self, locs, info, origami_picks
+    ):
+        boxes = [
+            ((x - 0.75, y - 0.75), (x + 0.75, y + 0.75))
+            for x, y in origami_picks
+        ]
+        _, _, drift = postprocess.undrift_from_fiducials(
+            locs.copy(),
+            info,
+            picks=boxes,
+            pick_shape="Box",
+            pick_size=None,
+            undrift_z=False,
+        )
+        assert len(drift) == info[0]["Frames"]
+
 
 class TestApplyDrift:
     def test_apply_constant_drift_dataframe(self, locs, info):
@@ -1334,6 +1562,28 @@ class TestAlign:
         # First channel is the reference: ~0 shift
         assert abs(shifts[0][0]) < 1e-6
         assert abs(shifts[1][0]) < 1e-6
+
+    def test_align_from_picked_box_recovers_known_shift(
+        self, locs_copy, info, origami_picks
+    ):
+        a = locs_copy
+        b = a.copy()
+        b["x"] += 0.1
+        boxes = [
+            (
+                (x - PICK_SIZE / 2, y - PICK_SIZE / 2),
+                (x + PICK_SIZE / 2, y + PICK_SIZE / 2),
+            )
+            for x, y in origami_picks
+        ]
+        _, shifts = postprocess.align_from_picked(
+            [a, b],
+            [info, info],
+            picks=boxes,
+            pick_shape="Box",
+            return_shifts=True,
+        )
+        assert abs(shifts[1][1] - 0.1) < 0.05
 
     def test_align_from_picked_invalid_shape_raises(
         self, locs_copy, info, origami_picks

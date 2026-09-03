@@ -76,6 +76,12 @@ INITIAL_REL_MAXIMUM = 0.5
 ZOOM = 9 / 7
 N_GROUP_COLORS = render.N_GROUP_COLORS  # 8
 POLYGON_POINTER_SIZE = 16  # must be even
+# shortest drag (display pixels, in x and y) that still yields a box
+# pick, so that a stray click does not create one of zero area
+MIN_BOX_PICK_DRAG = 3
+# empty space kept around a pick by "Move to pick", as a fraction of the
+# pick's extent on each side
+MOVE_TO_PICK_MARGIN = 0.2
 # steps of the loading progress bar per file, such that it also
 # advances within a file, see ``LocsLoadWorker``
 LOAD_PROGRESS_RESOLUTION = 1000
@@ -6118,7 +6124,7 @@ class ToolsSettingsDialog(lib.Dialog):
         Contains the diameter of circular picks (nm)).
     pick_shape : QComboBox
         Contains the str with the shape of picks (circle, rectangle,
-        polygon or square).
+        polygon, square or box).
     pick_side_length : QDoubleSpinBox
         Contains the side length of square picks (nm).
     pick_similar_range : QDoubleSpinBox
@@ -6149,7 +6155,7 @@ class ToolsSettingsDialog(lib.Dialog):
         shape_label.setToolTip("Select the shape of the pick tool.")
         first_row.addWidget(shape_label)
         self.pick_shape = QtWidgets.QComboBox()
-        self.pick_shape.addItems(["Circle", "Rectangle", "Polygon", "Square"])
+        self.pick_shape.addItems(list(lib.PICK_SHAPES))
         first_row.addWidget(self.pick_shape)
         pick_stack = QtWidgets.QStackedWidget()
         pick_grid.addWidget(pick_stack, 1, 0, 1, 2)
@@ -6178,6 +6184,10 @@ class ToolsSettingsDialog(lib.Dialog):
         pick_stack.addWidget(self.pick_square_settings)
         self.pick_side_length = self.pick_square_settings.pick_side_length
 
+        # Box - drawn by dragging, so each pick carries its own size
+        self.pick_box_settings = QtWidgets.QWidget()
+        pick_stack.addWidget(self.pick_box_settings)
+
         # Pick similar works for all shapes but polygons, so its
         # settings live below the shape-specific pages
         range_label = QtWidgets.QLabel("Pick similar +/- range (std):")
@@ -6199,6 +6209,12 @@ class ToolsSettingsDialog(lib.Dialog):
             lambda shape: self.pick_similar_range.setEnabled(
                 shape != "Polygon"
             )
+        )
+        self.pick_shape.setToolTip(
+            "Circle and Square are placed with a single click and share\n"
+            "one size; Rectangle is a band of a fixed width drawn along\n"
+            "its center axis; Polygon is drawn vertex by vertex; Box is\n"
+            "dragged out to any size."
         )
 
         self.pick_annotation = QtWidgets.QCheckBox("Annotate picks")
@@ -7534,13 +7550,18 @@ class View(QtWidgets.QLabel):
     pan_start_x, pan_start_y : float
         x and y coordinates of panning's starting position.
     _picks : list
-        Contains the coordinates of current picks.
-    _pick_shape : {"Circle", "Rectangle", "Polygon", "Square"}
+        Contains the coordinates of current picks. Each pick is
+        ``(x, y)`` for circles and squares, ``((x_start, y_start),
+        (x_end, y_end))`` center-axis points for rectangles, a list of
+        vertices for polygons and the two opposite corners
+        ``((x0, y0), (x1, y1))`` for boxes.
+    _pick_shape : {"Circle", "Rectangle", "Polygon", "Square", "Box"}
         Current shape of picks.
     _pick_size : float or None
-        Size of picks in camera pixels; None for polygonal picks (size
-        not defined). Diameter for circular picks, side length for
-        square picks and width for rectangular picks.
+        Size of picks in camera pixels; None for polygonal and box
+        picks, which carry their own extent. Diameter for circular
+        picks, side length for square picks and width for rectangular
+        picks.
     pixelsize : float
         (Property) Camera pixel size as defined in the display
         settings dialog.
@@ -7611,6 +7632,7 @@ class View(QtWidgets.QLabel):
         self._mode = "Zoom"
         self._pan = False
         self._rectangle_pick_ongoing = False
+        self._box_pick_ongoing = False
         self._size_hint = (768, 768)
         self.n_locs = 0
         self._picks = []
@@ -8058,6 +8080,36 @@ class View(QtWidgets.QLabel):
         for position in positions:
             self.add_pick(position, update_scene=False)
         self.update_scene(picks_only=True)
+
+    def add_box_pick(self, end_position: QtCore.QPoint) -> None:
+        """Finish a dragged box pick and add it.
+
+        A press and release without a drag would create a pick of zero
+        area, so drags shorter than ``MIN_BOX_PICK_DRAG`` display pixels
+        in either direction are discarded.
+
+        Parameters
+        ----------
+        end_position : QPoint
+            Position of the cursor when the mouse button was released.
+        """
+        if (
+            abs(end_position.x() - self.box_pick_start_x) < MIN_BOX_PICK_DRAG
+            or abs(end_position.y() - self.box_pick_start_y)
+            < MIN_BOX_PICK_DRAG
+        ):
+            self.update_scene(picks_only=True)  # clear the drag overlay
+            return
+        x_start, y_start = self.box_pick_start
+        x_end, y_end = self.map_to_movie(end_position)
+        # store the corners ordered, so that every consumer can rely on
+        # the first corner being the top left one
+        self.add_pick(
+            (
+                (min(x_start, x_end), min(y_start, y_end)),
+                (max(x_start, x_end), max(y_start, y_end)),
+            )
+        )
 
     def add_point(
         self,
@@ -8970,6 +9022,34 @@ class View(QtWidgets.QLabel):
         painter.end()
         return image
 
+    def draw_box_pick_ongoing(self, image: QtGui.QImage) -> QtGui.QImage:
+        """Draw an ongoing box pick onto image.
+
+        Parameters
+        ----------
+        image : QImage
+            Image containing rendered localizations.
+
+        Returns
+        -------
+        image : QImage
+            Image with the drawn pick.
+        """
+        painter = QtGui.QPainter(image)
+        painter.setPen(QtGui.QColor("green"))
+        # the drag anchors are already in display pixels, so unlike the
+        # rectangular pick no size conversion is needed
+        painter.drawRect(
+            QtCore.QRect(
+                QtCore.QPoint(self.box_pick_start_x, self.box_pick_start_y),
+                QtCore.QPoint(
+                    self.box_pick_current_x, self.box_pick_current_y
+                ),
+            ).normalized()
+        )
+        painter.end()
+        return image
+
     def draw_points(self, image: QtGui.QImage) -> QtGui.QImage:
         """Draw points, lines and distances between them onto image.
 
@@ -9161,6 +9241,8 @@ class View(QtWidgets.QLabel):
         self.qimage = self.draw_points(self.qimage)
         if self._rectangle_pick_ongoing:
             self.qimage = self.draw_rectangle_pick_ongoing(self.qimage)
+        if self._box_pick_ongoing:
+            self.qimage = self.draw_box_pick_ongoing(self.qimage)
 
         # convert to pixmap
         self.pixmap = QtGui.QPixmap.fromImage(self.qimage)
@@ -9229,14 +9311,8 @@ class View(QtWidgets.QLabel):
                 self.load_screenshot(file)
             # load pick regions
             loaded_shape = file.get("Shape", None)
-            if loaded_shape is not None:
-                if loaded_shape in [
-                    "Circle",
-                    "Rectangle",
-                    "Polygon",
-                    "Square",
-                ]:
-                    self.load_picks(paths[0])
+            if loaded_shape in lib.PICK_SHAPES:
+                self.load_picks(paths[0])
         if extensions == [".csv"]:  # just one csv dropped, thunderstorm
             self.add_multiple(paths)
         elif extensions == [".mat"]:  # just one mat dropped, SMAP
@@ -9268,37 +9344,15 @@ class View(QtWidgets.QLabel):
             if pick_no >= len(self._picks):
                 raise ValueError("Pick number provided too high")
             else:  # calculate new viewport
-                if self._pick_shape == "Circle":
-                    r = self._pick_size / 2
-                    x, y = self._picks[pick_no]
-                    x_min = x - 1.4 * r
-                    x_max = x + 1.4 * r
-                    y_min = y - 1.4 * r
-                    y_max = y + 1.4 * r
-                elif self._pick_shape == "Rectangle":
-                    (xs, ys), (xe, ye) = self._picks[pick_no]
-                    xc = np.mean([xs, xe])
-                    yc = np.mean([ys, ye])
-                    w = self._pick_size
-                    X, Y = lib.get_pick_rectangle_corners(xs, ys, xe, ye, w)
-                    x_min = min(X) - (0.2 * (xc - min(X)))
-                    x_max = max(X) + (0.2 * (max(X) - xc))
-                    y_min = min(Y) - (0.2 * (yc - min(Y)))
-                    y_max = max(Y) + (0.2 * (max(Y) - yc))
-                elif self._pick_shape == "Polygon":
-                    X, Y = lib.get_pick_polygon_corners(self._picks[pick_no])
-                    x_min = min(X) - 0.2 * (max(X) - min(X))
-                    x_max = max(X) + 0.2 * (max(X) - min(X))
-                    y_min = min(Y) - 0.2 * (max(Y) - min(Y))
-                    y_max = max(Y) + 0.2 * (max(Y) - min(Y))
-                elif self._pick_shape == "Square":
-                    w = self._pick_size
-                    x, y = self._picks[pick_no]
-                    x_min = x - 1.4 * (w / 2)
-                    x_max = x + 1.4 * (w / 2)
-                    y_min = y - 1.4 * (w / 2)
-                    y_max = y + 1.4 * (w / 2)
-                viewport = [(y_min, x_min), (y_max, x_max)]
+                x_min, x_max, y_min, y_max = lib.pick_bounds(
+                    self._picks[pick_no], self._pick_shape, self._pick_size
+                )
+                margin_x = MOVE_TO_PICK_MARGIN * (x_max - x_min)
+                margin_y = MOVE_TO_PICK_MARGIN * (y_max - y_min)
+                viewport = [
+                    (y_min - margin_y, x_min - margin_x),
+                    (y_max + margin_y, x_max + margin_x),
+                ]
                 self.update_scene(viewport=viewport)
 
     def export_grayscale(self, suffix: str, dpi: int = 96) -> None:
@@ -9814,12 +9868,17 @@ class View(QtWidgets.QLabel):
                 self.pan_relative(rel_y_move, rel_x_move)
                 self.pan_start_x = event.pos().x()
                 self.pan_start_y = event.pos().y()
-        # if drawing a rectangular pick
+        # if drawing a rectangular or box pick
         elif self._mode == "Pick":
             if self._pick_shape == "Rectangle":
                 if self._rectangle_pick_ongoing:
                     self.rectangle_pick_current_x = event.pos().x()
                     self.rectangle_pick_current_y = event.pos().y()
+                    self.update_scene(picks_only=True)
+            elif self._pick_shape == "Box":
+                if self._box_pick_ongoing:
+                    self.box_pick_current_x = event.pos().x()
+                    self.box_pick_current_y = event.pos().y()
                     self.update_scene(picks_only=True)
         # live update of the measuring cross and distance
         elif self._mode == "Measure" and self._measure_following:
@@ -9860,7 +9919,7 @@ class View(QtWidgets.QLabel):
                 event.accept()
             else:
                 event.ignore()
-        # start drawing rectangular pick
+        # start drawing rectangular or box pick
         elif self._mode == "Pick":
             if event.button() == QtCore.Qt.MouseButton.LeftButton:
                 if self._pick_shape == "Rectangle":
@@ -9868,6 +9927,13 @@ class View(QtWidgets.QLabel):
                     self.rectangle_pick_start_x = event.pos().x()
                     self.rectangle_pick_start_y = event.pos().y()
                     self.rectangle_pick_start = self.map_to_movie(event.pos())
+                elif self._pick_shape == "Box":
+                    self._box_pick_ongoing = True
+                    self.box_pick_start_x = event.pos().x()
+                    self.box_pick_start_y = event.pos().y()
+                    self.box_pick_current_x = event.pos().x()
+                    self.box_pick_current_y = event.pos().y()
+                    self.box_pick_start = self.map_to_movie(event.pos())
 
     def _mouse_release_zoom(self, event: QtCore.QEvent) -> None:
         """Zooms in (left click) if the zoom-in rectangle is visible,
@@ -9938,6 +10004,19 @@ class View(QtWidgets.QLabel):
             # remove the last point from the polygon
             elif event.button() == QtCore.Qt.MouseButton.RightButton:
                 self.remove_polygon_point()
+        elif self._pick_shape == "Box":
+            if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                # finish dragging the box and add it
+                self._box_pick_ongoing = False
+                self.add_box_pick(event.pos())
+                event.accept()
+            elif event.button() == QtCore.Qt.MouseButton.RightButton:
+                # remove pick
+                x, y = self.map_to_movie(event.pos())
+                self.remove_picks((x, y))
+                event.accept()
+            else:
+                event.ignore()
 
     def _mouse_release_measure(self, event: QtCore.QEvent) -> None:
         """Add a measure point on left click. The first right click
@@ -10290,7 +10369,8 @@ class View(QtWidgets.QLabel):
         """Return the size of the pick in camera pixels. For circle this
         is the diameter. For square this is the side length. For
         rectangle this is the width (perpendicular to the drawing
-        direction). For polygon this is None (undefined)."""
+        direction). For polygon and box this is None: they carry their
+        own extent."""
         tools_dialog = self.window.tools_settings_dialog
         pixelsize = self.pixelsize
         if self._pick_shape == "Circle":
@@ -10322,7 +10402,6 @@ class View(QtWidgets.QLabel):
             ax.scatter(locs["x"], locs["y"], color=colors[channel], s=2)
 
     @check_pick
-    @check_circular_picks
     def show_pick(self) -> None:
         """Let the user select picks based on their 2D scatter. Open
         ``self.pick_message_box`` to display information."""
@@ -10331,7 +10410,6 @@ class View(QtWidgets.QLabel):
         if channel is not None:
             n_channels = len(self.locs_paths)
             colors = lib.get_colors(n_channels)
-            r = self._pick_size / 2
             is_multi = channel is len(self.locs_paths)
             if is_multi:
                 all_picked_locs = [
@@ -10357,10 +10435,9 @@ class View(QtWidgets.QLabel):
                     self._draw_pick_scatter(
                         ax, all_picked_locs, i, colors, channel, is_multi
                     )
-                    x_min = pick[0] - r
-                    x_max = pick[0] + r
-                    y_min = pick[1] - r
-                    y_max = pick[1] + r
+                    x_min, x_max, y_min, y_max = lib.pick_bounds(
+                        pick, self._pick_shape, self._pick_size
+                    )
                     ax.set_xlabel("X [Px]")
                     ax.set_ylabel("Y [Px]")
                     ax.set_xlim([x_min, x_max])
@@ -10563,11 +10640,13 @@ class View(QtWidgets.QLabel):
         if path:
             saved_locs = pd.concat(saved_locs, ignore_index=True)
             if saved_locs is not None:
-                d = self._pick_size
                 pick_info = {
                     "Generated by:": f"Picasso v{__version__} Render",
-                    "Pick Diameter (nm):": d,
+                    "Pick Shape": self._pick_shape,
                 }
+                # writes the size entry the current shape actually has,
+                # in nm; polygons and boxes carry their own extent
+                self._add_shape_specific_info(pick_info)
                 io.save_locs(
                     path, saved_locs, self.infos[channel] + [pick_info]
                 )
@@ -10706,7 +10785,6 @@ class View(QtWidgets.QLabel):
         return removelist
 
     @check_picks
-    @check_circular_picks
     def filter_picks(self) -> None:
         """Filters picks by number of localizations."""
         channel = self.get_channel_all_seq(
@@ -10715,8 +10793,6 @@ class View(QtWidgets.QLabel):
         if channel is None:
             return
 
-        # assumes circular picks
-        r = self._pick_size / 2
         if channel is len(self.locs_paths):  # all channels
             channels = list(range(len(self.locs_paths)))
         else:
@@ -10724,7 +10800,7 @@ class View(QtWidgets.QLabel):
         # number of locs in each pick
         loccount = np.zeros((len(channels), len(self._picks)), dtype=int)
         for i, channel_ in enumerate(channels):
-            loccount[i] = self._count_locs_in_picks(channel_, r)
+            loccount[i] = self._count_locs_in_picks(channel_)
         loccount = np.array(loccount)  # shape (n_channels, n_picks)
 
         self._display_pick_count_histogram(loccount, channels)
@@ -10756,14 +10832,36 @@ class View(QtWidgets.QLabel):
                 self.update_pick_info_short()
         self.update_scene()
 
-    def _count_locs_in_picks(self, channel: int, r: float) -> list[int]:
+    def _count_locs_in_picks(self, channel: int) -> list[int]:
         """Count number of localizations for each pick in a given
-        channel."""
+        channel.
+
+        Circular picks take the indexed numba path, which only needs the
+        3x3 block neighborhood around each pick; every other shape is
+        counted through ``picked_locs``.
+        """
+        if self._pick_shape != "Circle":
+            picked_locs = self.picked_locs(channel, add_group=False)
+            if len(picked_locs) == len(self._picks):
+                return np.array([len(_) for _ in picked_locs], dtype=int)
+            # ``picked_locs`` skips polygons that are not closed yet;
+            # those hold no localizations
+            is_closed = np.array(
+                [
+                    lib.get_pick_polygon_corners(pick)[0] is not None
+                    for pick in self._picks
+                ]
+            )
+            loccount = np.zeros(len(self._picks), dtype=int)
+            loccount[is_closed] = [len(_) for _ in picked_locs]
+            return loccount
+
         progress = lib.ProgressDialog(
             "Counting in picks..", 0, len(self._picks) - 1, self
         )
         progress.set_value(0)
         progress.show()
+        r = self._pick_size / 2
         loccount = np.zeros(len(self._picks), dtype=int)
         # index locs in a grid
         index_blocks = self.get_index_blocks(channel)
@@ -10989,7 +11087,7 @@ class View(QtWidgets.QLabel):
             df.to_csv(path, index=False)
 
     @check_picks
-    @check_pick_shapes("Circle", "Square", "Rectangle")
+    @check_pick_shapes("Circle", "Square", "Rectangle", "Box")
     def pick_similar(self) -> None:
         """Search picks similar to the current picks.
 
@@ -10998,18 +11096,20 @@ class View(QtWidgets.QLabel):
         additionally rotated onto the principal axis of the
         localizations they contain and all take the median length of the
         current picks; their similarity is judged by the RMSD along and
-        across that axis. Std is defined in ``ToolsSettingsDialog``.
+        across that axis. Box picks all take the median width and height
+        of the current picks. Std is defined in ``ToolsSettingsDialog``.
         """
         channel = self.get_channel("Pick similar")
         if channel is not None:
             std_range = (
                 self.window.tools_settings_dialog.pick_similar_range.value()
             )
-            # rectangular picks need index blocks of a size that depends
-            # on the pick length, so they are built in pick_similar
+            # rectangular and box picks need index blocks of a size
+            # that depends on the pick extent, so they are built in
+            # pick_similar
             index_blocks = (
                 None
-                if self._pick_shape == "Rectangle"
+                if self._pick_shape in ("Rectangle", "Box")
                 else self.get_index_blocks(channel)
             )
             status = lib.StatusDialog("Picking similar...", self.window)
@@ -11162,47 +11262,6 @@ class View(QtWidgets.QLabel):
             )
             return picked_locs
 
-    def _filter_circle_picks(
-        self, x: float, y: float, pick_diameter_2: float
-    ) -> list:
-        """Return picks not overlapping position (x, y) for circular picks."""
-        return [
-            (x_, y_)
-            for x_, y_ in self._picks
-            if (x - x_) ** 2 + (y - y_) ** 2 > pick_diameter_2
-        ]
-
-    def _filter_rectangle_picks(
-        self, x: float, y: float, width: float
-    ) -> list:
-        """Return picks not overlapping position (x, y) for rectangular
-        picks."""
-        xarr = np.array([x])
-        yarr = np.array([y])
-        new_picks = []
-        for pick in self._picks:
-            (start_x, start_y), (end_x, end_y) = pick
-            X, Y = lib.get_pick_rectangle_corners(
-                start_x, start_y, end_x, end_y, width
-            )
-            if not Y[0] == Y[1]:
-                if not lib.check_if_in_rectangle(
-                    xarr, yarr, np.array(X), np.array(Y)
-                )[0]:
-                    new_picks.append(pick)
-        return new_picks
-
-    def _filter_square_picks(self, x: float, y: float, side: float) -> list:
-        """Return picks not overlapping position (x, y) for square picks."""
-        return [
-            (x_, y_)
-            for x_, y_ in self._picks
-            if not (
-                (x_ - side / 2 <= x <= x_ + side / 2)
-                and (y_ - side / 2 <= y <= y_ + side / 2)
-            )
-        ]
-
     def remove_picks(self, position: tuple[float, float]) -> None:
         """Delete picks found at a given position.
 
@@ -11212,13 +11271,24 @@ class View(QtWidgets.QLabel):
             Specifies x and y coordinates.
         """
         x, y = position
-        new_picks = []
         if self._pick_shape == "Circle":
-            new_picks = self._filter_circle_picks(x, y, self._pick_size**2)
-        elif self._pick_shape == "Rectangle":
-            new_picks = self._filter_rectangle_picks(x, y, self._pick_size)
-        elif self._pick_shape == "Square":
-            new_picks = self._filter_square_picks(x, y, self._pick_size)
+            # circles are removed when clicked within one diameter of
+            # their center rather than strictly inside them, which keeps
+            # small picks clickable when zoomed out
+            d2 = self._pick_size**2
+            new_picks = [
+                pick
+                for pick in self._picks
+                if (x - pick[0]) ** 2 + (y - pick[1]) ** 2 > d2
+            ]
+        else:
+            new_picks = [
+                pick
+                for pick in self._picks
+                if not lib.point_in_pick(
+                    x, y, pick, self._pick_shape, self._pick_size
+                )
+            ]
 
         # delete picks and add new_picks
         self._picks = []
@@ -11605,7 +11675,8 @@ class View(QtWidgets.QLabel):
             pick_info["Pick Side Length (nm)"] = picksize_nm
         # if polygon pick and the last not closed, ignore the last pick
         if (
-            self._pick_shape == "Polygon"
+            "Number of picks" in pick_info
+            and self._pick_shape == "Polygon"
             and self._picks[-1][0] != self._picks[-1][-1]
         ):
             pick_info["Number of picks"] -= 1
@@ -11652,6 +11723,15 @@ class View(QtWidgets.QLabel):
             a = self._pick_size * pixelsize
             regions["Side Length (nm)"] = float(a)
             regions["Centers"] = [[float(_[0]), float(_[1])] for _ in picks]
+        elif self._pick_shape == "Box":
+            # each box carries its own extent, so no size is saved
+            regions["Corners"] = [
+                [
+                    [float(c0[0]), float(c0[1])],
+                    [float(c1[0]), float(c1[1])],
+                ]
+                for c0, c1 in picks
+            ]
         regions["Shape"] = self._pick_shape
         return regions
 
@@ -12243,6 +12323,7 @@ class View(QtWidgets.QLabel):
             info=self.infos[channel],
             picks=self._picks,
             pick_size=pick_size,
+            pick_shape=self._pick_shape,
             undrift_z=undrift_z,
             index_blocks=index_blocks,
         )
@@ -12358,12 +12439,8 @@ class View(QtWidgets.QLabel):
             )
             return
 
-        # automatically assign the group if circular picks are present
-        if (
-            "group" not in self.locs[0].columns
-            and len(self._picks)
-            and self._pick_shape == "Circle"
-        ):
+        # automatically assign the group if picks are present
+        if "group" not in self.locs[0].columns and len(self._picks):
             locs = self.picked_locs(0, add_group=True)
             locs = pd.concat(locs, ignore_index=True)
             self.locs[0] = locs
@@ -12502,11 +12579,14 @@ class View(QtWidgets.QLabel):
                 self._update_cursor_polygon()
             elif self._pick_shape == "Square":
                 self._update_cursor_square()
+            elif self._pick_shape == "Box":
+                # the box has no size until it is dragged out, so the
+                # cursor marks the corner rather than the pick
+                self.setCursor(QtCore.Qt.CursorShape.CrossCursor)
             else:
                 self.unsetCursor()
 
     @check_pick
-    @check_circular_picks
     def update_pick_info_long(self) -> None:
         """Evaluate pick statistics in ``InfoDialog``."""
         channel = self.get_channel("Calculate pick info")
@@ -13981,6 +14061,11 @@ class Window(QtWidgets.QMainWindow):
             return
         self.view._picks = [info["Pick"]]
         self.view._pick_shape = info["Pick shape"]
+        # keep the shape selector in sync; assigning _pick_shape first
+        # makes ``on_pick_shape_changed`` a no-op, so the pick survives
+        self.tools_settings_dialog.pick_shape.setCurrentText(
+            self.view._pick_shape
+        )
         if self.view._pick_shape == "Circle":
             self.tools_settings_dialog.pick_diameter.setValue(
                 info["Pick size (nm)"]

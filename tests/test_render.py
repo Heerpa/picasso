@@ -5,8 +5,6 @@ picasso.masking.
 :copyright: Copyright (c) 2025 Jungmann Lab, MPI of Biochemistry
 """
 
-import sys
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -43,12 +41,17 @@ MASKING_METHODS = [
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _qt_app():
-    """Ensure a QGuiApplication exists for QImage / QPainter operations."""
-    app = QtGui.QGuiApplication.instance()
-    if app is None:
-        app = QtGui.QGuiApplication(sys.argv)
-    yield app
+def _qt_app(qapp):
+    """Ensure an application object exists for QImage / QPainter
+    operations.
+
+    Defers to the shared ``qapp`` rather than building a
+    ``QGuiApplication`` here: Qt allows one application object per
+    process, and a plain ``QGuiApplication`` has no ``topLevelWidgets``,
+    which the ``qt_offscreen`` fixture needs. Creating one here first
+    would therefore break every widget test that runs afterwards.
+    """
+    return qapp
 
 
 @pytest.fixture(scope="module")
@@ -1554,6 +1557,67 @@ class TestDrawing:
         assert isinstance(out, QtGui.QImage)
         assert out.width() == 120 and out.height() == 120
         assert not np.array_equal(before, _qimage_to_array(out))
+
+    def test_draw_picks_box(self):
+        canvas = _fresh_canvas()
+        before = _qimage_to_array(canvas)
+        out = render.draw_picks(
+            canvas,
+            ((0, 0), (32, 32)),
+            "Box",
+            [((4, 4), (20, 12))],
+            pick_size=None,
+        )
+        assert isinstance(out, QtGui.QImage)
+        assert out.width() == 120 and out.height() == 120
+        assert not np.array_equal(before, _qimage_to_array(out))
+
+    def test_draw_picks_box_outside_viewport_is_culled(self):
+        canvas = _fresh_canvas()
+        before = _qimage_to_array(canvas)
+        out = render.draw_picks(
+            canvas,
+            ((0, 0), (32, 32)),
+            "Box",
+            [((100, 100), (110, 110))],
+            pick_size=None,
+        )
+        assert np.array_equal(before, _qimage_to_array(out))
+
+    def test_draw_picks_box_overlapping_viewport_is_drawn(self):
+        # culling is on intersection, not on the pick's center: this box
+        # is centered at (40, 40), well outside the viewport, but its
+        # top left corner reaches into it
+        canvas = _fresh_canvas()
+        before = _qimage_to_array(canvas)
+        out = render.draw_picks(
+            canvas,
+            ((0, 0), (32, 32)),
+            "Box",
+            [((20, 20), (60, 60))],
+            pick_size=None,
+        )
+        assert not np.array_equal(before, _qimage_to_array(out))
+
+    def test_draw_picks_square_culls_on_its_center(self):
+        # contrast with the box above: the click-placed shapes are
+        # culled as soon as their center leaves the viewport
+        canvas = _fresh_canvas()
+        before = _qimage_to_array(canvas)
+        out = render.draw_picks(
+            canvas, ((0, 0), (32, 32)), "Square", [(40, 40)], pick_size=40
+        )
+        assert np.array_equal(before, _qimage_to_array(out))
+
+    def test_draw_picks_unknown_shape_raises(self):
+        with pytest.raises(ValueError):
+            render.draw_picks(
+                _fresh_canvas(),
+                ((0, 0), (32, 32)),
+                "Hexagon",
+                [(16, 16)],
+                pick_size=4,
+            )
 
     def test_draw_points(self):
         canvas = _fresh_canvas()

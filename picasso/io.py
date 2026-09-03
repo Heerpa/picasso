@@ -1238,7 +1238,9 @@ def load_mask(
 
 def load_picks(  # noqa: C901
     path: str, pixelsize: float | None = None
-) -> tuple[list, Literal["Circle", "Rectangle", "Polygon", "Square"], float]:
+) -> tuple[
+    list, Literal["Circle", "Rectangle", "Polygon", "Square", "Box"], float
+]:
     """Load picks generated with the Picasso GUI.
 
     Parameters
@@ -1254,14 +1256,21 @@ def load_picks(  # noqa: C901
     -------
     picks : list
         A list of picks.
-    shape : Literal["Circle", "Rectangle", "Polygon", "Square"]
+    shape : {"Circle", "Rectangle", "Polygon", "Square", "Box"}
         The shape of the picks.
     size : float
         The size of the picks in camera pixels (if `pixelsize` is
         provided, otherwise in original units). For circular picks, the
         size is the diameter; for rectangular picks, the size is the
         width; for square picks, the size is the side length. None for
-        polygonal picks (size not defined).
+        polygonal and box picks (size not defined).
+
+    Raises
+    ------
+    ValueError
+        If the file is not recognized as a picks file, if the pick
+        shape is unknown, or if a shape that needs a size does not
+        carry one.
     """
     assert path.endswith(".yaml"), "Picks should be stored in a .yaml file."
 
@@ -1282,26 +1291,62 @@ def load_picks(  # noqa: C901
     # assign loaded picks and pick size
     if shape == "Circle":
         picks = regions["Centers"]
-        if "Diameter (nm)" in regions:
-            size = regions["Diameter (nm)"] / pixelsize
-        elif "Diameter" in regions:
-            size = regions["Diameter"]
+        # legacy files store the size in camera pixels, without "(nm)"
+        size = _pick_size_from_regions(regions, "Diameter", pixelsize)
     elif shape == "Rectangle":
         picks = regions["Center-Axis-Points"]
-        if "Width (nm)" in regions:
-            size = regions["Width (nm)"] / pixelsize
-        elif "Width" in regions:
-            size = regions["Width"]
+        size = _pick_size_from_regions(regions, "Width", pixelsize)
     elif shape == "Polygon":
         picks = regions["Vertices"]
         size = None
     elif shape == "Square":
         picks = regions["Centers"]
         # no backward compatibility here, always in nm
-        size = regions["Side Length (nm)"] / pixelsize
+        size = _pick_size_from_regions(regions, "Side Length", pixelsize)
+    elif shape == "Box":
+        # each box carries its own extent, so there is no size
+        picks = regions["Corners"]
+        size = None
     else:
-        raise ValueError("Unrecognized pick shape")
+        raise ValueError(f"Unrecognized pick shape: {shape}")
     return picks, shape, size
+
+
+def _pick_size_from_regions(
+    regions: dict, key: str, pixelsize: float
+) -> float:
+    """Return a pick size from a loaded picks file, in camera pixels.
+
+    Sizes are stored in nm under ``"<key> (nm)"``; files written by
+    older versions of Picasso store them in camera pixels under the bare
+    ``key``.
+
+    Parameters
+    ----------
+    regions : dict
+        Contents of the picks .yaml file.
+    key : str
+        Name of the size entry, e.g., "Diameter".
+    pixelsize : float
+        Camera pixel size in nm.
+
+    Returns
+    -------
+    size : float
+        Pick size in camera pixels.
+
+    Raises
+    ------
+    ValueError
+        If neither the nm nor the legacy entry is present.
+    """
+    if f"{key} (nm)" in regions:
+        return regions[f"{key} (nm)"] / pixelsize
+    elif key in regions:
+        return regions[key]
+    raise ValueError(
+        f"Picks file is missing the pick size entry '{key} (nm)'."
+    )
 
 
 def save_drift(path: str, drift: pd.DataFrame) -> None:
