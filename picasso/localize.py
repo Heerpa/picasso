@@ -1659,7 +1659,10 @@ def identifications_from_futures(
     ids_list_of_lists = [_.result() for _ in futures]
     ids_list = list(chain(*ids_list_of_lists))
     ids = pd.concat(ids_list, ignore_index=True)
-    ids.sort_values(by="frame", kind="quicksort", inplace=True)
+    # stable sort: frames are processed by racing threads, so rows can
+    # arrive in a scheduling-dependent order; a non-stable sort would let
+    # that non-determinism leak into the relative order of same-frame spots
+    ids.sort_values(by="frame", kind="stable", inplace=True)
     return ids
 
 
@@ -1824,7 +1827,7 @@ def _identify_serial(
         if callable(progress_callback):
             progress_callback(i)
     ids = pd.concat(identifications, ignore_index=True)
-    ids.sort_values(by="frame", kind="quicksort", inplace=True)
+    ids.sort_values(by="frame", kind="stable", inplace=True)
     return ids
 
 
