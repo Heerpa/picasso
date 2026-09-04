@@ -1,6 +1,48 @@
 # Changelog
 
-Last change: 20-AUG-2026 CEST
+Last change: 04-SEP-2026 CEST
+
+## 0.11.1
+
+### General
+- Plugins can now extend Picasso's [Python API and command line](https://picassosr.readthedocs.io/en/latest/plugins.html#for-developers), not only the GUIs, and can be [installed and enabled without ever opening one](https://picassosr.readthedocs.io/en/latest/plugins.html#managing-plugins-without-a-gui) using the new [`picasso plugins`](https://picassosr.readthedocs.io/en/latest/cmd.html#plugins) command.
+- Errors are no longer silently swallowed in the one-click installers. Picasso now redirects errors to a log file (`~/.picasso/logs/picasso.log`), logs every uncaught exception (main thread, worker threads and unraisable ones) there, and shows it in a message box - whose *Show Details...* holds the full traceback.
+
+### Localize
+- Localize can fit multichannel data one channel at a time, see the [documentation](https://picassosr.readthedocs.io/en/latest/localize.html#analyzing-each-channel-on-its-own).
+- A lateral correction (astigmatism / chromatic) can now be kept in its own file and loaded separately from the 3D calibration, see the [documentation](https://picassosr.readthedocs.io/en/latest/localize.html#appending-or-loading-separately).
+- New translation transform model (2 DOF, at least 1 bead pair), offered wherever Picasso fits a geometric transform. It fits a pure shift in x and y.
+- Localize loads z-stack `.nd2` files.
+- Localize's contrast is not set to auto on opening a new movie.
+- ROI id is saved in single-channel localization (if ROIs are used).
+- Fixed empty space in Localize's Parameters dialog.
+- Fixed drawing ROIs in Localize while the temporal median filter is on.
+
+### Render
+- New pick shape in Render: **Box**, an axis-aligned rectangle dragged out to any size with the left mouse button. See the [documentation](https://picassosr.readthedocs.io/en/latest/render.html#picking-of-regions-of-interest).
+- New pick shape in Render: **Brush**, painted freehand with the left mouse button. Strokes whose painted areas touch merge into one pick, a right click undoes the last stroke, and each stroke keeps the width it was painted with. See the [documentation](https://picassosr.readthedocs.io/en/latest/render.html#picking-of-regions-of-interest).
+- Pick statistics (`View > Show info > Calculate info below`), `Filter picks by number of localizations` and `Select picks (XY scatter)` now work with every pick shape; they used to refuse anything but circles.
+- Log-scale contrast sliders in Render: in the Display Settings dialogs of the main and of the 3D (rotation) window, and in the Test Clustering dialog.
+- Render asks for the camera pixel size when loading `.hdf5` files whose metadata does not contain `Pixelsize` (e.g. saved by old Picasso versions), instead of raising an error at rendering.
+- Render warns when the loaded channels have different camera pixel sizes and lets the user pick one pixel size for all of them, instead of raising an error at rendering.
+- (Hopefully) fixed the problem of disappearing localizations when zoomed in.
+- Fixed save cluster areas for SMLM clusterer ([#697](https://github.com/jungmannlab/picasso/issues/697)).
+- Fixed the occasional "AttributeError: 'ViewRotation' object has no attribute 'viewport'" before the 3D window was opened.
+- Fixed reading of old Picasso files ([#698](https://github.com/jungmannlab/picasso/pull/698)); thanks to @boydcpeters.
+- Fixed `Undrift from picked` ignoring the pick shape: rectangular, square and polygonal picks were silently treated as circles (and polygons raised an error). `postprocess.undrift_from_fiducials` gained a `pick_shape` argument.
+- Fixed right-clicking a polygon pick clearing every pick instead of the one clicked, and right-clicking anywhere deleting a perfectly vertical rectangular pick.
+- Fixed saving rotated localizations (Render 3D) for polygonal picks.
+
+### Others
+- Fixed SPINNA simulations for empty targets.
+- Average uses the shared global process pool: thus the initialization is not needed for each iteration.
+- Capping multiprocessing at 61 processes only on Windows.
+- More instructions on plugins.
+- Clear error message in case opened localizations are not fully downloaded/copied.
+- `io.load_picks` now raises a clear error for an unknown pick shape or a missing pick size, instead of `UnboundLocalError`/`KeyError`, and `render.draw_picks` raises instead of silently returning `None`.
+- Templates for bug reports and feature/pull requests.
+- Every GUI now starts through the shared `picasso.gui.app.run_gui`. Error reporting is installed *first*, so a failure while the main window is being built - a missing bundled library, a broken `settings.yaml` - is now shown and logged instead of killing the app without a word.
+- Fixed progress dialog closing faster than within 0.5 s ([#700](https://github.com/jungmannlab/picasso/issues/700)).
 
 ## 0.11.0
 

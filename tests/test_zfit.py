@@ -369,6 +369,207 @@ class TestZfitAffineCorrections:
         )
 
 
+class TestZfitSeparatelyLoadedLateralCorrections:
+    """A lateral correction may be kept in its own file instead of being
+    appended to the 3D calibration. Loading it separately must give the
+    same coordinates as appending it, compose with the corrections the
+    calibration does carry, and never be applied twice.
+    """
+
+    ASTIG = [[1.0, 0.0, 3.0], [0.0, 1.0, -1.5], [0.0, 0.0, 1.0]]
+    CHROMATIC = [[1.0, 0.0, 5.0], [0.0, 1.0, 2.0], [0.0, 0.0, 1.0]]
+
+    @staticmethod
+    def _entry(kind, matrix):
+        return {"Type": kind, "Transform": affine(matrix).to_dict()}
+
+    @classmethod
+    def _calibration(cls, *matrices):
+        calibration = dict(CALIB_3D)
+        for kind, matrix in matrices:
+            lib.append_lateral_transform(calibration, cls._entry(kind, matrix))
+        return calibration
+
+    def test_separate_matches_appended(self, locs, info):
+        """The whole point: the same two corrections, one file or two."""
+        appended, _ = zfit.zfit(
+            locs,
+            info,
+            calibration=self._calibration(
+                ("astigmatism", self.ASTIG), ("chromatic", self.CHROMATIC)
+            ),
+            filter=0,
+        )
+        separate, new_info = zfit.zfit(
+            locs,
+            info,
+            calibration=self._calibration(("astigmatism", self.ASTIG)),
+            lateral_transforms=[self._entry("chromatic", self.CHROMATIC)],
+            filter=0,
+        )
+        np.testing.assert_allclose(
+            separate["x"].to_numpy(), appended["x"].to_numpy(), atol=1e-6
+        )
+        np.testing.assert_allclose(
+            separate["y"].to_numpy(), appended["y"].to_numpy(), atol=1e-6
+        )
+        # both are named, in application order
+        assert new_info[-1]["Lateral corrections applied"] == [
+            "astigmatism, affine",
+            "chromatic, affine",
+        ]
+
+    def test_applied_without_any_in_the_calibration(self, locs, info):
+        """A 3D calibration carrying no correction at all - the plainest
+        version of loading one separately."""
+        plain, _ = zfit.zfit(locs, info, calibration=dict(CALIB_3D), filter=0)
+        moved, new_info = zfit.zfit(
+            locs,
+            info,
+            calibration=dict(CALIB_3D),
+            lateral_transforms=[self._entry("chromatic", self.CHROMATIC)],
+            filter=0,
+        )
+        np.testing.assert_allclose(
+            moved["x"].to_numpy(), plain["x"].to_numpy() + 5.0, atol=1e-3
+        )
+        np.testing.assert_allclose(
+            moved["y"].to_numpy(), plain["y"].to_numpy() + 2.0, atol=1e-3
+        )
+        # z is untouched by a lateral correction
+        np.testing.assert_allclose(
+            moved["z"].to_numpy(), plain["z"].to_numpy(), atol=1e-6
+        )
+        assert new_info[-1]["Lateral corrections applied"] == [
+            "chromatic, affine"
+        ]
+
+    def test_a_copy_of_the_calibrations_own_is_skipped(self, locs, info):
+        """The duplicate case: the correction is in the 3D calibration and
+        loaded separately as well, so it must be applied once, and said."""
+        calibration = self._calibration(("astigmatism", self.ASTIG))
+        once, _ = zfit.zfit(locs, info, calibration=calibration, filter=0)
+        with pytest.warns(
+            lib.DuplicateLateralTransformWarning, match="already carries"
+        ):
+            twice, new_info = zfit.zfit(
+                locs,
+                info,
+                calibration=calibration,
+                # the same transform, saved under another name
+                lateral_transforms=[
+                    {
+                        "Type": "astigmatism",
+                        "Transform": affine(self.ASTIG).to_dict(),
+                        "Bead pairs": 99,
+                    }
+                ],
+                filter=0,
+            )
+        np.testing.assert_allclose(
+            twice["x"].to_numpy(), once["x"].to_numpy(), atol=1e-6
+        )
+        assert new_info[-1]["Lateral corrections applied"] == [
+            "astigmatism, affine"
+        ]
+        assert new_info[-1]["Lateral corrections skipped"] == [
+            "astigmatism, affine (99 bead pairs)"
+        ]
+
+    def test_a_calibration_dict_works_as_the_carrier(self, locs, info):
+        """Not just a list of entries: a whole calibration may be handed in,
+        which is what a standalone .yaml deserializes to."""
+        standalone = lib.append_lateral_transform(
+            {}, self._entry("chromatic", self.CHROMATIC)
+        )
+        moved, _ = zfit.zfit(
+            locs,
+            info,
+            calibration=dict(CALIB_3D),
+            lateral_transforms=standalone,
+            filter=0,
+        )
+        plain, _ = zfit.zfit(locs, info, calibration=dict(CALIB_3D), filter=0)
+        np.testing.assert_allclose(
+            moved["x"].to_numpy(), plain["x"].to_numpy() + 5.0, atol=1e-3
+        )
+
+    def test_a_path_is_read_from_disk(self, locs, info, tmp_path):
+        """The file itself may be handed in, as on the command line."""
+        standalone = lib.append_lateral_transform(
+            {}, self._entry("chromatic", self.CHROMATIC)
+        )
+        path = str(tmp_path / "chromatic.yaml")
+        io.save_any_calibration(path, standalone)
+        moved, _ = zfit.zfit(
+            locs,
+            info,
+            calibration=dict(CALIB_3D),
+            lateral_transforms=path,
+            filter=0,
+        )
+        plain, _ = zfit.zfit(locs, info, calibration=dict(CALIB_3D), filter=0)
+        np.testing.assert_allclose(
+            moved["x"].to_numpy(), plain["x"].to_numpy() + 5.0, atol=1e-3
+        )
+
+    def test_a_file_without_corrections_raises(self, locs, info, tmp_path):
+        """Silently correcting nothing would be worse than failing."""
+        path = str(tmp_path / "empty_3d_calib.yaml")
+        io.save_any_calibration(path, dict(CALIB_3D))
+        with pytest.raises(ValueError, match="No lateral corrections"):
+            zfit.zfit(
+                locs,
+                info,
+                calibration=dict(CALIB_3D),
+                lateral_transforms=path,
+                filter=0,
+            )
+
+    def test_none_is_a_no_op(self, locs, info):
+        plain, plain_info = zfit.zfit(
+            locs, info, calibration=dict(CALIB_3D), filter=0
+        )
+        same, same_info = zfit.zfit(
+            locs,
+            info,
+            calibration=dict(CALIB_3D),
+            lateral_transforms=None,
+            filter=0,
+        )
+        np.testing.assert_allclose(
+            same["x"].to_numpy(), plain["x"].to_numpy(), atol=1e-6
+        )
+        assert "Lateral corrections applied" not in same_info[-1]
+        assert "Lateral corrections skipped" not in plain_info[-1]
+
+    @pytest.mark.slow
+    def test_multiprocess_path_applies_it_once(self, locs, info):
+        extra = [self._entry("chromatic", self.CHROMATIC)]
+        serial, _ = zfit.zfit(
+            locs,
+            info,
+            calibration=self._calibration(("astigmatism", self.ASTIG)),
+            lateral_transforms=extra,
+            multiprocess=False,
+            filter=0,
+        )
+        parallel, _ = zfit.zfit(
+            locs,
+            info,
+            calibration=self._calibration(("astigmatism", self.ASTIG)),
+            lateral_transforms=extra,
+            multiprocess=True,
+            filter=0,
+        )
+        keys = ["frame", "z"]
+        s = serial.sort_values(keys).reset_index(drop=True)
+        p = parallel.sort_values(keys).reset_index(drop=True)
+        np.testing.assert_allclose(
+            s["x"].to_numpy(), p["x"].to_numpy(), atol=1e-3
+        )
+
+
 # ---------------------------------------------------------------------------
 # GPU (numba.cuda) z fitting
 # ---------------------------------------------------------------------------

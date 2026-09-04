@@ -26,6 +26,9 @@ from picasso import transforms
 # input normalization a degree-3 fit here loses ten significant digits.
 CHIP = 2048.0
 
+TRANSLATION_TRUTH = np.array(
+    [[1.0, 0.0, 3.5], [0.0, 1.0, -2.25], [0.0, 0.0, 1.0]]
+)
 AFFINE_TRUTH = np.array(
     [[1.004, -0.011, 3.5], [0.008, 0.997, -2.25], [0.0, 0.0, 1.0]]
 )
@@ -66,7 +69,9 @@ def _poly_truth(xy, degree=3):
 def _model(model, n=60, seed=0):
     """A fitted transform of each model, on data it can represent exactly."""
     src = _src(n, seed)
-    if model == "affine":
+    if model == "translation":
+        dst = _apply_matrix(TRANSLATION_TRUTH, src)
+    elif model == "affine":
         dst = _apply_matrix(AFFINE_TRUTH, src)
     elif model == "projective":
         dst = _apply_matrix(PROJECTIVE_TRUTH, src)
@@ -201,7 +206,14 @@ class TestEstimateValidation:
     def test_barely_enough_correspondences_warns(self, model):
         n = transforms.min_points(model)
         src = _src(n, seed=5)
-        with pytest.warns(UserWarning, match="interpolate the noise"):
+        # A translation has no simpler model to fall back on, so it warns
+        # about the noise it inherits rather than about interpolating it.
+        expected = (
+            "inherits their localization noise"
+            if model == "translation"
+            else "interpolate the noise"
+        )
+        with pytest.warns(UserWarning, match=expected):
             transforms.estimate(src, src, model)
 
     def test_mismatched_lengths_raise(self):
@@ -673,3 +685,82 @@ class TestChannelJacobians:
         from_objects = transforms.channel_jacobians([t], ref_xy)
         from_dicts = transforms.channel_jacobians([t.to_dict()], ref_xy)
         assert np.array_equal(from_objects, from_dicts)
+
+
+# ---------------------------------------------------------------------------
+# The translation model
+# ---------------------------------------------------------------------------
+
+
+class TestTranslation:
+    """The 2-DOF model: what distinguishes it from an affine that happens to
+    have an identity linear part."""
+
+    def test_is_an_affine_so_every_affine_fast_path_takes_it(self):
+        """The constant-Jacobian route through the spline kernels and the
+        single-call route through warp_image both key off the class."""
+        _, _, t = _model("translation")
+        assert isinstance(t, transforms.AffineTransform)
+        assert t.model == "translation"
+        assert t.n_params == 2
+
+    def test_fits_only_the_shift_and_leaves_rotation_in_the_residual(self):
+        """A rotation an affine would absorb must show up as residual
+        instead - that is the point of constraining the model."""
+        src = _src(80, seed=3)
+        rotated = _apply_matrix(AFFINE_TRUTH, src)
+        t = transforms.estimate(src, rotated, "translation")
+        assert np.allclose(t.jacobian(src), np.eye(2))
+        resid = rotated - t.apply(src)
+        assert np.sqrt(np.mean(np.sum(resid**2, axis=1))) > 1.0
+        # ...while the affine, free to rotate, has none
+        affine = transforms.estimate(src, rotated, "affine")
+        assert np.allclose(affine.apply(src), rotated, atol=1e-8)
+
+    def test_shift_is_the_mean_displacement(self):
+        src = _src(40, seed=7)
+        rng = np.random.RandomState(11)
+        dst = src + [3.5, -2.25] + rng.normal(0.0, 0.5, src.shape)
+        t = transforms.estimate(src, dst, "translation")
+        assert np.allclose(t.shift, (dst - src).mean(axis=0))
+        assert np.allclose(t.shift, t.translation)
+
+    def test_a_single_correspondence_fixes_it(self):
+        assert transforms.min_points("translation") == 1
+        with pytest.warns(UserWarning):
+            t = transforms.estimate(
+                [[10.0, 20.0]], [[13.5, 17.75]], "translation"
+            )
+        assert np.allclose(t.shift, [3.5, -2.25])
+
+    def test_a_non_identity_linear_part_is_rejected(self):
+        with pytest.raises(ValueError, match="identity linear part"):
+            transforms.TranslationTransform(matrix=AFFINE_TRUTH)
+
+    def test_from_shift_round_trips_through_a_dict(self):
+        t = transforms.TranslationTransform.from_shift(
+            [3.5, -2.25], domain=[[0.0, 0.0], [CHIP, CHIP]]
+        )
+        data = t.to_dict()
+        assert data["model"] == "translation"
+        assert data["shift"] == [3.5, -2.25]
+        # the same builtin-only guarantee the other models make
+        assert yaml.safe_load(yaml.dump(data)) == data
+        assert json.loads(json.dumps(data)) == data
+        assert transforms.from_dict(data).allclose(t)
+
+    def test_inverse_and_composition_stay_translations(self):
+        """A translation must not silently widen into an affine: downstream
+        code reads the model name back off the transform."""
+        _, _, t = _model("translation")
+        assert t.inverse().model == "translation"
+        assert t.compose_translations(pre=(1.0, 2.0)).model == "translation"
+        assert transforms.identity("translation").model == "translation"
+
+    def test_never_compares_equal_to_the_matching_affine(self):
+        """Same map, different model - a calibration fitted with a constrained
+        model is not the same calibration as an unconstrained one."""
+        t = transforms.TranslationTransform.from_shift([3.5, -2.25])
+        affine = transforms.AffineTransform(matrix=t.matrix.copy())
+        assert not t.allclose(affine)
+        assert not affine.allclose(t)

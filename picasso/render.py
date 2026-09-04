@@ -40,6 +40,9 @@ else:
 _DRAW_MAX_SIGMA = 3  # max. sigma from mean to render (mu +/- 3 sigma)
 N_GROUP_COLORS = 8
 POLYGON_POINTER_SIZE = 16  # must be even
+# opacity of the fill of a brush pick, so that the localizations under
+# the painted region stay visible
+BRUSH_FILL_ALPHA = 70
 
 
 def render(
@@ -2383,11 +2386,151 @@ def _draw_picks_square(
     return image
 
 
+def _draw_picks_box(
+    image: QtGui.QImage,
+    viewport: tuple[tuple[float, float], tuple[float, float]],  # cam. px
+    picks: list[tuple],  # picks in camera pixels
+    annotate_picks: bool = False,
+    color: QtGui.QColor | None = None,  # default: yellow
+) -> QtGui.QImage:
+    """Draw box picks onto the image of rendered localizations. See
+    ``draw_picks`` for more details."""
+    if color is None:
+        color = QtGui.QColor("yellow")
+    painter = QtGui.QPainter(image)
+    painter.setPen(color)
+    for i, pick in enumerate(picks):
+        X, Y = lib.get_pick_box_corners(pick)
+        # unlike the click-placed shapes, a box can be larger than the
+        # view, so cull on intersection rather than on its center
+        if (
+            max(X) < viewport[0][1]
+            or min(X) > viewport[1][1]
+            or max(Y) < viewport[0][0]
+            or min(Y) > viewport[1][0]
+        ):
+            continue
+
+        # convert from camera units to display units
+        x0, y0 = map_to_view(min(X), min(Y), image.size(), viewport)
+        x1, y1 = map_to_view(max(X), max(Y), image.size(), viewport)
+        painter.drawRect(x0, y0, x1 - x0, y1 - y0)
+
+        # annotate picks
+        if annotate_picks:
+            painter.drawText(x1 + 10, y1 + 10, str(i))
+    painter.end()
+    return image
+
+
+def brush_pick_path(
+    pick: list[tuple[float, list[tuple[float, float]]]],
+    image_size: QtCore.QSize,
+    viewport: tuple[tuple[float, float], tuple[float, float]],  # cam. px
+) -> QtGui.QPainterPath:
+    """Return the painted outline of a brush pick in display units.
+
+    Each stroke is swept with a round-capped, round-joined pen of its
+    own width - the same region ``lib.check_if_in_brush_stroke`` tests
+    against - and the strokes of a pick are united into a single path,
+    so that the region can be filled once. Filling stroke by stroke
+    would darken every overlap, and the strokes of a merged pick always
+    overlap.
+
+    Parameters
+    ----------
+    pick : list of tuples
+        One brush pick, i.e., a list of ``(width, path)`` strokes in
+        camera pixels.
+    image_size : QSize
+        Size of the image the pick is drawn onto.
+    viewport : tuple
+        Current field of view in camera pixels, ``((y_min, x_min),
+        (y_max, x_max))``.
+
+    Returns
+    -------
+    path : QPainterPath
+        The painted region in display coordinates.
+    """
+    scale = image_size.width() / viewport_width(viewport)
+    region = QtGui.QPainterPath()
+    for stroke in pick:
+        width, X, Y = lib.brush_stroke_arrays(stroke)
+        path = QtGui.QPainterPath()
+        for j, (x, y) in enumerate(zip(X, Y)):
+            cx, cy = map_to_view(x, y, image_size, viewport)
+            point = QtCore.QPointF(cx, cy)
+            if j == 0:
+                path.moveTo(point)
+            else:
+                path.lineTo(point)
+        if len(X) == 1:  # a dot: sweeping a zero-length path
+            path.lineTo(path.currentPosition())
+        pen = QtGui.QPen(
+            QtGui.QColor("black"),
+            max(width * scale, 1.0),
+            QtCore.Qt.PenStyle.SolidLine,
+            QtCore.Qt.PenCapStyle.RoundCap,
+            QtCore.Qt.PenJoinStyle.RoundJoin,
+        )
+        stroker = QtGui.QPainterPathStroker(pen)
+        region = region.united(stroker.createStroke(path))
+    return region.simplified()
+
+
+def _draw_picks_brush(
+    image: QtGui.QImage,
+    viewport: tuple[tuple[float, float], tuple[float, float]],  # cam. px
+    picks: list[tuple],  # picks in camera pixels
+    annotate_picks: bool = False,
+    color: QtGui.QColor | None = None,  # default: yellow
+) -> QtGui.QImage:
+    """Draw brush picks onto the image of rendered localizations, as a
+    translucent highlight with a solid outline. See ``draw_picks`` for
+    more details."""
+    if color is None:
+        color = QtGui.QColor("yellow")
+    fill = QtGui.QColor(color)
+    fill.setAlpha(BRUSH_FILL_ALPHA)
+    painter = QtGui.QPainter(image)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    painter.setPen(color)
+    for i, pick in enumerate(picks):
+        if not len(pick):
+            continue
+        x_min, x_max, y_min, y_max = lib.pick_bounds(pick, "Brush", None)
+        # a painted region can be larger than the view, so cull on
+        # intersection rather than on a center
+        if (
+            x_max < viewport[0][1]
+            or x_min > viewport[1][1]
+            or y_max < viewport[0][0]
+            or y_min > viewport[1][0]
+        ):
+            continue
+
+        region = brush_pick_path(pick, image.size(), viewport)
+        painter.fillPath(region, QtGui.QBrush(fill))
+        painter.drawPath(region)
+
+        # annotate picks at the start of the first stroke
+        if annotate_picks:
+            cx, cy = map_to_view(
+                pick[0][1][0][0], pick[0][1][0][1], image.size(), viewport
+            )
+            painter.drawText(cx + 10, cy + 10, str(i))
+    painter.end()
+    return image
+
+
 @adjust_viewport_decorator
 def draw_picks(
     image: QtGui.QImage,
     viewport: tuple[tuple[float, float], tuple[float, float]],  # cam. px
-    pick_shape: Literal["Circle", "Rectangle", "Polygon", "Square"],
+    pick_shape: Literal[
+        "Circle", "Rectangle", "Polygon", "Square", "Box", "Brush"
+    ],
     picks: list[tuple],  # pick coords in camera pixels
     pick_size: float | None,  # diameter in camera pixels
     point_picks: bool = False,
@@ -2404,7 +2547,7 @@ def draw_picks(
     viewport : tuple
         Current field of view in camera pixels, ((y_min, y_max), (x_min,
         x_max)).
-    pick_shape : {"Circle", "Rectangle", "Polygon", "Square"}
+    pick_shape : {"Circle", "Rectangle", "Polygon", "Square", "Box", "Brush"}
         Shape of the picks to be drawn.
     picks : list of tuples
         List of picks, where each pick is a tuple specifying the pick
@@ -2413,8 +2556,8 @@ def draw_picks(
     pick_size : float or None
         Size of the picks in camera pixels. For "Circle", this is the
         diameter; for "Rectangle", this is the width; for "Square", this
-        is the side length. This parameter is ignored for "Polygon"
-        picks.
+        is the side length. This parameter is ignored for "Polygon",
+        "Box" and "Brush" picks, which carry their own extent.
     point_picks : bool, optional
         If True and pick_shape is "Circle", draw picks as points instead
         of circles. Default is False.
@@ -2428,6 +2571,11 @@ def draw_picks(
     -------
     image : QImage
         Image with the drawn picks.
+
+    Raises
+    ------
+    ValueError
+        If ``pick_shape`` is not recognized.
     """
     image = image.copy()
     if pick_shape == "Circle":
@@ -2466,6 +2614,24 @@ def draw_picks(
             annotate_picks=annotate_picks,
             color=color,
         )
+    elif pick_shape == "Box":
+        return _draw_picks_box(
+            image,
+            viewport=viewport,
+            picks=picks,
+            annotate_picks=annotate_picks,
+            color=color,
+        )
+    elif pick_shape == "Brush":
+        return _draw_picks_brush(
+            image,
+            viewport=viewport,
+            picks=picks,
+            annotate_picks=annotate_picks,
+            color=color,
+        )
+    else:
+        raise ValueError(f"Unknown pick shape: {pick_shape}")
 
 
 @adjust_viewport_decorator

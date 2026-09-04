@@ -29,6 +29,7 @@ from matplotlib.widgets import SpanSelector, RectangleSelector
 from matplotlib.colors import LogNorm
 
 from .. import io, lib, clusterer, __version__
+from .app import run_gui
 
 plt.style.use("ggplot")
 
@@ -1069,25 +1070,9 @@ class Window(QtWidgets.QMainWindow):
         QtWidgets.QApplication.instance().closeAllWindows()
 
 
-def main():
-    app = QtWidgets.QApplication(sys.argv)
-    window = Window()
-
-    # load plugins from ~/.picasso/plugins
-    from .plugins_loader import load_plugins, add_plugins_menu_actions
-
-    load_plugins(window, "filter")
-    add_plugins_menu_actions(window, "filter")
-
-    window.show()
-
-    from ..updater import setup_gui_update_check
-
-    setup_gui_update_check(window)
-
-    lib.install_excepthook(window)
-
-    sys.exit(app.exec())
+def main() -> None:
+    """Start Picasso: Filter - see ``picasso.gui.app.run_gui``."""
+    sys.exit(run_gui(Window, "filter"))
 
 
 if __name__ == "__main__":

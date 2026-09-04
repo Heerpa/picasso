@@ -17,7 +17,6 @@ are added, for example, localization cloud shape modeling.
 
 from __future__ import annotations
 
-import os
 import time
 from abc import ABCMeta, abstractmethod
 from concurrent.futures import ProcessPoolExecutor
@@ -3088,9 +3087,7 @@ def _run_g5m_parallel(
         List of futures.
     """
     n_groups = len(np.unique(locs["group"]))
-    n_workers = min(
-        60, max(1, int(0.35 * os.cpu_count()))
-    )  # Python crashes when using >64 cores
+    n_workers = lib.n_workers(0.35)
     groups_per_task = [
         (
             int(n_groups / N_TASKS + 1)

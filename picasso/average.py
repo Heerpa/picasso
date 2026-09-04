@@ -287,6 +287,130 @@ def prepare_locs_for_save(
     return locs, new_info
 
 
+class AveragePool:
+    """Reusable pool of worker processes for particle averaging.
+
+    Starting a process pool is expensive: every worker process imports
+    ``picasso`` and receives a copy of the group index. Keeping one pool
+    alive across several calls to :func:`average` (e.g. in ``Picasso:
+    Average``, where the same file is usually averaged repeatedly with
+    different settings) avoids paying that cost at every run.
+
+    The pool is bound to the localizations it was created with. The
+    group index and the shared coordinate arrays are set up once; the
+    coordinates are overwritten at the beginning of each averaging run,
+    so the pool stays valid after a previous run has shifted the
+    localizations. It must be recreated if a different file (or a
+    different number of localizations or groups) is to be averaged.
+
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations with a ``group`` column.
+    n_workers : int, optional
+        Number of worker processes. Default is ``lib.n_workers()``.
+
+    Attributes
+    ----------
+    group_index : scipy.sparse.lil_matrix
+        Sparse matrix indexing groups.
+    n_groups : int
+        Number of groups.
+    n_locs : int
+        Number of localizations the pool was created with.
+    n_workers : int
+        Number of worker processes.
+    groups_per_worker : int
+        Chunk size used when mapping groups onto the workers.
+    x, y : ctypes.Array
+        Shared coordinate arrays that the workers read from and write
+        into.
+    counter : multiprocessing.managers.ValueProxy
+        Shared counter for the number of groups processed.
+    lock : multiprocessing.managers.AcquirerProxy
+        Lock synchronizing access to ``counter``.
+    pool : multiprocessing.Pool
+        The worker pool itself.
+    closed : bool
+        True if the pool has been shut down and can no longer be used.
+    """
+
+    def __init__(
+        self, locs: pd.DataFrame, n_workers: int | None = None
+    ) -> None:
+        assert (
+            "group" in locs.columns
+        ), "Localizations DataFrame must have a 'group' column."
+        self.group_index = build_group_index(locs)
+        self.n_groups = self.group_index.shape[0]
+        self.n_locs = len(locs)
+        self.n_workers = lib.n_workers() if n_workers is None else n_workers
+        self.groups_per_worker = max(1, int(self.n_groups / self.n_workers))
+        self.x = sharedctypes.RawArray("f", locs["x"].to_numpy())
+        self.y = sharedctypes.RawArray("f", locs["y"].to_numpy())
+        self.manager = multiprocessing.Manager()
+        self.counter = self.manager.Value("d", 0)
+        self.lock = self.manager.Lock()
+        self.pool = multiprocessing.Pool(
+            self.n_workers,
+            _init_pool_worker,
+            (self.x, self.y, self.group_index),
+        )
+        self.closed = False
+
+    def set_coordinates(self, locs: pd.DataFrame) -> None:
+        """Copy localization coordinates into the shared arrays.
+
+        Parameters
+        ----------
+        locs : pd.DataFrame
+            Localizations with the same number of rows as the ones the
+            pool was created with.
+
+        Raises
+        ------
+        ValueError
+            If ``locs`` does not match the localizations the pool was
+            created with.
+        """
+        if len(locs) != self.n_locs:
+            raise ValueError(
+                "The given localizations do not match the ones this pool"
+                f" was created with ({len(locs)} instead of {self.n_locs}"
+                " localizations). Please create a new AveragePool."
+            )
+        np.ctypeslib.as_array(self.x)[:] = locs["x"].to_numpy()
+        np.ctypeslib.as_array(self.y)[:] = locs["y"].to_numpy()
+
+    def close(self) -> None:
+        """Let the workers finish and shut the pool down."""
+        self._shutdown(terminate=False)
+
+    def terminate(self) -> None:
+        """Kill the workers immediately and shut the pool down."""
+        self._shutdown(terminate=True)
+
+    def _shutdown(self, terminate: bool) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if terminate:
+            self.pool.terminate()
+        else:
+            self.pool.close()
+        self.pool.join()
+        self.manager.shutdown()
+
+    def __enter__(self) -> "AveragePool":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self.terminate()
+
+
 def _make_pbars(use_tqdm, iterations, n_groups):
     if use_tqdm:
         return (
@@ -360,6 +484,7 @@ def average(
     return_shifted_locs: bool = False,
     progress_callback: callable | Literal["console"] | None = None,
     abort_callback: Callable[[], bool] | None = None,
+    pool: AveragePool | None = None,
 ) -> pd.DataFrame | tuple[pd.DataFrame, list[dict]] | None:
     """Average super-resolution images of particles by alignment and rotation.
 
@@ -392,6 +517,14 @@ def average(
         Callable with no arguments returning a bool. If it returns
         True, averaging is aborted, the worker pool is terminated, and
         ``None`` is returned. Default is None (no abort).
+    pool : AveragePool or None, optional
+        Pool of worker processes to average with, see
+        :class:`AveragePool`. Pass one to reuse the same workers across
+        several calls, which avoids restarting them every time. It must
+        have been created with the same localizations. If None
+        (default), a pool is started and shut down internally. Note that
+        an externally provided pool is terminated (and thus rendered
+        unusable) if averaging is aborted.
 
     Returns
     -------
@@ -407,9 +540,17 @@ def average(
     assert (
         "group" in locs.columns
     ), "Localizations DataFrame must have a 'group' column."
-    group_index = build_group_index(locs)
+    own_pool = pool is None
+    if own_pool:
+        pool = AveragePool(locs)
+    elif pool.closed:
+        raise ValueError(
+            "The given AveragePool has been shut down. Please create a"
+            " new one."
+        )
+    group_index = pool.group_index
     locs = com_align(locs, group_index)
-    n_groups = group_index.shape[0]
+    n_groups = pool.n_groups
     r = 2 * np.sqrt((locs["x"] ** 2 + locs["y"] ** 2).mean())
     t_min = -r
     t_max = r
@@ -422,24 +563,13 @@ def average(
     a_step = np.arcsin(1 / (oversampling * r))
     angles = np.arange(0, 2 * np.pi, a_step)
 
-    # Setup multiprocessing
-    n_workers = min(
-        60, max(1, int(0.75 * multiprocessing.cpu_count()))
-    )  # Python crashes when using >64 cores
-    manager = multiprocessing.Manager()
-    counter = manager.Value("d", 0)
-    lock = manager.Lock()
-    groups_per_worker = max(1, int(n_groups / n_workers))
-
-    # Initialize shared arrays
-    x = sharedctypes.RawArray("f", locs["x"].to_numpy())
-    y = sharedctypes.RawArray("f", locs["y"].to_numpy())
-
-    pool = multiprocessing.Pool(
-        n_workers,
-        _init_pool_worker,
-        (x, y, group_index),
-    )
+    # Setup multiprocessing; the shared arrays are (re-)filled with the
+    # current coordinates, so that a reused pool starts from them
+    counter = pool.counter
+    lock = pool.lock
+    x = pool.x
+    y = pool.y
+    pool.set_coordinates(locs)
 
     use_tqdm = progress_callback == "console"
     iter_pbar, group_pbar = _make_pbars(use_tqdm, iterations, n_groups)
@@ -479,7 +609,9 @@ def average(
                 counter,
                 lock,
             )
-            result = pool.map_async(fc, range(n_groups), groups_per_worker)
+            result = pool.pool.map_async(
+                fc, range(n_groups), pool.groups_per_worker
+            )
 
             # Wait for completion and report progress
             aborted = _wait_for_alignment(
@@ -514,11 +646,12 @@ def average(
         if use_tqdm:
             group_pbar.close()
             iter_pbar.close()
+        # an aborted run leaves work queued in the pool, so it is
+        # terminated even if it was provided by the caller
         if aborted:
             pool.terminate()
-        else:
+        elif own_pool:
             pool.close()
-        pool.join()
 
     return _finalize_average(
         locs,

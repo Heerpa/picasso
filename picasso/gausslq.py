@@ -35,7 +35,6 @@ at the array level even though the fitted positions and widths agree.
 
 from __future__ import annotations
 
-import multiprocessing
 from concurrent import futures
 from typing import Callable, Literal
 
@@ -703,9 +702,7 @@ def _fit_spots_parallel(
         ``return_chi_square``. If `asynch` is True, returns a list of
         futures that can be processed asynchronously.
     """
-    n_workers = min(
-        60, max(1, int(0.75 * multiprocessing.cpu_count()))
-    )  # Python crashes when using >64 cores
+    n_workers = lib.n_workers()
     n_spots = len(spots)
     n_tasks = 100 * n_workers
     spots_per_task = [

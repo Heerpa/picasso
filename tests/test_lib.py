@@ -720,9 +720,403 @@ class TestPickAreas:
         areas = lib.pick_areas(picks, "Square", pick_size=3.0)
         assert areas[0] == 9.0
 
+    def test_box(self):
+        picks = [((1.0, 2.0), (4.0, 6.0)), ((0.0, 0.0), (2.0, 2.0))]
+        areas = lib.pick_areas(picks, "Box", pick_size=None)
+        assert areas.tolist() == [12.0, 4.0]
+
+    def test_box_ignores_corner_order(self):
+        areas = lib.pick_areas(
+            [((4.0, 6.0), (1.0, 2.0))], "Box", pick_size=None
+        )
+        assert areas[0] == 12.0
+
     def test_unknown_shape_raises(self):
         with pytest.raises(ValueError):
             lib.pick_areas([(0.0, 0.0)], "Triangle", pick_size=1.0)
+
+
+class TestPickBoxCorners:
+    def test_orders_corners(self):
+        X, Y = lib.get_pick_box_corners(((4.0, 6.0), (1.0, 2.0)))
+        assert X == [1.0, 4.0, 4.0, 1.0]
+        assert Y == [2.0, 2.0, 6.0, 6.0]
+
+    def test_matches_input_when_already_ordered(self):
+        pick = ((1.0, 2.0), (4.0, 6.0))
+        assert lib.get_pick_box_corners(pick) == lib.get_pick_box_corners(
+            (pick[1], pick[0])
+        )
+
+
+class TestBoxContainment:
+    PICK = ((1.0, 2.0), (5.0, 4.0))  # 4 wide, 2 high, centered (3, 3)
+
+    def test_inside(self):
+        assert lib.is_loc_in_box_numba(
+            3.0, 3.0, np.array([[3.0], [3.0]]), 4.0, 2.0
+        )[0]
+
+    def test_outside_in_y_only(self):
+        # inside the 4-wide extent (1..5) but outside the 2-high one
+        # (2..4), so a square test of the longer side would wrongly
+        # accept it
+        assert not lib.is_loc_in_box_numba(
+            3.0, 3.0, np.array([[3.0], [4.5]]), 4.0, 2.0
+        )[0]
+
+    def test_bounds_are_exclusive(self):
+        # matches postprocess._picked_box_locs
+        assert not lib.is_loc_in_box_numba(
+            3.0, 3.0, np.array([[5.0], [3.0]]), 4.0, 2.0
+        )[0]
+
+    def test_locs_in_box_numba_filters(self):
+        locs_xy = np.array([[3.0, 9.0, 2.0], [3.0, 9.0, 2.5]])
+        out = lib.locs_in_box_numba(3.0, 3.0, locs_xy, 4.0, 2.0)
+        assert out.shape == (2, 2)
+
+
+# ---------------------------------------------------------------------------
+# Pick bounds and containment dispatch (all shapes)
+# ---------------------------------------------------------------------------
+
+CLOSED_POLYGON = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0), (0.0, 0.0)]
+
+
+class TestPickBounds:
+    def test_circle(self):
+        assert lib.pick_bounds((5.0, 5.0), "Circle", 2.0) == (
+            4.0,
+            6.0,
+            4.0,
+            6.0,
+        )
+
+    def test_square(self):
+        assert lib.pick_bounds((5.0, 5.0), "Square", 2.0) == (
+            4.0,
+            6.0,
+            4.0,
+            6.0,
+        )
+
+    def test_rectangle_spans_its_corners(self):
+        pick = ((5.0, 5.0), (5.0, 15.0))  # vertical band of width 2
+        x_min, x_max, y_min, y_max = lib.pick_bounds(pick, "Rectangle", 2.0)
+        assert (x_min, x_max) == (4.0, 6.0)
+        assert (y_min, y_max) == (5.0, 15.0)
+
+    def test_polygon(self):
+        assert lib.pick_bounds(CLOSED_POLYGON, "Polygon", None) == (
+            0.0,
+            4.0,
+            0.0,
+            4.0,
+        )
+
+    def test_open_polygon_falls_back_to_its_vertices(self):
+        assert lib.pick_bounds(CLOSED_POLYGON[:-1], "Polygon", None) == (
+            0.0,
+            4.0,
+            0.0,
+            4.0,
+        )
+
+    def test_empty_polygon_raises(self):
+        with pytest.raises(ValueError):
+            lib.pick_bounds([], "Polygon", None)
+
+    def test_box(self):
+        assert lib.pick_bounds(((4.0, 6.0), (1.0, 2.0)), "Box", None) == (
+            1.0,
+            4.0,
+            2.0,
+            6.0,
+        )
+
+    def test_unknown_shape_raises(self):
+        with pytest.raises(ValueError):
+            lib.pick_bounds((0.0, 0.0), "Triangle", 1.0)
+
+
+class TestPointInPick:
+    def test_circle(self):
+        pick = (5.0, 5.0)
+        assert lib.point_in_pick(5.5, 5.0, pick, "Circle", 2.0)
+        # outside the radius but inside the bounding box corner
+        assert not lib.point_in_pick(5.9, 5.9, pick, "Circle", 2.0)
+
+    def test_square(self):
+        pick = (5.0, 5.0)
+        assert lib.point_in_pick(5.4, 5.4, pick, "Square", 1.0)
+        assert not lib.point_in_pick(5.6, 5.0, pick, "Square", 1.0)
+
+    def test_vertical_rectangle(self):
+        # ray casting over the corners divides by zero here, which is
+        # why point_in_pick rotates into the rectangle's frame instead
+        pick = ((5.0, 5.0), (5.0, 15.0))
+        assert lib.point_in_pick(5.5, 10.0, pick, "Rectangle", 2.0)
+        assert not lib.point_in_pick(6.5, 10.0, pick, "Rectangle", 2.0)
+
+    def test_oriented_rectangle_agrees_with_ray_casting(self):
+        pick = ((0.0, 0.0), (10.0, 6.0))
+        X, Y = lib.get_pick_rectangle_corners(0.0, 0.0, 10.0, 6.0, 3.0)
+        rng = np.random.default_rng(0)
+        points = rng.uniform(-4, 12, size=(2, 200))
+        expected = lib.check_if_in_rectangle(
+            points[0], points[1], np.array(X), np.array(Y)
+        )
+        got = [
+            lib.point_in_pick(x, y, pick, "Rectangle", 3.0)
+            for x, y in zip(*points)
+        ]
+        assert np.array_equal(np.array(got), expected)
+
+    def test_polygon(self):
+        assert lib.point_in_pick(2.0, 2.0, CLOSED_POLYGON, "Polygon", None)
+        assert not lib.point_in_pick(5.0, 2.0, CLOSED_POLYGON, "Polygon", None)
+
+    def test_open_polygon_contains_nothing(self):
+        assert not lib.point_in_pick(
+            2.0, 2.0, CLOSED_POLYGON[:-1], "Polygon", None
+        )
+
+    def test_box(self):
+        pick = ((1.0, 2.0), (5.0, 4.0))
+        assert lib.point_in_pick(3.0, 3.0, pick, "Box", None)
+        assert not lib.point_in_pick(3.0, 4.5, pick, "Box", None)
+
+    def test_box_ignores_corner_order(self):
+        pick = ((5.0, 4.0), (1.0, 2.0))
+        assert lib.point_in_pick(3.0, 3.0, pick, "Box", None)
+
+    def test_brush(self):
+        pick = [(2.0, [(0.0, 0.0), (10.0, 0.0)])]  # width 2 -> r = 1
+        assert lib.point_in_pick(5.0, 0.9, pick, "Brush", None)
+        assert not lib.point_in_pick(5.0, 1.1, pick, "Brush", None)
+
+    def test_brush_uses_every_stroke(self):
+        pick = [
+            (2.0, [(0.0, 0.0), (10.0, 0.0)]),
+            (2.0, [(0.0, 20.0), (10.0, 20.0)]),
+        ]
+        assert lib.point_in_pick(5.0, 20.0, pick, "Brush", None)
+
+    def test_unknown_shape_raises(self):
+        with pytest.raises(ValueError):
+            lib.point_in_pick(0.0, 0.0, (0.0, 0.0), "Triangle", 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Brush strokes
+# ---------------------------------------------------------------------------
+
+
+def _brute_point_segment_distance(px, py, ax, ay, bx, by, n=20001):
+    """Smallest distance from a point to a densely sampled segment."""
+    t = np.linspace(0.0, 1.0, n)
+    xs = ax + t * (bx - ax)
+    ys = ay + t * (by - ay)
+    return np.min(np.hypot(xs - px, ys - py))
+
+
+class TestPointSegmentDistance:
+    @pytest.mark.parametrize(
+        "px, py",
+        [(5.0, 3.0), (-4.0, 2.0), (14.0, -1.0), (0.0, 0.0), (2.0, 0.0)],
+    )
+    def test_matches_brute_force(self, px, py):
+        seg = (0.0, 0.0, 10.0, 0.0)
+        got = np.sqrt(lib._point_segment_distance_sq(px, py, *seg))
+        assert got == pytest.approx(
+            _brute_point_segment_distance(px, py, *seg), abs=1e-3
+        )
+
+    def test_degenerate_segment_is_a_point(self):
+        d2 = lib._point_segment_distance_sq(3.0, 4.0, 0.0, 0.0, 0.0, 0.0)
+        assert np.sqrt(d2) == pytest.approx(5.0)
+
+
+class TestSegmentSegmentDistance:
+    def test_crossing_segments_are_zero(self):
+        d2 = lib._segment_segment_distance_sq(
+            0.0, 0.0, 10.0, 0.0, 5.0, -5.0, 5.0, 5.0
+        )
+        assert d2 == 0.0
+
+    def test_parallel_segments(self):
+        d2 = lib._segment_segment_distance_sq(
+            0.0, 0.0, 10.0, 0.0, 0.0, 3.0, 10.0, 3.0
+        )
+        assert np.sqrt(d2) == pytest.approx(3.0)
+
+    def test_matches_brute_force_for_disjoint_segments(self):
+        rng = np.random.default_rng(0)
+        for _ in range(30):
+            a = rng.uniform(-10, 10, 4)
+            b = rng.uniform(-10, 10, 4)
+            got = np.sqrt(lib._segment_segment_distance_sq(*a, *b))
+            t = np.linspace(0.0, 1.0, 400)
+            p = np.stack([a[0] + t * (a[2] - a[0]), a[1] + t * (a[3] - a[1])])
+            q = np.stack([b[0] + t * (b[2] - b[0]), b[1] + t * (b[3] - b[1])])
+            brute = np.min(
+                np.hypot(
+                    p[0][:, None] - q[0][None, :],
+                    p[1][:, None] - q[1][None, :],
+                )
+            )
+            assert got <= brute + 1e-6
+
+
+class TestBrushStroke:
+    STROKE = (2.0, [(0.0, 0.0), (10.0, 0.0)])  # width 2 -> r = 1
+
+    def _inside(self, x, y, stroke=None):
+        width, X, Y = lib.brush_stroke_arrays(stroke or self.STROKE)
+        return lib.check_if_in_brush_stroke(
+            np.atleast_1d(np.asarray(x, dtype=float)),
+            np.atleast_1d(np.asarray(y, dtype=float)),
+            X,
+            Y,
+            width / 2,
+        )
+
+    def test_along_the_path(self):
+        assert self._inside(5.0, 0.9)[0]
+        assert not self._inside(5.0, 1.1)[0]
+
+    def test_round_caps_reach_past_the_ends(self):
+        # a round-capped pen paints half a disk beyond each end
+        assert self._inside(-0.5, 0.0)[0]
+        assert not self._inside(-1.5, 0.0)[0]
+        assert self._inside(10.5, 0.0)[0]
+        assert not self._inside(11.5, 0.0)[0]
+
+    def test_corner_is_covered_on_both_sides(self):
+        stroke = (2.0, [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)])
+        assert self._inside(10.7, 0.7, stroke)[0]  # outside of the corner
+        assert self._inside(9.5, 0.5, stroke)[0]  # inside of the corner
+
+    def test_single_point_path_is_a_disk(self):
+        dot = (2.0, [(3.0, 3.0)])
+        assert self._inside(3.9, 3.0, dot)[0]
+        assert not self._inside(4.1, 3.0, dot)[0]
+
+    def test_locs_in_brush_unions_the_strokes(self):
+        locs = pd.DataFrame({"x": [5.0, 5.0, 50.0], "y": [0.0, 20.0, 50.0]})
+        pick = [self.STROKE, (2.0, [(0.0, 20.0), (10.0, 20.0)])]
+        assert len(lib.locs_in_brush(locs, pick)) == 2
+
+    def test_locs_in_brush_on_an_empty_pick(self):
+        locs = pd.DataFrame({"x": [5.0], "y": [0.0]})
+        assert len(lib.locs_in_brush(locs, [])) == 0
+
+
+class TestBrushStrokesOverlap:
+    def _ov(self, a, b):
+        wa, Xa, Ya = lib.brush_stroke_arrays(a)
+        wb, Xb, Yb = lib.brush_stroke_arrays(b)
+        return lib.brush_strokes_overlap(Xa, Ya, Xb, Yb, (wa + wb) / 2)
+
+    BASE = (2.0, [(0.0, 0.0), (10.0, 0.0)])
+
+    def test_touching_strokes_overlap(self):
+        # gap of 1.5 between the paths, radii sum to 2
+        assert self._ov(self.BASE, (2.0, [(5.0, 1.5), (5.0, 10.0)]))
+
+    def test_strokes_just_out_of_reach_do_not(self):
+        assert not self._ov(self.BASE, (2.0, [(5.0, 2.5), (5.0, 10.0)]))
+
+    def test_crossing_strokes_overlap(self):
+        assert self._ov(self.BASE, (0.1, [(5.0, -5.0), (5.0, 5.0)]))
+
+    def test_far_apart_strokes_do_not(self):
+        # the bounding-box short circuit
+        assert not self._ov(self.BASE, (2.0, [(50.0, 50.0), (60.0, 60.0)]))
+
+    def test_dots_overlap_by_their_radii(self):
+        assert self._ov((2.0, [(0.0, 0.0)]), (2.0, [(1.9, 0.0)]))
+        assert not self._ov((2.0, [(0.0, 0.0)]), (2.0, [(2.1, 0.0)]))
+
+
+class TestMergeBrushStrokes:
+    A = (2.0, [(0.0, 0.0), (10.0, 0.0)])
+    B = (2.0, [(0.0, 20.0), (10.0, 20.0)])
+
+    def test_disjoint_strokes_stay_separate(self):
+        assert len(lib.merge_brush_strokes([self.A, self.B])) == 2
+
+    def test_overlapping_strokes_merge(self):
+        near = (2.0, [(0.0, 1.0), (10.0, 1.0)])
+        picks = lib.merge_brush_strokes([self.A, near])
+        assert len(picks) == 1
+        assert len(picks[0]) == 2
+
+    def test_a_bridge_merges_both_picks(self):
+        bridge = (2.0, [(5.0, 0.0), (5.0, 20.0)])
+        picks = lib.merge_brush_strokes([self.A, self.B, bridge])
+        assert len(picks) == 1
+        assert len(picks[0]) == 3
+
+    def test_the_newest_stroke_is_last(self):
+        # what makes "remove the last stroke" well defined
+        bridge = (2.0, [(5.0, 0.0), (5.0, 20.0)])
+        for strokes in ([self.A, self.B], [self.A, self.B, bridge]):
+            picks = lib.merge_brush_strokes(strokes)
+            assert picks[-1][-1] is strokes[-1]
+
+    def test_dropping_the_bridge_splits_the_pick_again(self):
+        bridge = (2.0, [(5.0, 0.0), (5.0, 20.0)])
+        merged = lib.merge_brush_strokes([self.A, self.B, bridge])[0]
+        assert len(lib.merge_brush_strokes(merged[:-1])) == 2
+
+    def test_empty_input(self):
+        assert lib.merge_brush_strokes([]) == []
+
+    def test_accepts_lists_as_loaded_from_yaml(self):
+        loaded = [[2.0, [[0.0, 0.0], [10.0, 0.0]]]]
+        assert len(lib.merge_brush_strokes(loaded)) == 1
+
+
+class TestBrushBoundsAndAreas:
+    def test_bounds_expand_by_each_stroke_radius(self):
+        pick = [(2.0, [(0.0, 0.0), (10.0, 0.0)])]
+        assert lib.pick_bounds(pick, "Brush", None) == pytest.approx(
+            (-1.0, 11.0, -1.0, 1.0)
+        )
+
+    def test_bounds_span_all_strokes(self):
+        pick = [
+            (2.0, [(0.0, 0.0), (10.0, 0.0)]),
+            (4.0, [(0.0, 20.0), (10.0, 20.0)]),
+        ]
+        x_min, x_max, y_min, y_max = lib.pick_bounds(pick, "Brush", None)
+        assert (y_min, y_max) == pytest.approx((-1.0, 22.0))
+        assert (x_min, x_max) == pytest.approx((-2.0, 12.0))
+
+    def test_empty_pick_raises(self):
+        with pytest.raises(ValueError):
+            lib.pick_bounds([], "Brush", None)
+
+    def test_area_of_a_straight_stroke(self):
+        # a swept disk: 2 r L for the body plus a full disk of caps
+        r, length = 1.0, 10.0
+        pick = [(2 * r, [(0.0, 0.0), (length, 0.0)])]
+        area = lib.pick_areas([pick], "Brush", None)[0]
+        assert area == pytest.approx(2 * r * length + np.pi * r**2, rel=0.02)
+
+    def test_overlap_is_not_counted_twice(self):
+        # the same path walked out and back must not double the area
+        r, length = 1.0, 10.0
+        there = [(2 * r, [(0.0, 0.0), (length, 0.0)])]
+        and_back = [(2 * r, [(0.0, 0.0), (length, 0.0), (0.0, 0.0)])]
+        assert lib.pick_areas([and_back], "Brush", None)[0] == pytest.approx(
+            lib.pick_areas([there], "Brush", None)[0]
+        )
+
+    def test_area_of_an_empty_pick_is_zero(self):
+        assert lib.pick_areas([[]], "Brush", None)[0] == 0.0
 
 
 # ---------------------------------------------------------------------------

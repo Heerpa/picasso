@@ -358,7 +358,9 @@ def _spline_channel_jacobians(
     if stored is not None and len(stored) == n_channels:
         for c, t in enumerate(stored):
             transform = _tf.from_dict(t)
-            if transform.model != "affine":
+            # A translation is an AffineTransform too, and its Jacobian is
+            # the identity everywhere - both have one constant value.
+            if not isinstance(transform, _tf.AffineTransform):
                 raise ValueError(
                     "This calibration registers its channels with a "
                     f"{transform.model} transform, whose local Jacobian "

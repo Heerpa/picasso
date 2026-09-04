@@ -30,6 +30,7 @@ from scipy.optimize import curve_fit
 from scipy.stats import norm
 
 from .. import io, lib, simulate, __version__
+from .app import run_gui
 
 
 def fitFuncBg(x: lib.FloatArray2D, a: float, b: float) -> lib.FloatArray1D:
@@ -2615,26 +2616,9 @@ class CalibrationDialog(lib.Dialog):
         )
 
 
-def main():
-
-    app = QtWidgets.QApplication(sys.argv)
-    window = Window()
-
-    # load plugins from ~/.picasso/plugins
-    from .plugins_loader import load_plugins, add_plugins_menu_actions
-
-    load_plugins(window, "simulate")
-    add_plugins_menu_actions(window, "simulate")
-
-    window.show()
-
-    from ..updater import setup_gui_update_check
-
-    setup_gui_update_check(window)
-
-    lib.install_excepthook(window)
-
-    sys.exit(app.exec())
+def main() -> None:
+    """Start Picasso: Simulate - see ``picasso.gui.app.run_gui``."""
+    sys.exit(run_gui(Window, "simulate"))
 
 
 if __name__ == "__main__":

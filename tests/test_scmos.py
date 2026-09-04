@@ -27,6 +27,7 @@ import os
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from picasso import scmos
 
@@ -190,6 +191,57 @@ class TestGain:
         assert calib["Gain fallback pixels"] == 0
         assert 1.5 < calib["Gain median (ADU/e-)"] < 3.5
 
+    def test_records_the_response_of_every_level(self, calibration):
+        """The per-level medians the linearity panel is drawn from: one entry
+        per movie, in the order given, rising with the illumination."""
+        _, calib = calibration
+        signal = calib["Level median signal (ADU)"]
+        variance = calib["Level median variance (ADU^2)"]
+        assert len(signal) == len(variance) == 15
+        assert calib["Level frames"] == [4_000] * 15
+        assert np.all(np.diff(signal) > 0)
+        assert np.all(np.diff(variance) > 0)
+        # The series spans 20-200 photons, so the last level reads about ten
+        # times the first, whatever the gain.
+        assert signal[-1] / signal[0] == pytest.approx(10.0, rel=0.05)
+        # Signal and excess variance both scale with the photon count, so
+        # their ratio is the gain.
+        ratio = np.asarray(variance) / np.asarray(signal)
+        assert np.allclose(ratio, calib["Gain median (ADU/e-)"], rtol=0.1)
+
+    def test_records_the_illumination_when_it_is_given(
+        self, scmos_maps_factory, dark_movie_factory
+    ):
+        """Unevenly spaced levels, which is what the plot needs them for."""
+        maps = scmos_maps_factory(height=8, width=8, seed=61)
+        dark = dark_movie_factory(maps, 2_000, seed=62)
+        powers = [0.1, 1.0, 5.0, 10.0]
+        bright = [
+            dark_movie_factory(maps, 1_000, photons=20 * p, seed=70 + k)
+            for k, p in enumerate(powers)
+        ]
+        calib = scmos.calibrate_scmos(
+            dark, bright, bright_levels=powers, level_unit="mW"
+        )
+        assert calib["Level illumination"] == powers
+        assert calib["Level unit"] == "mW"
+        # The signal follows the power, not the level index.
+        signal = np.asarray(calib["Level median signal (ADU)"])
+        assert signal[3] / signal[1] == pytest.approx(10.0, rel=0.05)
+
+    def test_illumination_defaults_to_unknown(self, calibration):
+        _, calib = calibration
+        assert calib["Level illumination"] == []
+        assert calib["Level unit"] == ""
+
+    def test_one_illumination_per_bright_movie(
+        self, scmos_maps, dark_movie_factory
+    ):
+        dark = dark_movie_factory(scmos_maps, 200, seed=63)
+        bright = [dark_movie_factory(scmos_maps, 100, photons=50, seed=64)]
+        with pytest.raises(ValueError, match="one level per movie"):
+            scmos.calibrate_scmos(dark, bright, bright_levels=[1.0, 2.0])
+
     def test_falls_back_for_an_unresponsive_pixel(
         self, scmos_maps_factory, dark_movie_factory
     ):
@@ -340,3 +392,64 @@ class TestCalibrationPlot:
         path = str(tmp_path / "real_maps.png")
         scmos.save_calibration_plot(calib, path)
         assert os.path.getsize(path) > 0
+
+    def test_plots_against_the_illumination_when_it_is_known(self, tmp_path):
+        """An unevenly spaced series must still be plottable, both with the
+        illumination recorded and without it."""
+        rng = np.random.default_rng(3)
+        base = dict(
+            self._calibration(rng),
+            **{
+                "Level median signal (ADU)": [4.2, 41.5, 207.3, 414.1],
+                "Level median variance (ADU^2)": [8.7, 86.5, 432.0, 863.0],
+                "Level frames": [1000] * 4,
+            },
+        )
+        with_power = dict(
+            base,
+            **{
+                "Level illumination": [0.1, 1.0, 5.0, 10.0],
+                "Level unit": "mW",
+            },
+        )
+        for name, calibration in (
+            ("power", with_power),
+            ("nopower", base),
+        ):
+            path = str(tmp_path / f"{name}_maps.png")
+            scmos.save_calibration_plot(calibration, path)
+            assert os.path.getsize(path) > 0
+
+    def test_the_level_row_only_appears_with_a_bright_series(self, tmp_path):
+        """The linearity row is worth a taller figure only when there is a
+        series to draw on it."""
+        rng = np.random.default_rng(2)
+        bare = self._calibration(rng)
+        with_levels = dict(
+            bare,
+            **{
+                "Level median signal (ADU)": [40.0, 120.0, 200.0],
+                "Level median variance (ADU^2)": [85.0, 255.0, 425.0],
+                "Level frames": [1000, 1000, 1000],
+            },
+        )
+        one_level = dict(
+            bare,
+            **{
+                "Level median signal (ADU)": [40.0],
+                "Level median variance (ADU^2)": [85.0],
+                "Level frames": [1000],
+            },
+        )
+        sizes = {}
+        for name, calibration in (
+            ("bare", bare),
+            ("one", one_level),
+            ("levels", with_levels),
+        ):
+            path = str(tmp_path / f"{name}_maps.png")
+            scmos.save_calibration_plot(calibration, path)
+            with Image.open(path) as image:
+                sizes[name] = image.size
+        assert sizes["one"] == sizes["bare"]
+        assert sizes["levels"][1] > sizes["bare"][1]

@@ -19,6 +19,32 @@ import pandas as pd
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .. import io, lib, average, render, __version__
+from .app import run_gui
+
+
+class PoolWorker(QtCore.QThread):
+    """Worker thread starting the pool of averaging processes.
+
+    Starting the processes takes several seconds, so it is done in the
+    background, right after a file has been loaded. The pool is then
+    reused by every averaging run on that file.
+
+    Attributes
+    ----------
+    locs : pd.DataFrame
+        Localizations with group indices (``group`` column).
+    pool : average.AveragePool
+        The pool that was started, available once the thread finished.
+    """
+
+    def __init__(self, locs: pd.DataFrame) -> None:
+        super().__init__()
+        self.locs = locs
+        self.pool = None
+
+    def run(self) -> None:
+        """Start the pool of worker processes."""
+        self.pool = average.AveragePool(self.locs)
 
 
 class Worker(QtCore.QThread):
@@ -36,6 +62,9 @@ class Worker(QtCore.QThread):
         Localizations with group indices (``group`` column).
     display_px_size : float
         Display pixel size in nm used in averaging.
+    pool : average.AveragePool or None
+        Pool of worker processes to average with. If None, a pool is
+        started and shut down by the averaging function itself.
     """
 
     progressMade = QtCore.pyqtSignal(int, int, pd.DataFrame, bool, int, int)
@@ -47,12 +76,14 @@ class Worker(QtCore.QThread):
         info: list[dict],
         display_px_size: float,
         iterations: int,
+        pool: average.AveragePool | None = None,
     ) -> None:
         super().__init__()
         self.locs = locs.copy()
         self.info = info
         self.display_px_size = display_px_size
         self.iterations = iterations
+        self.pool = pool
         self.was_aborted = False
 
     def on_progress(
@@ -86,6 +117,7 @@ class Worker(QtCore.QThread):
             iterations=self.iterations,
             progress_callback=self.on_progress,
             abort_callback=self.isInterruptionRequested,
+            pool=self.pool,
         )
         if result is None:
             self.was_aborted = True
@@ -171,6 +203,11 @@ class View(QtWidgets.QLabel):
         Flag indicating whether the averaging process is running.
     thread : Worker
         Worker thread for performing the averaging.
+    pool : average.AveragePool or None
+        Pool of worker processes, started once per loaded file and
+        reused by every averaging run.
+    pool_thread : PoolWorker or None
+        Worker thread starting the pool in the background.
     window : QtWidgets.QMainWindow
         Main window instance.
     """
@@ -184,6 +221,8 @@ class View(QtWidgets.QLabel):
         self._pixmap = None
         self.running = False
         self.thread = None
+        self.pool = None
+        self.pool_thread = None
         self.avg_history = []
 
     def average(self):
@@ -201,6 +240,7 @@ class View(QtWidgets.QLabel):
                 self.info,
                 display_px_size,
                 iterations,
+                self.wait_for_pool(),
             )
             self.thread.progressMade.connect(self.on_progress)
             self.thread.aborted.connect(self.on_aborted)
@@ -257,6 +297,10 @@ class View(QtWidgets.QLabel):
             self.window.statusBar().showMessage("Done!")
         self.running = False
         self.window.abort_action.setEnabled(False)
+        if self.pool is not None and self.pool.closed:
+            # aborting terminates the pool, so start a new one
+            self.pool = None
+            self.start_pool()
 
     def on_aborted(self) -> None:
         """Handle abortion of the averaging thread."""
@@ -320,8 +364,44 @@ class View(QtWidgets.QLabel):
         )
         self.window.parameters_dialog.on_disp_px_size_changed()
         self.update_image()
+        self.start_pool()
 
         self.window.statusBar().showMessage("Ready for processing!")
+
+    def start_pool(self) -> None:
+        """Start the pool of averaging processes in the background.
+
+        Any pool that is still around (e.g., from a previously loaded
+        file) is shut down first.
+        """
+        self.shutdown_pool()
+        self.pool_thread = PoolWorker(self.locs)
+        self.pool_thread.start()
+
+    def wait_for_pool(self) -> average.AveragePool | None:
+        """Return the pool of averaging processes, waiting for it to be
+        started if necessary.
+
+        Returns
+        -------
+        pool : average.AveragePool or None
+            The pool to average with, None if none was started.
+        """
+        if self.pool_thread is not None:
+            self.pool_thread.wait()
+            self.pool = self.pool_thread.pool
+            self.pool_thread = None
+        return self.pool
+
+    def shutdown_pool(self) -> None:
+        """Shut down the pool of averaging processes, if there is one."""
+        if self.pool_thread is not None:
+            self.pool_thread.wait()
+            self.pool = self.pool_thread.pool
+            self.pool_thread = None
+        if self.pool is not None:
+            self.pool.terminate()
+            self.pool = None
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         """Rescale the displayed image to the new widget size.
@@ -486,6 +566,17 @@ class Window(QtWidgets.QMainWindow):
         self.abort_action.setEnabled(False)
         self.plugin_menu = menu_bar.addMenu("Plugins")  # do not delete
 
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        """Shut down the averaging processes before closing.
+
+        Parameters
+        ----------
+        event : QtGui.QCloseEvent
+            The Qt close event.
+        """
+        self.view.shutdown_pool()
+        super().closeEvent(event)
+
     def show_metadata(self) -> None:
         """Open the metadata dialog."""
         if not hasattr(self.view, "info"):
@@ -521,25 +612,8 @@ class Window(QtWidgets.QMainWindow):
 
 
 def main() -> None:
-    """Start Picasso: Average, load its plugins and run the Qt event loop."""
-    app = QtWidgets.QApplication(sys.argv)
-    window = Window()
-
-    # load plugins from ~/.picasso/plugins
-    from .plugins_loader import load_plugins, add_plugins_menu_actions
-
-    load_plugins(window, "average")
-    add_plugins_menu_actions(window, "average")
-
-    window.show()
-
-    from ..updater import setup_gui_update_check
-
-    setup_gui_update_check(window)
-
-    lib.install_excepthook(window)
-
-    sys.exit(app.exec())
+    """Start Picasso: Average - see ``picasso.gui.app.run_gui``."""
+    sys.exit(run_gui(Window, "average"))
 
 
 if __name__ == "__main__":

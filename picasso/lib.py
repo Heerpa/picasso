@@ -14,7 +14,9 @@ import glob
 import collections
 import colorsys
 import importlib
+import multiprocessing
 import os
+import sys
 import warnings
 from copy import deepcopy
 from typing import Any, TypeAlias, Literal, TYPE_CHECKING
@@ -46,6 +48,17 @@ SOUND_NOTIFICATION_DURATION = 60  # seconds
 
 # Columns that are required for Picasso
 REQUIRED_COLUMNS = ["frame", "x", "y", "z", "lpx", "lpy", "lpz"]
+
+#: Shapes that a pick region can take. "Circle" and "Square" are placed
+#: by a single click and share one global size; "Rectangle" is an
+#: oriented band of a global width drawn along its center axis;
+#: "Polygon", "Box" and "Brush" carry their own extent and have no
+#: global size.
+PICK_SHAPES = ("Circle", "Rectangle", "Polygon", "Square", "Box", "Brush")
+
+#: Pick shapes whose extent is defined per pick rather than by a single
+#: global size, i.e., those for which ``pick_size`` is None.
+PICK_SHAPES_WITHOUT_SIZE = ("Polygon", "Box", "Brush")
 
 # Type alias
 IntArray1D: TypeAlias = np.ndarray[tuple[int], np.dtype[np.integer[Any]]]
@@ -100,6 +113,7 @@ _QT_NAMES = (
     "ScrollableGroupBox",
     "LogDoubleSpinBox",
     "RangeSlider",
+    "DensityContrastSlider",
     "GenericPlotWindow",
     "RemoveColumnsDialog",
     "HelpButton",
@@ -118,6 +132,32 @@ def __getattr__(name: str) -> Any:
         globals()[name] = value  # cache for subsequent lookups
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+#: Maximum number of workers on Windows, where ``WaitForMultipleObjects``
+#: cannot wait on more than 64 handles at once and Python crashes above it.
+WINDOWS_MAX_WORKERS = 61
+
+
+def n_workers(cpu_utilization: float = 0.75) -> int:
+    """Number of workers (processes or threads) to use for parallel
+    computation.
+
+    Parameters
+    ----------
+    cpu_utilization : float, optional
+        Fraction of the available CPUs to use. Default 0.75.
+
+    Returns
+    -------
+    n_workers : int
+        ``cpu_utilization`` times the CPU count, at least 1 and, on
+        Windows only, at most ``WINDOWS_MAX_WORKERS``.
+    """
+    n = max(1, int(cpu_utilization * multiprocessing.cpu_count()))
+    if sys.platform == "win32":
+        n = min(WINDOWS_MAX_WORKERS, n)
+    return n
 
 
 def normalize_frame_bounds(frame_bounds, n_frames):
@@ -720,6 +760,9 @@ def overwrite_metadata(
     """Overwrite a value in the localization metadata (list of
     dictionaries or a dictionary). If the key does not exist an error
     is raised.
+
+    Only the memory copy of the data is modified, the disk storage stays
+    untouched.
 
     Parameters
     ----------
@@ -1647,6 +1690,71 @@ def locs_in_square_numba(
 
 
 @numba.jit(nopython=True, nogil=True, cache=True)
+def is_loc_in_box_numba(
+    x: float,
+    y: float,
+    locs_xy: FloatArray2D,
+    w: float,
+    h: float,
+) -> BoolArray1D:
+    """Check which localizations are within the axis-aligned box of
+    width ``w`` and height ``h`` centered at ``(x, y)``.
+
+    Generalization of ``is_loc_in_square_numba`` to independent side
+    lengths. The bounds are exclusive, matching
+    ``postprocess._picked_box_locs``.
+
+    Parameters
+    ----------
+    x, y : float
+        Center of the box.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+    w, h : float
+        Width (x) and height (y) of the box.
+
+    Returns
+    -------
+    is_picked : BoolArray1D
+        True if a localization is within the box.
+    """
+    dx = np.abs(locs_xy[0] - x)
+    dy = np.abs(locs_xy[1] - y)
+    is_picked = (dx < 0.5 * w) & (dy < 0.5 * h)
+    return is_picked
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def locs_in_box_numba(
+    x: float,
+    y: float,
+    locs_xy: FloatArray2D,
+    w: float,
+    h: float,
+) -> FloatArray2D:
+    """Return localizations within the axis-aligned box of width ``w``
+    and height ``h`` centered at ``(x, y)``.
+
+    Parameters
+    ----------
+    x, y : float
+        Center of the box.
+    locs_xy : FloatArray2D
+        Localization coordinates, shape ``(2, N)``.
+    w, h : float
+        Width (x) and height (y) of the box.
+
+    Returns
+    -------
+    picked_xy : FloatArray2D
+        ``(2, n_picked)`` coordinates inside the box. See
+        ``is_loc_in_box_numba``.
+    """
+    is_picked = is_loc_in_box_numba(x, y, locs_xy, w, h)
+    return locs_xy[:, is_picked]
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
 def is_loc_in_rectangle_numba(
     xc: float,
     yc: float,
@@ -1944,6 +2052,327 @@ def locs_in_polygon(
     return locs[is_in_polygon]
 
 
+@numba.jit(nopython=True, nogil=True, cache=True)
+def _point_segment_distance_sq(
+    px: float,
+    py: float,
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+) -> float:
+    """Return the squared distance from the point ``(px, py)`` to the
+    segment ``(ax, ay)-(bx, by)``.
+
+    The primitive underlying every brush stroke test. A degenerate
+    segment (both ends equal) reduces to the point-to-point distance.
+
+    Parameters
+    ----------
+    px, py : float
+        The point.
+    ax, ay : float
+        One end of the segment.
+    bx, by : float
+        The other end of the segment.
+
+    Returns
+    -------
+    distance_sq : float
+        Squared distance from the point to the segment.
+    """
+    dx = bx - ax
+    dy = by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq == 0.0:  # degenerate segment, i.e., a single point
+        t = 0.0
+    else:
+        # projection of the point onto the segment, clamped to its ends
+        t = ((px - ax) * dx + (py - ay) * dy) / length_sq
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+    ex = px - (ax + t * dx)
+    ey = py - (ay + t * dy)
+    return ex * ex + ey * ey
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def _segment_segment_distance_sq(
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+    cx: float,
+    cy: float,
+    dx_: float,
+    dy_: float,
+) -> float:
+    """Return the squared distance between the segments
+    ``(ax, ay)-(bx, by)`` and ``(cx, cy)-(dx_, dy_)``.
+
+    Zero if the segments intersect; otherwise the smallest of the four
+    endpoint-to-segment distances, since the closest pair of points on
+    two disjoint segments always involves at least one endpoint.
+
+    Parameters
+    ----------
+    ax, ay, bx, by : float
+        Ends of the first segment.
+    cx, cy, dx_, dy_ : float
+        Ends of the second segment.
+
+    Returns
+    -------
+    distance_sq : float
+        Squared distance between the two segments.
+    """
+    # orientation of each endpoint with respect to the other segment
+    r_x = bx - ax
+    r_y = by - ay
+    s_x = dx_ - cx
+    s_y = dy_ - cy
+    denom = r_x * s_y - r_y * s_x
+    if denom != 0.0:
+        t = ((cx - ax) * s_y - (cy - ay) * s_x) / denom
+        u = ((cx - ax) * r_y - (cy - ay) * r_x) / denom
+        if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0:
+            return 0.0  # the segments cross
+    best = _point_segment_distance_sq(ax, ay, cx, cy, dx_, dy_)
+    d = _point_segment_distance_sq(bx, by, cx, cy, dx_, dy_)
+    if d < best:
+        best = d
+    d = _point_segment_distance_sq(cx, cy, ax, ay, bx, by)
+    if d < best:
+        best = d
+    d = _point_segment_distance_sq(dx_, dy_, ax, ay, bx, by)
+    if d < best:
+        best = d
+    return best
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def check_if_in_brush_stroke(
+    x: FloatArray1D,
+    y: FloatArray1D,
+    X: FloatArray1D,
+    Y: FloatArray1D,
+    r: float,
+) -> BoolArray1D:
+    """Check which points ``(x, y)`` lie within distance ``r`` of the
+    polyline ``(X, Y)``.
+
+    This is the region a round-capped, round-joined pen of width ``2r``
+    paints when swept along the polyline, so the test matches the drawn
+    stroke exactly. A one-point polyline is a disk of radius ``r``.
+
+    Parameters
+    ----------
+    x, y : FloatArray1D
+        x and y coordinates of the points to test.
+    X, Y : FloatArray1D
+        x and y coordinates of the polyline vertices, in drawing order.
+    r : float
+        Half the stroke width.
+
+    Returns
+    -------
+    is_in_stroke : BoolArray1D
+        Boolean array indicating which points are within ``r`` of the
+        polyline.
+    """
+    n_points = len(x)
+    n_vertices = len(X)
+    r2 = r * r
+    is_in_stroke = np.zeros(n_points, dtype=np.bool_)
+    for i in range(n_points):
+        if n_vertices == 1:  # a dot rather than a swept path
+            dx = x[i] - X[0]
+            dy = y[i] - Y[0]
+            is_in_stroke[i] = dx * dx + dy * dy <= r2
+            continue
+        for j in range(n_vertices - 1):
+            if (
+                _point_segment_distance_sq(
+                    x[i], y[i], X[j], Y[j], X[j + 1], Y[j + 1]
+                )
+                <= r2
+            ):
+                is_in_stroke[i] = True
+                break
+    return is_in_stroke
+
+
+@numba.jit(nopython=True, nogil=True, cache=True)
+def brush_strokes_overlap(
+    X1: FloatArray1D,
+    Y1: FloatArray1D,
+    X2: FloatArray1D,
+    Y2: FloatArray1D,
+    max_dist: float,
+) -> bool:
+    """Check whether two brush strokes paint overlapping regions.
+
+    The painted regions touch exactly when the two polylines come within
+    ``max_dist`` of each other, i.e., within the sum of their radii.
+
+    Parameters
+    ----------
+    X1, Y1 : FloatArray1D
+        Vertices of the first polyline.
+    X2, Y2 : FloatArray1D
+        Vertices of the second polyline.
+    max_dist : float
+        Sum of the two strokes' radii, i.e., half the sum of their
+        widths.
+
+    Returns
+    -------
+    overlap : bool
+        True if the painted regions overlap.
+    """
+    # bounding boxes expanded by max_dist cannot miss an overlap
+    if (
+        np.min(X1) - max_dist > np.max(X2)
+        or np.max(X1) + max_dist < np.min(X2)
+        or np.min(Y1) - max_dist > np.max(Y2)
+        or np.max(Y1) + max_dist < np.min(Y2)
+    ):
+        return False
+
+    max_dist_sq = max_dist * max_dist
+    n1 = len(X1)
+    n2 = len(X2)
+    for i in range(max(n1 - 1, 1)):
+        # a one-vertex polyline is treated as a degenerate segment
+        i_next = i + 1 if n1 > 1 else i
+        for j in range(max(n2 - 1, 1)):
+            j_next = j + 1 if n2 > 1 else j
+            if (
+                _segment_segment_distance_sq(
+                    X1[i],
+                    Y1[i],
+                    X1[i_next],
+                    Y1[i_next],
+                    X2[j],
+                    Y2[j],
+                    X2[j_next],
+                    Y2[j_next],
+                )
+                <= max_dist_sq
+            ):
+                return True
+    return False
+
+
+def brush_stroke_arrays(
+    stroke: tuple[float, list[tuple[float, float]]],
+) -> tuple[float, FloatArray1D, FloatArray1D]:
+    """Split a brush stroke into its width and its path arrays.
+
+    A brush stroke is stored as ``(width, path)``, where ``path`` is the
+    list of ``(x, y)`` positions the cursor swept, in camera pixels.
+    Loading a picks file yields lists rather than tuples, so the stroke
+    is indexed rather than unpacked.
+
+    Parameters
+    ----------
+    stroke : tuple
+        One brush stroke, ``(width, path)``.
+
+    Returns
+    -------
+    width : float
+        Width of the stroke in camera pixels.
+    X, Y : FloatArray1D
+        x and y coordinates of the path.
+    """
+    path = np.asarray(stroke[1], dtype=np.float64)
+    return float(stroke[0]), path[:, 0], path[:, 1]
+
+
+def locs_in_brush(
+    locs: pd.DataFrame,
+    pick: list[tuple[float, list[tuple[float, float]]]],
+) -> pd.DataFrame:
+    """Return localizations painted by any stroke of a brush pick.
+
+    Parameters
+    ----------
+    locs : pd.DataFrame
+        Localizations.
+    pick : list of tuples
+        One brush pick, i.e., a list of ``(width, path)`` strokes.
+
+    Returns
+    -------
+    picked_locs : pd.DataFrame
+        Localizations within the painted region.
+    """
+    if not len(pick):
+        return locs.iloc[:0]
+    x = locs["x"].to_numpy()
+    y = locs["y"].to_numpy()
+    is_picked = np.zeros(len(locs), dtype=np.bool_)
+    for stroke in pick:
+        width, X, Y = brush_stroke_arrays(stroke)
+        is_picked |= check_if_in_brush_stroke(x, y, X, Y, width / 2)
+    return locs[is_picked]
+
+
+def merge_brush_strokes(
+    strokes: list[tuple[float, list[tuple[float, float]]]],
+) -> list[list[tuple[float, list[tuple[float, float]]]]]:
+    """Group brush strokes into picks, merging those that overlap.
+
+    Strokes whose painted regions touch belong to the same region of
+    interest, and merging is transitive: a stroke bridging two picks
+    joins all three into one. Picks are returned in the order of their
+    newest stroke, so the stroke drawn last always ends up as
+    ``picks[-1][-1]`` - which is what makes "remove the last stroke"
+    well defined after adding, undoing or loading alike.
+
+    Parameters
+    ----------
+    strokes : list of tuples
+        Brush strokes, ``(width, path)``, in drawing order.
+
+    Returns
+    -------
+    picks : list of lists
+        Brush picks, each a list of strokes in drawing order.
+    """
+    picks = []
+    pick_arrays = []  # (width, X, Y) per stroke, cached per pick
+    for stroke in strokes:
+        width, X, Y = brush_stroke_arrays(stroke)
+        merged_strokes = []
+        merged_arrays = []
+        kept_picks = []
+        kept_arrays = []
+        for pick, arrays in zip(picks, pick_arrays):
+            overlaps = False
+            for width_, X_, Y_ in arrays:
+                if brush_strokes_overlap(X, Y, X_, Y_, (width + width_) / 2):
+                    overlaps = True
+                    break
+            if overlaps:
+                merged_strokes.extend(pick)
+                merged_arrays.extend(arrays)
+            else:
+                kept_picks.append(pick)
+                kept_arrays.append(arrays)
+        # the new stroke goes last, so it stays the newest one
+        merged_strokes.append(stroke)
+        merged_arrays.append((width, X, Y))
+        kept_picks.append(merged_strokes)
+        kept_arrays.append(merged_arrays)
+        picks = kept_picks
+        pick_arrays = kept_arrays
+    return picks
+
+
 @numba.jit(nopython=True)
 def check_if_in_rectangle(
     x: FloatArray1D,
@@ -2227,6 +2656,37 @@ def get_pick_rectangle_corners(
     return corners
 
 
+def get_pick_box_corners(
+    pick: tuple[tuple[float, float], tuple[float, float]],
+) -> tuple[list[float], list[float]]:
+    """Find the positions of corners of a box pick.
+
+    A box pick is defined by two opposite corners:
+        ``((x0, y0), (x1, y1))``
+    (all values in camera pixels). The corners are returned in the same
+    order as ``get_pick_rectangle_corners``, i.e., counter-clockwise
+    starting from the corner with the smaller x and y.
+
+    Parameters
+    ----------
+    pick : tuple of tuples
+        The two opposite corners of the box.
+
+    Returns
+    -------
+    corners : tuple
+        Contains corners' x and y coordinates in two lists.
+    """
+    (x0, y0), (x1, y1) = pick
+    x_min, x_max = (x0, x1) if x0 <= x1 else (x1, x0)
+    y_min, y_max = (y0, y1) if y0 <= y1 else (y1, y0)
+    corners = (
+        [x_min, x_max, x_max, x_min],
+        [y_min, y_min, y_max, y_max],
+    )
+    return corners
+
+
 def polygon_area(X: FloatArray1D, Y: FloatArray1D) -> float:
     """Find the area of a polygon defined by corners X and Y.
 
@@ -2302,9 +2762,122 @@ def _pick_areas_rectangle(
     return areas
 
 
+def _pick_areas_box(
+    picks: list[tuple[tuple[float, float], tuple[float, float]]],
+) -> FloatArray1D:
+    """Return pick areas for each box pick in picks.
+
+    Parameters
+    ----------
+    picks : list of tuples
+        List of picks, each pick holds the two opposite corners of the
+        box.
+
+    Returns
+    -------
+    areas : FloatArray1D
+        Pick areas.
+    """
+    areas = np.zeros(len(picks))
+    for i, ((x0, y0), (x1, y1)) in enumerate(picks):
+        areas[i] = abs(x1 - x0) * abs(y1 - y0)
+    return areas
+
+
+def _pick_areas_brush(
+    picks: list[list[tuple[float, list[tuple[float, float]]]]],
+    max_cells: int = 1_000_000,
+) -> FloatArray1D:
+    """Return pick areas for each brush pick in picks.
+
+    The painted region is a union of round-capped strokes that overlap
+    by construction - merging two picks means their strokes touch - so
+    the analytic ``2 r L + pi r**2`` of a single stroke would
+    double-count. The region is rasterized instead, as ``masking`` does
+    for image-based regions.
+
+    Parameters
+    ----------
+    picks : list of lists
+        Brush picks, each a list of ``(width, path)`` strokes.
+    max_cells : int, optional
+        Upper bound on the number of grid cells per pick, which caps the
+        cost for a large region drawn with a thin brush. Default is
+        1,000,000.
+
+    Returns
+    -------
+    areas : FloatArray1D
+        Pick areas, accurate to about 1%.
+    """
+    areas = np.zeros(len(picks))
+    for i, pick in enumerate(picks):
+        if not len(pick):
+            continue
+        x_min, x_max, y_min, y_max = _brush_bounds(pick)
+        r_min = min(float(stroke[0]) for stroke in pick) / 2
+        # resolve the thinnest stroke, but keep the grid bounded
+        step = max(
+            r_min / 4,
+            np.sqrt((x_max - x_min) * (y_max - y_min) / max_cells),
+        )
+        grid_x = np.arange(x_min + step / 2, x_max, step)
+        grid_y = np.arange(y_min + step / 2, y_max, step)
+        if not len(grid_x) or not len(grid_y):
+            continue
+        mesh_x, mesh_y = np.meshgrid(grid_x, grid_y)
+        mesh_x = mesh_x.ravel()
+        mesh_y = mesh_y.ravel()
+        is_inside = np.zeros(len(mesh_x), dtype=np.bool_)
+        for stroke in pick:
+            width, X, Y = brush_stroke_arrays(stroke)
+            is_inside |= check_if_in_brush_stroke(
+                mesh_x, mesh_y, X, Y, width / 2
+            )
+        areas[i] = is_inside.sum() * step**2
+    return areas
+
+
+def _brush_bounds(
+    pick: list[tuple[float, list[tuple[float, float]]]],
+) -> tuple[float, float, float, float]:
+    """Return the bounding box of a brush pick, i.e., the union of its
+    strokes' paths, each expanded by its own radius.
+
+    Parameters
+    ----------
+    pick : list of tuples
+        One brush pick, i.e., a list of ``(width, path)`` strokes.
+
+    Returns
+    -------
+    bounds : tuple
+        ``(x_min, x_max, y_min, y_max)`` in camera pixels.
+
+    Raises
+    ------
+    ValueError
+        If the pick holds no strokes.
+    """
+    if not len(pick):
+        raise ValueError("Cannot bound an empty brush pick.")
+    x_min = y_min = np.inf
+    x_max = y_max = -np.inf
+    for stroke in pick:
+        width, X, Y = brush_stroke_arrays(stroke)
+        r = width / 2
+        x_min = min(x_min, X.min() - r)
+        x_max = max(x_max, X.max() + r)
+        y_min = min(y_min, Y.min() - r)
+        y_max = max(y_max, Y.max() + r)
+    return float(x_min), float(x_max), float(y_min), float(y_max)
+
+
 def pick_areas(
     picks: list[tuple],
-    pick_shape: Literal["Circle", "Rectangle", "Polygon", "Square"],
+    pick_shape: Literal[
+        "Circle", "Rectangle", "Polygon", "Square", "Box", "Brush"
+    ],
     pick_size: float | None,
 ) -> FloatArray1D:
     """Get pick areas for each pick in picks.
@@ -2313,12 +2886,12 @@ def pick_areas(
     ----------
     picks : list of tuples
         Coordinates of picks in camera pixels.
-    pick_shape : {"Circle", "Rectangle", "Polygon", "Square"}
+    pick_shape : {"Circle", "Rectangle", "Polygon", "Square", "Box", "Brush"}
         Shape of picks.
     pick_size : float or None
         Size of picks in camera pixels. For circles - diameters. For
-        rectangles - width. For squares - side length. For polygons -
-        ignored.
+        rectangles - width. For squares - side length. For polygons,
+        boxes and brush picks - ignored.
 
     Returns
     -------
@@ -2336,9 +2909,157 @@ def pick_areas(
     elif pick_shape == "Square":
         # same area for all picks
         areas = pick_size**2 * np.ones(len(picks))
+    elif pick_shape == "Box":
+        areas = _pick_areas_box(picks)
+    elif pick_shape == "Brush":
+        areas = _pick_areas_brush(picks)
     else:
         raise ValueError(f"Unknown pick shape: {pick_shape}")
     return areas
+
+
+def pick_bounds(
+    pick: tuple,
+    pick_shape: Literal[
+        "Circle", "Rectangle", "Polygon", "Square", "Box", "Brush"
+    ],
+    pick_size: float | None,
+) -> tuple[float, float, float, float]:
+    """Return the axis-aligned bounding box of a single pick.
+
+    Used wherever a pick has to be framed rather than tested against,
+    e.g., to build a viewport around it or to set plot limits.
+
+    Parameters
+    ----------
+    pick : tuple
+        Coordinates of one pick in camera pixels. Must match the format
+        of ``pick_shape``.
+    pick_shape : {"Circle", "Rectangle", "Polygon", "Square", "Box", "Brush"}
+        Shape of the pick.
+    pick_size : float or None
+        Size of the pick in camera pixels. For circles - diameter. For
+        rectangles - width. For squares - side length. For polygons,
+        boxes and brush picks - ignored.
+
+    Returns
+    -------
+    bounds : tuple
+        ``(x_min, x_max, y_min, y_max)`` in camera pixels. For an open
+        polygon (fewer than three vertices or not closed), the bounding
+        box of its vertices is returned; an empty polygon or brush pick
+        raises ``ValueError``.
+    """
+    if pick_shape in ("Circle", "Square"):
+        # a circle of diameter d and a square of side d have the same
+        # bounding box
+        half = pick_size / 2
+        x, y = pick
+        return x - half, x + half, y - half, y + half
+    elif pick_shape == "Rectangle":
+        (xs, ys), (xe, ye) = pick
+        X, Y = get_pick_rectangle_corners(xs, ys, xe, ye, pick_size)
+    elif pick_shape == "Polygon":
+        X, Y = get_pick_polygon_corners(pick)
+        if X is None:  # not closed yet, fall back to the drawn vertices
+            if not len(pick):
+                raise ValueError("Cannot bound an empty polygon pick.")
+            X = [_[0] for _ in pick]
+            Y = [_[1] for _ in pick]
+    elif pick_shape == "Box":
+        X, Y = get_pick_box_corners(pick)
+    elif pick_shape == "Brush":
+        # each stroke reaches half its own width beyond its path
+        return _brush_bounds(pick)
+    else:
+        raise ValueError(f"Unknown pick shape: {pick_shape}")
+    return min(X), max(X), min(Y), max(Y)
+
+
+def point_in_pick(
+    x: float,
+    y: float,
+    pick: tuple,
+    pick_shape: Literal[
+        "Circle", "Rectangle", "Polygon", "Square", "Box", "Brush"
+    ],
+    pick_size: float | None,
+) -> bool:
+    """Check whether the point ``(x, y)`` lies inside a single pick.
+
+    Parameters
+    ----------
+    x, y : float
+        Position to test, in camera pixels.
+    pick : tuple
+        Coordinates of one pick in camera pixels. Must match the format
+        of ``pick_shape``.
+    pick_shape : {"Circle", "Rectangle", "Polygon", "Square", "Box", "Brush"}
+        Shape of the pick.
+    pick_size : float or None
+        Size of the pick in camera pixels. For circles - diameter. For
+        rectangles - width. For squares - side length. For polygons,
+        boxes and brush picks - ignored.
+
+    Returns
+    -------
+    is_inside : bool
+        True if the point is inside the pick. An open polygon (fewer
+        than three vertices or not closed) never contains a point.
+    """
+    point_xy = np.array([[float(x)], [float(y)]])
+    if pick_shape == "Circle":
+        r = pick_size / 2
+        return bool((x - pick[0]) ** 2 + (y - pick[1]) ** 2 < r**2)
+    elif pick_shape == "Square":
+        return bool(
+            is_loc_in_square_numba(pick[0], pick[1], point_xy, pick_size)[0]
+        )
+    elif pick_shape == "Rectangle":
+        (xs, ys), (xe, ye) = pick
+        # the oriented test rotates the point into the rectangle's
+        # frame, which - unlike ray casting over the corners - is well
+        # defined for axis-aligned rectangles
+        return bool(
+            is_loc_in_rectangle_numba(
+                0.5 * (xs + xe),
+                0.5 * (ys + ye),
+                np.arctan2(ye - ys, xe - xs),
+                np.hypot(xe - xs, ye - ys),
+                pick_size,
+                point_xy,
+            )[0]
+        )
+    elif pick_shape == "Polygon":
+        X, Y = get_pick_polygon_corners(pick)
+        if X is None:  # not a closed polygon
+            return False
+        return bool(
+            check_if_in_polygon(
+                point_xy[0], point_xy[1], np.array(X), np.array(Y)
+            )[0]
+        )
+    elif pick_shape == "Box":
+        (x0, y0), (x1, y1) = pick
+        return bool(
+            is_loc_in_box_numba(
+                0.5 * (x0 + x1),
+                0.5 * (y0 + y1),
+                point_xy,
+                abs(x1 - x0),
+                abs(y1 - y0),
+            )[0]
+        )
+    elif pick_shape == "Brush":
+        for stroke in pick:
+            width, X, Y = brush_stroke_arrays(stroke)
+            if check_if_in_brush_stroke(
+                point_xy[0], point_xy[1], X, Y, width / 2
+            )[0]:
+                return True
+        return False
+    else:
+        raise ValueError(f"Unknown pick shape: {pick_shape}")
 
 
 def permutation_test(
@@ -2663,6 +3384,16 @@ LATERAL_TRANSFORMS_KEY = "Lateral transforms"
 LATERAL_TRANSFORM_TYPES = ("astigmatism", "chromatic")
 
 
+class DuplicateLateralTransformWarning(UserWarning):
+    """A lateral correction was loaded separately although the calibration
+    used for fitting already carries it, and was skipped.
+
+    Its own category so that the CLI and the GUI can report the skip in
+    their own idiom (a console line, a status-bar message) by filtering
+    just this warning, instead of the same thing being said twice.
+    """
+
+
 def lateral_transforms(calibration: dict | list | None) -> list[dict]:
     """The ordered lateral-correction entries carried by a calibration.
 
@@ -2687,6 +3418,41 @@ def lateral_transforms(calibration: dict | list | None) -> list[dict]:
         # e.g. a calibration still given as a path; nothing to read
         return []
     return list(calibration.get(LATERAL_TRANSFORMS_KEY) or [])
+
+
+def resolve_lateral_transforms(source: dict | list | str | None) -> list:
+    """The lateral corrections held by ``source``, reading it from disk if
+    it is a path.
+
+    Parameters
+    ----------
+    source : dict, list, str or None
+        A calibration dictionary, a list of entries, the path of a
+        calibration file of any kind (see ``io.load_any_calibration``), or
+        None.
+
+    Returns
+    -------
+    transforms : list of dicts
+        The entries in the order they must be applied. Empty if `source`
+        is None or carries none.
+
+    Raises
+    ------
+    ValueError
+        If `source` is a path to a file that carries no lateral
+        corrections, which would otherwise be a silent no-op.
+    """
+    if not isinstance(source, str):
+        return lateral_transforms(source)
+    transforms = lateral_transforms(io.load_any_calibration(source))
+    if not transforms:
+        raise ValueError(
+            f"No lateral corrections found in {source}. Build one with "
+            "'picasso lateral-calibrate' or the 'Calibrate lateral "
+            "transform' dialog in Picasso: Localize."
+        )
+    return transforms
 
 
 def lateral_transform_models(calibration: dict | list | None) -> list:

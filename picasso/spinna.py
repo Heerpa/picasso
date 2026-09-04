@@ -16,7 +16,6 @@ import time
 import warnings
 from typing import Literal
 from concurrent import futures
-from multiprocessing import cpu_count
 from itertools import product as it_prod
 from copy import deepcopy
 from numbers import Number
@@ -719,9 +718,9 @@ def get_NN_dist(
         Array with distances of N-th neighbors for each point in data1.
         Shape: (N, n_neighbors)
     """
-    # if empty list passed, return empty array
+    # if empty list passed, return empty array (2D, for consistency)
     if len(data1) == 0 or len(data2) == 0:
-        return np.array([])
+        return np.zeros((0, n_neighbors))
 
     # check that data1 and data2 have the same dimensionalities
     if data1.shape[1] != data2.shape[1]:
@@ -861,14 +860,22 @@ def NND_score(
     -------
     score : float
         Sum of KS test statistics. Ranges between 0 (perfect fit)
-        and 1 (worst fit).
+        and 1 (worst fit). Pairs of molecular targets with no
+        distances measured are ignored; if no distances can be
+        compared at all, 1.0 (worst fit) is returned.
     """
     scores = []
     norm = 0
     for d1, d2 in zip(dists1, dists2):  # iterate over each pair of molecules
-        for n in range(d1.shape[1]):
+        if len(d1) == 0 or len(d2) == 0:
+            # no distances measured for this pair, e.g., one of the
+            # molecular targets is absent; the KS test is undefined here
+            continue
+        for n in range(min(d1.shape[1], d2.shape[1])):
             scores.append(ks_2samp(d1[:, n], d2[:, n]).statistic)
             norm += 1
+    if norm == 0:  # no distances could be compared at all
+        return 1.0
     score = np.sum(scores) / norm
     return score
 
@@ -3345,9 +3352,7 @@ class SPINNA:
             Contain the scoring for each combination of structures
         """
         # get number of threads and tasks
-        n_workers = min(
-            60, max(1, int(0.75 * cpu_count()))
-        )  # Python crashes when using >64 cores
+        n_workers = lib.n_workers()
 
         # split N_structures into groups that are tested by each Process
         # separately

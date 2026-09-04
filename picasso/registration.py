@@ -94,6 +94,28 @@ def resolve_model(calibration: dict, model: str | None) -> str:
     return "affine"
 
 
+def _icp_model(model: str) -> str:
+    """The model the ICP machinery works in for a registration finally fitted
+    with ``model``.
+
+    An affine, except for a translation: that is the one model *below* an
+    affine, so falling back to an affine would loosen the fit rather than
+    steady it, and the affine's 3-point minimum would reject pairings a
+    translation handles.
+    """
+    return "translation" if model == "translation" else "affine"
+
+
+def _icp_min_pairs(model: str) -> int:
+    """Fewest correspondences an ICP pass will fit from.
+
+    The ICP model's own minimum, but never a single pair: one pair fixes a
+    translation exactly, so a lone coincidental match would converge to a
+    zero residual and look like a perfect registration.
+    """
+    return max(tform.min_points(_icp_model(model)), 2)
+
+
 def fit_registration(
     src: np.ndarray,
     dst: np.ndarray,
@@ -102,9 +124,10 @@ def fit_registration(
 ) -> tuple[tform.Transform, str]:
     """Fit one ICP iteration's transform.
 
-    Intermediate iterations (``final=False``) always fit an affine, however
-    flexible ``model`` is: the early pairing is deliberately loose and contains
-    cross-molecule mismatches, and a flexible model bends to accommodate them,
+    Intermediate iterations (``final=False``) always fit an affine - a
+    translation, when that is what was asked for - however flexible ``model``
+    is: the early pairing is deliberately loose and contains cross-molecule
+    mismatches, and a flexible model bends to accommodate them,
     locking in the wrong correspondence field on the next pass - a failure an
     affine cannot have. Only the final iteration, which pairs at the tightest
     radius, fits the model the user asked for.
@@ -126,18 +149,19 @@ def fit_registration(
         The fitted transform.
     model : str
         The model that was *actually* fitted. If too few correspondences
-        survived for the one asked for, an affine is fitted instead and named
-        here, so the caller can report the fallback rather than hide it.
+        survived for the one asked for, the fallback model is fitted instead
+        and named here, so the caller can report it rather than hide it.
     """
     if final and len(src) >= tform.min_points(model):
         return tform.estimate(src, dst, model), model
+    fallback = _icp_model(model)
     with warnings.catch_warnings():
         # An intermediate ICP pass is an internal step towards the pairing,
         # not a registration anyone keeps, so its "thin data" warning would
         # only be noise; the final fit above still warns.
         if not final:
             warnings.simplefilter("ignore")
-        return tform.estimate(src, dst, "affine"), "affine"
+        return tform.estimate(src, dst, fallback), fallback
 
 
 def _similarity_from_two(
@@ -617,7 +641,7 @@ def _bootstrap_transform(
         ref_fov=ref_frames,
         c_fov=c_frames,
     )
-    if len(ref_idx) < 3:
+    if len(ref_idx) < _icp_min_pairs(model):
         return None
     transform, _ = fit_registration(
         ref_xy[ref_idx], c_xy[c_idx], model, final=False
@@ -640,7 +664,8 @@ def _icp_from_seed(
     :func:`register_from_point_sets` so several candidate seeds - the mirror
     orientations - can be run and compared."""
     transform = seed
-    fitted_model = "affine"
+    fitted_model = _icp_model(model)
+    floor = _icp_min_pairs(model)
     matched_ref = matched_c = np.empty((0, 2))
     for k, tol in enumerate(tols):
         acc_ref, acc_c = [], []
@@ -656,7 +681,7 @@ def _icp_from_seed(
             break
         matched_ref = np.vstack(acc_ref)
         matched_c = np.vstack(acc_c)
-        if len(matched_ref) < 3:
+        if len(matched_ref) < floor:
             break
         transform, fitted_model = fit_registration(
             matched_ref, matched_c, model, final=k == len(tols) - 1
@@ -664,11 +689,11 @@ def _icp_from_seed(
 
     # robust trim: drop coincidental pairs far from the converged transform,
     # then re-fit once on the inliers
-    if len(matched_ref) >= 3:
+    if len(matched_ref) >= floor:
         resid = matched_c - transform.apply(matched_ref)
         dist = np.sqrt(np.sum(resid**2, axis=1))
         keep = dist <= max(tol_lo, 3.0 * np.median(dist))
-        if keep.sum() >= 3:
+        if keep.sum() >= floor:
             matched_ref = matched_ref[keep]
             matched_c = matched_c[keep]
             transform, fitted_model = fit_registration(
@@ -820,7 +845,7 @@ def register_from_point_sets(
                 tol_lo,
             )
     transform, matched_ref, matched_c, fitted_model = best
-    if len(seeds) > 1 and len(matched_ref) >= 3:
+    if len(seeds) > 1 and len(matched_ref) >= _icp_min_pairs(model):
         # refit the winner audibly, so a thin-data warning is raised for the
         # registration that is actually kept
         transform, fitted_model = fit_registration(

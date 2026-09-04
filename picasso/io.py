@@ -19,7 +19,7 @@ import json
 import os
 import threading
 import warnings
-from typing import Callable, Literal, TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 import tifffile
 import yaml
@@ -1238,7 +1238,7 @@ def load_mask(
 
 def load_picks(  # noqa: C901
     path: str, pixelsize: float | None = None
-) -> tuple[list, Literal["Circle", "Rectangle", "Polygon", "Square"], float]:
+) -> tuple[list, str, float]:
     """Load picks generated with the Picasso GUI.
 
     Parameters
@@ -1254,14 +1254,21 @@ def load_picks(  # noqa: C901
     -------
     picks : list
         A list of picks.
-    shape : Literal["Circle", "Rectangle", "Polygon", "Square"]
-        The shape of the picks.
+    shape : str
+        The shape of the picks, one of ``lib.PICK_SHAPES``.
     size : float
         The size of the picks in camera pixels (if `pixelsize` is
         provided, otherwise in original units). For circular picks, the
         size is the diameter; for rectangular picks, the size is the
         width; for square picks, the size is the side length. None for
-        polygonal picks (size not defined).
+        polygonal, box and brush picks (size not defined).
+
+    Raises
+    ------
+    ValueError
+        If the file is not recognized as a picks file, if the pick
+        shape is unknown, or if a shape that needs a size does not
+        carry one.
     """
     assert path.endswith(".yaml"), "Picks should be stored in a .yaml file."
 
@@ -1282,26 +1289,72 @@ def load_picks(  # noqa: C901
     # assign loaded picks and pick size
     if shape == "Circle":
         picks = regions["Centers"]
-        if "Diameter (nm)" in regions:
-            size = regions["Diameter (nm)"] / pixelsize
-        elif "Diameter" in regions:
-            size = regions["Diameter"]
+        # legacy files store the size in camera pixels, without "(nm)"
+        size = _pick_size_from_regions(regions, "Diameter", pixelsize)
     elif shape == "Rectangle":
         picks = regions["Center-Axis-Points"]
-        if "Width (nm)" in regions:
-            size = regions["Width (nm)"] / pixelsize
-        elif "Width" in regions:
-            size = regions["Width"]
+        size = _pick_size_from_regions(regions, "Width", pixelsize)
     elif shape == "Polygon":
         picks = regions["Vertices"]
         size = None
     elif shape == "Square":
         picks = regions["Centers"]
         # no backward compatibility here, always in nm
-        size = regions["Side Length (nm)"] / pixelsize
+        size = _pick_size_from_regions(regions, "Side Length", pixelsize)
+    elif shape == "Box":
+        # each box carries its own extent, so there is no size
+        picks = regions["Corners"]
+        size = None
+    elif shape == "Brush":
+        # the file holds a flat, ordered list of strokes; which of them
+        # form one pick follows from their geometry, so the grouping is
+        # re-derived rather than stored
+        strokes = [
+            (stroke["Width (nm)"] / pixelsize, stroke["Path"])
+            for stroke in regions["Strokes"]
+        ]
+        picks = lib.merge_brush_strokes(strokes)
+        size = None
     else:
-        raise ValueError("Unrecognized pick shape")
+        raise ValueError(f"Unrecognized pick shape: {shape}")
     return picks, shape, size
+
+
+def _pick_size_from_regions(
+    regions: dict, key: str, pixelsize: float
+) -> float:
+    """Return a pick size from a loaded picks file, in camera pixels.
+
+    Sizes are stored in nm under ``"<key> (nm)"``; files written by
+    older versions of Picasso store them in camera pixels under the bare
+    ``key``.
+
+    Parameters
+    ----------
+    regions : dict
+        Contents of the picks .yaml file.
+    key : str
+        Name of the size entry, e.g., "Diameter".
+    pixelsize : float
+        Camera pixel size in nm.
+
+    Returns
+    -------
+    size : float
+        Pick size in camera pixels.
+
+    Raises
+    ------
+    ValueError
+        If neither the nm nor the legacy entry is present.
+    """
+    if f"{key} (nm)" in regions:
+        return regions[f"{key} (nm)"] / pixelsize
+    elif key in regions:
+        return regions[key]
+    raise ValueError(
+        f"Picks file is missing the pick size entry '{key} (nm)'."
+    )
 
 
 def save_drift(path: str, drift: pd.DataFrame) -> None:
@@ -1759,22 +1812,32 @@ class ND2Movie(AbstractPicassoMovie):
         self.dask = self.nd2file.to_dask()
         self.sizes = self.nd2file.sizes
 
-        required_dims = ["T", "Y", "X"]  # always required
-        for dim in required_dims:
+        for dim in ["Y", "X"]:  # always required
             if dim not in self.nd2file.sizes.keys():
                 raise KeyError(
                     "Required dimension {:s} not in file {:s}".format(
                         dim, self.path
                     )
                 )
+        # Movies are indexed along T. Files without a time axis (e.g. z
+        # stacks) are read along Z instead, treating each slice as a
+        # frame.
+        if "T" in self.nd2file.sizes:
+            self.frame_axis = "T"
+        elif "Z" in self.nd2file.sizes:
+            self.frame_axis = "Z"
+        else:
+            raise KeyError(
+                "Neither dimension T nor Z in file {:s}".format(self.path)
+            )
         # Allow an optional channel (C) axis; reject any other extra
-        # dimension (e.g. Z, P), as before.
-        allowed_dims = set(required_dims) | {"C"}
+        # dimension (e.g. the unused one of T/Z, or P), as before.
+        allowed_dims = {self.frame_axis, "Y", "X", "C"}
         extra_dims = set(self.nd2file.sizes.keys()) - allowed_dims
         if extra_dims:
             raise KeyError(
-                "File {:s} has unsupported dimensions {:s}; only T, Y, X "
-                "and C are supported.".format(
+                "File {:s} has unsupported dimensions {:s}; only T (or Z), "
+                "Y, X and C are supported.".format(
                     self.path, str(sorted(extra_dims))
                 )
             )
@@ -1800,7 +1863,7 @@ class ND2Movie(AbstractPicassoMovie):
         except Exception:
             self.meta = None
         self._shape = [
-            self.nd2file.sizes["T"],
+            self.nd2file.sizes[self.frame_axis],
             self.nd2file.sizes["X"],
             self.nd2file.sizes["Y"],
         ]
@@ -1832,7 +1895,7 @@ class ND2Movie(AbstractPicassoMovie):
             "Height": nd2file.sizes["Y"],
             "Width": nd2file.sizes["X"],
             "Data Type": nd2file.dtype.name,
-            "Frames": nd2file.sizes["T"],
+            "Frames": nd2file.sizes[self.frame_axis],
         }
         info["Acquisition Comments"] = ""
 
@@ -2055,11 +2118,11 @@ class ND2Movie(AbstractPicassoMovie):
         return self.get_frame(it)
 
     def __iter__(self):
-        for i in range(self.sizes["T"]):
+        for i in range(self.sizes[self.frame_axis]):
             yield self[i]
 
     def __len__(self):
-        return self.sizes["T"]
+        return self.sizes[self.frame_axis]
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -2086,7 +2149,7 @@ class ND2Movie(AbstractPicassoMovie):
         # plain (T, Y, X) file this reduces to ``self.dask[index]``.
         selection = []
         for dim in self.sizes:
-            if dim == "T":
+            if dim == self.frame_axis:
                 selection.append(index)
             elif dim == "C":
                 selection.append(self._channel)
@@ -4178,6 +4241,42 @@ def save_locs(path: str, locs: pd.DataFrame, info: list[dict]) -> None:
         save_info(info_path, info)
 
 
+def _raise_if_truncated(path: str, error: OSError) -> None:
+    """Re-raise an HDF5 open error as a readable "file is incomplete".
+
+    HDF5 refuses to open a file whose size on disk is smaller than the
+    size recorded in its superblock and reports this as a ``truncated
+    file: ... stored_eof = N`` message. Such a file is almost always
+    still being downloaded, copied or written by another program, which
+    the raw HDF5 message does not convey. Errors of any other kind, and
+    files that are not in fact short, are left to the caller.
+
+    Parameters
+    ----------
+    path : str
+        The path to the HDF5 file that could not be opened.
+    error : OSError
+        The error raised by ``h5py`` when opening ``path``.
+
+    Raises
+    ------
+    OSError
+        If ``path`` is shorter than the size recorded in its superblock.
+    """
+    match = re.search(r"stored_eof\s*=\s*(\d+)", str(error))
+    if match is None:
+        return
+    expected = int(match.group(1))
+    actual = os.path.getsize(path)
+    if actual >= expected:
+        return
+    raise OSError(
+        f"File {path} is incomplete: {actual:,} bytes on disk, "
+        f"{expected:,} bytes expected. It may still be downloading, "
+        "copying, or being written by another program."
+    ) from error
+
+
 def _read_locs_dataset(path: str, progress=None) -> pd.DataFrame:
     """Read the ``locs`` dataset of an .hdf5 file in row blocks.
 
@@ -4205,7 +4304,12 @@ def _read_locs_dataset(path: str, progress=None) -> pd.DataFrame:
     BLOCK_SIZE = LOCS_BLOCK_SIZE
     if not os.path.isfile(path):
         raise FileNotFoundError(f"File {path} does not exist.")
-    with h5py.File(path, "r") as locs_file:
+    try:
+        locs_file = h5py.File(path, "r")
+    except OSError as error:
+        _raise_if_truncated(path, error)
+        raise
+    with locs_file:
         if "locs" not in locs_file:
             raise KeyError(f"File: {path} does not contain a 'locs' dataset.")
         dataset = locs_file["locs"]
@@ -4230,7 +4334,7 @@ def _read_locs_dataset(path: str, progress=None) -> pd.DataFrame:
                     if progress is not None:
                         progress(stop, n_locs)
                 return pd.DataFrame(columns, copy=False)
-             
+
     # Non-compound HDF5 layouts are handled by PyTables/pandas.
     return pd.read_hdf(path, key="locs")
 

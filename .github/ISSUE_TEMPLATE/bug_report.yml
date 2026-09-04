@@ -1,0 +1,131 @@
+name: Bug report
+description: Report something in Picasso that is broken or behaves unexpectedly.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill in as much of
+        the form below as you can - it makes it much easier for us to
+        reproduce and fix the problem.
+
+        Before submitting, please search the
+        [existing issues](https://github.com/jungmannlab/picasso/issues?q=is%3Aissue)
+        to check whether the problem has already been reported.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: >
+        What were you trying to do, what happened instead, and what did you
+        expect to happen?
+      placeholder: |
+        I was trying to render a 3D dataset in Picasso: Render. When I
+        switched to the "z" colouring mode, the window froze instead of
+        updating the image.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      description: Which part of Picasso does this concern?
+      multiple: true
+      options:
+        - "Localize"
+        - "Filter"
+        - "Render"
+        - "Average"
+        - "SPINNA"
+        - "Nanotron"
+        - "Design"
+        - "Simulate"
+        - "Server / watcher"
+        - "Command line interface (picasso ...)"
+        - "Python API (import picasso...)"
+        - "Plugins"
+        - "Documentation"
+        - "Installation / start-up"
+        - "Other / not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: >
+        The exact steps needed to trigger the problem. If it only happens with
+        a particular dataset, please describe it (dimensions, camera, 3D or 2D)
+        and, if you can share it, attach a small example file.
+      placeholder: |
+        1. Open Picasso: Render
+        2. Load `example_locs.hdf5`
+        3. Press Ctrl+... / choose menu item ...
+        4. See the error
+    validations:
+      required: true
+
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Error message / traceback
+      description: >
+        Paste the full traceback or the contents of the error dialog.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: Picasso version
+      description: >
+        Shown in the title bar of any Picasso window, or via
+        `python -c "import picasso; print(picasso.__version__)"`.
+      placeholder: "0.11.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install Picasso?
+      options:
+        - "One-click installer (Windows, CPU)"
+        - "One-click installer (Windows, GPU)"
+        - "One-click installer (macOS)"
+        - "pip install picassosr"
+        - "Editable/developer installation from source"
+        - "Other / not sure"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - "Windows"
+        - "macOS"
+        - "Linux"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: >
+        Output of `python --version`. Leave empty if you use a one-click
+        installer.
+      placeholder: "3.12.7"
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: >
+        Anything else that might help: screenshots, GPU model if the problem is
+        related to GPU fitting, dataset size, etc.

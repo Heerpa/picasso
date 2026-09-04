@@ -44,6 +44,7 @@ from .. import (
 # transforms throughout this module
 from .. import transforms as transforms_mod
 from ..fitting import precision, splinefit
+from .app import run_gui
 from PyQt6 import QtCore, QtGui, QtWidgets
 from playsound3 import playsound
 
@@ -64,6 +65,26 @@ DEFAULT_PARAMETERS = {
 
 IDENTIFY_MODE_SEPARATE = "Each channel separately"
 IDENTIFY_MODE_SUM = "Sum of channels"
+# How multichannel (and split-FOV) data is fitted: all channels tied into one
+# global fit, or every channel on its own. Defined in ``picasso.localize``,
+# which records the mode in the metadata of an independent fit.
+FIT_MODE_JOINT = localize.FIT_MODE_JOINT
+FIT_MODE_SEPARATE = localize.FIT_MODE_INDEPENDENT
+FIT_MODE_TOOLTIP = (
+    "How the loaded channels (or split-FOV regions) are fitted.\n\n"
+    f"'{FIT_MODE_JOINT}': the channels are fitted together,\n"
+    "sharing one position per molecule (similar to globLoc). Needs a "
+    "multichannel\n"
+    "spline calibration or a channel registration, is available for the\n"
+    "spherical Gaussian and the spline PSF only, and keeps just the\n"
+    "molecules detected in every channel - but reaches the best precision.\n"
+    "With no calibration loaded the active channel is fitted alone.\n\n"
+    f"'{FIT_MODE_SEPARATE}': every channel is fitted on its own,\n"
+    "with its own model, optimizer and calibrations, and saved to its own\n"
+    "file. No registration (i.e., matching of signal across channels) is\n"
+    "needed and every detection is fitted; the channels can be connected\n"
+    "afterwards."
+)
 IMAGE_FILTER = (
     "All supported formats ("
     + " ".join("*" + e for e in io.MOVIE_EXTENSIONS)
@@ -122,6 +143,7 @@ _SUM_REGISTRATION_MAX_FRAMES = 200
 # (label, model). A polynomial's degree is part of the model name rather than
 # a separate field, so the combo carries one value - see picasso.transforms.
 _TRANSFORM_MODELS = [
+    ("Translation (2 DOF, >= 1 pair)", "translation"),
     ("Affine (6 DOF, >= 3 pairs)", "affine"),
     ("Projective (8 DOF, >= 4 pairs)", "projective"),
     ("Polynomial, degree 2 (>= 6 pairs)", "polynomial2"),
@@ -130,6 +152,9 @@ _TRANSFORM_MODELS = [
 
 _TRANSFORM_MODEL_TOOLTIP = (
     "How the two coordinate frames are related.\n"
+    "  Translation: a shift in x and y and nothing else - for frames that\n"
+    "    are known to differ only by an offset. Any rotation or scale then\n"
+    "    shows up in the residual instead of being absorbed.\n"
     "  Affine: translation, rotation, scale and shear - the default, and\n"
     "    what a well-aligned splitter does to first order.\n"
     "  Projective: adds the perspective/keystone term a tilted dichroic or\n"
@@ -147,6 +172,9 @@ def _transform_model_combo() -> QtWidgets.QComboBox:
     combo = QtWidgets.QComboBox()
     for label, data in _TRANSFORM_MODELS:
         combo.addItem(label, data)
+    # The list is ordered by increasing flexibility, so the default is not the
+    # first entry; select it explicitly.
+    combo.setCurrentIndex(combo.findData("affine"))
     combo.setToolTip(_TRANSFORM_MODEL_TOOLTIP)
     return combo
 
@@ -330,18 +358,40 @@ OPTIMIZER_TOOLTIP = (
 )
 
 
+def _copied_rois(rois: list) -> list:
+    """Copy a list of ROI rectangles down to their corners.
+
+    ROIs are edited in place all over the view (a region is moved by
+    rewriting its corners, a double click deletes one from the list), so a
+    snapshot that shares those lists changes underneath whoever took it -
+    a stale identification would keep comparing equal to the edited ROIs
+    in ``identifications_outdated``. Corners are plain ints, so copying the
+    two corner lists is deep enough.
+    """
+    return [[list(rect[0]), list(rect[1])] for rect in rois]
+
+
 def _filtered_identification_movie(
     movie,
     window: int,
     sigma: float,
-    rois: list | None,
-    roi_pad: int,
     cache: list,
 ) -> tuple[object, list]:
     """Put the identification filters on top of ``movie``: the temporal
-    median background subtraction, then the Gaussian smoothing - built
-    exactly the way ``localize.identify`` builds them, so the preview and
-    the batch run search the same image.
+    median background subtraction, then the Gaussian smoothing - the same
+    two stages ``localize.identify`` puts on top of the movie it searches,
+    so the preview and the batch run find the same spots.
+
+    Unlike the batch run, the stack is always built over the *whole* frame,
+    never restricted to the drawn ROIs. The display reads its frames from
+    here (see ``Window._draw_frame``), and a ROI-restricted temporal median
+    leaves everything outside its bounding box at zero: with the filter on,
+    drawing the first ROI would black out the rest of the movie and the
+    next ROI could not be placed. Identification is unaffected - the median
+    is computed per pixel, so inside the ROIs (and the padding around them
+    the gradients are read from) the filtered frames are identical either
+    way. Restricting the median stays a batch-run optimization, where
+    nothing is displayed.
 
     Both stages are lazy views, so ``cache`` (a ``[temporal, gaussian]``
     pair) keeps them across redraws: a stage is rebuilt only when its
@@ -358,14 +408,10 @@ def _filtered_identification_movie(
             temporal is None
             or temporal.raw is not movie
             or temporal.window != min(window, len(movie))
-            or temporal.roi != rois
-            or temporal.roi_pad != roi_pad
         ):
             # comparing against the raw movie by identity means loading a
             # movie or switching channel invalidates this for free
-            temporal = localize.TemporalMedianMovie(
-                movie, window, roi=rois, roi_pad=roi_pad
-            )
+            temporal = localize.TemporalMedianMovie(movie, window)
         movie = temporal
     else:
         temporal = None
@@ -466,6 +512,23 @@ class Channel:
     last_identification_info: dict | None = None
     extra_info: list = field(default_factory=list)
     params: dict = field(default_factory=dict)
+
+
+def _region_fit_summary(params: dict) -> list[tuple[str, str]]:
+    """One split-FOV region's fit settings as ``(text, tooltip)`` pairs for
+    the ROI table: the model (with its optimizer) and its PSF calibration."""
+    models = list(FIT_MODELS)
+    model = models[min(params.get("fit_model", 0), len(models) - 1)]
+    optimizers = FIT_MODELS[model]["optimizers"]
+    optimizer = ""
+    if optimizers:
+        names = list(optimizers)
+        optimizer = names[min(params.get("fit_optimizer", 0), len(names) - 1)]
+    path = params.get("spline_calibration_path") or ""
+    return [
+        (model, f"{model}, {optimizer}" if optimizer else model),
+        (os.path.basename(path) if path else "--", path or "none loaded"),
+    ]
 
 
 def _sanitize_filename(name: str) -> str:
@@ -668,6 +731,12 @@ class View(QtWidgets.QGraphicsView):
         different optics, so each gets its own detection threshold. Kept
         in step with ``rois`` by ``Window.region_mngs``; empty (and
         ignored) whenever ``split_fov_mode`` is off.
+    roi_params : list
+        Split-FOV only: the fit settings of each region (model, optimizer,
+        convergence, calibrations), parallel to ``rois``. A region fitted on
+        its own is a channel of its own, with its own PSF; kept in step with
+        ``rois`` by ``Window.region_params`` and used only when the regions
+        are fitted separately (see ``Window.fit_mode``).
     roi_end : QtCore.QPoint
         End point of the ROI being dragged.
     window : QtWidgets.QMainWindow
@@ -688,6 +757,8 @@ class View(QtWidgets.QGraphicsView):
         self.selected_roi = None
         # per-region min. net gradient in split-FOV mode, see roi_mngs above
         self.roi_mngs = []
+        # per-region fit settings in split-FOV mode, see roi_params above
+        self.roi_params = []
         # Split-FOV region mode: ROIs are equal-size rectangular channels of one
         # movie. The first region drawn fixes the size (derived live from the
         # existing regions, so clearing them frees the size again); further
@@ -938,9 +1009,12 @@ class View(QtWidgets.QGraphicsView):
             event.ignore()
             return
         self.window.region_mngs()  # align the thresholds before deleting
+        self.window.region_params()  # ... and the per-region fit settings
         del self.rois[idx]
         if idx < len(self.roi_mngs):
             del self.roi_mngs[idx]
+        if idx < len(self.roi_params):
+            del self.roi_params[idx]
         self.selected_roi = None
         # the release that closes this double click must not re-add a region
         self._suppress_release = True
@@ -1785,18 +1859,41 @@ class CameraCalibrationDialog(lib.Dialog):
             "a different intensity (Huang et al. used 15 levels spanning "
             "20-200 photons per pixel). Without them there is no gain map "
             "and the scalar Sensitivity keeps being used. The movies do not "
-            "need to be ordered by intensity."
+            "need to be ordered by intensity.\n\n"
+            "The illumination column is optional and changes nothing in the "
+            "calibration: it lets the diagnostic plot show the response "
+            "against the laser power (or exposure time) that was actually "
+            "set and read linearity off it when the levels are not evenly "
+            "spaced. Fill in every row or none."
         )
         bright_hint.setWordWrap(True)
         bright_layout.addWidget(bright_hint)
-        self.bright_list = QtWidgets.QListWidget()
+        self.bright_list = QtWidgets.QTableWidget(0, 2)
+        self.bright_list.setHorizontalHeaderLabels(
+            ["Movie", "Illumination (optional)"]
+        )
+        self.bright_list.verticalHeader().setVisible(False)
+        self.bright_list.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
         self.bright_list.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
         )
-        self.bright_list.setMaximumHeight(110)
+        header = self.bright_list.horizontalHeader()
+        header.setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        header.setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.bright_list.setMaximumHeight(130)
         bright_layout.addWidget(self.bright_list)
         bright_row = QtWidgets.QHBoxLayout()
         bright_layout.addLayout(bright_row)
+        bright_row.addWidget(QtWidgets.QLabel("Illumination unit:"))
+        self.unit_edit = QtWidgets.QLineEdit("mW")
+        self.unit_edit.setMaximumWidth(70)
+        bright_row.addWidget(self.unit_edit)
         bright_row.addStretch(1)
         add_button = QtWidgets.QPushButton("Add...")
         add_button.setAutoDefault(False)
@@ -1868,11 +1965,28 @@ class CameraCalibrationDialog(lib.Dialog):
         existing = self.bright_paths()
         for path in paths:
             if path not in existing:
-                self.bright_list.addItem(path)
+                self.add_bright(path)
+
+    def add_bright(self, path: str, illumination: str = "") -> None:
+        """Append one bright movie row; its illumination cell stays editable
+        while the path cell does not, since the path came from a picker."""
+        row = self.bright_list.rowCount()
+        self.bright_list.insertRow(row)
+        item = QtWidgets.QTableWidgetItem(path)
+        item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+        self.bright_list.setItem(row, 0, item)
+        self.bright_list.setItem(
+            row, 1, QtWidgets.QTableWidgetItem(illumination)
+        )
 
     def remove_bright(self) -> None:
-        for item in self.bright_list.selectedItems():
-            self.bright_list.takeItem(self.bright_list.row(item))
+        # Descending, so removing one row does not renumber the rest.
+        rows = sorted(
+            {index.row() for index in self.bright_list.selectedIndexes()},
+            reverse=True,
+        )
+        for row in rows:
+            self.bright_list.removeRow(row)
 
     def browse_out(self) -> None:
         base, _ = os.path.splitext(self.dark_edit.text())
@@ -1887,23 +2001,77 @@ class CameraCalibrationDialog(lib.Dialog):
 
     def bright_paths(self) -> list[str]:
         return [
-            self.bright_list.item(row).text()
-            for row in range(self.bright_list.count())
+            self.bright_list.item(row, 0).text()
+            for row in range(self.bright_list.rowCount())
         ]
+
+    def bright_levels(self) -> list[float] | None:
+        """The illumination of each bright movie, or None if the column was
+        left empty.
+
+        Raises
+        ------
+        ValueError
+            If some rows carry a level and others do not, or if one of them
+            is not a number. A partly filled column cannot be plotted against
+            and is more likely a slip than an intention.
+        """
+        texts = [
+            (
+                self.bright_list.item(row, 1).text().strip()
+                if self.bright_list.item(row, 1) is not None
+                else ""
+            )
+            for row in range(self.bright_list.rowCount())
+        ]
+        filled = [text for text in texts if text]
+        if not filled:
+            return None
+        if len(filled) != len(texts):
+            raise ValueError(
+                f"Only {len(filled)} of {len(texts)} bright movies have an "
+                "illumination. Fill in every row or leave the column empty."
+            )
+        try:
+            return [float(text) for text in texts]
+        except ValueError:
+            raise ValueError(
+                "The illumination column must contain numbers only "
+                f"(got {', '.join(repr(t) for t in texts)})."
+            ) from None
 
     @staticmethod
     def getCalibrationSpecs(
         parent: QtWidgets.QWidget | None = None,
-    ) -> tuple[str, list[str], str, bool]:
-        """Show the dialog and return the dark movie, the bright movies, the
-        output path and whether it was accepted."""
+    ) -> tuple[str, list[str], list[float] | None, str, str, bool]:
+        """Show the dialog and return the dark movie, the bright movies,
+        their illumination levels and unit, the output path and whether it
+        was accepted.
+
+        Re-shown, with the offending cells kept, if the illumination column
+        was filled in only partly or not with numbers."""
         dialog = CameraCalibrationDialog(parent)
-        result = dialog.exec()
+        while True:
+            result = dialog.exec()
+            accepted = result == QtWidgets.QDialog.DialogCode.Accepted
+            try:
+                levels = dialog.bright_levels()
+            except ValueError as error:
+                if not accepted:
+                    levels = None
+                    break
+                QtWidgets.QMessageBox.warning(
+                    parent, "Camera calibration", str(error)
+                )
+                continue
+            break
         return (
             dialog.dark_edit.text(),
             dialog.bright_paths(),
+            levels,
+            dialog.unit_edit.text().strip(),
             dialog.out_edit.text(),
-            result == QtWidgets.QDialog.DialogCode.Accepted,
+            accepted,
         )
 
 
@@ -2578,6 +2746,15 @@ class ROIDialog(lib.Dialog):
         view = self.window.view
         mngs = self.window.region_mngs()
         split_fov = self._split_fov()
+        # the fit settings are per region only when the regions are fitted
+        # one at a time; the joint fit uses one calibration for all of them
+        per_region_fit = (
+            split_fov and self.window.fit_mode() == FIT_MODE_SEPARATE
+        )
+        params = (
+            self.window.flush_region_fit_params() if per_region_fit else []
+        )
+        per_region_fit = per_region_fit and len(params) == len(view.rois)
         self._updating = True
         self.info_label.setText(
             "Each row is a rectangular ROI (y_min, x_min, y_max, x_max, "
@@ -2592,11 +2769,21 @@ class ROIDialog(lib.Dialog):
                 if split_fov
                 else ""
             )
+            + (
+                " Fitted separately, each region also carries its own fit "
+                "settings, shown read-only in the last two columns: select "
+                "a region to edit them in the parameters dialog."
+                if per_region_fit
+                else ""
+            )
         )
-        self.table.setColumnCount(5 if split_fov else 4)
+        self.table.setColumnCount(
+            4 + (1 if split_fov else 0) + (2 if per_region_fit else 0)
+        )
         self.table.setHorizontalHeaderLabels(
             ["y_min", "x_min", "y_max", "x_max"]
             + (["min_ng"] if split_fov else [])
+            + (["model", "PSF calib."] if per_region_fit else [])
         )
         self.table.setRowCount(len(view.rois))
         for row, ((y_min, x_min), (y_max, x_max)) in enumerate(view.rois):
@@ -2607,6 +2794,19 @@ class ROIDialog(lib.Dialog):
                 item = QtWidgets.QTableWidgetItem(str(int(val)))
                 item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row, col, item)
+            if per_region_fit:
+                for col, (text, tip) in enumerate(
+                    _region_fit_summary(params[row]), start=5
+                ):
+                    item = QtWidgets.QTableWidgetItem(text)
+                    item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                    item.setToolTip(tip)
+                    # the fit settings are edited in the parameters dialog,
+                    # with the region selected
+                    item.setFlags(
+                        item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable
+                    )
+                    self.table.setItem(row, col, item)
         if view.selected_roi is not None and view.selected_roi < len(
             view.rois
         ):
@@ -2660,11 +2860,14 @@ class ROIDialog(lib.Dialog):
             reverse=True,
         )
         self.window.region_mngs()  # align the thresholds before deleting
+        self.window.region_params()  # ... and the per-region fit settings
         for row in rows:
             if 0 <= row < len(view.rois):
                 del view.rois[row]
                 if row < len(view.roi_mngs):
                     del view.roi_mngs[row]
+                if row < len(view.roi_params):
+                    del view.roi_params[row]
         view.selected_roi = None
         self._commit(view.rois)
         self.update_table()
@@ -2683,6 +2886,7 @@ class ROIDialog(lib.Dialog):
         rows = {idx.row() for idx in self.table.selectedIndexes()}
         self.window.view.selected_roi = min(rows) if rows else None
         self.window.parameters_dialog.sync_mng_to_selected_region()
+        self.window.sync_region_fit_params()
         self.window.draw_frame()
 
 
@@ -2989,6 +3193,10 @@ class ParametersDialog(lib.Dialog):
     fit_model : QtWidgets.QComboBox
         Combo box for selecting the fitting model (e.g. 2D elliptical
         Gaussian or average of ROI).
+    fit_mode_combo : QtWidgets.QComboBox
+        Combo box for choosing whether multichannel (or split-FOV) data is
+        fitted jointly or one channel at a time, see ``FIT_MODE_JOINT`` /
+        ``FIT_MODE_SEPARATE``. Shown for multichannel data only.
     fit_optimizer : QtWidgets.QComboBox
         Combo box for selecting the optimizer (Least squares or MLE).
         Hidden for models that do not use an optimizer.
@@ -3072,7 +3280,7 @@ class ParametersDialog(lib.Dialog):
         # different thing (region-local transforms).
         self.channel_registration_calibration = {}
         self.channel_registration_path = None
-        # Standalone (2D) affine corrections applied after the fit; those
+        # Standalone lateral corrections applied after the fit; those
         # carried by the 3D / spline calibration are applied by the fit
         # itself (see load_affine_calib).
         self.lateral_transforms = []
@@ -3435,16 +3643,22 @@ class ParametersDialog(lib.Dialog):
             "baseline, EM gain, sensitivity, QE, pixel size) for every "
             "channel."
         )
+        self.link_calib_checkbox = QtWidgets.QCheckBox("PSF calibration")
+        self.link_calib_checkbox.setToolTip(
+            "Use the same experimental PSF (spline) calibration for every\n"
+            "channel? Untick to give each channel its own calibration."
+        )
+        self.link_calib_checkbox.setChecked(True)
         for cb in (
             self.link_box_checkbox,
             self.link_mng_checkbox,
             self.link_camera_checkbox,
+            self.link_calib_checkbox,
         ):
             cb.setTristate(False)
             cb.stateChanged.connect(self.on_link_params_changed)
             link_layout.addWidget(cb)
         link_layout.addStretch(1)
-        _retain_size_when_hidden(self.link_groupbox)
         self.link_groupbox.hide()  # shown by the window for >1 channel
 
         # Camera:
@@ -3718,6 +3932,24 @@ class ParametersDialog(lib.Dialog):
             self.gpu_checkbox.setDisabled(False)
         fit_grid.addWidget(self.gpu_checkbox, 4, 0, 1, 2)
 
+        # Multichannel: fit the channels together or each on its own. Shown
+        # by the window for multichannel / split-FOV data (see
+        # Window._update_multichannel_widgets); its space is reserved while
+        # hidden, so loading channels does not reflow the dialog.
+        self.fit_mode_label = QtWidgets.QLabel("Fit:")
+        self.fit_mode_label.setToolTip(FIT_MODE_TOOLTIP)
+        fit_grid.addWidget(self.fit_mode_label, 5, 0)
+        self.fit_mode_combo = QtWidgets.QComboBox()
+        self.fit_mode_combo.addItems([FIT_MODE_JOINT, FIT_MODE_SEPARATE])
+        self.fit_mode_combo.setToolTip(FIT_MODE_TOOLTIP)
+        self.fit_mode_combo.currentIndexChanged.connect(
+            self.on_fit_mode_changed
+        )
+        fit_grid.addWidget(self.fit_mode_combo, 5, 1)
+        for widget in (self.fit_mode_label, self.fit_mode_combo):
+            _retain_size_when_hidden(widget)
+            widget.hide()
+
         self.fit_model.currentIndexChanged.connect(self.on_fit_model_changed)
         self.fit_optimizer.currentIndexChanged.connect(
             self.on_fit_optimizer_changed
@@ -3894,29 +4126,34 @@ class ParametersDialog(lib.Dialog):
         self.gauss_link_photons_checkbox.hide()  # shown for 2-6 channels
         reg_grid.addWidget(self.gauss_link_photons_checkbox, 1, 0, 1, 3)
 
-        # Lateral (x, y) affine corrections for 2D data, applied after
-        # fitting. This is how a chromatic correction is used on its own,
-        # with no 3D calibration to append it to; for 3D the correction goes
-        # into the 3D / spline calibration above, which applies it itself.
-        affine_groupbox = QtWidgets.QGroupBox("2D lateral correction (x, y)")
+        # Lateral (x, y) corrections kept outside the calibration used for
+        # fitting, applied after it. For 2D data this is the only route;
+        # for 3D it is the alternative to appending the correction to the
+        # 3D / spline calibration, and gives the same coordinates.
+        affine_groupbox = QtWidgets.QGroupBox("Lateral correction (x, y)")
         affine_groupbox.setToolTip(
-            "Affine corrections applied to the fitted x/y of 2D data,\n"
-            "typically a chromatic-aberration correction. Build one with\n"
-            "3D > Calibrate lateral transform and load the standalone\n"
-            "calibration here.\n\n"
-            "For 3D data, append the correction to the 3D or spline\n"
-            "calibration instead: those are applied automatically during\n"
-            "the fit and must not be loaded here as well.\n\n"
+            "Corrections applied to the fitted x/y, typically a\n"
+            "chromatic-aberration correction. Build one with\n"
+            "3D > Calibrate lateral transform and load it here.\n\n"
+            "Works with 2D and 3D fits alike. With astigmatic 3D fitting\n"
+            "these are applied after the z fit, on top of any correction\n"
+            "the 3D calibration carries - so keeping a correction in its\n"
+            "own file gives the same result as appending it to the 3D\n"
+            "calibration (the recommended route, since the calibration\n"
+            "then travels with its correction).\n\n"
+            "A correction the loaded 3D or spline calibration already\n"
+            "carries is refused here: it is applied during the fit, and\n"
+            "applying it twice would correct the coordinates twice.\n\n"
             "Several files are applied in the order listed. Single-channel\n"
-            "data only: a multichannel (global) spline fit registers its\n"
+            "data only: a multichannel (global) fit registers its\n"
             "channels itself and ignores these."
         )
         vbox.addWidget(affine_groupbox)
         affine_grid = QtWidgets.QGridLayout(affine_groupbox)
-        load_affine_calib = QtWidgets.QPushButton("Load 2D correction")
+        load_affine_calib = QtWidgets.QPushButton("Load correction")
         load_affine_calib.setToolTip(
-            "Load a standalone lateral calibration (.yaml) to apply to this\n"
-            "2D measurement."
+            "Load a standalone lateral calibration (.yaml) to apply to\n"
+            "this measurement, 2D or 3D."
         )
         load_affine_calib.setAutoDefault(False)
         load_affine_calib.clicked.connect(self.load_affine_calib)
@@ -3928,7 +4165,7 @@ class ParametersDialog(lib.Dialog):
         )
         affine_grid.addWidget(clear_affine_calib, 0, 2)
         self.affine_calib_label = QtWidgets.QLabel(
-            "-- no 2D correction loaded --"
+            "-- no correction loaded --"
         )
         self.affine_calib_label.setAlignment(
             QtCore.Qt.AlignmentFlag.AlignCenter
@@ -4089,6 +4326,8 @@ class ParametersDialog(lib.Dialog):
         # and put the selected region's on the slider
         self.window.region_mngs()
         self.sync_mng_to_selected_region()
+        # ... and the selected region's own fit settings on the fit widgets
+        self.window.sync_region_fit_params()
         if not skip_dialog and self.roi_dialog is not None:
             self.roi_dialog.update_table()
 
@@ -4446,14 +4685,16 @@ class ParametersDialog(lib.Dialog):
             self.update_spline_calib(path)
 
     def load_affine_calib(self) -> None:
-        """Load one or more standalone lateral calibrations to apply to this
-        2D measurement after fitting.
+        """Load one or more standalone lateral calibrations to apply after
+        fitting, whether the fit is 2D or 3D.
 
-        Any calibration file works as a carrier - only its affine
-        corrections are read - but for 3D data the correction belongs in
-        the 3D / spline calibration itself, which applies it during the
-        fit; corrections that calibration already carries are rejected
-        here. Selecting several files applies them in the order chosen.
+        Any calibration file works as a carrier - only its lateral
+        corrections are read. With astigmatic 3D fitting they are applied
+        after the z fit, on top of the ones the 3D calibration carries, so
+        a correction kept in its own file lands exactly where an appended
+        one would; a correction the loaded 3D / spline calibration already
+        carries is rejected here, since that one is applied during the fit.
+        Selecting several files applies them in the order chosen.
         """
         if self.affine_calibration_paths:
             dialog_directory, _ = os.path.split(
@@ -4463,7 +4704,7 @@ class ParametersDialog(lib.Dialog):
             dialog_directory = None
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
-            "Load 2D lateral correction",
+            "Load lateral correction",
             directory=dialog_directory,
             filter="Calibration files (*.yaml *.hdf5)",
         )
@@ -4471,14 +4712,14 @@ class ParametersDialog(lib.Dialog):
             self.update_affine_calib(paths)
 
     def update_affine_calib(self, paths: list[str] | None) -> None:
-        """Load (or clear) the 2D lateral corrections applied after fitting."""
+        """Load (or clear) the lateral corrections applied after fitting."""
         if not paths:
             self.lateral_transforms = []
             self.affine_calibration_paths = []
             self.affine_calib_label.setAlignment(
                 QtCore.Qt.AlignmentFlag.AlignCenter
             )
-            self.affine_calib_label.setText("-- no 2D correction loaded --")
+            self.affine_calib_label.setText("-- no correction loaded --")
             self.affine_calib_label.setToolTip("")
             return
 
@@ -4489,7 +4730,7 @@ class ParametersDialog(lib.Dialog):
             except Exception as e:
                 QtWidgets.QMessageBox.warning(
                     self,
-                    "Load 2D lateral correction",
+                    "Load lateral correction",
                     f"Could not read {os.path.basename(path)}:\n{e}",
                 )
                 continue
@@ -4514,7 +4755,7 @@ class ParametersDialog(lib.Dialog):
         if empty:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Load 2D lateral correction",
+                "Load lateral correction",
                 "No affine corrections found in: "
                 + ", ".join(empty)
                 + ".\nBuild one with 3D > Calibrate lateral transform.",
@@ -4522,7 +4763,7 @@ class ParametersDialog(lib.Dialog):
         if already:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Load 2D lateral correction",
+                "Load lateral correction",
                 "Not loaded: "
                 + ", ".join(lib.describe_lateral_transforms(already))
                 + ".\n\nThe loaded 3D / spline calibration already carries "
@@ -4562,6 +4803,30 @@ class ParametersDialog(lib.Dialog):
             + "\n\nApplied in this order after fitting:\n"
             + "\n".join(f"{i + 1}. {d}" for i, d in enumerate(described))
         )
+
+    def _set_spline_state(self, calibration: dict, path: str | None) -> None:
+        """Store an already-loaded spline PSF calibration and label it.
+
+        Kept apart from ``update_spline_calib`` (as ``_set_affine_state`` is
+        from ``update_affine_calib``) so that restoring a channel's own
+        calibration neither re-reads the file nor triggers that function's
+        side effects - entering split-FOV mode and dropping the channel sum,
+        neither of which a channel switch should do."""
+        self.spline_calibration = calibration or {}
+        self.spline_calibration_path = path
+        if path:
+            self.spline_calib_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignRight
+            )
+            self.spline_calib_label.setText(os.path.basename(path))
+            self.spline_calib_label.setToolTip(path)
+        else:
+            self.spline_calib_label.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignCenter
+            )
+            self.spline_calib_label.setText("-- no calibration loaded --")
+            self.spline_calib_label.setToolTip("")
+        self._update_link_photons_visibility()
 
     def update_spline_calib_with_config_path(self) -> None:
         """Retrieve the spline PSF calibration path that corresponds to the
@@ -4661,8 +4926,10 @@ class ParametersDialog(lib.Dialog):
             cal.get("n_channels", len(cal.get("channel_transforms", []) or []))
         )
         is_multichannel = cal.get("model") == "spline-3d-multichannel"
-        show = is_multichannel and (
-            2 <= n_channels <= precision._LINK_XYZ_MAX_CHANNELS
+        show = (
+            is_multichannel
+            and self.joint_fit_selected()
+            and (2 <= n_channels <= precision._LINK_XYZ_MAX_CHANNELS)
         )
         if show:
             # default the toggle to the mode chosen when the calibration was
@@ -4805,7 +5072,9 @@ class ParametersDialog(lib.Dialog):
                 len(calibration.get("channel_transforms", []) or []),
             )
         )
-        show = 2 <= n_channels <= precision._LINK_XYZ_MAX_CHANNELS
+        show = self.joint_fit_selected() and (
+            2 <= n_channels <= precision._LINK_XYZ_MAX_CHANNELS
+        )
         self.gauss_link_photons_checkbox.setVisible(show)
 
     def _gauss_link_photons_enabled(self) -> bool:
@@ -5089,6 +5358,38 @@ class ParametersDialog(lib.Dialog):
         if self.identify_mode_combo.currentText() == IDENTIFY_MODE_SUM:
             self.window.ensure_channel_sum(notify=True)
         self._reset_contrast_and_refresh()
+
+    def joint_fit_selected(self) -> bool:
+        """Whether the 'Fit' setting asks for the joint multichannel fit.
+
+        True for single-channel data too: the combo is hidden then, and the
+        joint path degrades to the ordinary single-channel fit. Guarded so
+        the calls made while the dialog is still being built are a no-op."""
+        combo = getattr(self, "fit_mode_combo", None)
+        if combo is None:
+            return True
+        return combo.currentText() == FIT_MODE_JOINT
+
+    def on_fit_mode_changed(self) -> None:
+        """Switch between the joint fit and one fit per channel.
+
+        Nothing is linked or shared in the independent mode, so the options
+        that only mean something to the joint fit (photon linking) go away
+        with it, and the preview stops color-coding the cross-channel links.
+        """
+        joint = self.joint_fit_selected()
+        self._update_link_photons_visibility()
+        self._update_gauss_link_photons_visibility()
+        checkbox = self.link_colors_checkbox
+        if not joint and checkbox.isChecked():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(False)
+        checkbox.setEnabled(joint)
+        # entering the separate mode, the selected split-FOV region's own
+        # settings take over the fit widgets
+        self.window.sync_region_fit_params()
+        self.window.draw_frame()
 
     def on_gpu_fitting_changed(self) -> None:
         """Handle changes to the GPU fitting option."""
@@ -5574,6 +5875,9 @@ class Window(QtWidgets.QMainWindow):
         self.bead_diagnostics = []
         self.bead_calibration_path = None
         self._active_worker = None
+        # Lateral corrections the last fit applied, as descriptions, for the
+        # saved metadata (see _record_applied_lateral).
+        self._applied_lateral = []
         # Affine-transform (astigmatism) calibration dialog and its worker;
         # both created lazily when the calibration is first opened/run.
         self._affine_dialog = None
@@ -5584,6 +5888,15 @@ class Window(QtWidgets.QMainWindow):
         # Bookkeeping for a multichannel "Identify" (Ctrl+I) batch that runs
         # identification on every channel in turn; None when not running.
         self._multi_identify = None
+        # ... and for a "Fit" batch that fits every channel (or split-FOV
+        # region) on its own, see ``_fit_independent``.
+        self._multi_fit = None
+        # Split-FOV region currently being fitted on its own: its label is
+        # appended to every file that fit writes (see channel_output_base).
+        self._region_suffix = ""
+        # Which split-FOV region the fit settings now on the dialog belong to
+        # (see ``sync_region_fit_params``); None when none is selected.
+        self._region_params_owner = None
         # Channel-sum identification (IDENTIFY_MODE_SUM), see
         # ``identify_channel_sum``. ``sum_identifications`` marks the current
         # detections as coming from the summed channels, which is what tells
@@ -5680,6 +5993,11 @@ class Window(QtWidgets.QMainWindow):
             )
             if index >= 0:
                 self.parameters_dialog.fit_optimizer.setCurrentIndex(index)
+        fit_mode = settings["Localize"].get("fit_mode", None)
+        if fit_mode is not None:
+            index = self.parameters_dialog.fit_mode_combo.findText(fit_mode)
+            if index >= 0:
+                self.parameters_dialog.fit_mode_combo.setCurrentIndex(index)
 
         self.pwd = pwd
 
@@ -5709,6 +6027,9 @@ class Window(QtWidgets.QMainWindow):
         settings["Localize"][
             "fit_optimizer"
         ] = self.parameters_dialog.fit_optimizer.currentText()
+        settings["Localize"][
+            "fit_mode"
+        ] = self.parameters_dialog.fit_mode_combo.currentText()
         settings["Localize"]["Columns to save"] = {
             column: checkbox.isChecked()
             for column, checkbox in (
@@ -6222,6 +6543,8 @@ class Window(QtWidgets.QMainWindow):
         (
             dark_path,
             light_paths,
+            light_levels,
+            level_unit,
             out_path,
             accepted,
         ) = CameraCalibrationDialog.getCalibrationSpecs(self)
@@ -6251,6 +6574,8 @@ class Window(QtWidgets.QMainWindow):
                     progress_callback=progress.set_value,
                     dark_path=dark_path,
                     bright_paths=light_paths,
+                    bright_levels=light_levels,
+                    level_unit=level_unit,
                 )
         except Exception as error:
             progress.close()
@@ -6602,12 +6927,14 @@ class Window(QtWidgets.QMainWindow):
         'Link colors' needs channels to pair spots across; the shared-settings
         group links per-channel parameters and therefore applies to separate
         channels only (split-FOV channels share one movie's parameters).
-        'Identify on' needs channels to add together, so it follows the same
-        rule as 'Link colors'.
+        'Identify on' needs channels to add together, and 'Fit' channels to
+        fit one at a time, so both follow the same rule as 'Link colors'.
 
-        All three are hidden rather than disabled, and all three keep their
-        space while hidden (see ``_retain_size_when_hidden``), so opening or
-        closing channels never reflows the dialog."""
+        All of them are hidden rather than disabled. The row widgets keep
+        their space while hidden (see ``_retain_size_when_hidden``), so the
+        rows they sit in do not reflow; the shared-settings group box does
+        not, since reserving a whole group box leaves a visible gap in the
+        single-channel dialog."""
         separate_channels = len(self.channels) > 1
         multichannel = separate_channels or self.view.split_fov_mode
         pdialog = self.parameters_dialog
@@ -6630,6 +6957,15 @@ class Window(QtWidgets.QMainWindow):
             self.drop_channel_sum()
         pdialog.identify_mode_label.setVisible(multichannel)
         combo.setVisible(multichannel)
+        fit_combo = pdialog.fit_mode_combo
+        if not multichannel and fit_combo.currentText() != FIT_MODE_JOINT:
+            # as above: leaving it on the separate mode while hidden would
+            # keep single-channel data in a mode that cannot be turned off
+            fit_combo.blockSignals(True)
+            fit_combo.setCurrentText(FIT_MODE_JOINT)
+            fit_combo.blockSignals(False)
+        pdialog.fit_mode_label.setVisible(multichannel)
+        fit_combo.setVisible(multichannel)
 
     def build_spline_calibration(self) -> None:
         """Prompt for the spline PSF calibration parameters and build the
@@ -7342,13 +7678,8 @@ class Window(QtWidgets.QMainWindow):
         self._populate_channel_combo()
         self.frame_slider.setEnabled(True)
         self.contrast_slider.setEnabled(True)
-        # A fresh load starts at frame 0. The previous movie's contrast
-        # (manual black/white values, if Auto is off) is almost certainly
-        # wrong for the new one's intensity scale, so it is re-derived
-        # from the new first frame rather than carried over.
         self.curr_frame_number = 0
         self._restore_current_channel()
-        self.contrast_dialog.reset_to_frame()
         self.draw_frame()
         self.parameters_dialog.reset_quality_check()
 
@@ -7500,6 +7831,10 @@ class Window(QtWidgets.QMainWindow):
             # per loaded movie: each can need its own correction
             "lateral_transforms": pd.lateral_transforms,
             "affine_calibration_paths": pd.affine_calibration_paths,
+            # the PSF is measured per channel, so a channel fitted on its own
+            # can need its own calibration (shared unless the link is off)
+            "spline_calibration": pd.spline_calibration,
+            "spline_calibration_path": pd.spline_calibration_path,
             "use_gpu": pd.gpu_checkbox.isChecked(),
             "temporal_median_on": pd.temporal_median_checkbox.isChecked(),
             "temporal_median": pd.temporal_median_spinbox.value(),
@@ -7520,6 +7855,7 @@ class Window(QtWidgets.QMainWindow):
         link_box = pd.link_box_checkbox.isChecked()
         link_mng = pd.link_mng_checkbox.isChecked()
         link_cam = pd.link_camera_checkbox.isChecked()
+        link_calib = pd.link_calib_checkbox.isChecked()
         # Camera selection first: its cascade fills baseline/gain/pixelsize
         # from the config, which we then override with the channel's values.
         if not link_cam and hasattr(pd, "camera") and "camera" in params:
@@ -7570,6 +7906,12 @@ class Window(QtWidgets.QMainWindow):
             params.get("lateral_transforms", []),
             params.get("affine_calibration_paths", []),
         )
+        # .get(): parameter sets captured before per-channel PSF calibrations
+        if not link_calib and "spline_calibration" in params:
+            pd._set_spline_state(
+                params["spline_calibration"],
+                params.get("spline_calibration_path"),
+            )
         # Saved parameter files written before the Numba CUDA port use the
         # old "gpufit" key.
         pd.gpu_checkbox.setChecked(
@@ -7589,6 +7931,8 @@ class Window(QtWidgets.QMainWindow):
             keys += ["box"]
         if pd.link_mng_checkbox.isChecked():
             keys += ["mng", "mng_min", "mng_max"]
+        if pd.link_calib_checkbox.isChecked():
+            keys += ["spline_calibration", "spline_calibration_path"]
         if pd.link_camera_checkbox.isChecked():
             keys += [
                 "camera",
@@ -7614,11 +7958,16 @@ class Window(QtWidgets.QMainWindow):
 
     def channel_output_base(self) -> str:
         """Base path (no extension) for the active channel's output files,
-        suffixed with the channel name when channels share one file."""
+        suffixed with the channel name when channels share one file, and
+        with the region label while a split-FOV region is being fitted on
+        its own (see ``_fit_independent``) - the regions all come from one
+        movie, so they would otherwise overwrite each other."""
         base, _ = os.path.splitext(self.movie_path)
         if self._channels_share_file():
             name = self.channels[self.current_channel].name
             base = base + "_" + _sanitize_filename(name)
+        if self._region_suffix:
+            base = base + "_" + _sanitize_filename(self._region_suffix)
         return base
 
     def open_picks(self) -> None:
@@ -8051,7 +8400,7 @@ class Window(QtWidgets.QMainWindow):
                 if split_fov:
                     # label each region by its channel index (0 = reference)
                     # and the threshold it is identified with
-                    label = "ref" if i == 0 else f"ch{i}"
+                    label = localize.region_label(i)
                     if i < len(region_mngs):
                         label += f" ({region_mngs[i]:,})"
                     text = self.scene.addSimpleText(label)
@@ -8402,19 +8751,10 @@ class Window(QtWidgets.QMainWindow):
         if movie is None:
             return None
         parameters = self.channel_parameters(channel)
-        sigma = parameters["Gaussian Filter Sigma"]
-        rois = self.identification_rois() or None
-        roi_pad = (
-            localize.identification_roi_pad(parameters["Box Size"], sigma)
-            if rois
-            else 0
-        )
         movie, cache = _filtered_identification_movie(
             movie,
             parameters["Temporal Median Window"],
-            sigma,
-            rois,
-            roi_pad,
+            parameters["Gaussian Filter Sigma"],
             self._channel_filter_cache.get(channel, [None, None]),
         )
         self._channel_filter_cache[channel] = cache
@@ -9045,6 +9385,126 @@ class Window(QtWidgets.QMainWindow):
         view.roi_mngs = mngs
         return mngs
 
+    def region_params(self) -> list[dict]:
+        """Per-region fit settings in split-FOV mode, kept in step with
+        ``view.rois``.
+
+        Fitted separately, each region is a channel of its own: its own
+        model and optimizer, its own PSF calibration, its own z-calibration.
+        This is the split-FOV counterpart of the per-channel ``Channel.params``
+        (see ``_capture_params``), restricted to what the fit uses - one movie
+        holds every region, so the identification and camera settings stay
+        shared. Regions added since the last call inherit the settings now on
+        the dialog; removed ones drop out. Empty whenever split-FOV mode is
+        off or no region is drawn.
+        """
+        try:
+            view = self.view
+            if not view.split_fov_mode or not view.rois:
+                view.roi_params = []
+                return []
+            default = self._capture_region_fit_params()
+        except (AttributeError, RuntimeError):
+            # read from a partially built window
+            return []
+        params = list(view.roi_params[: len(view.rois)])
+        params += [dict(default) for _ in range(len(view.rois) - len(params))]
+        view.roi_params = params
+        return params
+
+    def _capture_region_fit_params(self) -> dict:
+        """The fit settings now on the dialog, as one region's parameters."""
+        pd = self.parameters_dialog
+        return {
+            "fit_model": pd.fit_model.currentIndex(),
+            "fit_optimizer": pd.fit_optimizer.currentIndex(),
+            "convergence": pd.convergence_criterion.value(),
+            "max_it": pd.max_it.value(),
+            "use_gpu": pd.gpu_checkbox.isChecked(),
+            "spline_calibration": pd.spline_calibration,
+            "spline_calibration_path": pd.spline_calibration_path,
+            "z_calibration": pd.z_calibration,
+            "z_calibration_path": pd.z_calibration_path,
+            "z_calib_label": pd.z_calib_label.text(),
+            "fit_z": pd.fit_z_checkbox.isChecked(),
+            "fit_z_enabled": pd.fit_z_checkbox.isEnabled(),
+        }
+
+    def _apply_region_fit_params(self, params: dict) -> None:
+        """Show one region's fit settings on the dialog.
+
+        ``_switching_channel`` is set for the same reason a channel switch
+        sets it: the value changes must not be read as the user editing the
+        parameters, which would drop the identifications (see
+        ``on_parameters_changed``)."""
+        if not params:
+            return
+        pd = self.parameters_dialog
+        self._switching_channel = True
+        try:
+            # the model first: its handler repopulates the optimizer list
+            pd.fit_model.setCurrentIndex(params["fit_model"])
+            pd.fit_optimizer.setCurrentIndex(params["fit_optimizer"])
+            pd.convergence_criterion.setValue(params["convergence"])
+            pd.max_it.setValue(params["max_it"])
+            pd.gpu_checkbox.setChecked(params["use_gpu"])
+            pd._set_spline_state(
+                params["spline_calibration"],
+                params["spline_calibration_path"],
+            )
+            pd.z_calibration = params["z_calibration"]
+            pd.z_calibration_path = params["z_calibration_path"]
+            pd.z_calib_label.setText(params["z_calib_label"])
+            pd.fit_z_checkbox.setEnabled(params["fit_z_enabled"])
+            pd.fit_z_checkbox.setChecked(params["fit_z"])
+        finally:
+            self._switching_channel = False
+
+    def sync_region_fit_params(self) -> None:
+        """Swap the fit settings over when another split-FOV region is
+        selected: what is on the dialog belongs to the region that was
+        selected before, and the newly selected region's settings take its
+        place.
+
+        A no-op unless the regions are actually fitted separately - in the
+        joint fit one calibration describes every region, so the dialog holds
+        one set of settings for all of them, exactly as before.
+        """
+        if self.fit_mode() != FIT_MODE_SEPARATE:
+            return
+        params = self.region_params()
+        index = self.view.selected_roi
+        owner = self._region_params_owner
+        if owner is not None and owner < len(params):
+            params[owner] = self._capture_region_fit_params()
+        if index is None or index >= len(params):
+            # nothing selected: the dialog sets every region at once, as the
+            # min. net gradient slider does
+            self._region_params_owner = None
+            return
+        self._apply_region_fit_params(params[index])
+        self._region_params_owner = index
+
+    def flush_region_fit_params(self) -> list[dict]:
+        """The per-region fit settings, with the dialog's current state
+        written into the region it belongs to.
+
+        The dialog *is* the selected region's settings until another region
+        is selected, so anything that reads them (the fit) has to fold them
+        back in first. With no region selected the dialog applies to every
+        region, mirroring the min. net gradient slider."""
+        params = self.region_params()
+        if not params:
+            return []
+        current = self._capture_region_fit_params()
+        index = self.view.selected_roi
+        if self.fit_mode() != FIT_MODE_SEPARATE or index is None:
+            return [dict(current) for _ in params]
+        if index < len(params):
+            params[index] = current
+        self.view.roi_params = params
+        return params
+
     def identify_mode(self) -> str:
         """Whether the channels are identified separately or added together,
         see ``IDENTIFY_MODE_SEPARATE`` / ``IDENTIFY_MODE_SUM``.
@@ -9061,6 +9521,24 @@ class Window(QtWidgets.QMainWindow):
         if not multichannel:
             return IDENTIFY_MODE_SEPARATE
         return dialog.identify_mode_combo.currentText()
+
+    def fit_mode(self) -> str:
+        """Whether the channels are fitted together or each on its own, see
+        ``FIT_MODE_JOINT`` / ``FIT_MODE_SEPARATE``.
+
+        Single-channel data always reports the joint mode: there is nothing
+        to fit separately, the combo box is hidden then (see
+        ``_update_multichannel_widgets``) and the joint dispatch degrades to
+        the ordinary single-channel fit."""
+        try:
+            dialog = self.parameters_dialog
+            multichannel = len(self.channels) > 1 or self.view.split_fov_mode
+        except (AttributeError, RuntimeError):
+            # read from a partially built window
+            return FIT_MODE_JOINT
+        if not multichannel:
+            return FIT_MODE_JOINT
+        return dialog.fit_mode_combo.currentText()
 
     @property
     def parameters(self) -> dict:
@@ -9144,15 +9622,22 @@ class Window(QtWidgets.QMainWindow):
         These are the drawn ROIs, except on the channel sum of split-FOV data:
         only the reference region of the summed canvas holds the sum (the other
         regions have been mapped into it), so it alone is searched - and the
-        detections are then already in reference-channel coordinates."""
+        detections are then already in reference-channel coordinates.
+
+        The rectangles are copied out of the view, so that whatever holds on
+        to them (a worker's ROIs, ``last_identification_info["ROI"]``) keeps
+        the regions as they were and not a live reference: the ROIs are also
+        edited in place - a split-FOV region is moved by rewriting its corners
+        (see ``View._move_region``) - and an aliased snapshot would silently
+        agree with the edited list and never look outdated."""
         summed = self.channel_sum_view()
         if (
             summed is not None
             and summed.regions is not None
             and self.identify_mode() == IDENTIFY_MODE_SUM
         ):
-            return [summed.regions[summed.reference]]
-        return self.view.rois
+            return _copied_rois([summed.regions[summed.reference]])
+        return _copied_rois(self.view.rois)
 
     def drop_channel_sum(self) -> None:
         """Forget the channel sum: its detections, its registration and the
@@ -9289,8 +9774,10 @@ class Window(QtWidgets.QMainWindow):
         """The movie the display and the identification preview run on:
         the raw movie (or the channel sum, in ``IDENTIFY_MODE_SUM``),
         optionally temporal median filtered and then Gaussian smoothed -
-        built exactly the way ``localize.identify`` builds it, so that the
-        preview and the batch run agree.
+        built the way ``localize.identify`` builds it, so that the preview
+        and the batch run agree. The one difference is that the filters
+        always cover the whole frame here, since this movie is also what is
+        displayed (see ``_filtered_identification_movie``).
 
         Never used for fitting - ``FitWorker`` and ``save_spots`` always
         cut spots out of ``self.movie``.
@@ -9316,16 +9803,6 @@ class Window(QtWidgets.QMainWindow):
         parameters = self.parameters
         window = parameters["Temporal Median Window"]
         sigma = parameters["Gaussian Filter Sigma"]
-        rois = self.identification_rois() or None
-        # grown by the Gaussian's kernel radius, see identification_roi_pad.
-        # Without a ROI the pad has no effect (the median covers the whole
-        # frame either way), and pinning it to 0 there keeps nudging the
-        # sigma spinbox from throwing away every cached median.
-        roi_pad = (
-            localize.identification_roi_pad(parameters["Box Size"], sigma)
-            if rois
-            else 0
-        )
         if not self.temporal_median_applicable():
             window = 0
         try:
@@ -9335,7 +9812,7 @@ class Window(QtWidgets.QMainWindow):
             # cached filter stack yet
             cache = [None, None]
         movie, cache = _filtered_identification_movie(
-            movie, window, sigma, rois, roi_pad, cache
+            movie, window, sigma, cache
         )
         self._temporal_movie, self._gaussian_movie = cache
         return movie
@@ -9363,6 +9840,10 @@ class Window(QtWidgets.QMainWindow):
         self.abort_action.setEnabled(False)
         # restore the GPU checkbox state for the selected model
         self.parameters_dialog.on_fit_optimizer_changed()
+        if self._multi_fit is not None:
+            # one channel aborted: the rest of the batch goes with it
+            self._abort_independent_fit()
+            return
         self.status_bar.showMessage("Aborted.")
 
     def identify(
@@ -9446,6 +9927,10 @@ class Window(QtWidgets.QMainWindow):
         registration the fit would (see
         ``ParametersDialog.link_calibration``).
         """
+        if self.fit_mode() == FIT_MODE_SEPARATE:
+            # every channel is fitted on its own: every detection is fitted
+            # and nothing is paired across channels
+            return None
         if self.sum_identifications is not None:
             # identified on the channel sum: every detection is fitted, there
             # is no linking step (see Window.identify_channel_sum)
@@ -10187,7 +10672,7 @@ class Window(QtWidgets.QMainWindow):
                 "Load a movie before fitting.",
             )
             return
-        if not self.ready_for_fit:
+        if not self._ready_for_fit_anywhere():
             QtWidgets.QMessageBox.warning(
                 self,
                 "Fit",
@@ -10196,6 +10681,13 @@ class Window(QtWidgets.QMainWindow):
             )
             return
         self.status_bar.showMessage("Preparing fit...")
+        # Each channel (or split-FOV region) fitted on its own, with its own
+        # settings and its own output file. Nothing is registered, linked or
+        # shared, so none of the joint dispatch below applies. A z-calibration
+        # run is single-channel by nature and keeps the ordinary path.
+        if not calibrate_z and self.fit_mode() == FIT_MODE_SEPARATE:
+            self._fit_independent()
+            return
         model = self.parameters_dialog.fit_model.currentText()
         optimizer = self.parameters_dialog.fit_optimizer.currentText()
         method = _fit_code(model, optimizer)
@@ -10209,7 +10701,6 @@ class Window(QtWidgets.QMainWindow):
             else None
         )
         max_it = self.parameters_dialog.max_it.value() if iterates else None
-        fit_z = self.parameters_dialog.fit_z_checkbox.isChecked()
         use_gpu = self.parameters_dialog.gpu_checkbox.isChecked()
         # A loaded channel registration turns the spherical Gaussian into a
         # joint fit across every channel; with none loaded the fit stays
@@ -10228,9 +10719,60 @@ class Window(QtWidgets.QMainWindow):
                     registration, method, use_gpu, eps, max_it
                 )
                 return
-        spline_calibration = None
         if method.startswith("spline"):
             spline_calibration = self.parameters_dialog.spline_calibration
+            if spline_calibration.get("model") == "spline-3d-multichannel":
+                if not self._check_spline_box_size(spline_calibration):
+                    self.status_bar.showMessage("")
+                    return
+                self._start_multichannel_spline_fit(
+                    spline_calibration, method, eps, max_it
+                )
+                return
+        worker = self._single_channel_fit_worker(calibrate_z=calibrate_z)
+        if worker is None:
+            self.status_bar.showMessage("")
+            return
+        self.fit_worker = worker
+        self.fit_worker.finished.connect(self.on_fit_finished)
+        self._start_fit_worker(self.fit_worker)
+
+    def _single_channel_fit_worker(
+        self,
+        identifications: pd.DataFrame | None = None,
+        calibrate_z: bool = False,
+    ) -> FitWorker | None:
+        """A ``FitWorker`` for the active channel, from the settings now on
+        the Parameters dialog.
+
+        Shared by the ordinary single-channel fit and by every step of an
+        independent batch, which is what lets a channel (or a region) be
+        fitted with whatever model, optimizer and calibration it carries.
+        Returns None - having said why - when those settings cannot fit:
+        a spline model with no calibration loaded, a box larger than the
+        calibration's, or a joint multichannel calibration where a
+        single-channel one is needed.
+
+        Parameters
+        ----------
+        identifications : pd.DataFrame or None, optional
+            The detections to fit. None (the default) fits the active
+            channel's own; a split-FOV region passes the detections inside
+            it.
+        calibrate_z : bool, optional
+            Whether the fit feeds a z-calibration. Default False.
+        """
+        dialog = self.parameters_dialog
+        model = dialog.fit_model.currentText()
+        method = _fit_code(model, dialog.fit_optimizer.currentText())
+        iterates = dialog.current_fit_code() in _CONVERGENCE_CODES
+        eps = dialog.convergence_criterion.value() if iterates else None
+        max_it = dialog.max_it.value() if iterates else None
+        fit_z = dialog.fit_z_checkbox.isChecked()
+        use_gpu = dialog.gpu_checkbox.isChecked()
+        spline_calibration = None
+        if method.startswith("spline"):
+            spline_calibration = dialog.spline_calibration
             if not spline_calibration:
                 QtWidgets.QMessageBox.warning(
                     self,
@@ -10239,26 +10781,39 @@ class Window(QtWidgets.QMainWindow):
                     "PSF (spline) > Load calibration), or build one via "
                     "3D > Calibrate spline PSF.",
                 )
-                self.status_bar.showMessage("")
-                return
+                return None
+            if spline_calibration.get("model") == "spline-3d-multichannel":
+                # it describes every channel at once and only means anything
+                # to the joint fit; fitting one channel against it would use
+                # the reference channel's PSF everywhere
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Spline PSF fit",
+                    "This is a multichannel spline calibration, which "
+                    "belongs to the joint fit. Fitting the channels "
+                    "separately needs one single-channel calibration per "
+                    "channel: load each channel's own calibration (untick "
+                    "'PSF calibration' under 'Same settings across "
+                    "channels'), or set 'Fit' back to "
+                    f"'{FIT_MODE_JOINT}'.",
+                )
+                return None
             # The spline fit requires the box size to match the one the
             # calibration was built with.
             if not self._check_spline_box_size(spline_calibration):
-                self.status_bar.showMessage("")
-                return
+                return None
             # A 3D spline fit recovers z directly, so the separate
             # astigmatism z-fitting step must not run.
             fit_z = False
-            if spline_calibration.get("model") == "spline-3d-multichannel":
-                self._start_multichannel_spline_fit(
-                    spline_calibration, method, eps, max_it
-                )
-                return
-        self.fit_worker = FitWorker(
+        return FitWorker(
             self.movie,
             self.info,
             self.camera_info,
-            self.identifications,
+            (
+                self.identifications
+                if identifications is None
+                else identifications
+            ),
             self.parameters["Box Size"],
             method,
             eps,
@@ -10274,13 +10829,261 @@ class Window(QtWidgets.QMainWindow):
                 self.parameters_dialog.camera_calibration or None
             ),
         )
-        self.fit_worker.progressMade.connect(self.on_fit_progress)
-        self.fit_worker.cutProgressMade.connect(self.on_cut_progress)
-        self.fit_worker.finished.connect(self.on_fit_finished)
-        self.fit_worker.aborted.connect(self.on_worker_aborted)
-        self._active_worker = self.fit_worker
+
+    def _start_fit_worker(self, worker: FitWorker) -> None:
+        """Wire a ``FitWorker``'s progress/abort signals up and start it.
+        Its ``finished`` signal is connected by the caller, which is what
+        decides whether the result is one fit or one step of a batch."""
+        worker.progressMade.connect(self.on_fit_progress)
+        worker.cutProgressMade.connect(self.on_cut_progress)
+        worker.aborted.connect(self.on_worker_aborted)
+        self._active_worker = worker
         self.abort_action.setEnabled(True)
-        self.fit_worker.start()
+        worker.start()
+
+    def _ready_for_fit_anywhere(self) -> bool:
+        """Whether there is anything to fit.
+
+        The active channel's detections, or - when the channels are fitted
+        one at a time - any channel's: a batch that has three identified
+        channels must not be refused because the fourth one is empty."""
+        if self.ready_for_fit:
+            return True
+        if self.fit_mode() != FIT_MODE_SEPARATE:
+            return False
+        return any(channel.ready_for_fit for channel in self.channels)
+
+    def _fit_independent(self) -> None:
+        """Fit every channel - or every split-FOV region - on its own.
+
+        The fitting counterpart of ``_identify_all_channels``: the channels
+        are worked through one at a time, each with the model, optimizer and
+        calibrations it carries, and each saved to its own file. Nothing is
+        registered or linked, so every detection is fitted and the channels
+        come out independent, to be connected afterwards.
+        """
+        if self.sum_identifications is not None:
+            # the sum's detections are one consensus set in the reference
+            # channel's coordinates, made for the joint fit; fitted
+            # separately they would put the reference channel's positions
+            # into every channel
+            QtWidgets.QMessageBox.information(
+                self,
+                "Fit",
+                "These detections were identified on the sum of the "
+                "channels, which is made for the joint fit: they are one "
+                "set in the reference channel's coordinates. Set "
+                f"'Identify on' to '{IDENTIFY_MODE_SEPARATE}' and identify "
+                "again to fit the channels on their own.",
+            )
+            self.status_bar.showMessage("")
+            return
+        if self.view.split_fov_mode:
+            # the drawn regions, not identification_rois(): every region is
+            # fitted here, whatever was identified where
+            regions = _copied_rois(self.view.rois)
+            if not regions:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Fit",
+                    "'Regions = channels' is on but no region is drawn. "
+                    "Draw the regions, or turn split-FOV mode off.",
+                )
+                self.status_bar.showMessage("")
+                return
+            state = {
+                "regions": regions,
+                "params": self.flush_region_fit_params(),
+                "queue": list(range(len(regions))),
+                "total": len(regions),
+                "info": self.info,
+                "selected_roi": self.view.selected_roi,
+            }
+        else:
+            state = {
+                "regions": None,
+                "params": None,
+                "queue": list(range(len(self.channels))),
+                "total": len(self.channels),
+                "info": None,
+                "selected_roi": None,
+            }
+        state |= {
+            "done": 0,
+            "sum": 0,
+            "skipped": [],
+            "current": None,
+            "return_channel": self.current_channel,
+        }
+        self._multi_fit = state
+        where = "regions" if state["regions"] is not None else "channels"
+        self.status_bar.showMessage(f"Fitting {state['total']} {where}...")
+        self._fit_run_next()
+
+    def _fit_run_next(self) -> None:
+        """Fit the next queued channel / region, or finish the batch."""
+        state = self._multi_fit
+        if state is None:
+            return
+        if not state["queue"]:
+            self._finish_independent_fit()
+            return
+        index = state["queue"].pop(0)
+        state["current"] = index
+        if state["regions"] is not None:
+            self._start_region_fit(index)
+        else:
+            self._start_channel_fit(index)
+
+    def _skip_in_batch(self, name: str, reason: str) -> None:
+        """Note a channel / region the batch cannot fit and move on."""
+        state = self._multi_fit
+        state["skipped"].append(name)
+        state["done"] += 1
+        self.status_bar.showMessage(f"Skipped {name}: {reason}.")
+        self._fit_run_next()
+
+    def _start_channel_fit(self, index: int) -> None:
+        """Fit one loaded channel with its own settings.
+
+        Activating the channel restores them (model, optimizer, calibrations,
+        camera) exactly as a manual channel switch does, so the fit that runs
+        is the one that channel is set up for."""
+        self.set_current_channel(index)
+        state = self._multi_fit
+        name = self.channels[index].name
+        if self.movie is None:
+            self._skip_in_batch(name, "no movie loaded")
+            return
+        if self.identifications is None or not len(self.identifications):
+            self._skip_in_batch(name, "no identifications")
+            return
+        worker = self._single_channel_fit_worker()
+        if worker is None:  # the dialog has said why
+            self._abort_independent_fit()
+            return
+        self.status_bar.showMessage(
+            f"Fitting channel {state['done'] + 1}/{state['total']} "
+            f"({name}) ..."
+        )
+        self.fit_worker = worker
+        worker.finished.connect(self.on_fit_finished)
+        self._start_fit_worker(worker)
+
+    def _start_region_fit(self, index: int) -> None:
+        """Fit one split-FOV region with its own settings.
+
+        One movie holds every region, so the region is selected (which is
+        what its own settings hang off) and only the detections inside it are
+        fitted."""
+        state = self._multi_fit
+        region = state["regions"][index]
+        label = localize.region_label(index)
+        self.view.selected_roi = index
+        self._apply_region_fit_params(state["params"][index])
+        self._region_params_owner = index
+        identifications = localize.confine_to_region(
+            self.identifications, region
+        )
+        if not len(identifications):
+            self._skip_in_batch(label, "no identifications in it")
+            return
+        worker = self._single_channel_fit_worker(
+            identifications=identifications
+        )
+        if worker is None:  # the dialog has said why
+            self._abort_independent_fit()
+            return
+        self.status_bar.showMessage(
+            f"Fitting region {state['done'] + 1}/{state['total']} "
+            f"({label}) ..."
+        )
+        self._region_suffix = label
+        self.fit_worker = worker
+        worker.finished.connect(self._on_region_fit_finished)
+        self._start_fit_worker(worker)
+        self.draw_frame()
+
+    def _on_region_fit_finished(
+        self,
+        locs: pd.DataFrame,
+        elapsed_time: float,
+        fit_z: bool,
+        calibrate_z: bool,
+    ) -> None:
+        """Store and save one region's localizations, in its own coordinates.
+
+        The region is a channel of its own once it is fitted separately, so
+        its localizations are moved to its own origin and its metadata gives
+        the region's size - which is what makes the regions overlay each
+        other when they are loaded side by side in Picasso: Render. The
+        on-screen markers stay where the spots were fitted.
+        """
+        state = self._multi_fit
+        if state is None:  # aborted while the fit was finishing
+            return
+        self._active_worker = None
+        self.abort_action.setEnabled(False)
+        region = state["regions"][state["current"]]
+        self.status_bar.showMessage(
+            f"Fitted {len(locs):,} spots in region "
+            f"{localize.region_label(state['current'])} in "
+            f"{elapsed_time:.2f} seconds."
+        )
+        self.locs = localize.locs_to_region_coordinates(locs, region)
+        self.locs_display = locs
+        self.info = localize.region_movie_info(state["info"], region)
+        self.draw_frame()
+        # the same tail as a single fit: the astigmatism z-fit (when it is
+        # asked for), then saving and the optional drift correction, which
+        # is where the batch moves on (see save_locs_after_fit)
+        if fit_z:
+            self.fit_z()
+        else:
+            self.save_locs_after_fit()
+
+    def _finish_independent_fit(self) -> None:
+        """Restore the view after the last channel / region and report."""
+        state = self._multi_fit
+        self._multi_fit = None
+        self._region_suffix = ""
+        self._active_worker = None
+        self.abort_action.setEnabled(False)
+        self._restore_after_independent_fit(state)
+        where = "regions" if state["regions"] is not None else "channels"
+        n_fitted = state["total"] - len(state["skipped"])
+        message = (
+            f"Fitted {state['sum']:,} spots in {n_fitted} {where}, saved to "
+            f"{n_fitted} files."
+        )
+        if state["skipped"]:
+            message += " Skipped " + ", ".join(state["skipped"]) + "."
+        self.status_bar.showMessage(message)
+
+    def _abort_independent_fit(self) -> None:
+        """Give up the rest of the batch and restore the view."""
+        state = self._multi_fit
+        self._multi_fit = None
+        self._region_suffix = ""
+        self._active_worker = None
+        self.abort_action.setEnabled(False)
+        if state is not None:
+            self._restore_after_independent_fit(state)
+        self.status_bar.showMessage("Aborted.")
+
+    def _restore_after_independent_fit(self, state: dict) -> None:
+        """Put back what the batch moved: the movie's own metadata and the
+        region selection, or the channel that was active before it."""
+        if state["regions"] is not None:
+            self.info = state["info"]
+            self.view.selected_roi = state["selected_roi"]
+            self.sync_region_fit_params()
+        else:
+            self.set_current_channel(state["return_channel"])
+            # persist the last channel's results (set_current_channel only
+            # snapshots on an actual switch)
+            self._snapshot_current_channel()
+        self.draw_frame()
 
     def _start_multichannel_gauss_fit(
         self,
@@ -10301,7 +11104,7 @@ class Window(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "Multichannel Gaussian fit",
-                "2D lateral corrections apply to single-channel data only and "
+                "Lateral corrections apply to single-channel data only and "
                 "are not used here: the multichannel fit registers its "
                 "channels itself, from the loaded channel registration.",
             )
@@ -10896,6 +11699,27 @@ class Window(QtWidgets.QMainWindow):
         self.abort_action.setEnabled(True)
         self.fit_z_worker.start()
 
+    def _record_applied_lateral(self, worker) -> None:
+        """Keep what the finished fit did with the lateral corrections, so
+        that ``save_locs`` can write it into the metadata.
+
+        The workers discard the info their fit returns - it is rebuilt from
+        the dialog when saving - so without this a corrected file would
+        carry no record of the correction, and the CLI's would.
+        """
+        self._applied_lateral = list(
+            getattr(worker, "applied_lateral_transforms", None) or []
+        )
+        skipped = list(
+            getattr(worker, "skipped_lateral_transforms", None) or []
+        )
+        if skipped:
+            self.status_bar.showMessage(
+                "Skipped "
+                + ", ".join(skipped)
+                + ": already applied by the calibration used for fitting."
+            )
+
     def _extra_lateral_transforms(self, calibration: dict | None) -> list:
         """The loaded affine corrections minus those ``calibration`` carries
         and therefore applies itself.
@@ -10977,6 +11801,7 @@ class Window(QtWidgets.QMainWindow):
         """Handle the completion of the fitting process. Draw fit
         markers, fit/calibration z coordinates, if requested, save
         localizations."""
+        self._record_applied_lateral(self._active_worker)
         self._active_worker = None
         self.abort_action.setEnabled(False)
         self.status_bar.showMessage(
@@ -11059,9 +11884,11 @@ class Window(QtWidgets.QMainWindow):
         fit itself (saveable ``locs``) stays with the reference channel, which
         is made active so it displays and saves in reference coordinates.
 
-        Returns False (a no-op) for single-movie data, including split-FOV.
+        Returns False (a no-op) for single-movie data, including split-FOV,
+        and for channels fitted independently - those localizations belong to
+        the channel they were fitted in, not to a reference channel.
         """
-        if len(self.channels) <= 1:
+        if len(self.channels) <= 1 or self.fit_mode() == FIT_MODE_SEPARATE:
             return False
         # Read the transforms off the worker that actually produced these
         # localizations, rather than whichever calibration happens to be
@@ -11106,6 +11933,7 @@ class Window(QtWidgets.QMainWindow):
         ``self.locs_display`` is left untouched so the on-screen
         FitMarker overlays stay at their pre-z-fit, pre-affine
         positions (mirroring the drift-correction pattern)."""
+        self._record_applied_lateral(self._active_worker)
         self._active_worker = None
         self.abort_action.setEnabled(False)
         self.status_bar.showMessage(
@@ -11120,8 +11948,24 @@ class Window(QtWidgets.QMainWindow):
             if sound_path is not None:
                 playsound(sound_path, block=False)
 
+    def attach_roi_id(self) -> None:
+        """Name the ROI each localization was found in, adding a
+        ``roi_id`` column to ``self.locs`` (see
+        ``localize.add_roi_id``).
+
+        Called once per fit, before drift correction moves the
+        coordinates the ids are derived from. Split-FOV mode is
+        excluded: there the regions are separate channels rather than
+        parts of one field, and each is saved to its own file already."""
+        if self.locs is None or self.view.split_fov_mode:
+            return
+        rois = (self.last_identification_info or {}).get("ROI")
+        self.locs = localize.add_roi_id(self.locs, rois)
+
     def save_locs_after_fit(self) -> None:
-        """Save localizations after fitting to an .hdf5 file."""
+        """Save localizations after fitting to an .hdf5 file, naming the
+        ROI each of them came from (see ``attach_roi_id``)."""
+        self.attach_roi_id()
         base = self.channel_output_base()
         self.save_locs(base + "_locs.hdf5")
 
@@ -11138,6 +11982,12 @@ class Window(QtWidgets.QMainWindow):
         fiducial_check = self.parameters_dialog.fiducial_check.isChecked()
         if aim_check or fiducial_check:
             self.drift_correction(aim_check, aim_segmentation, fiducial_check)
+        # this channel is done with, drift correction included: on to the
+        # next one (see _fit_independent)
+        if self._multi_fit is not None:
+            self._multi_fit["done"] += 1
+            self._multi_fit["sum"] += len(self.locs)
+            self._fit_run_next()
 
     def drift_correction(
         self, aim_check: bool, aim_segmentation: int, fiducial_check: bool
@@ -11356,6 +12206,15 @@ class Window(QtWidgets.QMainWindow):
         else:
             optimizer = self.parameters_dialog.fit_optimizer.currentText()
             localize_info["Fit method"] = f"{model}, {optimizer}"
+        # A channel fitted on its own says so, so that its file can be told
+        # apart from one the joint fit produced.
+        if self.fit_mode() == FIT_MODE_SEPARATE:
+            localize_info["Fit mode"] = FIT_MODE_SEPARATE
+            localize_info["Channel"] = self._region_suffix or (
+                self.channels[self.current_channel].name
+                if self.channels
+                else ""
+            )
         if self.parameters_dialog.fit_z_checkbox.isChecked():
             localize_info["Z Calibration Path"] = (
                 self.parameters_dialog.z_calibration_path
@@ -11363,6 +12222,18 @@ class Window(QtWidgets.QMainWindow):
             localize_info["Z Calibration"] = (
                 self.parameters_dialog.z_calibration
             )
+        # A correction loaded separately from the calibration leaves no
+        # other trace in the metadata (the calibration dicts below only
+        # record the ones they carry themselves), so name every correction
+        # the fit applied, and where the separate ones came from.
+        if self._applied_lateral:
+            localize_info["Lateral corrections applied"] = list(
+                self._applied_lateral
+            )
+            if self.parameters_dialog.affine_calibration_paths:
+                localize_info["Lateral correction paths"] = list(
+                    self.parameters_dialog.affine_calibration_paths
+                )
         if FIT_MODELS.get(model, {}).get("needs_spline_calibration"):
             # Record the path and model only; the coefficient table is far
             # too large to embed in the metadata.
@@ -11483,11 +12354,19 @@ class Window(QtWidgets.QMainWindow):
 
     def select_locs_columns(self) -> None:
         """Select only the columns that are checked in the corresponding
-        dialog."""
+        dialog.
+
+        The ROI id has no checkbox - only a fit restricted to ROIs has
+        it - and is always kept."""
         to_keep = []
         for column, checkbox in self.columns_dialog.column_checkboxes.items():
             if checkbox.isChecked() and column in self.locs.columns:
                 to_keep.append(column)
+        if (
+            localize.ROI_ID_COLUMN in self.locs.columns
+            and localize.ROI_ID_COLUMN not in to_keep
+        ):
+            to_keep.append(localize.ROI_ID_COLUMN)
         self.locs = self.locs[to_keep]
 
 
@@ -11521,7 +12400,10 @@ class IdentificationWorker(QtCore.QThread):
         super().__init__()
         self.window = window
         self.movie = window.movie if movie is None else movie
-        self.rois = list(window.view.rois) if rois is None else rois
+        # copied down to the corners: the worker's ROIs are handed back with
+        # the finished identifications and stored as the settings it ran with
+        # (see ``_copied_rois``)
+        self.rois = _copied_rois(window.view.rois if rois is None else rois)
         self.frame_range = window.frame_range
         if parameters is None:
             parameters = window.parameters
@@ -11625,6 +12507,10 @@ class FitWorker(QtCore.QThread):
         self.calibrate_z = calibrate_z
         self.spline_calibration = spline_calibration
         self.lateral_transforms = lateral_transforms or []
+        # What the fit did with them, for the metadata (see
+        # Window._record_applied_lateral). A 3D astigmatism run leaves this
+        # empty: FitZWorker applies them after the z fit and reports there.
+        self.applied_lateral_transforms = []
         self.camera_calibration = camera_calibration
         self.N = len(identifications)
         self._last_cut_emit = 0
@@ -11672,7 +12558,12 @@ class FitWorker(QtCore.QThread):
             self.aborted.emit()
             return
         if not self.fit_z:
+            # With a z fit to follow, FitZWorker applies them after it, so
+            # that they land on the final coordinates either way.
             locs = lib.apply_lateral_transforms(locs, self.lateral_transforms)
+            self.applied_lateral_transforms = lib.describe_lateral_transforms(
+                self.spline_calibration
+            ) + lib.describe_lateral_transforms(self.lateral_transforms)
         self.progressMade.emit(self.N + 1, self.N)
         dt = time.time() - t0
         self.finished.emit(locs, dt, self.fit_z, self.calibrate_z)
@@ -12226,6 +13117,10 @@ class FitZWorker(QtCore.QThread):
         self.fitting_method = fitting_method
         self.gpu = gpu
         self.lateral_transforms = lateral_transforms or []
+        # What the fit actually did with the lateral corrections, for the
+        # metadata and the status bar (see Window._record_applied_lateral).
+        self.applied_lateral_transforms = []
+        self.skipped_lateral_transforms = []
 
     def on_progress(self, n_done: int) -> None:
         self.progressMade.emit(n_done, len(self.locs))
@@ -12233,21 +13128,38 @@ class FitZWorker(QtCore.QThread):
     def run(self) -> None:
         t0 = time.time()
         # we ignore info since we will merge the metadata from 2D
-        # localization as well when saving localizations
-        locs, info = zfit.zfit(
-            locs=self.locs,
-            info=self.info,
-            calibration=self.calibration,
-            magnification_factor=self.magnification_factor,
-            pixelsize=self.pixelsize,
-            fitting_method=self.fitting_method,
-            multiprocess=not self.gpu,
-            gpu=self.gpu,
-            progress_callback=self.on_progress,
-            abort_callback=self.isInterruptionRequested,
-        )
-        if locs is not None:
-            locs = lib.apply_lateral_transforms(locs, self.lateral_transforms)
+        # localization as well when saving localizations - except for what
+        # zfit reports about the lateral corrections, which is kept below
+        # because nothing else records it.
+        # The separately loaded corrections go through zfit as well, so that
+        # they are applied after the ones the 3D calibration carries and a
+        # correction present in both is applied once, exactly as when it is
+        # appended to the calibration. zfit warns about that skip; the
+        # window says it in the status bar instead.
+        with warnings.catch_warnings():
+            warnings.simplefilter(
+                "ignore", lib.DuplicateLateralTransformWarning
+            )
+            locs, info = zfit.zfit(
+                locs=self.locs,
+                info=self.info,
+                calibration=self.calibration,
+                magnification_factor=self.magnification_factor,
+                pixelsize=self.pixelsize,
+                fitting_method=self.fitting_method,
+                lateral_transforms=self.lateral_transforms,
+                multiprocess=not self.gpu,
+                gpu=self.gpu,
+                progress_callback=self.on_progress,
+                abort_callback=self.isInterruptionRequested,
+            )
+        if info is not None:
+            self.applied_lateral_transforms = (
+                info[-1].get("Lateral corrections applied") or []
+            )
+            self.skipped_lateral_transforms = (
+                info[-1].get("Lateral corrections skipped") or []
+            )
         dt = time.time() - t0
         self.finished.emit(locs, dt)
 
@@ -12710,25 +13622,9 @@ class QualityWorker(QtCore.QThread):
         self.finished.emit("Quality parameters complete.")
 
 
-def main():
-    app = QtWidgets.QApplication(sys.argv)
-    window = Window()
-
-    # load plugins from ~/.picasso/plugins
-    from .plugins_loader import load_plugins, add_plugins_menu_actions
-
-    load_plugins(window, "localize")
-    add_plugins_menu_actions(window, "localize")
-
-    window.show()
-
-    from ..updater import setup_gui_update_check
-
-    setup_gui_update_check(window)
-
-    lib.install_excepthook(window)
-
-    sys.exit(app.exec())
+def main() -> None:
+    """Start Picasso: Localize - see ``picasso.gui.app.run_gui``."""
+    sys.exit(run_gui(Window, "localize"))
 
 
 if __name__ == "__main__":

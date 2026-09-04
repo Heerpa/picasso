@@ -1135,6 +1135,7 @@ def _localize_process_file(
     spline_calibration: dict | None = None,
     camera_calibration: dict | None = None,
     lateral_transforms: list | None = None,
+    region_fit: dict | None = None,
 ) -> None:
     """Identify, fit, save and optionally undrift one movie.
 
@@ -1151,15 +1152,20 @@ def _localize_process_file(
         Cubic-spline PSF calibration when the fit method is a spline method;
         else ``None``. A 3D spline fit recovers z directly (no ``zfit``).
     lateral_transforms : list or None
-        Extra lateral affine corrections (see ``--affine-calibration``),
-        applied to x/y after fitting and, for 3D astigmatism, after ``zfit``
-        applied the ones stored in the 3D calibration. Corrections the
-        spline or astigmatism calibration carries - and therefore applies
-        itself - are skipped rather than applied a second time.
+        Lateral corrections loaded separately from the calibration used
+        for fitting (see ``--affine-calibration``), applied to x/y after
+        fitting and, for 3D astigmatism, after the ones the 3D calibration
+        carries - so loading one separately gives the same coordinates as
+        appending it to the calibration. Corrections the spline or
+        astigmatism calibration carries - and therefore applies itself -
+        are skipped rather than applied a second time.
+    region_fit : dict or None
+        Set by ``--regions-separately``: fit each ``--roi`` region on its
+        own and write one file per region. Holds the per-region fitting
+        methods and spline calibrations (see ``_localize_regions``).
     """
-    from os.path import splitext
-    from .io import load_movie, load_tif_concatenated, save_locs
-    from .localize import localize, add_file_to_db
+    from .io import load_movie, load_tif_concatenated
+    from .localize import localize
 
     if isinstance(paths, str):
         paths = [paths]
@@ -1185,6 +1191,25 @@ def _localize_process_file(
     fitting_method = _FIT_METHOD_MAP[args.fit_method]
     cam_info = dict(camera_info)
     cam_info["Pixelsize"] = args.pixelsize
+    if region_fit is not None:
+        _localize_regions(
+            movie,
+            info,
+            path,
+            args,
+            box,
+            min_net_gradient,
+            roi,
+            frame_bounds,
+            cam_info,
+            convergence,
+            max_iterations,
+            z_params,
+            region_fit,
+            camera_calibration=camera_calibration,
+            lateral_transforms=lateral_transforms,
+        )
+        return
     parameters = {
         "Min. Net Gradient": min_net_gradient,
         "Box Size": box,
@@ -1210,6 +1235,199 @@ def _localize_process_file(
         return_info=True,
     )
 
+    _localize_finish(
+        locs,
+        info,
+        path,
+        args,
+        z_params,
+        lateral_transforms,
+        spline_calibration,
+    )
+
+
+def _localize_region_fit(
+    fit_methods: list[str],
+    spline_calibrations: list[dict],
+    n_regions: int,
+) -> dict:
+    """The per-region fitting methods and spline calibrations of a
+    ``--regions-separately`` run, one entry per region.
+
+    A single ``--fit-method`` / ``--spline-calibration`` applies to every
+    region; several must match the ``--roi`` count, so that it is clear
+    which region gets which."""
+    if n_regions < 1:
+        raise Exception(
+            "--regions-separately fits each --roi region on its own, so at "
+            "least one --roi is needed. Pass the regions, e.g. "
+            "--roi 0 0 256 256 --roi 0 256 256 512."
+        )
+    methods = [_FIT_METHOD_MAP[method] for method in fit_methods]
+    if len(methods) not in (1, n_regions):
+        raise Exception(
+            f"{len(methods)} fitting methods were given but {n_regions} "
+            "ROIs; pass one --fit-method per --roi, or a single one for all "
+            "of them."
+        )
+    if len(methods) == 1:
+        methods = methods * n_regions
+    calibrations = list(spline_calibrations)
+    if calibrations and len(calibrations) not in (1, n_regions):
+        raise Exception(
+            f"{len(calibrations)} spline calibrations were given but "
+            f"{n_regions} ROIs; pass one --spline-calibration per --roi, or "
+            "a single one for all of them."
+        )
+    if len(calibrations) == 1:
+        calibrations = calibrations * n_regions
+    if not calibrations:
+        calibrations = [None] * n_regions
+    return {"methods": methods, "spline_calibrations": calibrations}
+
+
+def _localize_regions(
+    movie,
+    info: list[dict],
+    path: str,
+    args: argparse.Namespace,
+    box: int,
+    min_net_gradient,
+    roi: list,
+    frame_bounds,
+    cam_info: dict,
+    convergence: float,
+    max_iterations: int,
+    z_params,
+    region_fit: dict,
+    camera_calibration: dict | None = None,
+    lateral_transforms: list | None = None,
+) -> None:
+    """Fit each ``--roi`` region of one movie on its own
+    (``--regions-separately``).
+
+    The regions are channels imaged side by side on one sensor, so the spots
+    are identified once over the whole frame and then fitted region by
+    region - each with its own fitting method and spline calibration, each
+    saved to its own file, in its own coordinates. Nothing is registered or
+    linked across the regions; they are connected afterwards (e.g. by
+    aligning them in Picasso: Render).
+    """
+    from .localize import (
+        fit_split_fov_independent,
+        identify,
+        region_label,
+    )
+
+    identifications, identify_info = identify(
+        movie,
+        min_net_gradient,
+        box,
+        roi=roi,
+        frame_bounds=frame_bounds,
+        threaded=True,
+        temporal_median_window=args.temporal_median,
+        gaussian_filter_sigma=args.gaussian_filter,
+        progress_callback="console",
+    )
+    print(
+        f"Identified {len(identifications):,} spots in {len(roi)} regions. "
+        "Fitting each region on its own..."
+    )
+    results = fit_split_fov_independent(
+        movie,
+        cam_info,
+        identifications,
+        box,
+        roi,
+        region_fit["methods"],
+        movie_info=info,
+        eps=convergence if convergence > 0 else None,
+        max_it=max_iterations if max_iterations > 0 else None,
+        spline_calibration=region_fit["spline_calibrations"],
+        camera_calibration=camera_calibration,
+        multiprocess=True,
+        progress_callback="console",
+    )
+    for c, (locs, region_info) in enumerate(results):
+        label = region_label(c)
+        print("------------------------------------------")
+        if not len(locs):
+            # an empty file would say nothing; the missing one, with this
+            # line, says the threshold found nothing in that region
+            print(
+                f"Region {label}: no spots identified in it, nothing saved. "
+                "Lower its --gradient to detect any."
+            )
+            continue
+        print(f"Region {label}: {len(locs):,} localizations")
+        # as ``localize`` builds it: the movie's metadata, then the
+        # identification, then the fit
+        region_info = region_info[:-1] + [identify_info] + [region_info[-1]]
+        _localize_finish(
+            locs,
+            region_info,
+            path,
+            args,
+            z_params,
+            lateral_transforms,
+            region_fit["spline_calibrations"][c],
+            suffix=f"_{label}",
+            fitting_method=region_fit["methods"][c],
+        )
+
+
+def _print_lateral_report(
+    applied: list[str] | None, skipped: list[str] | None
+) -> None:
+    """Report what happened to the lateral corrections, in the console
+    idiom - the same lines whether the fit was 2D or 3D."""
+    if applied:
+        print("Applied lateral correction(s): " + ", ".join(applied))
+    if skipped:
+        print(
+            "Skipping "
+            + ", ".join(skipped)
+            + ": the calibration used for fitting already applies this"
+            " correction itself; applying it again would correct twice."
+        )
+
+
+def _localize_finish(
+    locs,
+    info: list[dict],
+    path: str,
+    args: argparse.Namespace,
+    z_params,
+    lateral_transforms: list | None,
+    spline_calibration: dict | None,
+    suffix: str = "",
+    fitting_method: str | None = None,
+) -> None:
+    """Everything that happens to one set of localizations once it is
+    fitted: the astigmatic z fit, the separately loaded lateral
+    corrections, saving, the quality database and the drift correction.
+
+    Split out of ``_localize_process_file`` so that a run that fits the
+    regions separately (``--regions-separately``) does all of it per region,
+    each region writing its own file.
+
+    Parameters
+    ----------
+    suffix : str, optional
+        Inserted into the output name before ``_locs``, e.g. ``"_ref"`` for
+        one region of a split field of view. Default "" (one file per movie).
+    fitting_method : str or None, optional
+        The method this set was fitted with, which decides the noise model
+        of the astigmatic z fit. None (the default) uses ``args.fit_method``.
+    """
+    import warnings
+    from os.path import splitext
+    from . import lib
+    from .io import save_locs
+    from .localize import add_file_to_db
+
+    method_name = fitting_method or args.fit_method
     if z_params is not None:
         from . import zfit
 
@@ -1217,51 +1435,52 @@ def _localize_process_file(
         z_calibration["Magnification Factor"] = magnification_factor
         print("------------------------------------------")
         print("Fitting 3D...")
-        method = "gausslq" if "mle" not in args.fit_method else "gaussmle"
-        locs, info = zfit.zfit(
-            locs=locs,
-            info=info,
-            calibration=z_calibration,
-            fitting_method=method,
-            filter=0,
-            multiprocess=not args.fit_z_gpu,
-            gpu=args.fit_z_gpu,
-            progress_callback="console",
-        )
+        method = "gausslq" if "mle" not in method_name else "gaussmle"
+        # The corrections loaded with --affine-calibration go through zfit
+        # too, which applies them after the ones the 3D calibration carries
+        # and skips any it carries already: loading a correction separately
+        # then gives the same coordinates as appending it to the 3D
+        # calibration. It says so itself through a warning, which the
+        # console message below replaces.
+        with warnings.catch_warnings():
+            warnings.simplefilter(
+                "ignore", lib.DuplicateLateralTransformWarning
+            )
+            locs, info = zfit.zfit(
+                locs=locs,
+                info=info,
+                calibration=z_calibration,
+                fitting_method=method,
+                filter=0,
+                lateral_transforms=lateral_transforms,
+                multiprocess=not args.fit_z_gpu,
+                gpu=args.fit_z_gpu,
+                progress_callback="console",
+            )
         info[-1]["Z Calibration Path"] = zpath
         print("3D fitting complete.")
         print("------------------------------------------")
-
-    if lateral_transforms:
-        from . import lib
-
-        # Corrections the fit already applied on its own - those carried by
-        # the spline calibration (applied by ``localize``) and by the
-        # astigmatism calibration (applied by ``zfit``) - are dropped here.
-        # Passing the very same file to --affine-calibration would otherwise
-        # correct the coordinates twice.
-        applied = lib.lateral_transforms(spline_calibration)
-        if z_params is not None:
-            applied += lib.lateral_transforms(z_params[2])
-        extra, duplicates = lib.drop_duplicate_lateral_transforms(
-            lateral_transforms, applied
+        _print_lateral_report(
+            info[-1].get("Lateral corrections applied"),
+            info[-1].get("Lateral corrections skipped"),
         )
-        if duplicates:
-            print(
-                "Skipping "
-                + ", ".join(lib.describe_lateral_transforms(duplicates))
-                + ": the calibration used for fitting already applies this"
-                " correction itself; applying it again would correct twice."
-            )
+    elif lateral_transforms:
+        # No z fit to fold them into, so apply them here. Corrections the
+        # spline calibration carries were applied by ``localize`` itself;
+        # passing that same file to --affine-calibration would otherwise
+        # correct the coordinates twice.
+        extra, duplicates = lib.drop_duplicate_lateral_transforms(
+            lateral_transforms, spline_calibration
+        )
         if extra:
             locs = lib.apply_lateral_transforms(locs, extra)
-            described = lib.describe_lateral_transforms(extra)
-            # zfit records what it applied in this same entry, so extend the
-            # list rather than replacing it.
-            info[-1]["Lateral corrections applied"] = (
-                info[-1].get("Lateral corrections applied", []) + described
-            )
-            print("Applied lateral correction(s): " + ", ".join(described))
+            info[-1]["Lateral corrections applied"] = info[-1].get(
+                "Lateral corrections applied", []
+            ) + lib.describe_lateral_transforms(extra)
+        _print_lateral_report(
+            lib.describe_lateral_transforms(extra),
+            lib.describe_lateral_transforms(duplicates),
+        )
 
     base, ext = splitext(path)
 
@@ -1270,7 +1489,7 @@ def _localize_process_file(
     except Exception:
         sfx = ""
 
-    out_path = f"{base}{sfx}_locs.hdf5"
+    out_path = f"{base}{sfx}{suffix}_locs.hdf5"
     save_locs(out_path, locs, info)
     print("File saved to {}".format(out_path))
 
@@ -1338,6 +1557,16 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
     print("Localize - Parameters:")
     print("{:<8} {:<15} {:<10}".format("No", "Label", "Value"))
 
+    # The repeatable options collapse to their single value unless the
+    # regions are fitted separately, where they are one per region; the
+    # first one stands for the run as a whole (the GPU check, the 3D and
+    # spline branches below).
+    fit_methods = args.fit_method or ["mle"]
+    args.fit_method = fit_methods[0]
+    gradients = args.gradient or [5000]
+    args.gradient = gradients[0]
+    spline_paths = args.spline_calibration or []
+    args.spline_calibration = spline_paths[0] if spline_paths else ""
     if _FIT_METHOD_MAP[args.fit_method].endswith("-gpu"):
         if localize.CUDA_AVAILABLE:
             print("CUDA GPU found")
@@ -1380,7 +1609,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
 
     print(args)
     box = args.box_side_length
-    min_net_gradient = args.gradient
+    min_net_gradient = gradients[0] if len(gradients) == 1 else gradients
     roi = args.roi
     if roi is not None:
         # argparse (action="append", nargs=4) yields a list of 4-int
@@ -1393,6 +1622,13 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             for y_min, x_min, y_max, x_max in roi
         ]
         roi = clip_rois(rois, min_size=box)
+    n_regions = len(roi) if roi else 0
+    if len(gradients) > 1 and len(gradients) != n_regions:
+        raise Exception(
+            f"{len(gradients)} minimum net gradients were given but "
+            f"{n_regions} ROIs; pass one --gradient per --roi, or a single "
+            "one for all of them."
+        )
     frame_bounds = args.frame_bounds
     camera_info = {
         "Baseline": args.baseline,
@@ -1422,20 +1658,29 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
                 )
                 args.fit_z_gpu = False
 
-    spline_calibration = None
-    if args.fit_method.startswith("spline"):
+    spline_calibrations = []
+    if any(method.startswith("spline") for method in fit_methods):
         from .io import load_spline_calibration
 
-        if not args.spline_calibration:
+        if not spline_paths:
             raise Exception(
                 "Spline fitting requires --spline-calibration <file.hdf5>. "
                 "Build one with 'picasso spline-calibrate'."
             )
-        spline_calibration = load_spline_calibration(args.spline_calibration)
-        print(
-            "Loaded spline PSF calibration "
-            f"({spline_calibration.get('model')}) from "
-            f"{args.spline_calibration}"
+        for calibration_path in spline_paths:
+            calibration = load_spline_calibration(calibration_path)
+            print(
+                "Loaded spline PSF calibration "
+                f"({calibration.get('model')}) from {calibration_path}"
+            )
+            spline_calibrations.append(calibration)
+    spline_calibration = (
+        spline_calibrations[0] if spline_calibrations else None
+    )
+    region_fit = None
+    if args.regions_separately:
+        region_fit = _localize_region_fit(
+            fit_methods, spline_calibrations, n_regions
         )
 
     # Extra lateral affine corrections, applied after fitting on top of any
@@ -1511,6 +1756,7 @@ def _localize(args: argparse.Namespace) -> None:  # noqa: C901
             spline_calibration=spline_calibration,
             lateral_transforms=lateral_transforms,
             camera_calibration=camera_calibration,
+            region_fit=region_fit,
         )
 
 
@@ -1540,12 +1786,22 @@ def _camera_calibrate(args: argparse.Namespace) -> None:
             "per-pixel gain as well."
         )
 
+    powers = args.power or None
+    if powers is not None and len(powers) != len(bright_movies):
+        raise ValueError(
+            f"Got {len(powers)} -p/--power value(s) for "
+            f"{len(bright_movies)} light movie(s). Pass one per movie, in "
+            "the same order, or none at all."
+        )
+
     calibration = scmos.calibrate_scmos(
         dark_movie,
         bright_movies or None,
         progress_callback="console",
         dark_path=args.dark,
         bright_paths=bright_paths,
+        bright_levels=powers,
+        level_unit=args.power_unit,
     )
 
     out_path = args.output
@@ -1581,6 +1837,16 @@ def _camera_calibrate(args: argparse.Namespace) -> None:
             f"{calibration['Gain max (ADU/e-)']:.3f} "
             f"({calibration['Gain levels']} illumination levels)"
         )
+        signal = calibration.get("Level median signal (ADU)") or []
+        if len(signal) > 1:
+            # The gain fit assumes the response is linear over the range the
+            # series covers, and nothing in the fit itself would complain if
+            # a level had saturated.
+            print(
+                "Level medians:     "
+                + ", ".join(f"{value:.1f}" for value in signal)
+                + " ADU (mean - offset)"
+            )
         if calibration["Gain fallback pixels"]:
             print(
                 f"                   {calibration['Gain fallback pixels']} "
@@ -2976,6 +3242,228 @@ def _g5m(
         save_locs(new_path, mols, g5m_info)
 
 
+# =============================================================================
+# Plugins
+# =============================================================================
+
+
+def _run_plugin_command(args) -> None:
+    """Run the handler a plugin subcommand named via ``set_defaults``.
+
+    Kept separate from the built-in dispatch so that a plugin that forgot
+    the ``func`` default gets a clear message instead of an
+    ``AttributeError`` traceback.
+    """
+    func = getattr(args, "func", None)
+    if func is None:
+        print(
+            f"The plugin command '{args.command}' does not name a handler. "
+            "The plugin must call parser.set_defaults(func=...) when it "
+            "registers the command."
+        )
+        return
+    func(args)
+
+
+def _plugins_confirm(question: str, assume_yes: bool) -> bool:
+    """Ask for confirmation on the terminal unless ``--yes`` was given."""
+    if assume_yes:
+        return True
+    try:
+        answer = input(f"{question} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
+_PLUGIN_TRUST_WARNING = (
+    "Plugins are Python files that run with full access to your computer "
+    "every time Picasso starts. Only enable files you have reviewed or "
+    "whose author you trust."
+)
+
+
+def _plugins_list() -> None:
+    """Print every plugin file found, with what it contributes."""
+    from . import io, plugins
+
+    directory = io.plugins_directory()
+    state = plugins.load_state()
+    files = plugins._discover_plugin_files()
+    if not files:
+        print(f"No plugin files in {directory}")
+        return
+
+    by_file = {
+        record.get("file"): (pid, record)
+        for pid, record in state["plugins"].items()
+        if record.get("file")
+    }
+    failed = False
+
+    print(f"Plugins in {directory}:\n")
+    for path in files:
+        name = os.path.basename(path)
+        enabled = plugins.is_enabled(state, name)
+        installed = by_file.get(name)
+        origin = "local file"
+        if installed is not None:
+            pid, record = installed
+            version = record.get("version") or "?"
+            origin = f"registry: {pid} {version}"
+        print(f"  {'[x]' if enabled else '[ ]'} {name}  ({origin})")
+
+        if not enabled:
+            continue
+        # Only an enabled plugin may be imported, so only an enabled one
+        # can be asked what it provides.
+        try:
+            module = plugins._load_module_from_path(path)
+        except Exception:  # noqa: BLE001 - reported, not fatal
+            import traceback
+
+            failed = True
+            print("        failed to load:")
+            for line in traceback.format_exc().rstrip().splitlines():
+                print(f"          {line}")
+            continue
+        details = []
+        if getattr(module, "Plugin", None) is not None:
+            details.append("GUI menu entry")
+        commands = plugins.plugin_cli_commands(module)
+        if commands:
+            details.append("commands: " + ", ".join(commands))
+        try:
+            exports = plugins._api_names(module)
+        except Exception:  # noqa: BLE001
+            exports = {}
+        if exports:
+            details.append("API: " + ", ".join(sorted(exports)))
+        for detail in details:
+            print(f"        {detail}")
+
+    disabled = plugins.disabled_plugin_files(state)
+    if disabled:
+        print(
+            f"\n{len(disabled)} file(s) not enabled. Review one, then run "
+            "'picasso plugins enable <file.py>'."
+        )
+    if failed:
+        print(
+            "\nA plugin that fails to load is skipped; the rest of Picasso "
+            "is unaffected. Fix the file, or run 'picasso plugins disable "
+            "<file.py>' to stop loading it."
+        )
+
+
+def _plugins_set_enabled(filename: str, value: bool, assume_yes: bool) -> None:
+    """Enable or disable one plugin file by name."""
+    from . import plugins
+
+    if not plugins.is_safe_filename(filename):
+        print(f"Not a plugin file name: {filename!r} (expected e.g. 'my.py')")
+        return
+    path = plugins.plugin_path(filename)
+    if not os.path.exists(path):
+        print(f"No such plugin file: {path}")
+        return
+
+    if value:
+        print(_PLUGIN_TRUST_WARNING)
+        print(f"\nThe file is at {path}")
+        if not _plugins_confirm(f"Enable '{filename}'?", assume_yes):
+            print("Nothing was changed.")
+            return
+
+    state = plugins.load_state()
+    plugins.set_enabled(state, filename, value)
+    print(f"{'Enabled' if value else 'Disabled'} {filename}")
+
+
+def _plugins_install(plugin_id: str, assume_yes: bool) -> None:
+    """Download, verify and enable a plugin from the online registry."""
+    from . import plugins
+
+    try:
+        manifest = plugins.fetch_manifest()
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user
+        print(f"Could not reach the online plugin registry: {exc}")
+        return
+    entry = next((e for e in manifest if e["id"] == plugin_id), None)
+    if entry is None:
+        print(
+            f"No plugin with id {plugin_id!r} in the registry. "
+            f"Available: {', '.join(sorted(e['id'] for e in manifest))}"
+        )
+        return
+    if not plugins.is_compatible(entry):
+        print(
+            f"{plugin_id!r} requires Picasso "
+            f"{entry.get('min_picasso_version')} or newer."
+        )
+        return
+
+    print(f"{entry.get('display_name', plugin_id)} {entry.get('version', '')}")
+    if entry.get("description"):
+        print(entry["description"])
+    print(f"\n{_PLUGIN_TRUST_WARNING}")
+    print(
+        "The download is checked against the hash published in the registry, "
+        "but that only proves the file is the published one — not that it is "
+        f"safe. Source: {plugins.REPO_URL}/blob/{plugins.BRANCH}/"
+        f"{entry['file']}"
+    )
+    if not _plugins_confirm(f"Install and enable {plugin_id!r}?", assume_yes):
+        print("Nothing was installed.")
+        return
+
+    state = plugins.load_state()
+    try:
+        plugins.install(entry, state)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user
+        print(f"Install failed: {exc}")
+        return
+    print(f"Installed and enabled {plugin_id!r}.")
+
+
+def _plugins_uninstall(plugin_id: str) -> None:
+    """Delete an installed plugin's file and forget it."""
+    from . import plugins
+
+    state = plugins.load_state()
+    if plugin_id not in state["plugins"]:
+        print(f"{plugin_id!r} is not installed from the registry.")
+        return
+    plugins.uninstall(plugin_id, state)
+    print(f"Uninstalled {plugin_id!r}.")
+
+
+def _plugins(args) -> None:
+    """Dispatch the ``picasso plugins`` subcommands."""
+    from . import io, plugins
+
+    action = args.plugins_action
+    if action == "list":
+        _plugins_list()
+    elif action == "path":
+        print(io.plugins_directory())
+    elif action == "enable":
+        _plugins_set_enabled(args.file, True, args.yes)
+    elif action == "disable":
+        _plugins_set_enabled(args.file, False, args.yes)
+    elif action in ("install", "update"):
+        _plugins_install(args.id, args.yes)
+    elif action == "uninstall":
+        _plugins_uninstall(args.id)
+    else:
+        print(
+            "Usage: picasso plugins {list,path,enable,disable,install,"
+            "update,uninstall}"
+        )
+        print(f"\nPlugins folder: {io.plugins_directory()}")
+        print(f"Online registry: {plugins.REPO_URL}")
+
+
 def main():  # noqa: C901
     """Entry point of the ``picasso`` command line interface.
 
@@ -2985,6 +3473,14 @@ def main():  # noqa: C901
     handler. Called by the ``picasso`` console script and by
     ``python -m picasso``. Run ``picasso -h`` for the full list.
     """
+    from .diagnostics import ensure_std_streams, install_excepthooks
+
+    # in the windowed one-click build there is no console: give the
+    # process usable streams and log uncaught exceptions to
+    # ~/.picasso/logs/picasso.log instead of dropping them
+    ensure_std_streams()
+    install_excepthooks()
+
     # Main parser
     parser = argparse.ArgumentParser("picasso")
     subparsers = parser.add_subparsers(dest="command")
@@ -3040,24 +3536,29 @@ def main():  # noqa: C901
             "spline-mle-gpu",
             "avg",
         ],
-        default="mle",
+        action="append",
+        default=None,
         help=(
-            "fitting method. 'spline'/'spline-mle' fit an experimental "
-            "cubic-spline PSF on the CPU by least squares / maximum "
-            "likelihood, 'spline-gpu'/'spline-mle-gpu' do the same on the "
-            "GPU (needs a CUDA-capable GPU); all four need "
-            "--spline-calibration"
+            "fitting method (default 'mle'). 'spline'/'spline-mle' fit an "
+            "experimental cubic-spline PSF on the CPU by least squares / "
+            "maximum likelihood, 'spline-gpu'/'spline-mle-gpu' do the same "
+            "on the GPU (needs a CUDA-capable GPU); all four need "
+            "--spline-calibration. With --regions-separately it may be "
+            "given once per --roi, to fit each region its own way"
         ),
     )
     localize_parser.add_argument(
         "-sc",
         "--spline-calibration",
         type=str,
-        default="",
+        action="append",
+        default=None,
         help=(
             "path to a cubic-spline PSF calibration (.hdf5) for the "
             "'spline', 'spline-mle', 'spline-gpu' and 'spline-mle-gpu' "
-            "fit methods"
+            "fit methods. With --regions-separately it may be given once "
+            "per --roi: the PSF is measured per channel, so regions "
+            "fitted separately usually need one calibration each"
         ),
     )
     localize_parser.add_argument(
@@ -3092,7 +3593,29 @@ def main():  # noqa: C901
         ),
     )
     localize_parser.add_argument(
-        "-g", "--gradient", type=int, default=5000, help="minimum net gradient"
+        "-g",
+        "--gradient",
+        type=int,
+        action="append",
+        default=None,
+        help=(
+            "minimum net gradient (default 5000). May be given once per "
+            "--roi, since regions imaged through different optics need not "
+            "share a brightness scale"
+        ),
+    )
+    localize_parser.add_argument(
+        "-rs",
+        "--regions-separately",
+        action="store_true",
+        help=(
+            "fit each --roi region on its own and save one file per region "
+            "(<movie>_ref_locs.hdf5, <movie>_ch1_locs.hdf5, ...), in that "
+            "region's own coordinates. Use it when the regions are channels "
+            "imaged side by side on one sensor and are to be analyzed - and "
+            "connected - as separate channels. --fit-method, --gradient and "
+            "--spline-calibration may then be given once per region"
+        ),
     )
     localize_parser.add_argument(
         "-tm",
@@ -3266,6 +3789,26 @@ def main():  # noqa: C901
         ),
     )
     camera_calib_parser.add_argument(
+        "-p",
+        "--power",
+        type=float,
+        action="append",
+        help=(
+            "illumination each -l/--light movie was recorded at (laser "
+            "power, exposure time, ...), repeated once per light movie in "
+            "the same order. Not used by the gain fit; it lets the "
+            "diagnostic plot show the response against what was actually "
+            "set, which is the only way to judge linearity when the levels "
+            "are not evenly spaced"
+        ),
+    )
+    camera_calib_parser.add_argument(
+        "--power-unit",
+        type=str,
+        default="mW",
+        help="unit of -p/--power, for the plot axis (default: mW)",
+    )
+    camera_calib_parser.add_argument(
         "-o",
         "--output",
         type=str,
@@ -3345,8 +3888,9 @@ def main():  # noqa: C901
         default="affine",
         help=(
             "how the channels are registered to the reference in a"
-            " multichannel or split-FOV calibration: affine (6 DOF, the"
-            " default), projective (8 DOF, adds the perspective term) or"
+            " multichannel or split-FOV calibration: translation (2 DOF, a"
+            " pure xy shift), affine (6 DOF, the default), projective (8 DOF,"
+            " adds the perspective term) or"
             " polynomial2 / polynomial3 (a smooth field-distortion warp,"
             " needing 6 / 10 well-spread beads). Ignored for a"
             " single-channel calibration"
@@ -3461,9 +4005,10 @@ def main():  # noqa: C901
         choices=list(TRANSFORM_MODELS),
         default="affine",
         help=(
-            "transform model: affine (6 DOF, the default), projective (8 DOF),"
-            " polynomial2 or polynomial3, needing at least 3 / 4 / 6 / 10"
-            " bead pairs respectively"
+            "transform model: translation (2 DOF, a pure xy shift), affine"
+            " (6 DOF, the default), projective (8 DOF), polynomial2 or"
+            " polynomial3, needing at least 1 / 3 / 4 / 6 / 10 bead pairs"
+            " respectively"
         ),
     )
     lateral_parser.add_argument(
@@ -4251,12 +4796,72 @@ def main():  # noqa: C901
         ),
     )
 
+    # plugins
+    plugins_parser = subparsers.add_parser(
+        "plugins", help="manage Picasso plugins"
+    )
+    plugins_actions = plugins_parser.add_subparsers(dest="plugins_action")
+    plugins_actions.add_parser(
+        "list", help="list the plugin files found and what they provide"
+    )
+    plugins_actions.add_parser("path", help="print the plugins folder")
+    plugins_enable_parser = plugins_actions.add_parser(
+        "enable", help="allow a plugin file to be loaded and run"
+    )
+    plugins_enable_parser.add_argument(
+        "file", help="the plugin file name, e.g. my_plugin.py"
+    )
+    plugins_disable_parser = plugins_actions.add_parser(
+        "disable", help="stop loading a plugin file, without deleting it"
+    )
+    plugins_disable_parser.add_argument(
+        "file", help="the plugin file name, e.g. my_plugin.py"
+    )
+    plugins_install_parser = plugins_actions.add_parser(
+        "install", help="download a plugin from the online registry"
+    )
+    plugins_install_parser.add_argument("id", help="the plugin id")
+    plugins_update_parser = plugins_actions.add_parser(
+        "update", help="re-download an installed plugin at its latest version"
+    )
+    plugins_update_parser.add_argument("id", help="the plugin id")
+    plugins_uninstall_parser = plugins_actions.add_parser(
+        "uninstall", help="delete an installed plugin"
+    )
+    plugins_uninstall_parser.add_argument("id", help="the plugin id")
+    for _p in (
+        plugins_enable_parser,
+        plugins_disable_parser,
+        plugins_install_parser,
+        plugins_update_parser,
+    ):
+        _p.add_argument(
+            "--yes",
+            action="store_true",
+            help="skip the confirmation prompt",
+        )
+
+    # Plugins may add their own subcommands. Done last so that a plugin can
+    # never shadow a built-in command, and skipped entirely when no plugin is
+    # enabled, so the common case costs one directory listing.
+    #
+    # "picasso plugins ..." is skipped too: it needs no plugin-contributed
+    # command, and it reports a plugin that will not load in full itself, so
+    # importing here would only precede that report with a terse warning
+    # about the very thing it is about to explain.
+    import sys
+
+    plugin_commands: set[str] = set()
+    if sys.argv[1:2] != ["plugins"]:
+        from .plugins import register_cli_plugins
+
+        plugin_commands = register_cli_plugins(subparsers)
+
     # Parse
     args = parser.parse_args()
     if args.command:
         # check for updates and print in the console if available
         from .updater import cli_notify_update, check_and_notify
-        import sys
 
         cli_update_check = True
         update_thread = None
@@ -4277,7 +4882,11 @@ def main():  # noqa: C901
         if cli_update_check:
             update_thread = check_and_notify(cli_notify_update)
 
-        if args.command == "localize":
+        if args.command in plugin_commands:
+            _run_plugin_command(args)
+        elif args.command == "plugins":
+            _plugins(args)
+        elif args.command == "localize":
             if args.files:
                 _localize(args)
             else:

@@ -2,153 +2,100 @@
 picasso.gui.plugins_loader
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Discovery, loading and online management of user plugins from
-``~/.picasso/plugins``.
+Qt side of the user plugin system: loading the plugins that extend a
+Picasso GUI, the Plugins menu, and the store dialog for browsing,
+installing and enabling plugins from the online registry.
 
-A plugin is a single ``.py`` file defining a ``Plugin`` class with an
+Everything that does not need Qt — discovery, the enable-state sidecar,
+the registry client and the hooks that let a plugin extend the Python
+API and the command line — lives in :mod:`picasso.plugins` and is
+re-exported here, so existing code importing it from this module keeps
+working.
+
+A GUI plugin is a single ``.py`` file defining a ``Plugin`` class with an
 ``__init__(self, window)`` that sets ``self.name`` (the target GUI app,
 e.g. ``"render"``) and ``self.window``, plus an ``execute(self)`` method
-that adds actions to ``window.plugin_menu``. See ``plugin_template.py``.
+that adds actions to ``window.plugin_menu``. The same file may also
+export ``PICASSO_API`` and ``register_cli`` to extend Picasso outside the
+GUI; see :mod:`picasso.plugins` and ``plugin_template.py``.
 
 Plugins are executed as ordinary Python inside the Picasso process, so
 they cannot be sandboxed: a loaded plugin can do anything Picasso can.
-The safeguards here therefore aim at *provenance and reviewability*
-rather than containment:
-
-* nothing is loaded until it has been explicitly enabled, so a file that
-  merely appears in the plugins folder never runs (``is_enabled``);
-* registry downloads are verified against a ``sha256`` pinned in the
-  manifest, so the code behind a plugin cannot change without a reviewed
-  manifest commit (``install``);
-* ids and repository paths taken from the manifest are validated before
-  they are used as file names or URLs (``is_safe_id``,
-  ``is_safe_repo_path``);
-* the store dialog can show a plugin's source before installing it and a
-  diff of what changed before updating it.
+The safeguards therefore aim at *provenance and reviewability* rather
+than containment — nothing loads until it has been enabled, registry
+downloads are pinned to a ``sha256``, and the dialogs below can show a
+plugin's source before installing it and a diff before updating it.
 
 Loading is deliberately tolerant: a broken plugin prints a traceback and
 is skipped so that it can never crash app startup.
-
-The second half of this module implements an online plugin store for
-browsing, installing, updating and uninstalling plugins from the
-``picasso_plugins`` GitHub repository. The registry is a single
-``index.json`` manifest at the repo root; plugins are plain ``.py`` files
-downloaded into the user plugins directory. Installed plugins, their
-versions and which files are enabled are tracked in a hidden
-``.installed.json`` sidecar there.
 
 :copyright: Copyright (c) 2016-2026 Jungmann Lab, MPI of Biochemistry
 """
 
 from __future__ import annotations
 
-import difflib
-import glob
-import hashlib
-import importlib.util
-import json
 import os
-import re
 import traceback
-import urllib.request
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .. import io
-from ..version import __version__ as PICASSO_VERSION
+
+# Re-exported for backwards compatibility with code and tests that
+# imported these from this module before they moved to picasso.plugins.
+from ..plugins import (  # noqa: F401
+    API_APP,
+    BRANCH,
+    INCOMPATIBLE,
+    LOCAL_ONLY,
+    MANIFEST_URL,
+    NOT_INSTALLED,
+    ORPHAN,
+    RAW_BASE,
+    REPO,
+    REPO_URL,
+    UNMANAGED,
+    UNVERIFIED,
+    UPDATE_AVAILABLE,
+    UP_TO_DATE,
+    _discover_plugin_files,
+    _get,
+    _is_usable_entry,
+    _load_module_from_path,
+    _local_filename,
+    _sidecar_path,
+    _SIDECAR,
+    _TIMEOUT,
+    clear_module_cache,
+    compare_versions,
+    diff_sources,
+    disabled_plugin_files,
+    download_source,
+    entry_filename,
+    fetch_manifest,
+    install,
+    is_compatible,
+    is_enabled,
+    is_safe_filename,
+    is_safe_id,
+    is_safe_repo_path,
+    is_valid_digest,
+    load_state,
+    merged_entries,
+    parse_version,
+    plugin_path,
+    read_local_source,
+    save_state,
+    set_enabled,
+    sha256_bytes,
+    status_for,
+    uninstall,
+)
 
 
 # =============================================================================
-# Safety helpers: identifiers, paths and integrity
+# Loading GUI plugins
 # =============================================================================
-
-_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
-_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-
-
-def is_safe_id(value) -> bool:
-    """Whether ``value`` may be used as a plugin id and file name stem.
-
-    Ids come from a remote manifest and are turned into file names inside
-    the user plugins directory, so they must not be able to escape it:
-    only ASCII letters, digits, ``_`` and ``-`` are allowed.
-    """
-    return isinstance(value, str) and bool(_ID_RE.match(value))
-
-
-def is_safe_repo_path(value) -> bool:
-    """Whether ``value`` is a safe relative path inside the registry repo.
-
-    Rejects absolute paths, Windows separators, ``..`` segments and
-    anything that is not a ``.py`` file, so a manifest entry cannot point
-    the download at another repository or at a path outside it.
-    """
-    if not isinstance(value, str) or not value.endswith(".py"):
-        return False
-    if value.startswith("/") or "\\" in value or ":" in value:
-        return False
-    return all(part not in ("", ".", "..") for part in value.split("/"))
-
-
-def is_safe_filename(value) -> bool:
-    """Whether ``value`` is a bare ``.py`` file name with no directory part."""
-    return (
-        isinstance(value, str)
-        and value.endswith(".py")
-        and len(value) > len(".py")
-        and os.path.basename(value) == value
-    )
-
-
-def is_valid_digest(value) -> bool:
-    """Whether ``value`` looks like a hex-encoded SHA-256 digest."""
-    return isinstance(value, str) and bool(_SHA256_RE.match(value))
-
-
-def sha256_bytes(data: bytes) -> str:
-    """Hex SHA-256 of ``data``."""
-    return hashlib.sha256(data).hexdigest()
-
-
-def plugin_path(filename: str) -> str:
-    """Absolute path of ``filename`` inside the user plugins directory.
-
-    Raises ``ValueError`` if ``filename`` is not a bare ``.py`` name or if
-    the resolved path would land outside the plugins directory.
-    """
-    if not is_safe_filename(filename):
-        raise ValueError(f"Unsafe plugin file name: {filename!r}")
-    directory = os.path.abspath(io.plugins_directory())
-    path = os.path.abspath(os.path.join(directory, filename))
-    if os.path.dirname(path) != directory:
-        raise ValueError(
-            f"Plugin file escapes the plugins folder: {filename!r}"
-        )
-    return path
-
-
-# =============================================================================
-# Discovery and loading
-# =============================================================================
-
-
-def _discover_plugin_files() -> list[str]:
-    """Return sorted ``.py`` files in the user plugins directory, skipping
-    files whose name starts with ``_``."""
-    directory = io.plugins_directory()
-    files = sorted(glob.glob(os.path.join(directory, "*.py")))
-    return [f for f in files if not os.path.basename(f).startswith("_")]
-
-
-def _load_module_from_path(path: str):
-    """Import a standalone ``.py`` file that is not part of any package."""
-    name = "picasso_plugin_" + os.path.splitext(os.path.basename(path))[0]
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not create import spec for {path!r}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def load_plugins(window, app_name: str) -> list:
@@ -184,7 +131,12 @@ def load_plugins(window, app_name: str) -> list:
             continue
         try:
             module = _load_module_from_path(path)
-            plugin = module.Plugin(window)
+            plugin_class = getattr(module, "Plugin", None)
+            if plugin_class is None:
+                # A plugin that only extends the API or the command line
+                # has no GUI half; that is not an error.
+                continue
+            plugin = plugin_class(window)
             if getattr(plugin, "name", None) == app_name:
                 plugin.execute()
                 plugins.append(plugin)
@@ -209,16 +161,6 @@ def execute_plugins(window) -> None:
         except Exception:
             print(f"Failed to execute plugin {plugin!r}:")
             traceback.print_exc()
-
-
-def disabled_plugin_files(state: dict | None = None) -> list[str]:
-    """File names present in the plugins folder that are not enabled."""
-    state = load_state() if state is None else state
-    return [
-        os.path.basename(p)
-        for p in _discover_plugin_files()
-        if not is_enabled(state, os.path.basename(p))
-    ]
 
 
 def add_plugins_menu_actions(window, app_name: str) -> None:
@@ -260,7 +202,12 @@ def _open_store(window, app_name: str) -> None:
 
 
 def reload_plugins(window, app_name: str) -> None:
-    """Clear the plugins menu and re-load plugins from disk."""
+    """Clear the plugins menu and re-load plugins from disk.
+
+    Drops the imported-module cache first, so a plugin file edited while
+    Picasso is running is picked up.
+    """
+    clear_module_cache()
     window.plugin_menu.clear()
     load_plugins(window, app_name)
     add_plugins_menu_actions(window, app_name)
@@ -273,341 +220,6 @@ _reload = reload_plugins
 # =============================================================================
 # Online plugin store
 # =============================================================================
-
-# --- Registry location -------------------------------------------------------
-
-REPO = "jungmannlab/picasso_plugins"
-BRANCH = "main"  # the registry's default branch
-RAW_BASE = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}"
-MANIFEST_URL = f"{RAW_BASE}/index.json"
-REPO_URL = f"https://github.com/{REPO}"
-
-_TIMEOUT = 15  # seconds, for every network request
-_SIDECAR = ".installed.json"
-
-
-# --- Version helpers ---------------------------------------------------------
-
-
-def parse_version(value: str | None) -> tuple[int, ...]:
-    """Parse a version string into a tuple of its numeric components.
-
-    Non-numeric suffixes (e.g. the ``a0`` in ``0.11.0a0``) are split on so
-    that ``0.11.0a0`` -> ``(0, 11, 0, 0)``. Good enough to order the simple
-    versions plugins use; it is not a full PEP 440 implementation.
-    """
-    if not value:
-        return ()
-    return tuple(int(p) for p in re.findall(r"\d+", str(value)))
-
-
-def compare_versions(a: str | None, b: str | None) -> int:
-    """Return -1, 0 or 1 for ``a`` <, == or > ``b`` (zero-padded compare)."""
-    ta, tb = parse_version(a), parse_version(b)
-    n = max(len(ta), len(tb))
-    ta = ta + (0,) * (n - len(ta))
-    tb = tb + (0,) * (n - len(tb))
-    return (ta > tb) - (ta < tb)
-
-
-def is_compatible(entry: dict) -> bool:
-    """Whether the running Picasso satisfies the plugin's minimum version."""
-    minimum = entry.get("min_picasso_version")
-    if not minimum:
-        return True
-    return compare_versions(PICASSO_VERSION, minimum) >= 0
-
-
-# --- Installed-state sidecar -------------------------------------------------
-
-
-def _sidecar_path() -> str:
-    return os.path.join(io.plugins_directory(), _SIDECAR)
-
-
-def load_state() -> dict:
-    """Load the installed-state sidecar, tolerant of a missing/corrupt file.
-
-    The state holds three things: ``plugins`` (per-id records of what was
-    installed from the registry), ``enabled`` (per-file-name flags deciding
-    what may be loaded) and ``trust_acknowledged`` (the one-time warning).
-    """
-    path = _sidecar_path()
-    state = {"plugins": {}, "enabled": {}, "trust_acknowledged": False}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            state["plugins"] = data.get("plugins", {}) or {}
-            enabled = data.get("enabled", {}) or {}
-            if isinstance(enabled, dict):
-                state["enabled"] = {
-                    k: bool(v)
-                    for k, v in enabled.items()
-                    if isinstance(k, str)
-                }
-            state["trust_acknowledged"] = bool(data.get("trust_acknowledged"))
-    except (OSError, ValueError):
-        pass
-    return state
-
-
-def save_state(state: dict) -> None:
-    with open(_sidecar_path(), "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
-
-def is_enabled(state: dict, filename: str) -> bool:
-    """Whether ``filename`` is allowed to be loaded and executed.
-
-    Unknown files are *not* enabled: enabling is the explicit consent step,
-    so a plugin only ever runs after the user has said so.
-    """
-    return bool(state.get("enabled", {}).get(filename))
-
-
-def set_enabled(state: dict, filename: str, value: bool) -> None:
-    """Record whether ``filename`` may be loaded, and save the sidecar."""
-    state.setdefault("enabled", {})[filename] = bool(value)
-    save_state(state)
-
-
-# --- Network + install operations -------------------------------------------
-
-
-def _get(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "picasso"})
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-        return resp.read()
-
-
-def _is_usable_entry(entry: dict) -> bool:
-    """Whether a manifest entry is structurally safe to work with.
-
-    Entries with an unsafe id or file path are dropped outright — they can
-    never be legitimate, since both are used to build a local file name and
-    a download URL. A missing or malformed ``sha256`` is *not* filtered here:
-    such entries are kept and surfaced as ``UNVERIFIED`` so the user sees
-    why they cannot be installed.
-    """
-    return is_safe_id(entry.get("id")) and is_safe_repo_path(entry.get("file"))
-
-
-def fetch_manifest() -> list[dict]:
-    """Download and parse the registry manifest.
-
-    Returns the list of plugin entries whose id and file path pass
-    validation. Raises on any network/parse error so the caller can show a
-    message and offer to retry.
-    """
-    data = json.loads(_get(MANIFEST_URL).decode("utf-8"))
-    plugins = data.get("plugins", []) if isinstance(data, dict) else []
-    entries = []
-    for entry in plugins:
-        if not isinstance(entry, dict) or not entry.get("id"):
-            continue
-        if not _is_usable_entry(entry):
-            print(
-                "Skipping plugin registry entry with an unsafe id or file "
-                f"path: {entry.get('id')!r} -> {entry.get('file')!r}"
-            )
-            continue
-        entries.append(entry)
-    return entries
-
-
-def _local_filename(entry: dict) -> str:
-    """The on-disk ``.py`` name for an entry: the plugin id plus ``.py``."""
-    if not is_safe_id(entry.get("id")):
-        raise ValueError(f"Unsafe plugin id: {entry.get('id')!r}")
-    return f"{entry['id']}.py"
-
-
-def download_source(entry: dict) -> bytes:
-    """Download an entry's ``.py`` and verify it against the pinned hash.
-
-    Raises ``ValueError`` if the entry carries no valid ``sha256`` or if the
-    downloaded bytes do not match it, so unverified code is never written to
-    disk or shown as if it were the published plugin.
-    """
-    if not _is_usable_entry(entry):
-        raise ValueError(f"Unsafe registry entry for {entry.get('id')!r}")
-    expected = entry.get("sha256")
-    if not is_valid_digest(expected):
-        raise ValueError(
-            f"The registry entry for {entry['id']!r} has no valid sha256 "
-            "integrity hash, so it cannot be verified. Refusing to install."
-        )
-    content = _get(f"{RAW_BASE}/{entry['file']}")
-    actual = sha256_bytes(content)
-    if actual != expected.lower():
-        raise ValueError(
-            f"Integrity check failed for {entry['id']!r}: the downloaded file "
-            f"does not match the hash pinned in the registry.\n\n"
-            f"expected {expected.lower()}\ngot      {actual}\n\n"
-            "The file may have been changed after it was published. Nothing "
-            "was installed."
-        )
-    return content
-
-
-def install(entry: dict, state: dict) -> None:
-    """Download, verify and store ``entry``'s ``.py``, then enable it.
-
-    Installing is an explicit user action, so the file is enabled on
-    success. Raises before touching the disk if verification fails.
-    """
-    content = download_source(entry)
-    filename = _local_filename(entry)
-    target = plugin_path(filename)
-    with open(target, "wb") as f:
-        f.write(content)
-    state["plugins"][entry["id"]] = {
-        "file": filename,
-        "version": entry.get("version"),
-        "app": entry.get("app"),
-        "display_name": entry.get("display_name", entry["id"]),
-        "sha256": sha256_bytes(content),
-    }
-    state.setdefault("enabled", {})[filename] = True
-    save_state(state)
-
-
-def uninstall(plugin_id: str, state: dict) -> None:
-    """Delete the installed ``.py`` for ``plugin_id`` and forget it."""
-    record = state["plugins"].get(plugin_id, {})
-    filename = record.get("file")
-    if not is_safe_filename(filename):
-        filename = f"{plugin_id}.py" if is_safe_id(plugin_id) else None
-    if filename:
-        try:
-            os.remove(plugin_path(filename))
-        except (OSError, ValueError):
-            pass
-        state.get("enabled", {}).pop(filename, None)
-    state["plugins"].pop(plugin_id, None)
-    save_state(state)
-
-
-def read_local_source(filename: str) -> str:
-    """Read an on-disk plugin file as text, replacing undecodable bytes."""
-    path = plugin_path(filename)
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        return f.read()
-
-
-def diff_sources(old: str, new: str, filename: str) -> str:
-    """Unified diff between the installed and the incoming source."""
-    lines = list(
-        difflib.unified_diff(
-            old.splitlines(keepends=True),
-            new.splitlines(keepends=True),
-            fromfile=f"{filename} (installed)",
-            tofile=f"{filename} (update)",
-        )
-    )
-    if not lines:
-        return (
-            "The new version is byte-for-byte identical to the installed one."
-        )
-    return "".join(lines)
-
-
-# --- Status model ------------------------------------------------------------
-
-NOT_INSTALLED = "not_installed"
-UP_TO_DATE = "up_to_date"
-UPDATE_AVAILABLE = "update_available"
-INCOMPATIBLE = "incompatible"
-UNVERIFIED = "unverified"  # registry entry without a usable sha256
-UNMANAGED = "unmanaged"  # registry plugin whose file was copied in by hand
-LOCAL_ONLY = "local_only"  # file in the folder with no registry entry
-ORPHAN = "orphan"  # installed but no longer in the manifest
-
-
-def status_for(entry: dict, state: dict) -> str:
-    installed = state["plugins"].get(entry["id"])
-    if entry.get("_orphan"):
-        return ORPHAN
-    if entry.get("_local"):
-        return LOCAL_ONLY
-    if not is_compatible(entry):
-        return INCOMPATIBLE
-    if not is_valid_digest(entry.get("sha256")):
-        return UNVERIFIED
-    if installed is None:
-        try:
-            exists = os.path.exists(plugin_path(_local_filename(entry)))
-        except ValueError:
-            exists = False
-        return UNMANAGED if exists else NOT_INSTALLED
-    if compare_versions(entry.get("version"), installed.get("version")) > 0:
-        return UPDATE_AVAILABLE
-    return UP_TO_DATE
-
-
-def entry_filename(entry: dict) -> str | None:
-    """The on-disk file name an entry maps to, or ``None`` if unsafe."""
-    if entry.get("_local"):
-        return entry.get("file")
-    try:
-        return _local_filename(entry)
-    except ValueError:
-        return None
-
-
-def merged_entries(manifest: list[dict], state: dict) -> list[dict]:
-    """Manifest entries, plus installed plugins and loose files not in it.
-
-    Orphans (installed locally but dropped from the registry) are surfaced
-    so they can still be uninstalled; they are flagged with ``_orphan``.
-    Files sitting in the plugins folder that the registry knows nothing
-    about are surfaced too — flagged with ``_local`` — so that manually
-    shared plugins can be reviewed and enabled from the same place.
-    """
-    by_id = {e["id"]: e for e in manifest}
-    entries = list(manifest)
-    accounted = {
-        name
-        for name in (entry_filename(e) for e in manifest)
-        if name is not None
-    }
-    for pid, rec in state["plugins"].items():
-        if rec.get("file"):
-            accounted.add(rec["file"])
-        if pid not in by_id:
-            entries.append(
-                {
-                    "id": pid,
-                    "display_name": rec.get("display_name", pid),
-                    "app": rec.get("app"),
-                    "description": "(no longer in the online registry)",
-                    "version": rec.get("version"),
-                    "file": rec.get("file"),
-                    "_orphan": True,
-                }
-            )
-    for path in _discover_plugin_files():
-        name = os.path.basename(path)
-        if name in accounted:
-            continue
-        entries.append(
-            {
-                "id": os.path.splitext(name)[0],
-                "display_name": name,
-                "app": None,
-                "description": (
-                    "(local file, not from the online registry — review its "
-                    "source before enabling it)"
-                ),
-                "file": name,
-                "_local": True,
-            }
-        )
-    return sorted(
-        entries, key=lambda e: str(e.get("display_name", e["id"])).lower()
-    )
-
 
 # --- Dialogs -----------------------------------------------------------------
 
@@ -745,12 +357,18 @@ class PluginStoreDialog(QtWidgets.QDialog):
         self._populate()
 
     def _visible_entries(self) -> list[dict]:
+        """The entries to show, filtered to this app unless 'show all' is on.
+
+        Plugins marked ``app: "api"`` extend the Python API or the command
+        line rather than one GUI, so they are relevant from wherever the
+        dialog was opened and are always shown.
+        """
         entries = merged_entries(self.manifest, self.state)
         if not self.show_all.isChecked():
             entries = [
                 e
                 for e in entries
-                if e.get("app") == self.app_name
+                if e.get("app") in (self.app_name, API_APP)
                 or e.get("_orphan")
                 or e.get("_local")
             ]
