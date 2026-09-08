@@ -7,9 +7,16 @@ Selectable 2D geometric transform models.
 Picasso fits a coordinate transform in two places: the channel registration
 of a multichannel / split-FOV cubic-spline PSF calibration (reference channel
 -> channel ``c``), and the lateral astigmatism / chromatic corrections
-(target image -> reference frame). This module supplies the three models
-they can be fitted with:
+(target image -> reference frame). This module supplies the models they can
+be fitted with, in order of increasing flexibility:
 
+``translation``
+    2 DOF. A rigid shift in x and y, nothing else. The right model when the
+    two frames are known to differ only by an offset - a stage drift, a
+    detector read out with a different origin, or a splitter whose two halves
+    are optically identical and only misplaced. With one free parameter per
+    axis it is the least noise-prone of the models, and a single
+    correspondence already fixes it.
 ``affine``
     6 DOF. Translation, rotation, anisotropic scale and shear. Parallel lines
     stay parallel. The default, and what an aligned image splitter does to
@@ -46,6 +53,7 @@ import numpy as np
 __all__ = [
     "MODELS",
     "Transform",
+    "TranslationTransform",
     "AffineTransform",
     "ProjectiveTransform",
     "PolynomialTransform",
@@ -58,14 +66,22 @@ __all__ = [
     "channel_jacobians",
 ]
 
-MODELS = ("affine", "projective", "polynomial2", "polynomial3")
+MODELS = (
+    "translation",
+    "affine",
+    "projective",
+    "polynomial2",
+    "polynomial3",
+)
 
-Model = Literal["affine", "projective", "polynomial2", "polynomial3"]
+Model = Literal[
+    "translation", "affine", "projective", "polynomial2", "polynomial3"
+]
 
 # Minimum correspondences per model. A model fitted on exactly this many
 # points interpolates them exactly and says nothing about the field in
 # between, hence the "thin data" warning at _WARN_FACTOR times these.
-_MIN_POINTS = {"affine": 3, "projective": 4}
+_MIN_POINTS = {"translation": 1, "affine": 3, "projective": 4}
 _WARN_FACTOR = 3
 
 
@@ -94,14 +110,15 @@ def min_points(model: Model) -> int:
 
     Parameters
     ----------
-    model : {"affine", "projective", "polynomial2", "polynomial3"}
-        The transform model. See the module docstring.
+    model : str
+        The transform model, one of :data:`MODELS`. See the module
+        docstring.
 
     Returns
     -------
     n_points : int
-        3 for affine, 4 for projective, 6 for ``polynomial2`` and 10 for
-        ``polynomial3``.
+        1 for translation, 3 for affine, 4 for projective, 6 for
+        ``polynomial2`` and 10 for ``polynomial3``.
 
     Raises
     ------
@@ -160,10 +177,24 @@ def _check_pairs(src: np.ndarray, dst: np.ndarray, model: Model) -> None:
     )
     if len(src) < needed:
         raise ValueError(
-            f"{name} needs at least {needed} correspondences; only "
+            f"{name} needs at least {needed} "
+            f"correspondence{'s' if needed != 1 else ''}; only "
             f"{len(src)} were given. Use more beads, spread them across the "
             "field, or choose a simpler model."
         )
+    if model == "translation":
+        # The generic warning below advises a simpler model, and there is
+        # none; what a thinly fitted translation is short of is averaging.
+        if len(src) < _WARN_FACTOR:
+            warnings.warn(
+                f"A translation is being fitted on only {len(src)} "
+                "correspondence"
+                f"{'s' if len(src) != 1 else ''}; the shift inherits their "
+                "localization noise instead of averaging it out. Use more "
+                "beads.",
+                stacklevel=3,
+            )
+        return
     if len(src) < _WARN_FACTOR * needed:
         warnings.warn(
             f"{name} is being fitted on only {len(src)} correspondences "
@@ -546,6 +577,100 @@ class AffineTransform(Transform):
 
 
 @dataclass(frozen=True, eq=False)
+class TranslationTransform(AffineTransform):
+    """A 2-DOF pure shift in x and y.
+
+    A translation is an affine whose linear part is the identity, and it is
+    stored as one - the same ``(3, 3)`` homogeneous matrix, with the upper
+    ``(2, 2)`` block constrained to ``I``. Deriving it from
+    :class:`AffineTransform` rather than reimplementing it is what lets every
+    affine-only fast path take it unchanged: the constant-Jacobian route
+    through the spline fit kernels, and the single ``scipy`` call in
+    :func:`warp_image`.
+
+    Constrain a fit to this model when the two frames are known to differ
+    only by an offset. It cannot absorb a rotation or a scale, so a
+    misalignment that is not a pure shift shows up in the registration
+    residual instead of being silently soaked up by parameters the optics do
+    not justify.
+
+    Attributes
+    ----------
+    matrix : np.ndarray
+        The ``(3, 3)`` homogeneous matrix, always C-contiguous float64, with
+        ``matrix[:2, :2] == np.eye(2)``.
+    domain : np.ndarray or None
+        See :class:`Transform`.
+    """
+
+    @property
+    def model(self) -> str:
+        return "translation"
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not np.array_equal(self.matrix[:2, :2], np.eye(2)):
+            raise ValueError(
+                "A translation matrix must have an identity linear part, got "
+                f"{self.matrix[:2, :2].tolist()}. Use AffineTransform for a "
+                "transform with rotation, scale or shear."
+            )
+
+    @classmethod
+    def from_shift(cls, shift, domain=None) -> "TranslationTransform":
+        """Build a translation from its ``(x, y)`` displacement.
+
+        Parameters
+        ----------
+        shift : array
+            ``(2,)`` displacement ``(dx, dy)``, in pixels.
+        domain : array, optional
+            ``[[xmin, ymin], [xmax, ymax]]`` to attach as
+            :attr:`Transform.domain`.
+
+        Returns
+        -------
+        transform : TranslationTransform
+        """
+        matrix = np.eye(3)
+        matrix[:2, 2] = np.asarray(shift, dtype=np.float64).reshape(2)
+        return cls(matrix=matrix, domain=domain)
+
+    @property
+    def shift(self) -> np.ndarray:
+        """The ``(2,)`` displacement ``(dx, dy)``. Same as
+        :attr:`AffineTransform.translation`."""
+        return self.matrix[:2, 2]
+
+    def inverse(self) -> "TranslationTransform":
+        domain = None
+        if self.domain is not None:
+            domain = self.domain + self.shift
+        return TranslationTransform.from_shift(-self.shift, domain=domain)
+
+    def compose_translations(self, pre=(0.0, 0.0), post=(0.0, 0.0)):
+        pre = np.asarray(pre, dtype=np.float64).reshape(2)
+        post = np.asarray(post, dtype=np.float64).reshape(2)
+        # The linear part is the identity, so `pre` passes through unchanged
+        # and both shifts simply add.
+        domain = None if self.domain is None else self.domain - pre
+        return TranslationTransform.from_shift(
+            self.shift + pre + post, domain=domain
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "model": "translation",
+            "shift": [float(v) for v in self.shift],
+            "domain": _domain_to_list(self.domain),
+        }
+
+    @property
+    def n_params(self) -> int:
+        return 2
+
+
+@dataclass(frozen=True, eq=False)
 class ProjectiveTransform(Transform):
     """An 8-DOF homography, stored as a ``(3, 3)`` matrix normalized so that
     ``matrix[2, 2] == 1`` where that is possible.
@@ -917,6 +1042,16 @@ def _monomial_gradients(
 # ---------------------------------------------------------------------------
 
 
+def _estimate_translation(
+    src: np.ndarray, dst: np.ndarray, domain: np.ndarray
+) -> TranslationTransform:
+    # With the linear part fixed, the least-squares shift is just the mean
+    # displacement - there is nothing to solve.
+    return TranslationTransform.from_shift(
+        (dst - src).mean(axis=0), domain=domain
+    )
+
+
 def _estimate_affine(
     src: np.ndarray, dst: np.ndarray, domain: np.ndarray
 ) -> AffineTransform:
@@ -1072,8 +1207,9 @@ def estimate(
     ----------
     src_xy, dst_xy : array
         ``(n, 2)`` correspondences, in the same units.
-    model : {"affine", "projective", "polynomial2", "polynomial3"}
-        The transform model. See the module docstring.
+    model : str
+        The transform model, one of :data:`MODELS`. See the module
+        docstring.
     refine : bool
         Whether to follow the projective DLT with a Gauss-Newton refinement
         against the geometric residual. Ignored by the other models.
@@ -1097,6 +1233,8 @@ def estimate(
     dst = _as_xy(dst_xy)
     _check_pairs(src, dst, model)
     domain = _domain_of(src)
+    if model == "translation":
+        return _estimate_translation(src, dst, domain)
     if model == "affine":
         return _estimate_affine(src, dst, domain)
     if model == "projective":
@@ -1109,8 +1247,9 @@ def identity(model: Model = "affine", domain=None) -> Transform:
 
     Parameters
     ----------
-    model : {"affine", "projective", "polynomial2", "polynomial3"}
-        The transform model. See the module docstring.
+    model : str
+        The transform model, one of :data:`MODELS`. See the module
+        docstring.
     domain : array, optional
         ``[[xmin, ymin], [xmax, ymax]]`` to attach as
         :attr:`Transform.domain`.
@@ -1127,6 +1266,8 @@ def identity(model: Model = "affine", domain=None) -> Transform:
     """
     _validate_model(model)
     domain = None if domain is None else np.asarray(domain, dtype=np.float64)
+    if model == "translation":
+        return TranslationTransform(matrix=np.eye(3), domain=domain)
     if model == "affine":
         return AffineTransform(matrix=np.eye(3), domain=domain)
     if model == "projective":
@@ -1178,6 +1319,8 @@ def from_dict(data) -> Transform:
     model = data.get("model")
     domain = data.get("domain")
     domain = None if domain is None else np.asarray(domain, dtype=np.float64)
+    if model == "translation":
+        return TranslationTransform.from_shift(data["shift"], domain=domain)
     if model == "affine":
         return AffineTransform(matrix=data["matrix"], domain=domain)
     if model == "projective":

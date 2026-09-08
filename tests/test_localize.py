@@ -427,6 +427,72 @@ class TestClipRois:
 
 
 # ---------------------------------------------------------------------------
+# add_roi_id
+# ---------------------------------------------------------------------------
+
+
+def _roi_locs() -> pd.DataFrame:
+    """Two localizations in the left half, one in the right, one outside
+    both halves."""
+    return pd.DataFrame(
+        {
+            "frame": np.arange(4, dtype=np.uint32),
+            "x": np.array([1.5, 63.4, 64.6, 200.0], dtype=np.float32),
+            "y": np.array([1.5, 10.0, 10.0, 10.0], dtype=np.float32),
+            "photons": np.full(4, 1000.0, dtype=np.float32),
+        }
+    )
+
+
+class TestAddRoiId:
+    """The ``roi_id`` column of a fit restricted to several ROIs."""
+
+    ROIS = [[[0, 0], [64, 64]], [[0, 64], [64, 128]]]
+
+    def test_the_index_of_the_roi_is_stored(self):
+        out = localize.add_roi_id(_roi_locs(), self.ROIS)
+        assert out.columns[-1] == localize.ROI_ID_COLUMN
+        assert list(out["roi_id"]) == [0, 0, 1, localize.NO_ROI_ID]
+        assert out["roi_id"].dtype == np.int32
+
+    def test_the_other_columns_are_untouched(self):
+        locs = _roi_locs()
+        out = localize.add_roi_id(locs, self.ROIS)
+        pd.testing.assert_frame_equal(out[locs.columns], locs)
+        assert "roi_id" not in locs.columns  # the input is not mutated
+
+    def test_every_localization_gets_exactly_one_index(self):
+        rois = localize.clip_rois([[[0, 0], [64, 128]], [[0, 32], [64, 96]]])
+        out = localize.add_roi_id(_roi_locs(), rois)
+        ids = out["roi_id"]
+        assert ids.between(localize.NO_ROI_ID, len(rois) - 1).all()
+
+    def test_overlapping_rectangles_resolve_to_the_first(self):
+        """``clip_rois`` does not produce overlaps, but a hand-written
+        ``roi`` argument may - one index per localization either way."""
+        out = localize.add_roi_id(
+            _roi_locs(), [[[0, 0], [64, 128]], [[0, 0], [64, 64]]]
+        )
+        assert list(out["roi_id"]) == [0, 0, 0, localize.NO_ROI_ID]
+
+    def test_a_single_rectangle_is_accepted(self):
+        """The whole ``roi`` argument of ``identify``/``localize``, not
+        just its list form."""
+        out = localize.add_roi_id(_roi_locs(), ((0, 0), (64, 64)))
+        assert list(out["roi_id"]) == [0, 0, -1, -1]
+
+    def test_corner_order_does_not_matter(self):
+        out = localize.add_roi_id(_roi_locs(), [((64, 64), (0, 0))])
+        assert list(out["roi_id"]) == [0, 0, -1, -1]
+
+    @pytest.mark.parametrize("roi", [None, []])
+    def test_no_roi_no_column(self, roi):
+        locs = _roi_locs()
+        out = localize.add_roi_id(locs, roi)
+        assert list(out.columns) == list(locs.columns)
+
+
+# ---------------------------------------------------------------------------
 # _to_photons
 # ---------------------------------------------------------------------------
 
@@ -7321,21 +7387,37 @@ class TestGaussianFilterGui:
         finally:
             dialog.close()
 
-    def test_roi_pad_grows_with_the_sigma(self):
-        """The preview must pad the temporal median's bounding box exactly
-        as ``localize.identify`` does, or the two disagree on ROI borders.
+    def test_the_preview_filters_are_never_restricted_to_the_rois(self):
+        """The preview movie is what the window displays, so its filters
+        have to cover the whole frame: a ROI-restricted temporal median
+        leaves everything outside its bounding box at zero, and with the
+        filter on, drawing the first ROI would black out the rest of the
+        movie - the next one could not be placed. The detections must
+        still match ``localize.identify``, which does restrict it.
         """
-        rng = np.random.default_rng(1)
-        movie = rng.integers(0, 4000, size=(20, 40, 40), dtype=np.uint16)
+        n_frames, size = 12, 64
+        yy, xx = np.mgrid[0:size, 0:size]
+        rng = np.random.default_rng(5)
+        movie = rng.integers(90, 110, size=(n_frames, size, size)).astype(
+            np.uint16
+        )
+        # blinking, or the temporal median would subtract them away
+        for frame_number in (2, 3, 8):
+            for cy, cx in ((26, 26), (48, 48)):  # inside and outside the ROI
+                movie[frame_number] += (
+                    4000
+                    * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 1.2**2))
+                ).astype(np.uint16)
+        rois = [[[20, 20], [32, 32]]]
         window = localize_gui.Window.__new__(localize_gui.Window)
         window.parameters_dialog = self._dialog()
         dialog = window.parameters_dialog
         try:
-            rois = [((0, 0), (8, 8))]
             window.view = type("_View", (), {"rois": rois})()
             window.movie = movie
             window._temporal_movie = None
             window._gaussian_movie = None
+            window.frame_range = None
             dialog.temporal_median_checkbox.setChecked(True)
             dialog.temporal_median_spinbox.setValue(5)
             for sigma in (0.0, 1.5):
@@ -7346,17 +7428,36 @@ class TestGaussianFilterGui:
                     if isinstance(filtered, localize.GaussianFilteredMovie)
                     else filtered
                 )
-                assert median.roi_pad == localize.identification_roi_pad(
-                    dialog.box_spinbox.value(), sigma
+                # the whole frame stays filtered, and stays visible
+                assert median.roi is None
+                assert filtered[3][40:, 40:].max() > 0
+                # ... and identification still agrees with the batch run,
+                # which restricts the median to the ROI
+                preview = localize.identify_by_frame_number(
+                    filtered, 200, BOX, 3, roi=rois
+                )
+                batch = localize.identify(
+                    movie,
+                    200,
+                    BOX,
+                    roi=rois,
+                    threaded=False,
+                    temporal_median_window=5,
+                    gaussian_filter_sigma=sigma,
+                    return_info=False,
+                )
+                batch = batch[batch["frame"] == 3]
+                assert len(preview) == len(batch) == 1
+                np.testing.assert_allclose(
+                    preview["net_gradient"].to_numpy(),
+                    batch["net_gradient"].to_numpy(),
+                    rtol=1e-4,
                 )
 
-            # without a ROI the pad is irrelevant, so changing sigma must
-            # not throw away the (expensive) cached medians
-            window.view.rois = []
-            window._temporal_movie = None
-            window._gaussian_movie = None
-            dialog.gaussian_filter_spinbox.setValue(1.0)
+            # the ROIs no longer key the median, so drawing one (or nudging
+            # the sigma) must not throw away the expensive cached medians
             median_stage = window.identification_movie().raw
+            window.view.rois = rois + [[[40, 40], [56, 56]]]
             dialog.gaussian_filter_spinbox.setValue(2.0)
             assert window.identification_movie().raw is median_stage
         finally:
@@ -7477,6 +7578,69 @@ class TestGaussianFilterGui:
             assert not window.identifications_outdated()
         finally:
             window.close()
+
+
+class TestRoiSnapshotsGui:
+    """ROIs are edited in place all over Picasso: Localize - a region is
+    moved by rewriting its corners, a double click deletes one from the
+    list. Anything that snapshots them (the identification worker, the
+    settings the identifications were made with) therefore has to copy
+    them, or the snapshot changes underneath it and keeps agreeing with
+    the edited ROIs.
+    """
+
+    _dialog = staticmethod(TestTemporalMedianGui._dialog)
+
+    @staticmethod
+    def _window(dialog, rois):
+        window = localize_gui.Window.__new__(localize_gui.Window)
+        window.parameters_dialog = dialog
+        window.view = type("_View", (), {"rois": rois})()
+        window.movie = np.zeros((4, 8, 8), np.uint16)
+        window.frame_range = None
+        return window
+
+    def test_identification_rois_are_copied_out_of_the_view(self):
+        dialog = self._dialog()
+        rois = [[[0, 0], [8, 8]]]
+        try:
+            window = self._window(dialog, rois)
+            copied = window.identification_rois()
+            assert copied == rois
+            copied[0][0][0] = 4
+            copied.append([[10, 10], [20, 20]])
+            assert rois == [[[0, 0], [8, 8]]]
+        finally:
+            dialog.close()
+
+    def test_moving_a_region_invalidates_identifications(self):
+        dialog = self._dialog()
+        rois = [[[0, 0], [8, 8]]]
+        try:
+            window = self._window(dialog, rois)
+            window.last_identification_info = {
+                **window.parameters,
+                "ROI": window.identification_rois(),
+                "Frame bounds": None,
+            }
+            assert not window.identifications_outdated()
+            # as ``View._move_region`` moves a split-FOV region
+            rois[0] = [[2, 2], [10, 10]]
+            assert window.identifications_outdated()
+        finally:
+            dialog.close()
+
+    def test_worker_rois_do_not_follow_the_view(self):
+        dialog = self._dialog()
+        rois = [[[0, 0], [8, 8]]]
+        try:
+            window = self._window(dialog, rois)
+            worker = localize_gui.IdentificationWorker(window, False, False)
+            rois[0][1][0] = 16
+            rois.append([[10, 10], [20, 20]])
+            assert worker.rois == [[[0, 0], [8, 8]]]
+        finally:
+            dialog.close()
 
 
 def _two_region_frame() -> np.ndarray:
@@ -7851,12 +8015,15 @@ class TestFitAffineTransform:
         cyl_xy = _apply_homogeneous(inverse, ref_xy)
         return _affine_bead_image(ref_xy), _affine_bead_image(cyl_xy), ref_xy
 
-    @pytest.mark.parametrize("model", transforms.MODELS)
+    @pytest.mark.parametrize(
+        "model", [m for m in transforms.MODELS if m != "translation"]
+    )
     def test_every_model_recovers_the_applied_transform(
         self, bead_movies, model
     ):
-        """The correction is a pure affine here, which every model can
-        represent - so each must recover it, and record which one it is."""
+        """The correction is a pure affine here, which every model except the
+        translation can represent - so each must recover it, and record which
+        one it is. The translation is covered on a pure shift below."""
         movie_ref, movie_cyl, ref_xy = bead_movies
         calibration, _ = localize.fit_lateral_transform(
             movie_ref,
@@ -7871,6 +8038,28 @@ class TestFitAffineTransform:
         cyl_xy = _apply_homogeneous(np.linalg.inv(self.TRUTH), ref_xy)
         mapped = transforms.from_dict(entry["Transform"]).apply(cyl_xy)
         assert np.allclose(mapped, ref_xy, atol=0.3)
+
+    def test_a_translation_recovers_a_pure_shift(self):
+        """The 2-DOF model on the only correction it claims to fit. It is
+        given its own bead pair because the class-wide ``TRUTH`` rotates and
+        scales, which a translation must *not* absorb."""
+        shift = np.array([3.5, -2.25])
+        ref_xy = _affine_bead_grid()
+        movie_ref = _affine_bead_image(ref_xy)
+        movie_shifted = _affine_bead_image(ref_xy - shift)
+        calibration, _ = localize.fit_lateral_transform(
+            movie_ref,
+            movie_shifted,
+            {},
+            box=BOX,
+            minimum_ng=1000,
+            model="translation",
+        )
+        (entry,) = lib.lateral_transforms(calibration)
+        assert entry["Transform"]["model"] == "translation"
+        transform = transforms.from_dict(entry["Transform"])
+        assert np.allclose(transform.shift, shift, atol=0.1)
+        assert np.allclose(transform.apply(ref_xy - shift), ref_xy, atol=0.3)
 
     def test_too_few_pairs_for_the_model_raises(self):
         """Enough beads for an affine, too few for a degree-3 polynomial: the
@@ -8552,9 +8741,11 @@ class TestChainedAffineTransforms:
         )
         assert len(new) == 2 and duplicates == []
 
-    def test_localize_3d_drops_a_duplicate_of_the_z_calibration(self):
-        """The pipeline applies the 3D calibration's transform via zfit and
-        must not re-apply the same one handed in as an extra."""
+    def test_a_duplicate_of_the_fits_own_calibration_is_dropped(self):
+        """The 2D / spline route: the fit applies what its calibration
+        carries, so the same one handed in as an extra must be skipped.
+        (The astigmatic 3D route does this inside ``zfit`` - see
+        ``TestZfitSeparatelyLoadedLateralCorrections``.)"""
         locs = pd.DataFrame(
             {"x": [10.0, 20.0], "y": [30.0, 40.0], "frame": [0, 1]}
         )
@@ -8566,7 +8757,7 @@ class TestChainedAffineTransforms:
         assert out is locs  # untouched
         assert info == []
 
-    def test_localize_3d_applies_a_genuinely_new_correction(self):
+    def test_a_genuinely_new_correction_is_applied(self):
         locs = pd.DataFrame(
             {"x": [10.0, 20.0], "y": [30.0, 40.0], "frame": [0, 1]}
         )
@@ -10192,12 +10383,47 @@ class TestCameraCalibrationDialogs:
         dialog = localize_gui.CameraCalibrationDialog(None)
         try:
             assert dialog.bright_paths() == []
-            dialog.bright_list.addItem("/a.raw")
-            dialog.bright_list.addItem("/b.raw")
+            dialog.add_bright("/a.raw")
+            dialog.add_bright("/b.raw")
             assert dialog.bright_paths() == ["/a.raw", "/b.raw"]
-            dialog.bright_list.item(0).setSelected(True)
+            dialog.bright_list.selectRow(0)
             dialog.remove_bright()
             assert dialog.bright_paths() == ["/b.raw"]
+        finally:
+            dialog.close()
+
+    def test_illumination_levels_are_read_back(self):
+        """The optional column, which only the diagnostic plot uses."""
+        dialog = localize_gui.CameraCalibrationDialog(None)
+        try:
+            dialog.add_bright("/a.raw", "0.1")
+            dialog.add_bright("/b.raw", "1")
+            dialog.add_bright("/c.raw", "10")
+            assert dialog.bright_levels() == [0.1, 1.0, 10.0]
+        finally:
+            dialog.close()
+
+    def test_no_illumination_levels_is_not_an_error(self):
+        dialog = localize_gui.CameraCalibrationDialog(None)
+        try:
+            dialog.add_bright("/a.raw")
+            dialog.add_bright("/b.raw")
+            assert dialog.bright_levels() is None
+        finally:
+            dialog.close()
+
+    def test_a_partly_filled_or_non_numeric_column_is_refused(self):
+        """Either is a slip; a level list that does not match the movies
+        cannot be plotted against."""
+        dialog = localize_gui.CameraCalibrationDialog(None)
+        try:
+            dialog.add_bright("/a.raw", "0.1")
+            dialog.add_bright("/b.raw")
+            with pytest.raises(ValueError, match="every row"):
+                dialog.bright_levels()
+            dialog.bright_list.item(1, 1).setText("bright")
+            with pytest.raises(ValueError, match="numbers only"):
+                dialog.bright_levels()
         finally:
             dialog.close()
 
@@ -10486,19 +10712,6 @@ class TestIdentifyModeParameter:
             )
         finally:
             window.close()
-
-    def test_every_multichannel_widget_keeps_its_space_while_hidden(self):
-        dialog = localize_gui.Window().parameters_dialog
-        try:
-            for widget in (
-                dialog.identify_mode_label,
-                dialog.identify_mode_combo,
-                dialog.link_colors_checkbox,
-                dialog.link_groupbox,
-            ):
-                assert widget.sizePolicy().retainSizeWhenHidden()
-        finally:
-            dialog.window.close()
 
     def test_the_dialog_does_not_reflow_when_channels_are_loaded(self):
         """The complaint this guards against: the identification group used to
@@ -12668,5 +12881,1069 @@ class TestSlotsSurviveAStaleWindow:
             window.save_locs(path)  # must not raise
             _, info = io.load_locs(path)
             assert info[-1]["Generated by"].startswith("Picasso")
+        finally:
+            window.close()
+
+
+# ---------------------------------------------------------------------------
+# Independent (per channel / per region) fitting
+# ---------------------------------------------------------------------------
+
+
+def _independent_movie(n_frames=6, height=32, width=64, spots=(), seed=3):
+    """A movie with one Gaussian spot per (frame, position) entry.
+
+    ``spots`` is a list of ``(x, y, amplitude)``, each repeated in every
+    frame. Returns ``(movie, identifications)``."""
+    rng = np.random.RandomState(seed)
+    j, i = np.mgrid[0:height, 0:width]
+    movie = np.zeros((n_frames, height, width))
+    for x, y, amp in spots:
+        movie += amp * np.exp(-0.5 * ((i - x) ** 2 + (j - y) ** 2) / 1.2**2)
+    movie = rng.poisson(movie + 10).astype(np.uint16)
+    ids = pd.DataFrame(
+        {
+            "frame": np.repeat(np.arange(n_frames), len(spots)),
+            "x": np.tile([int(round(s[0])) for s in spots], n_frames),
+            "y": np.tile([int(round(s[1])) for s in spots], n_frames),
+            "net_gradient": np.full(
+                n_frames * len(spots), 1e4, dtype=np.float32
+            ),
+        }
+    )
+    return movie, ids
+
+
+class TestPerChannelArgument:
+    """Scalars are shared by every channel, lists are per channel."""
+
+    def test_scalar_is_broadcast(self):
+        assert localize._per_channel_arg("gausslq", 3, "m") == ["gausslq"] * 3
+
+    def test_a_dict_is_one_shared_calibration(self):
+        # a calibration is a mapping, not a per-channel sequence
+        calib = {"model": "spline-2d"}
+        assert localize._per_channel_arg(calib, 2, "c") == [calib, calib]
+
+    def test_list_must_match_the_channel_count(self):
+        with pytest.raises(ValueError, match="2 entries but there are 3"):
+            localize._per_channel_arg(["a", "b"], 3, "fitting_method")
+
+
+class TestRegionCoordinates:
+    """Moving localizations into a region's own frame, and back out."""
+
+    REGION = [[10, 20], [40, 60]]
+
+    def _locs(self):
+        return pd.DataFrame(
+            {
+                "frame": [0, 1, 2],
+                "x": np.float32([25.5, 55.0, 5.0]),
+                "y": np.float32([12.5, 30.0, 30.0]),
+            }
+        )
+
+    def test_locs_are_shifted_by_the_region_origin(self):
+        shifted = localize.locs_to_region_coordinates(
+            self._locs(), self.REGION
+        )
+        np.testing.assert_allclose(shifted["x"], [5.5, 35.0, -15.0])
+        np.testing.assert_allclose(shifted["y"], [2.5, 20.0, 20.0])
+
+    def test_corner_order_does_not_matter(self):
+        flipped = localize.locs_to_region_coordinates(
+            self._locs(), [[40, 60], [10, 20]]
+        )
+        expected = localize.locs_to_region_coordinates(
+            self._locs(), self.REGION
+        )
+        np.testing.assert_allclose(flipped["x"], expected["x"])
+
+    def test_region_info_carries_the_region_size(self):
+        info = [{"Frames": 5, "Height": 64, "Width": 128}]
+        region_info = localize.region_movie_info(info, self.REGION)
+        assert region_info[-1]["Width"] == 40
+        assert region_info[-1]["Height"] == 30
+        assert region_info[-1]["Region"] == [[10, 20], [40, 60]]
+        # the original is untouched
+        assert info[-1]["Width"] == 128
+
+    def test_split_by_region_matches_confine_to_region(self):
+        locs = self._locs()
+        regions = [self.REGION, [[10, 60], [40, 100]]]
+        per_region = localize.split_locs_by_region(
+            locs, regions, to_local=False
+        )
+        for region, part in zip(regions, per_region):
+            expected = localize.confine_to_region(locs, region)
+            np.testing.assert_allclose(part["x"], expected["x"])
+        # the localization at x=5 is in neither region and is dropped
+        assert sum(len(_) for _ in per_region) == 2
+
+    def test_split_by_region_is_local_by_default(self):
+        locs = self._locs()
+        first = localize.split_locs_by_region(locs, [self.REGION])[0]
+        np.testing.assert_allclose(first["x"], [5.5, 35.0])
+        np.testing.assert_allclose(first["y"], [2.5, 20.0])
+
+
+class TestFitIndependent:
+    """Several movies, each fitted on its own."""
+
+    def _channels(self, factory):
+        movie_a, ids_a = _independent_movie(spots=[(12.4, 15.6, 900.0)])
+        movie_b, ids_b = _independent_movie(
+            spots=[(40.2, 20.3, 700.0)], seed=7
+        )
+        info = [{"Frames": len(movie_a)}]
+        return (
+            [factory(movie_a, info), factory(movie_b, info)],
+            [ids_a, ids_b],
+        )
+
+    def test_matches_fitting_each_channel_separately(
+        self, picasso_movie_factory
+    ):
+        movies, ids = self._channels(picasso_movie_factory)
+        results = localize.fit_independent(
+            movies,
+            CAMERA_INFO_WITH_PIXELSIZE,
+            ids,
+            BOX,
+            "gausslq",
+            multiprocess=False,
+        )
+        assert len(results) == 2
+        for c, (locs, info) in enumerate(results):
+            expected, _ = localize.fit(
+                movies[c],
+                camera_info=CAMERA_INFO_WITH_PIXELSIZE,
+                identifications=ids[c],
+                box=BOX,
+                fitting_method="gausslq",
+                multiprocess=False,
+            )
+            np.testing.assert_allclose(locs["x"], expected["x"], rtol=1e-6)
+            assert info["Channel"] == c
+            assert info["Channels"] == 2
+            assert info["Fit mode"] == localize.FIT_MODE_INDEPENDENT
+
+    def test_each_channel_may_use_its_own_method(self, picasso_movie_factory):
+        movies, ids = self._channels(picasso_movie_factory)
+        results = localize.fit_independent(
+            movies,
+            CAMERA_INFO_WITH_PIXELSIZE,
+            ids,
+            BOX,
+            ["gausslq", "avg"],
+            multiprocess=False,
+        )
+        assert results[0][1]["Fit method"] == "gausslq"
+        assert results[1][1]["Fit method"] == "avg"
+
+    def test_channel_positions_are_recovered(self, picasso_movie_factory):
+        movies, ids = self._channels(picasso_movie_factory)
+        results = localize.fit_independent(
+            movies,
+            CAMERA_INFO_WITH_PIXELSIZE,
+            ids,
+            BOX,
+            "gausslq",
+            multiprocess=False,
+        )
+        assert abs(results[0][0]["x"].mean() - 12.4) < 0.3
+        assert abs(results[1][0]["x"].mean() - 40.2) < 0.3
+
+    def test_one_identification_table_per_movie_is_required(
+        self, picasso_movie_factory
+    ):
+        movies, ids = self._channels(picasso_movie_factory)
+        with pytest.raises(ValueError, match="one per channel"):
+            localize.fit_independent(
+                movies, CAMERA_INFO_WITH_PIXELSIZE, ids[:1], BOX
+            )
+
+    def test_a_joint_calibration_is_rejected(self, picasso_movie_factory):
+        movies, ids = self._channels(picasso_movie_factory)
+        with pytest.raises(ValueError, match="spline-3d-multichannel"):
+            localize.fit_independent(
+                movies,
+                CAMERA_INFO_WITH_PIXELSIZE,
+                ids,
+                BOX,
+                "spline",
+                spline_calibration={"model": "spline-3d-multichannel"},
+            )
+
+    def test_an_abort_gives_up_the_whole_batch(
+        self, picasso_movie_factory, monkeypatch
+    ):
+        """A channel that aborts mid-fit returns None from ``fit``; the
+        batch must not come back half-finished."""
+        movies, ids = self._channels(picasso_movie_factory)
+        monkeypatch.setattr(localize, "fit", lambda *a, **k: (None, {}))
+        assert (
+            localize.fit_independent(
+                movies,
+                CAMERA_INFO_WITH_PIXELSIZE,
+                ids,
+                BOX,
+                "gausslq",
+                multiprocess=False,
+            )
+            is None
+        )
+
+
+class TestFitSplitFovIndependent:
+    """Regions of one movie, each fitted on its own."""
+
+    REGIONS = [[[0, 0], [32, 32]], [[0, 32], [32, 64]]]
+
+    def _movie(self, factory):
+        movie, ids = _independent_movie(
+            spots=[(12.4, 15.6, 900.0), (44.7, 18.2, 700.0)]
+        )
+        return factory(movie, [{"Frames": len(movie)}]), ids
+
+    def _fit(self, factory, **kwargs):
+        movie, ids = self._movie(factory)
+        results = localize.fit_split_fov_independent(
+            movie,
+            CAMERA_INFO_WITH_PIXELSIZE,
+            ids,
+            BOX,
+            self.REGIONS,
+            "gausslq",
+            multiprocess=False,
+            **kwargs,
+        )
+        return movie, ids, results
+
+    def test_each_region_is_fitted_on_its_own(self, picasso_movie_factory):
+        movie, ids, results = self._fit(picasso_movie_factory)
+        assert len(results) == 2
+        for region, (locs, _) in zip(self.REGIONS, results):
+            expected, _ = localize.fit(
+                movie,
+                camera_info=CAMERA_INFO_WITH_PIXELSIZE,
+                identifications=localize.confine_to_region(ids, region),
+                box=BOX,
+                fitting_method="gausslq",
+                multiprocess=False,
+            )
+            expected = localize.locs_to_region_coordinates(expected, region)
+            np.testing.assert_allclose(locs["x"], expected["x"], rtol=1e-6)
+
+    def test_localizations_come_out_in_region_coordinates(
+        self, picasso_movie_factory
+    ):
+        _, _, results = self._fit(picasso_movie_factory)
+        # both regions are 32 px wide, so both spots land in the same range
+        assert abs(results[0][0]["x"].mean() - 12.4) < 0.3
+        assert abs(results[1][0]["x"].mean() - 12.7) < 0.3
+        assert results[1][0]["x"].max() < 32
+
+    def test_sensor_coordinates_on_request(self, picasso_movie_factory):
+        _, _, results = self._fit(picasso_movie_factory, to_local=False)
+        assert abs(results[1][0]["x"].mean() - 44.7) < 0.3
+
+    def test_region_metadata_is_returned_with_the_movie_info(
+        self, picasso_movie_factory
+    ):
+        info = [{"Frames": 6, "Height": 32, "Width": 64}]
+        _, _, results = self._fit(picasso_movie_factory, movie_info=info)
+        first, second = (r[1] for r in results)
+        # the movie entry describes the region, the fit entry the fit
+        assert first[0]["Width"] == 32 and first[0]["Height"] == 32
+        assert second[0]["Region"] == [[0, 32], [32, 64]]
+        assert second[-1]["Channel"] == 1
+        assert second[-1]["Fit method"] == "gausslq"
+        assert second[-1]["Fit mode"] == localize.FIT_MODE_INDEPENDENT
+        assert second[-1]["Region coordinates"] == "region"
+
+    def test_the_fit_metadata_comes_back_without_a_movie_info(
+        self, picasso_movie_factory
+    ):
+        _, _, results = self._fit(picasso_movie_factory)
+        for c, (_, info) in enumerate(results):
+            assert len(info) == 1
+            assert info[-1]["Channel"] == c
+            assert info[-1]["Fit mode"] == localize.FIT_MODE_INDEPENDENT
+
+    def test_each_region_may_use_its_own_method(self, picasso_movie_factory):
+        movie, ids = self._movie(picasso_movie_factory)
+        results = localize.fit_split_fov_independent(
+            movie,
+            CAMERA_INFO_WITH_PIXELSIZE,
+            ids,
+            BOX,
+            self.REGIONS,
+            ["gausslq", "avg"],
+            multiprocess=False,
+        )
+        # "avg" has no fitted width, so its localizations differ from a
+        # Gaussian fit's - the point is only that both ran
+        assert len(results) == 2
+        assert all(len(locs) for locs, _ in results)
+
+    def test_at_least_one_region_is_needed(self, picasso_movie_factory):
+        movie, ids = self._movie(picasso_movie_factory)
+        with pytest.raises(ValueError, match="at least one region"):
+            localize.fit_split_fov_independent(
+                movie, CAMERA_INFO_WITH_PIXELSIZE, ids, BOX, [], "gausslq"
+            )
+
+
+class TestLocalizeCliSeparateLateralCorrection:
+    """``picasso localize -ac`` alongside ``-zc``: a lateral correction kept
+    in its own file must land exactly where an appended one would, compose
+    with the one the 3D calibration carries, and never be applied twice.
+    """
+
+    CHROMATIC = [[1.0, 0.0, 5.0], [0.0, 1.0, 2.0], [0.0, 0.0, 1.0]]
+    ASTIG = [[1.0, 0.0, 3.0], [0.0, 1.0, -1.5], [0.0, 0.0, 1.0]]
+
+    @staticmethod
+    def _entry(kind, matrix):
+        return {"Type": kind, "Transform": affine(matrix).to_dict()}
+
+    def _movie_path(self, tmp_path):
+        movie, _ = _independent_movie(spots=[(12.4, 15.6, 900.0)])
+        path = str(tmp_path / "movie.raw")
+        io.save_raw(
+            path,
+            movie.astype(np.uint16),
+            [
+                {
+                    "Byte Order": "<",
+                    "Data Type": "uint16",
+                    "Frames": int(movie.shape[0]),
+                    "Height": int(movie.shape[1]),
+                    "Width": int(movie.shape[2]),
+                }
+            ],
+        )
+        return path
+
+    def _calibration(self, tmp_path, name, *entries):
+        calibration = dict(CALIB_3D)
+        for entry in entries:
+            lib.append_lateral_transform(calibration, entry)
+        path = str(tmp_path / name)
+        io.save_any_calibration(path, calibration)
+        return path
+
+    def _run(self, tmp_path, monkeypatch, movie, suffix, method, *extra):
+        from picasso import __main__ as cli
+
+        # "lq-3d" is what turns --zc into an astigmatic z fit; "lq" is the
+        # plain 2D fit.
+        argv = [
+            "picasso",
+            "localize",
+            movie,
+            "-b",
+            "7",
+            "-g",
+            "100",
+            "-a",
+            method,
+            "-d",
+            "0",
+            "-mf",
+            "0.79",
+            "-sf",
+            suffix,
+            *extra,
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+        cli.main()
+        return io.load_locs(str(tmp_path / f"movie{suffix}_locs.hdf5"))
+
+    def test_separate_matches_appended(self, tmp_path, monkeypatch):
+        movie = self._movie_path(tmp_path)
+        appended = self._calibration(
+            tmp_path,
+            "both_3d_calib.yaml",
+            self._entry("astigmatism", self.ASTIG),
+            self._entry("chromatic", self.CHROMATIC),
+        )
+        astig_only = self._calibration(
+            tmp_path,
+            "astig_3d_calib.yaml",
+            self._entry("astigmatism", self.ASTIG),
+        )
+        chromatic = str(tmp_path / "chromatic.yaml")
+        io.save_any_calibration(
+            chromatic,
+            lib.append_lateral_transform(
+                {}, self._entry("chromatic", self.CHROMATIC)
+            ),
+        )
+
+        ref, ref_info = self._run(
+            tmp_path,
+            monkeypatch,
+            movie,
+            "_appended",
+            "lq-3d",
+            "-zc",
+            appended,
+        )
+        out, info = self._run(
+            tmp_path,
+            monkeypatch,
+            movie,
+            "_separate",
+            "lq-3d",
+            "-zc",
+            astig_only,
+            "-ac",
+            chromatic,
+        )
+        assert len(out) == len(ref) and len(out)
+        np.testing.assert_allclose(
+            out["x"].to_numpy(), ref["x"].to_numpy(), atol=1e-5
+        )
+        np.testing.assert_allclose(
+            out["y"].to_numpy(), ref["y"].to_numpy(), atol=1e-5
+        )
+        # both routes name both corrections, in application order
+        for each in (ref_info, info):
+            assert lib.get_from_metadata(
+                each, "Lateral corrections applied"
+            ) == ["astigmatism, affine", "chromatic, affine"]
+
+    def test_a_duplicate_of_the_z_calibration_is_skipped(
+        self, tmp_path, monkeypatch
+    ):
+        movie = self._movie_path(tmp_path)
+        appended = self._calibration(
+            tmp_path,
+            "astig_3d_calib.yaml",
+            self._entry("astigmatism", self.ASTIG),
+        )
+        # the same transform, saved on its own under another name
+        copy = str(tmp_path / "astig_copy.yaml")
+        io.save_any_calibration(
+            copy,
+            lib.append_lateral_transform(
+                {}, self._entry("astigmatism", self.ASTIG)
+            ),
+        )
+        ref, _ = self._run(
+            tmp_path, monkeypatch, movie, "_once", "lq-3d", "-zc", appended
+        )
+        out, info = self._run(
+            tmp_path,
+            monkeypatch,
+            movie,
+            "_twice",
+            "lq-3d",
+            "-zc",
+            appended,
+            "-ac",
+            copy,
+        )
+        np.testing.assert_allclose(
+            out["x"].to_numpy(), ref["x"].to_numpy(), atol=1e-5
+        )
+        assert lib.get_from_metadata(info, "Lateral corrections applied") == [
+            "astigmatism, affine"
+        ]
+        assert lib.get_from_metadata(info, "Lateral corrections skipped") == [
+            "astigmatism, affine"
+        ]
+
+    def test_applied_to_a_2d_fit_as_well(self, tmp_path, monkeypatch):
+        """No -zc at all: the same flag corrects a plain 2D fit."""
+        movie = self._movie_path(tmp_path)
+        chromatic = str(tmp_path / "chromatic.yaml")
+        io.save_any_calibration(
+            chromatic,
+            lib.append_lateral_transform(
+                {}, self._entry("chromatic", self.CHROMATIC)
+            ),
+        )
+        plain, _ = self._run(tmp_path, monkeypatch, movie, "_plain", "lq")
+        out, info = self._run(
+            tmp_path, monkeypatch, movie, "_corrected", "lq", "-ac", chromatic
+        )
+        np.testing.assert_allclose(
+            out["x"].to_numpy(), plain["x"].to_numpy() + 5.0, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            out["y"].to_numpy(), plain["y"].to_numpy() + 2.0, atol=1e-5
+        )
+        assert lib.get_from_metadata(info, "Lateral corrections applied") == [
+            "chromatic, affine"
+        ]
+
+
+class TestLocalizeCliRegionsSeparately:
+    """``picasso localize --regions-separately``: one file per region."""
+
+    REGIONS = ["0", "0", "32", "32"], ["0", "32", "32", "64"]
+
+    def _movie_path(self, tmp_path):
+        movie, _ = _independent_movie(
+            spots=[(12.4, 15.6, 900.0), (44.7, 18.2, 700.0)]
+        )
+        path = str(tmp_path / "split.raw")
+        io.save_raw(
+            path,
+            movie.astype(np.uint16),
+            [
+                {
+                    "Byte Order": "<",
+                    "Data Type": "uint16",
+                    "Frames": int(movie.shape[0]),
+                    "Height": int(movie.shape[1]),
+                    "Width": int(movie.shape[2]),
+                }
+            ],
+        )
+        return path
+
+    def _run(self, tmp_path, monkeypatch, *extra):
+        from picasso import __main__ as cli
+
+        path = self._movie_path(tmp_path)
+        argv = ["picasso", "localize", path, "-b", "7", "-d", "0"]
+        for region in self.REGIONS:
+            argv += ["-r", *region]
+        argv += ["--regions-separately", *extra]
+        monkeypatch.setattr(sys, "argv", argv)
+        cli.main()
+        return path
+
+    def test_each_region_is_saved_on_its_own(self, tmp_path, monkeypatch):
+        self._run(tmp_path, monkeypatch, "-g", "100", "-a", "lq")
+        ref = tmp_path / "split_ref_locs.hdf5"
+        ch1 = tmp_path / "split_ch1_locs.hdf5"
+        assert ref.exists() and ch1.exists()
+        # ... and not the single combined file of an ordinary run
+        assert not (tmp_path / "split_locs.hdf5").exists()
+        for expected_x, path in ((12.4, ref), (12.7, ch1)):
+            locs, info = io.load_locs(str(path))
+            assert len(locs)
+            # each region's localizations are in its own coordinates
+            assert abs(locs["x"].mean() - expected_x) < 0.5
+            assert lib.get_from_metadata(info, "Width") == 32
+            assert (
+                lib.get_from_metadata(info, "Fit mode")
+                == localize.FIT_MODE_INDEPENDENT
+            )
+
+    def test_a_fitting_method_per_region(self, tmp_path, monkeypatch):
+        self._run(
+            tmp_path,
+            monkeypatch,
+            "-g",
+            "100",
+            "-a",
+            "lq",
+            "-a",
+            "avg",
+        )
+        _, ref_info = io.load_locs(str(tmp_path / "split_ref_locs.hdf5"))
+        _, ch1_info = io.load_locs(str(tmp_path / "split_ch1_locs.hdf5"))
+        assert lib.get_from_metadata(ref_info, "Fit method") == "gausslq"
+        assert lib.get_from_metadata(ch1_info, "Fit method") == "avg"
+
+    def test_a_threshold_per_region(self, tmp_path, monkeypatch):
+        """One --gradient per --roi, as the regions need not share a
+        brightness scale."""
+        self._run(
+            tmp_path, monkeypatch, "-g", "100", "-g", "1000000", "-a", "lq"
+        )
+        ref, _ = io.load_locs(str(tmp_path / "split_ref_locs.hdf5"))
+        assert len(ref)
+        # nothing in the second region passes a threshold that high, so it
+        # is not written at all
+        assert not (tmp_path / "split_ch1_locs.hdf5").exists()
+
+    def test_the_counts_must_match_the_regions(self, tmp_path, monkeypatch):
+        with pytest.raises(Exception, match="one --fit-method per --roi"):
+            self._run(
+                tmp_path,
+                monkeypatch,
+                "-a",
+                "lq",
+                "-a",
+                "avg",
+                "-a",
+                "mle",
+            )
+
+    def test_regions_are_required(self, tmp_path, monkeypatch):
+        from picasso import __main__ as cli
+
+        path = self._movie_path(tmp_path)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["picasso", "localize", path, "--regions-separately", "-d", "0"],
+        )
+        with pytest.raises(Exception, match="at least one --roi is needed"):
+            cli.main()
+
+    def test_an_ordinary_run_still_writes_one_file(
+        self, tmp_path, monkeypatch
+    ):
+        from picasso import __main__ as cli
+
+        path = self._movie_path(tmp_path)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["picasso", "localize", path, "-b", "7", "-d", "0", "-a", "lq"],
+        )
+        cli.main()
+        assert (tmp_path / "split_locs.hdf5").exists()
+        assert not (tmp_path / "split_ref_locs.hdf5").exists()
+
+
+@pytest.mark.gui
+class TestFitModeParameter:
+    """The 'Fit' setting: joint by default, shown for multichannel data."""
+
+    def test_single_channel_data_hides_it_and_fits_jointly(self):
+        window = localize_gui.Window()
+        try:
+            window._set_channels(
+                [np.zeros((2, 8, 8), np.float32)], [_info()], ["a.tif"], ["c0"]
+            )
+            assert not window.parameters_dialog.fit_mode_combo.isVisible()
+            assert window.fit_mode() == localize_gui.FIT_MODE_JOINT
+        finally:
+            window.close()
+
+    def test_several_channels_show_it(self):
+        window = localize_gui.Window()
+        try:
+            movie = np.zeros((2, 8, 8), np.float32)
+            window._set_channels(
+                [movie, movie],
+                [_info("c0"), _info("c1")],
+                ["a.tif", "b.tif"],
+                ["c0", "c1"],
+            )
+            dialog = window.parameters_dialog
+            assert dialog.fit_mode_combo.isVisibleTo(dialog)
+            assert dialog.fit_mode_label.isVisibleTo(dialog)
+            # the default keeps every existing analysis as it was
+            assert window.fit_mode() == localize_gui.FIT_MODE_JOINT
+        finally:
+            window.close()
+
+    def test_it_keeps_its_space_while_hidden(self):
+        dialog = localize_gui.Window().parameters_dialog
+        try:
+            for widget in (dialog.fit_mode_label, dialog.fit_mode_combo):
+                assert widget.sizePolicy().retainSizeWhenHidden()
+        finally:
+            dialog.window.close()
+
+    def test_the_mode_is_reset_when_the_channels_go(self):
+        """Left on 'separately' with one channel it could not be turned off
+        again - the combo is hidden then."""
+        window = localize_gui.Window()
+        try:
+            movie = np.zeros((2, 8, 8), np.float32)
+            window._set_channels(
+                [movie, movie],
+                [_info("c0"), _info("c1")],
+                ["a.tif", "b.tif"],
+                ["c0", "c1"],
+            )
+            window.parameters_dialog.fit_mode_combo.setCurrentText(
+                localize_gui.FIT_MODE_SEPARATE
+            )
+            assert window.fit_mode() == localize_gui.FIT_MODE_SEPARATE
+            window._set_channels([movie], [_info()], ["a.tif"], ["c0"])
+            assert window.fit_mode() == localize_gui.FIT_MODE_JOINT
+        finally:
+            window.close()
+
+    def test_the_joint_only_options_go_with_it(self):
+        """Nothing is shared between channels fitted on their own, so the
+        photon-linking checkboxes have nothing to say."""
+        window = localize_gui.Window()
+        dialog = window.parameters_dialog
+        try:
+            movie = np.zeros((2, 8, 8), np.float32)
+            window._set_channels(
+                [movie, movie],
+                [_info("c0"), _info("c1")],
+                ["a.tif", "b.tif"],
+                ["c0", "c1"],
+            )
+            dialog.channel_registration_calibration = {"n_channels": 2}
+            dialog._update_gauss_link_photons_visibility()
+            # isHidden, not isVisibleTo: the box it sits in is shown only
+            # for the model that has a joint Gaussian fit
+            assert not dialog.gauss_link_photons_checkbox.isHidden()
+            dialog.fit_mode_combo.setCurrentText(
+                localize_gui.FIT_MODE_SEPARATE
+            )
+            assert dialog.gauss_link_photons_checkbox.isHidden()
+        finally:
+            window.close()
+
+
+def _pump(window, timeout=60.0):
+    """Run the Qt event loop until an independent fit batch has finished."""
+    deadline = time.time() + timeout
+    while window._multi_fit is not None and time.time() < deadline:
+        QtWidgets.QApplication.processEvents()
+        worker = window._active_worker
+        if worker is not None:
+            worker.wait(50)
+    QtWidgets.QApplication.processEvents()
+
+
+def _spot_movie(n_frames=4, height=32, width=64, spots=(), seed=5):
+    """A movie with one Gaussian spot per ``(x, y, amplitude)``, and the
+    integer detections that identification would produce for it."""
+    return _independent_movie(n_frames, height, width, spots, seed)
+
+
+@pytest.mark.gui
+class TestFitEachChannelSeparately:
+    """Several loaded movies, each fitted with its own settings."""
+
+    def _window(self, tmp_path, factory):
+        movie_a, ids_a = _spot_movie(spots=[(12.4, 15.6, 900.0)])
+        movie_b, ids_b = _spot_movie(spots=[(40.2, 20.3, 700.0)], seed=7)
+        info = [{"Frames": 4, "Height": 32, "Width": 64}]
+        movie_a = factory(movie_a, info)
+        movie_b = factory(movie_b, info)
+        window = localize_gui.Window()
+        dialog = window.parameters_dialog
+        dialog.baseline.setValue(0)
+        dialog.sensitivity.setValue(1.0)
+        dialog.gain.setValue(1)
+        window._set_channels(
+            [movie_a, movie_b],
+            [list(info), list(info)],
+            [str(tmp_path / "a.tif"), str(tmp_path / "b.tif")],
+            ["c0", "c1"],
+        )
+        dialog.box_spinbox.setValue(7)
+        dialog.fit_mode_combo.setCurrentText(localize_gui.FIT_MODE_SEPARATE)
+        # every channel identified, as Identify (Ctrl+I) leaves them
+        for index, ids in ((0, ids_a), (1, ids_b)):
+            window.set_current_channel(index)
+            window.identifications = ids
+            window.ready_for_fit = True
+            window.last_identification_info = dict(window.parameters)
+        window.set_current_channel(0)
+        return window
+
+    def test_every_channel_is_fitted_and_saved_on_its_own(
+        self, tmp_path, picasso_movie_factory
+    ):
+        window = self._window(tmp_path, picasso_movie_factory)
+        try:
+            window.fit()
+            _pump(window)
+            assert (tmp_path / "a_locs.hdf5").exists()
+            assert (tmp_path / "b_locs.hdf5").exists()
+            first, _ = io.load_locs(str(tmp_path / "a_locs.hdf5"))
+            second, _ = io.load_locs(str(tmp_path / "b_locs.hdf5"))
+            assert abs(first["x"].mean() - 12.4) < 0.5
+            assert abs(second["x"].mean() - 40.2) < 0.5
+            # each channel keeps its own localizations - the joint fit's
+            # reference-channel distribution must not have run
+            assert window.channels[0].locs is not None
+            assert window.channels[1].locs is not None
+            assert len(window.channels[0].locs) == len(first)
+        finally:
+            window.close()
+
+    def test_each_channel_uses_its_own_model(
+        self, tmp_path, picasso_movie_factory
+    ):
+        window = self._window(tmp_path, picasso_movie_factory)
+        try:
+            window.set_current_channel(1)
+            window.parameters_dialog.fit_model.setCurrentText("Average of ROI")
+            window.set_current_channel(0)
+            window.fit()
+            _pump(window)
+            _, first_info = io.load_locs(str(tmp_path / "a_locs.hdf5"))
+            _, second_info = io.load_locs(str(tmp_path / "b_locs.hdf5"))
+            assert "Gaussian" in lib.get_from_metadata(
+                first_info, "Fit method"
+            )
+            assert (
+                lib.get_from_metadata(second_info, "Fit method")
+                == "Average of ROI"
+            )
+            assert (
+                lib.get_from_metadata(second_info, "Fit mode")
+                == localize_gui.FIT_MODE_SEPARATE
+            )
+        finally:
+            window.close()
+
+    def test_a_channel_without_identifications_is_skipped(
+        self, tmp_path, picasso_movie_factory
+    ):
+        window = self._window(tmp_path, picasso_movie_factory)
+        try:
+            window.set_current_channel(1)
+            window.identifications = None
+            window.ready_for_fit = False
+            window.set_current_channel(0)
+            window.fit()
+            _pump(window)
+            assert (tmp_path / "a_locs.hdf5").exists()
+            assert not (tmp_path / "b_locs.hdf5").exists()
+            assert "Skipped c1" in window.status_bar.currentMessage()
+        finally:
+            window.close()
+
+    def test_the_active_channel_comes_back(
+        self, tmp_path, picasso_movie_factory
+    ):
+        window = self._window(tmp_path, picasso_movie_factory)
+        try:
+            window.set_current_channel(1)
+            window.fit()
+            _pump(window)
+            assert window.current_channel == 1
+        finally:
+            window.close()
+
+
+@pytest.mark.gui
+class TestFitEachRegionSeparately:
+    """One movie whose regions are the channels, each fitted on its own."""
+
+    REGIONS = [[[0, 0], [32, 32]], [[0, 32], [32, 64]]]
+
+    def _window(self, tmp_path, factory):
+        movie, ids = _spot_movie(
+            spots=[(12.4, 15.6, 900.0), (44.7, 18.2, 700.0)]
+        )
+        movie = factory(movie, [{"Frames": 4, "Height": 32, "Width": 64}])
+        window = localize_gui.Window()
+        dialog = window.parameters_dialog
+        dialog.baseline.setValue(0)
+        dialog.sensitivity.setValue(1.0)
+        dialog.gain.setValue(1)
+        window._set_channels(
+            [movie],
+            [[{"Frames": 4, "Height": 32, "Width": 64}]],
+            [str(tmp_path / "split.tif")],
+            ["c0"],
+        )
+        dialog.box_spinbox.setValue(7)
+        window.view.rois = [list(r) for r in self.REGIONS]
+        window.set_split_fov_mode(True)
+        dialog.fit_mode_combo.setCurrentText(localize_gui.FIT_MODE_SEPARATE)
+        window.identifications = ids
+        window.ready_for_fit = True
+        window.last_identification_info = dict(window.parameters)
+        return window
+
+    def test_one_file_per_region_in_its_own_coordinates(
+        self, tmp_path, picasso_movie_factory
+    ):
+        window = self._window(tmp_path, picasso_movie_factory)
+        try:
+            window.fit()
+            _pump(window)
+            ref = tmp_path / "split_ref_locs.hdf5"
+            ch1 = tmp_path / "split_ch1_locs.hdf5"
+            assert ref.exists() and ch1.exists()
+            first, first_info = io.load_locs(str(ref))
+            second, second_info = io.load_locs(str(ch1))
+            assert abs(first["x"].mean() - 12.4) < 0.5
+            # the second region's spot sits at x = 44.7 on the sensor and at
+            # 12.7 in its own frame
+            assert abs(second["x"].mean() - 12.7) < 0.5
+            assert lib.get_from_metadata(second_info, "Width") == 32
+            assert lib.get_from_metadata(second_info, "Region") == [
+                [0, 32],
+                [32, 64],
+            ]
+            assert (
+                lib.get_from_metadata(first_info, "Fit mode")
+                == localize_gui.FIT_MODE_SEPARATE
+            )
+        finally:
+            window.close()
+
+    def test_each_region_keeps_its_own_fit_settings(
+        self, tmp_path, picasso_movie_factory
+    ):
+        window = self._window(tmp_path, picasso_movie_factory)
+        dialog = window.parameters_dialog
+        try:
+            # select the second region and give it another model; selecting
+            # a region swaps the fit settings over, as it does the threshold
+            window.view.selected_roi = 1
+            window.sync_region_fit_params()
+            dialog.fit_model.setCurrentText("Average of ROI")
+            window.view.selected_roi = 0
+            window.sync_region_fit_params()
+            assert dialog.fit_model.currentText() != "Average of ROI"
+            window.fit()
+            _pump(window)
+            _, first_info = io.load_locs(str(tmp_path / "split_ref_locs.hdf5"))
+            _, second_info = io.load_locs(
+                str(tmp_path / "split_ch1_locs.hdf5")
+            )
+            assert "Gaussian" in lib.get_from_metadata(
+                first_info, "Fit method"
+            )
+            assert (
+                lib.get_from_metadata(second_info, "Fit method")
+                == "Average of ROI"
+            )
+        finally:
+            window.close()
+
+    def test_the_movie_metadata_is_restored_afterwards(
+        self, tmp_path, picasso_movie_factory
+    ):
+        window = self._window(tmp_path, picasso_movie_factory)
+        try:
+            window.fit()
+            _pump(window)
+            assert lib.get_from_metadata(window.info, "Width") == 64
+            assert window._region_suffix == ""
+        finally:
+            window.close()
+
+    def test_a_region_without_identifications_is_skipped(
+        self, tmp_path, picasso_movie_factory
+    ):
+        window = self._window(tmp_path, picasso_movie_factory)
+        try:
+            # only the reference region's detections
+            window.identifications = localize.confine_to_region(
+                window.identifications, self.REGIONS[0]
+            )
+            window.fit()
+            _pump(window)
+            assert (tmp_path / "split_ref_locs.hdf5").exists()
+            assert not (tmp_path / "split_ch1_locs.hdf5").exists()
+            assert "Skipped ch1" in window.status_bar.currentMessage()
+        finally:
+            window.close()
+
+    def test_a_joint_calibration_is_refused(
+        self, tmp_path, monkeypatch, picasso_movie_factory
+    ):
+        """A multichannel spline calibration describes every region at once;
+        fitting one region against it would use the wrong PSF."""
+        window = self._window(tmp_path, picasso_movie_factory)
+        dialog = window.parameters_dialog
+        warned = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "warning",
+            lambda *args, **kwargs: warned.append(args[2]),
+        )
+        try:
+            dialog.fit_model.setCurrentText("Experimental PSF (cubic spline)")
+            dialog.spline_calibration = {
+                "model": "spline-3d-multichannel",
+                "n_data": [7, 7, 21],
+            }
+            window.fit()
+            _pump(window)
+            assert warned and "multichannel spline calibration" in warned[0]
+            assert not (tmp_path / "split_ref_locs.hdf5").exists()
+            assert window._multi_fit is None
+        finally:
+            window.close()
+
+
+@pytest.mark.gui
+class TestIndependentFitGuards:
+    """What the independent fit refuses, and why."""
+
+    def test_sum_detections_are_refused(self, tmp_path, monkeypatch):
+        """The channel sum's detections are one consensus set in reference
+        coordinates - fitting them per channel would fit the reference
+        channel's positions everywhere."""
+        movie = np.zeros((2, 16, 16), np.float32)
+        window = localize_gui.Window()
+        told = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "information",
+            lambda *args, **kwargs: told.append(args[2]),
+        )
+        try:
+            window._set_channels(
+                [movie, movie],
+                [_info("c0"), _info("c1")],
+                [str(tmp_path / "a.tif"), str(tmp_path / "b.tif")],
+                ["c0", "c1"],
+            )
+            window.parameters_dialog.fit_mode_combo.setCurrentText(
+                localize_gui.FIT_MODE_SEPARATE
+            )
+            ids = pd.DataFrame(
+                {"frame": [0], "x": [8], "y": [8], "net_gradient": [1e4]}
+            )
+            window.identifications = ids
+            window.sum_identifications = ids
+            window.ready_for_fit = True
+            window.fit()
+            assert told and "sum of the channels" in told[0]
+            assert window._multi_fit is None
+        finally:
+            window.close()
+
+    def test_a_channel_keeps_its_own_psf_calibration(self, tmp_path):
+        """With the PSF link off, each channel's calibration follows it."""
+        movie = np.zeros((2, 16, 16), np.float32)
+        window = localize_gui.Window()
+        dialog = window.parameters_dialog
+        try:
+            window._set_channels(
+                [movie, movie],
+                [_info("c0"), _info("c1")],
+                [str(tmp_path / "a.tif"), str(tmp_path / "b.tif")],
+                ["c0", "c1"],
+            )
+            dialog.link_calib_checkbox.setChecked(False)
+            dialog._set_spline_state({"model": "spline-2d"}, "ref_psf.hdf5")
+            window.set_current_channel(1)
+            assert dialog.spline_calibration_path != "ref_psf.hdf5"
+            dialog._set_spline_state({"model": "spline-2d"}, "ch1_psf.hdf5")
+            window.set_current_channel(0)
+            assert dialog.spline_calibration_path == "ref_psf.hdf5"
+            window.set_current_channel(1)
+            assert dialog.spline_calibration_path == "ch1_psf.hdf5"
+        finally:
+            window.close()
+
+    def test_the_link_keeps_one_calibration_for_every_channel(self, tmp_path):
+        """Ticked (the default), the calibration is shared - which is what
+        the joint multichannel fit needs."""
+        movie = np.zeros((2, 16, 16), np.float32)
+        window = localize_gui.Window()
+        dialog = window.parameters_dialog
+        try:
+            window._set_channels(
+                [movie, movie],
+                [_info("c0"), _info("c1")],
+                [str(tmp_path / "a.tif"), str(tmp_path / "b.tif")],
+                ["c0", "c1"],
+            )
+            assert dialog.link_calib_checkbox.isChecked()
+            dialog._set_spline_state({"model": "spline-2d"}, "shared.hdf5")
+            window.set_current_channel(1)
+            assert dialog.spline_calibration_path == "shared.hdf5"
         finally:
             window.close()

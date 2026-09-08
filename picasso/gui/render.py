@@ -55,6 +55,7 @@ from ..lib import (
     FloatArray2D,
 )
 from .rotation import RotationWindow
+from .app import run_gui
 
 # Optional modules with external/hardware dependencies live in ext
 from ..ext.bitplane import IMSWRITER  # PyImarisWrite works on Windows only
@@ -75,6 +76,15 @@ INITIAL_REL_MAXIMUM = 0.5
 ZOOM = 9 / 7
 N_GROUP_COLORS = render.N_GROUP_COLORS  # 8
 POLYGON_POINTER_SIZE = 16  # must be even
+# shortest drag (display pixels, in x and y) that still yields a box
+# pick, so that a stray click does not create one of zero area
+MIN_BOX_PICK_DRAG = 3
+# how far (display pixels) the cursor must travel before another point
+# is appended to the brush stroke being painted
+MIN_BRUSH_POINT_SPACING = 2
+# empty space kept around a pick by "Move to pick", as a fraction of the
+# pick's extent on each side
+MOVE_TO_PICK_MARGIN = 0.2
 # steps of the loading progress bar per file, such that it also
 # advances within a file, see ``LocsLoadWorker``
 LOAD_PROGRESS_RESOLUTION = 1000
@@ -3469,9 +3479,10 @@ class TestClustererDialog(lib.Dialog):
         Channel index for localizations that are tested.
     clusterer_name : QComboBox
         Contains all clusterer types available in Picasso: Render.
-    contrast_slider : QSlider
-        Adjusts the brightness (contrast) of the rendered view. The
-        center position corresponds to automatic contrast.
+    contrast_slider : RangeSlider
+        Log-scale two-handle slider holding the minimum and maximum
+        density of the rendered view. Seeded with the automatic contrast
+        limits of the first rendering.
     display_all_locs : QCheckBox
         If ticked, unclustered locs are displayed in separate channel.
     pick : list
@@ -3592,15 +3603,16 @@ class TestClustererDialog(lib.Dialog):
         contrast_label = QtWidgets.QLabel("Contrast:")
         contrast_label.setToolTip("Adjust the brightness of the rendering.")
         contrast_layout.addWidget(contrast_label)
-        self.contrast_slider = QtWidgets.QSlider(
-            QtCore.Qt.Orientation.Horizontal
-        )
+        # log-scale track, like in the Display Settings dialog: the
+        # rendered densities are strongly skewed, so a linear one would
+        # squeeze the useful range into a few pixels
+        self.contrast_slider = lib.RangeSlider()
         self.contrast_slider.setToolTip(
-            "Adjust the brightness of the rendering."
+            "Adjust the minimum and maximum rendered density."
         )
-        self.contrast_slider.setRange(-100, 100)
-        self.contrast_slider.setValue(0)
-        self.contrast_slider.valueChanged.connect(self.view._apply_contrast)
+        self.contrast_slider.setLogScale(True)
+        self.contrast_slider.setValueLabels("Min. density", "Max. density")
+        self.contrast_slider.valuesChanged.connect(self.view._apply_contrast)
         contrast_layout.addWidget(self.contrast_slider)
         parameters_grid.addLayout(contrast_layout, 6, 0, 1, 2)
 
@@ -4326,6 +4338,9 @@ class TestClustererView(QtWidgets.QLabel):
         # without re-rendering the localizations
         self._raw_image = None
         self._auto_contrast = None
+        # whether the contrast slider has been given its initial values;
+        # afterwards the user's limits are kept across re-renderings
+        self._contrast_seeded = False
         self._render_locs = None
         self._render_info = None
         self._render_colors = None
@@ -4420,20 +4435,46 @@ class TestClustererView(QtWidgets.QLabel):
         self._render_locs = locs
         self._render_info = info
         self._render_colors = colors
+        self._sync_contrast_slider()
         self._apply_contrast()
 
-    def _apply_contrast(self) -> None:
-        """Rescale the cached raw image with the contrast slider value
+    def _sync_contrast_slider(self) -> None:
+        """Fit the contrast slider's track to the image just rendered,
+        seeding its handles with the auto-contrast limits the first time.
+
+        Later renderings keep whatever limits the user has dragged, so
+        that two clustering settings can be compared at one contrast.
+        """
+        slider = self.dialog.contrast_slider
+        vmin, vmax = self._auto_contrast
+        upper = float(self._raw_image.max()) if self._raw_image.size else 0.0
+        # never cut off the auto-contrast limits, nor the handles the
+        # user has set (before seeding they are still the widget's
+        # defaults and say nothing about the data)
+        low, high = slider.values()
+        upper = max(upper, vmax, high if self._contrast_seeded else 0.0, 1e-6)
+        slider.blockSignals(True)
+        try:
+            # the handles must not be able to collapse onto each other,
+            # or the rendering would divide by a zero contrast range
+            slider.setMinimumGap(upper / 1e4)
+            slider.setRange(0.0, upper)
+            if self._contrast_seeded:
+                slider.setValues(low, high)
+            else:
+                slider.setValues(vmin, vmax)
+                self._contrast_seeded = True
+        finally:
+            slider.blockSignals(False)
+        slider.update()
+
+    def _apply_contrast(self, *args) -> None:
+        """Rescale the cached raw image with the contrast slider's limits
         and display it. Cheap compared to ``update_scene`` as it reuses
         the cached raw image instead of re-rendering localizations."""
         if self._raw_image is None:
             return
-        vmin, vmax = self._auto_contrast
-        # slider in [-100, 100] maps exponentially to a brightness
-        # factor in [0.25, 4], with 0 (default) leaving auto-contrast
-        # unchanged; brighter means a lower upper contrast limit
-        factor = 2 ** (self.dialog.contrast_slider.value() / 50.0)
-        contrast = (vmin, vmax / factor)
+        contrast = self.dialog.contrast_slider.values()
         qimage = render.render_scene(
             locs=self._render_locs,
             info=self._render_info,
@@ -6072,6 +6113,38 @@ class PickToolSquareSettings(QtWidgets.QWidget):
         self.grid.setRowStretch(1, 1)
 
 
+class PickToolBrushSettings(QtWidgets.QWidget):
+    """Choose parameters for brush picks."""
+
+    def __init__(
+        self,
+        window: QtWidgets.QMainWindow,
+        tools_settings_dialog: ToolsSettingsDialog,
+    ) -> None:
+        super().__init__()
+        self.window = window
+        self.grid = QtWidgets.QGridLayout(self)
+        width_label = QtWidgets.QLabel("Stroke width (nm):")
+        width_label.setToolTip(
+            "Width of the next brush stroke.\n\n"
+            "Every stroke keeps the width it was painted with, so\n"
+            "changing this does not reshape the picks already drawn."
+        )
+        self.grid.addWidget(width_label, 0, 0)
+        self.brush_width = QtWidgets.QDoubleSpinBox()
+        self.brush_width.setRange(0.1, 99999999.0)
+        self.brush_width.setValue(100.0)
+        self.brush_width.setSingleStep(5.0)
+        self.brush_width.setDecimals(1)
+        self.brush_width.setKeyboardTracking(False)
+        # only the cursor depends on it; the drawn strokes do not
+        self.brush_width.valueChanged.connect(
+            tools_settings_dialog.on_brush_width_changed
+        )
+        self.grid.addWidget(self.brush_width, 0, 1)
+        self.grid.setRowStretch(1, 1)
+
+
 class ToolsSettingsDialog(lib.Dialog):
     """Customize picks - shape and size, annotate, change std for
     picking similar.
@@ -6080,13 +6153,15 @@ class ToolsSettingsDialog(lib.Dialog):
 
     Attributes
     ----------
+    brush_width : QDoubleSpinBox
+        Contains the width of the next brush stroke (nm).
     pick_annotation : QCheckBox
         Tick to display picks' indeces.
     pick_diameter : QDoubleSpinBox
         Contains the diameter of circular picks (nm)).
     pick_shape : QComboBox
         Contains the str with the shape of picks (circle, rectangle,
-        polygon or square).
+        polygon, square, box or brush).
     pick_side_length : QDoubleSpinBox
         Contains the side length of square picks (nm).
     pick_similar_range : QDoubleSpinBox
@@ -6117,7 +6192,7 @@ class ToolsSettingsDialog(lib.Dialog):
         shape_label.setToolTip("Select the shape of the pick tool.")
         first_row.addWidget(shape_label)
         self.pick_shape = QtWidgets.QComboBox()
-        self.pick_shape.addItems(["Circle", "Rectangle", "Polygon", "Square"])
+        self.pick_shape.addItems(list(lib.PICK_SHAPES))
         first_row.addWidget(self.pick_shape)
         pick_stack = QtWidgets.QStackedWidget()
         pick_grid.addWidget(pick_stack, 1, 0, 1, 2)
@@ -6146,6 +6221,15 @@ class ToolsSettingsDialog(lib.Dialog):
         pick_stack.addWidget(self.pick_square_settings)
         self.pick_side_length = self.pick_square_settings.pick_side_length
 
+        # Box - drawn by dragging, so each pick carries its own size
+        self.pick_box_settings = QtWidgets.QWidget()
+        pick_stack.addWidget(self.pick_box_settings)
+
+        # Brush - each stroke keeps the width it was painted with
+        self.pick_brush_settings = PickToolBrushSettings(window, self)
+        pick_stack.addWidget(self.pick_brush_settings)
+        self.brush_width = self.pick_brush_settings.brush_width
+
         # Pick similar works for all shapes but polygons, so its
         # settings live below the shape-specific pages
         range_label = QtWidgets.QLabel("Pick similar +/- range (std):")
@@ -6165,8 +6249,15 @@ class ToolsSettingsDialog(lib.Dialog):
         pick_grid.addWidget(self.pick_similar_range, 2, 1)
         self.pick_shape.currentTextChanged.connect(
             lambda shape: self.pick_similar_range.setEnabled(
-                shape != "Polygon"
+                shape not in ("Polygon", "Brush")
             )
+        )
+        self.pick_shape.setToolTip(
+            "Circle and Square are placed with a single click and share\n"
+            "one size; Rectangle is a band of a fixed width drawn along\n"
+            "its center axis; Polygon is drawn vertex by vertex; Box is\n"
+            "dragged out to any size; Brush is painted freehand, and\n"
+            "overlapping strokes merge into one pick."
         )
 
         self.pick_annotation = QtWidgets.QCheckBox("Annotate picks")
@@ -6182,6 +6273,15 @@ class ToolsSettingsDialog(lib.Dialog):
         self.point_picks.setToolTip("Display circular picks as points?")
         self.point_picks.stateChanged.connect(self.update_scene_with_cache)
         pick_grid.addWidget(self.point_picks, 4, 0)
+
+    def on_brush_width_changed(self, *args) -> None:
+        """Update the cursor to the new brush width.
+
+        Unlike the other pick sizes this does not touch the scene or the
+        spatial index: every brush stroke keeps the width it was painted
+        with, so the picks already drawn are unaffected.
+        """
+        self.window.view.update_cursor()
 
     def on_pick_dimension_changed(self, *args) -> None:
         """Reset index_blocks in self.window.view and update the
@@ -6461,6 +6561,9 @@ class DisplaySettingsDialog(lib.Dialog):
         properties.
     color_step : QSpinBox
         Defines how many colors are to be rendered.
+    contrast_slider : DensityContrastSlider(RangeSlider)
+        Log-scale two-handle slider mirroring the minimum and maximum
+        density spin boxes.
     disp_px_size : QDoubleSpinBox
         Contains the size of super-resolution pixels in nm.
     dynamic_disp_px : QCheckBox
@@ -6580,13 +6683,23 @@ class DisplaySettingsDialog(lib.Dialog):
         self.maximum.setKeyboardTracking(False)
         self.maximum.valueChanged.connect(self.update_scene)
         contrast_grid.addWidget(self.maximum, 1, 1)
+        # log-scale slider mirroring the two spin boxes, for dragging the
+        # contrast instead of typing it
+        self.contrast_slider = lib.DensityContrastSlider(
+            self.minimum,
+            self.maximum,
+            image=lambda: getattr(
+                getattr(self.window, "view", None), "image", None
+            ),
+        )
+        contrast_grid.addWidget(self.contrast_slider, 2, 0, 1, 2)
         c_label = QtWidgets.QLabel("Colormap:")
         c_label.setToolTip("Colormap used for rendering single-channel data.")
-        contrast_grid.addWidget(c_label, 2, 0)
+        contrast_grid.addWidget(c_label, 3, 0)
         self.colormap = QtWidgets.QComboBox()
         self.colormap.addItems(plt.colormaps())
         self.colormap.addItem("Custom")
-        contrast_grid.addWidget(self.colormap, 2, 1)
+        contrast_grid.addWidget(self.colormap, 3, 1)
         self.colormap.currentIndexChanged.connect(self.on_cmap_changed)
 
         # Blur
@@ -6878,12 +6991,21 @@ class DisplaySettingsDialog(lib.Dialog):
         self.minimum.blockSignals(True)
         self.minimum.setValue(value)
         self.minimum.blockSignals(False)
+        # the spin box' signals are blocked, so the slider is moved here
+        self.contrast_slider.sync()
+
+    def silent_pixelsize_update(self, value: float) -> None:
+        """Change the value of self.pixelsize in the background."""
+        self.pixelsize.blockSignals(True)
+        self.pixelsize.setValue(value)
+        self.pixelsize.blockSignals(False)
 
     def silent_maximum_update(self, value: float) -> None:
         """Change the value of self.maximum in the background."""
         self.maximum.blockSignals(True)
         self.maximum.setValue(value)
         self.maximum.blockSignals(False)
+        self.contrast_slider.sync()
 
     def render_scene(self, *args, **kwargs) -> None:
         """Update scene in the main window."""
@@ -7480,13 +7602,19 @@ class View(QtWidgets.QLabel):
     pan_start_x, pan_start_y : float
         x and y coordinates of panning's starting position.
     _picks : list
-        Contains the coordinates of current picks.
-    _pick_shape : {"Circle", "Rectangle", "Polygon", "Square"}
+        Contains the coordinates of current picks. Each pick is
+        ``(x, y)`` for circles and squares, ``((x_start, y_start),
+        (x_end, y_end))`` center-axis points for rectangles, a list of
+        vertices for polygons, the two opposite corners
+        ``((x0, y0), (x1, y1))`` for boxes, and a list of
+        ``(width, path)`` strokes for brush picks.
+    _pick_shape : {"Circle", "Rectangle", "Polygon", "Square", "Box", "Brush"}
         Current shape of picks.
     _pick_size : float or None
-        Size of picks in camera pixels; None for polygonal picks (size
-        not defined). Diameter for circular picks, side length for
-        square picks and width for rectangular picks.
+        Size of picks in camera pixels; None for polygonal, box and
+        brush picks, which carry their own extent. Diameter for circular
+        picks, side length for square picks and width for rectangular
+        picks.
     pixelsize : float
         (Property) Camera pixel size as defined in the display
         settings dialog.
@@ -7557,6 +7685,10 @@ class View(QtWidgets.QLabel):
         self._mode = "Zoom"
         self._pan = False
         self._rectangle_pick_ongoing = False
+        self._box_pick_ongoing = False
+        self._brush_stroke_ongoing = False
+        self._brush_stroke = []  # path being painted, in camera pixels
+        self._brush_last_pos = None  # last point added, in display px
         self._size_hint = (768, 768)
         self.n_locs = 0
         self._picks = []
@@ -7594,17 +7726,85 @@ class View(QtWidgets.QLabel):
 
     def _prompt_pixelsize(self, path: str) -> float | None:
         """Ask for the camera pixel size of a file that does not store
-        it (ThunderSTORM .csv, SMAP _sml.mat). None if canceled."""
+        it (ThunderSTORM .csv, SMAP _sml.mat, .hdf5 files saved by old
+        Picasso versions). None if canceled."""
         pixelsize, ok = QtWidgets.QInputDialog.getDouble(
             self,
             "Camera pixel size",
             f"Enter camera pixel size in nm for {os.path.basename(path)}:",
-            value=100,
+            value=self.pixelsize,
             min=0.01,
             max=10000,
             decimals=2,
         )
         return pixelsize if ok else None
+
+    def _reconcile_pixelsizes(self) -> None:
+        """Make all loaded channels agree on the camera pixel size.
+
+        Rendering combines the channels on one grid, sampled at
+        ``Pixelsize / display pixel size`` per channel (see
+        ``render.render``), so channels that disagree on the camera
+        pixel size render at different shapes and cannot be combined -
+        usually a typo in one file's metadata. If they disagree, the
+        user is warned and picks the pixel size to use; it is written
+        to the metadata of every loaded channel in memory only, the
+        files on disk are not touched.
+
+        Called once per load, after every file is in (see
+        ``_on_load_finished``), and never while files are still being
+        read: a modal dialog runs a nested event loop, which would
+        deliver the next file's ``loaded`` signal in the middle of
+        ``add`` and so append the channels out of order.
+        """
+        loaded = [
+            (path, lib.get_from_metadata(info, "Pixelsize"))
+            for path, info in zip(self.locs_paths, self.infos)
+        ]
+        loaded = [(p, s) for p, s in loaded if s is not None]
+        if len(loaded) < 2:
+            return
+        sizes = [s for _, s in loaded]
+        # the pixel size of the first channel, i.e. the one the render
+        # falls back to if the user does not choose
+        current = sizes[0]
+        if all(np.isclose(s, current) for s in sizes):
+            return
+
+        listing = "\n".join(
+            f"    {os.path.basename(p)}: {s:g} nm" for p, s in loaded
+        )
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Camera pixel size mismatch",
+            "The loaded channels have different camera pixel sizes:\n"
+            f"{listing}\n\nChannels with different camera pixel sizes "
+            "cannot be rendered together. Choose the pixel size to use for "
+            "all of them next. Only the loaded data is changed, the files "
+            "on disk are not modified.",
+        )
+        chosen, ok = QtWidgets.QInputDialog.getDouble(
+            self,
+            "Camera pixel size",
+            "Camera pixel size in nm to use for all channels:",
+            value=current,
+            min=0.01,
+            max=10000,
+            decimals=2,
+        )
+        if not ok:  # canceled; the channels still have to be renderable
+            chosen = current
+        for info in self.infos:
+            try:
+                lib.overwrite_metadata(info, "Pixelsize", chosen)
+            except KeyError:
+                info.append(
+                    {
+                        "Generated by": f"Picasso v{__version__} Render",
+                        "Pixelsize": chosen,
+                    }
+                )
+        self.window.display_settings_dlg.silent_pixelsize_update(chosen)
 
     def add(
         self,
@@ -7641,12 +7841,25 @@ class View(QtWidgets.QLabel):
             (default True).
         """
         # update pixelsize (credits to Boyd Peters #602)
-        pixelsize = lib.get_from_metadata(
-            info,
-            "Pixelsize",
-            default=self.pixelsize,
-        )
-        self.window.display_settings_dlg.pixelsize.setValue(pixelsize)
+        pixelsize = lib.get_from_metadata(info, "Pixelsize")
+        if pixelsize is None:
+            # metadata written by old Picasso versions does not store
+            # the camera pixel size; ask for it and add it to the
+            # metadata, such that rendering etc. work as usual
+            pixelsize = self._prompt_pixelsize(path)
+            if pixelsize is None:  # canceled by the user
+                pixelsize = self.pixelsize
+            info.append(
+                {
+                    "Generated by": f"Picasso v{__version__} Render",
+                    "Pixelsize": pixelsize,
+                }
+            )
+        self.window.display_settings_dlg.silent_pixelsize_update(pixelsize)
+
+        # the cached raw image holds one plane per channel loaded so far,
+        # so it must not be reused once a channel is added
+        self.image = None
 
         # append loaded data
         self.locs.append(locs)
@@ -7864,6 +8077,7 @@ class View(QtWidgets.QLabel):
         n_loaded = len(self.locs)
         self._finish_load()
         if n_loaded:  # if loading was successful
+            self._reconcile_pixelsizes()
             if self._load_fit_in_view:
                 self.fit_in_view(autoscale=True)
             else:
@@ -7921,6 +8135,115 @@ class View(QtWidgets.QLabel):
         """Add several picks."""
         for position in positions:
             self.add_pick(position, update_scene=False)
+        self.update_scene(picks_only=True)
+
+    def add_box_pick(self, end_position: QtCore.QPoint) -> None:
+        """Finish a dragged box pick and add it.
+
+        A press and release without a drag would create a pick of zero
+        area, so drags shorter than ``MIN_BOX_PICK_DRAG`` display pixels
+        in either direction are discarded.
+
+        Parameters
+        ----------
+        end_position : QPoint
+            Position of the cursor when the mouse button was released.
+        """
+        if (
+            abs(end_position.x() - self.box_pick_start_x) < MIN_BOX_PICK_DRAG
+            or abs(end_position.y() - self.box_pick_start_y)
+            < MIN_BOX_PICK_DRAG
+        ):
+            self.update_scene(picks_only=True)  # clear the drag overlay
+            return
+        x_start, y_start = self.box_pick_start
+        x_end, y_end = self.map_to_movie(end_position)
+        # store the corners ordered, so that every consumer can rely on
+        # the first corner being the top left one
+        self.add_pick(
+            (
+                (min(x_start, x_end), min(y_start, y_end)),
+                (max(x_start, x_end), max(y_start, y_end)),
+            )
+        )
+
+    def extend_brush_stroke(self, position: QtCore.QPoint) -> None:
+        """Append a point to the brush stroke being painted.
+
+        Points are only added once the cursor has travelled
+        ``MIN_BRUSH_POINT_SPACING`` display pixels, which keeps a slow
+        drag from filling the stroke - and the saved file - with
+        near-identical points. They are stored in camera pixels, so the
+        stroke is independent of the zoom it was painted at.
+
+        Parameters
+        ----------
+        position : QPoint
+            Current cursor position.
+        """
+        moved = abs(position.x() - self._brush_last_pos.x()) + abs(
+            position.y() - self._brush_last_pos.y()
+        )
+        if moved < MIN_BRUSH_POINT_SPACING:
+            return
+        self._brush_last_pos = position
+        self._brush_stroke.append(self.map_to_movie(position))
+        self.update_scene(picks_only=True)
+
+    def add_brush_stroke(self, end_position: QtCore.QPoint) -> None:
+        """Finish the brush stroke being painted and merge it into the
+        picks.
+
+        The strokes of every pick the new one touches are pulled into a
+        single pick, which is appended last so that the newest stroke is
+        always ``self._picks[-1][-1]``. A press and release without a
+        drag paints a dot.
+
+        Parameters
+        ----------
+        end_position : QPoint
+            Position of the cursor when the mouse button was released.
+        """
+        self._brush_stroke_ongoing = False
+        if not self._brush_stroke:
+            return
+        end = self.map_to_movie(end_position)
+        if end != self._brush_stroke[-1]:
+            self._brush_stroke.append(end)
+        stroke = (self._brush_width, self._brush_stroke)
+        self._brush_stroke = []
+
+        width, X, Y = lib.brush_stroke_arrays(stroke)
+        merged = []
+        kept = []
+        for pick in self._picks:
+            overlaps = any(
+                lib.brush_strokes_overlap(X, Y, X_, Y_, (width + width_) / 2)
+                for width_, X_, Y_ in map(lib.brush_stroke_arrays, pick)
+            )
+            if overlaps:
+                merged.extend(pick)
+            else:
+                kept.append(pick)
+        merged.append(stroke)
+        kept.append(merged)
+        self._picks = kept
+
+        self.update_pick_info_short()
+        self.update_scene(picks_only=True)
+
+    def remove_last_brush_stroke(self) -> None:
+        """Remove the brush stroke painted last.
+
+        Dropping a stroke can break a pick apart again - it may have
+        been the only thing joining two painted regions - so the
+        remaining strokes are re-merged from scratch.
+        """
+        if not len(self._picks):
+            return
+        strokes = self._picks.pop()[:-1]
+        self._picks.extend(lib.merge_brush_strokes(strokes))
+        self.update_pick_info_short()
         self.update_scene(picks_only=True)
 
     def add_point(
@@ -8502,12 +8825,12 @@ class View(QtWidgets.QLabel):
             progress = lib.ProgressDialog(
                 "Calculating cluster areas",
                 0,
-                len(np.unique(locs.group)),
+                len(np.unique(clustered_locs.group)),
                 self,
             )
             progress.set_value(0)
             areas = clusterer.cluster_areas(
-                locs, self.infos[channel], progress.set_value
+                clustered_locs, self.infos[channel], progress.set_value
             )
             path = os.path.splitext(path)[0] + "_areas.csv"
             areas.to_csv(path, index=False)
@@ -8834,6 +9157,61 @@ class View(QtWidgets.QLabel):
         painter.end()
         return image
 
+    def draw_box_pick_ongoing(self, image: QtGui.QImage) -> QtGui.QImage:
+        """Draw an ongoing box pick onto image.
+
+        Parameters
+        ----------
+        image : QImage
+            Image containing rendered localizations.
+
+        Returns
+        -------
+        image : QImage
+            Image with the drawn pick.
+        """
+        painter = QtGui.QPainter(image)
+        painter.setPen(QtGui.QColor("green"))
+        # the drag anchors are already in display pixels, so unlike the
+        # rectangular pick no size conversion is needed
+        painter.drawRect(
+            QtCore.QRect(
+                QtCore.QPoint(self.box_pick_start_x, self.box_pick_start_y),
+                QtCore.QPoint(
+                    self.box_pick_current_x, self.box_pick_current_y
+                ),
+            ).normalized()
+        )
+        painter.end()
+        return image
+
+    def draw_brush_stroke_ongoing(self, image: QtGui.QImage) -> QtGui.QImage:
+        """Draw the brush stroke being painted onto image.
+
+        Parameters
+        ----------
+        image : QImage
+            Image containing rendered localizations.
+
+        Returns
+        -------
+        image : QImage
+            Image with the drawn stroke.
+        """
+        if not self._brush_stroke:
+            return image
+        stroke = (self._brush_width, self._brush_stroke)
+        region = render.brush_pick_path([stroke], image.size(), self.viewport)
+        fill = QtGui.QColor("green")
+        fill.setAlpha(render.BRUSH_FILL_ALPHA)
+        painter = QtGui.QPainter(image)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.setPen(QtGui.QColor("green"))
+        painter.fillPath(region, QtGui.QBrush(fill))
+        painter.drawPath(region)
+        painter.end()
+        return image
+
     def draw_points(self, image: QtGui.QImage) -> QtGui.QImage:
         """Draw points, lines and distances between them onto image.
 
@@ -9025,6 +9403,10 @@ class View(QtWidgets.QLabel):
         self.qimage = self.draw_points(self.qimage)
         if self._rectangle_pick_ongoing:
             self.qimage = self.draw_rectangle_pick_ongoing(self.qimage)
+        if self._box_pick_ongoing:
+            self.qimage = self.draw_box_pick_ongoing(self.qimage)
+        if self._brush_stroke_ongoing:
+            self.qimage = self.draw_brush_stroke_ongoing(self.qimage)
 
         # convert to pixmap
         self.pixmap = QtGui.QPixmap.fromImage(self.qimage)
@@ -9093,14 +9475,8 @@ class View(QtWidgets.QLabel):
                 self.load_screenshot(file)
             # load pick regions
             loaded_shape = file.get("Shape", None)
-            if loaded_shape is not None:
-                if loaded_shape in [
-                    "Circle",
-                    "Rectangle",
-                    "Polygon",
-                    "Square",
-                ]:
-                    self.load_picks(paths[0])
+            if loaded_shape in lib.PICK_SHAPES:
+                self.load_picks(paths[0])
         if extensions == [".csv"]:  # just one csv dropped, thunderstorm
             self.add_multiple(paths)
         elif extensions == [".mat"]:  # just one mat dropped, SMAP
@@ -9132,37 +9508,15 @@ class View(QtWidgets.QLabel):
             if pick_no >= len(self._picks):
                 raise ValueError("Pick number provided too high")
             else:  # calculate new viewport
-                if self._pick_shape == "Circle":
-                    r = self._pick_size / 2
-                    x, y = self._picks[pick_no]
-                    x_min = x - 1.4 * r
-                    x_max = x + 1.4 * r
-                    y_min = y - 1.4 * r
-                    y_max = y + 1.4 * r
-                elif self._pick_shape == "Rectangle":
-                    (xs, ys), (xe, ye) = self._picks[pick_no]
-                    xc = np.mean([xs, xe])
-                    yc = np.mean([ys, ye])
-                    w = self._pick_size
-                    X, Y = lib.get_pick_rectangle_corners(xs, ys, xe, ye, w)
-                    x_min = min(X) - (0.2 * (xc - min(X)))
-                    x_max = max(X) + (0.2 * (max(X) - xc))
-                    y_min = min(Y) - (0.2 * (yc - min(Y)))
-                    y_max = max(Y) + (0.2 * (max(Y) - yc))
-                elif self._pick_shape == "Polygon":
-                    X, Y = lib.get_pick_polygon_corners(self._picks[pick_no])
-                    x_min = min(X) - 0.2 * (max(X) - min(X))
-                    x_max = max(X) + 0.2 * (max(X) - min(X))
-                    y_min = min(Y) - 0.2 * (max(Y) - min(Y))
-                    y_max = max(Y) + 0.2 * (max(Y) - min(Y))
-                elif self._pick_shape == "Square":
-                    w = self._pick_size
-                    x, y = self._picks[pick_no]
-                    x_min = x - 1.4 * (w / 2)
-                    x_max = x + 1.4 * (w / 2)
-                    y_min = y - 1.4 * (w / 2)
-                    y_max = y + 1.4 * (w / 2)
-                viewport = [(y_min, x_min), (y_max, x_max)]
+                x_min, x_max, y_min, y_max = lib.pick_bounds(
+                    self._picks[pick_no], self._pick_shape, self._pick_size
+                )
+                margin_x = MOVE_TO_PICK_MARGIN * (x_max - x_min)
+                margin_y = MOVE_TO_PICK_MARGIN * (y_max - y_min)
+                viewport = [
+                    (y_min - margin_y, x_min - margin_x),
+                    (y_max + margin_y, x_max + margin_x),
+                ]
                 self.update_scene(viewport=viewport)
 
     def export_grayscale(self, suffix: str, dpi: int = 96) -> None:
@@ -9536,6 +9890,11 @@ class View(QtWidgets.QLabel):
             tools_dlg.pick_width.setValue(size * pixelsize)
         elif self._pick_shape == "Square":
             tools_dlg.pick_side_length.setValue(size * pixelsize)
+        elif self._pick_shape == "Brush" and len(self._picks):
+            # brush strokes keep their own widths; seed the spin box
+            # with the widest one so the next stroke matches the picks
+            widest = max(stroke[0] for pick in self._picks for stroke in pick)
+            tools_dlg.brush_width.setValue(widest * pixelsize)
 
         # update Info Dialog
         self.update_pick_info_short()
@@ -9678,13 +10037,21 @@ class View(QtWidgets.QLabel):
                 self.pan_relative(rel_y_move, rel_x_move)
                 self.pan_start_x = event.pos().x()
                 self.pan_start_y = event.pos().y()
-        # if drawing a rectangular pick
+        # if drawing a rectangular or box pick
         elif self._mode == "Pick":
             if self._pick_shape == "Rectangle":
                 if self._rectangle_pick_ongoing:
                     self.rectangle_pick_current_x = event.pos().x()
                     self.rectangle_pick_current_y = event.pos().y()
                     self.update_scene(picks_only=True)
+            elif self._pick_shape == "Box":
+                if self._box_pick_ongoing:
+                    self.box_pick_current_x = event.pos().x()
+                    self.box_pick_current_y = event.pos().y()
+                    self.update_scene(picks_only=True)
+            elif self._pick_shape == "Brush":
+                if self._brush_stroke_ongoing:
+                    self.extend_brush_stroke(event.pos())
         # live update of the measuring cross and distance
         elif self._mode == "Measure" and self._measure_following:
             self._measure_cursor = self.map_to_movie(event.pos())
@@ -9724,7 +10091,7 @@ class View(QtWidgets.QLabel):
                 event.accept()
             else:
                 event.ignore()
-        # start drawing rectangular pick
+        # start drawing rectangular or box pick
         elif self._mode == "Pick":
             if event.button() == QtCore.Qt.MouseButton.LeftButton:
                 if self._pick_shape == "Rectangle":
@@ -9732,6 +10099,17 @@ class View(QtWidgets.QLabel):
                     self.rectangle_pick_start_x = event.pos().x()
                     self.rectangle_pick_start_y = event.pos().y()
                     self.rectangle_pick_start = self.map_to_movie(event.pos())
+                elif self._pick_shape == "Box":
+                    self._box_pick_ongoing = True
+                    self.box_pick_start_x = event.pos().x()
+                    self.box_pick_start_y = event.pos().y()
+                    self.box_pick_current_x = event.pos().x()
+                    self.box_pick_current_y = event.pos().y()
+                    self.box_pick_start = self.map_to_movie(event.pos())
+                elif self._pick_shape == "Brush":
+                    self._brush_stroke_ongoing = True
+                    self._brush_stroke = [self.map_to_movie(event.pos())]
+                    self._brush_last_pos = event.pos()
 
     def _mouse_release_zoom(self, event: QtCore.QEvent) -> None:
         """Zooms in (left click) if the zoom-in rectangle is visible,
@@ -9802,6 +10180,30 @@ class View(QtWidgets.QLabel):
             # remove the last point from the polygon
             elif event.button() == QtCore.Qt.MouseButton.RightButton:
                 self.remove_polygon_point()
+        elif self._pick_shape == "Box":
+            if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                # finish dragging the box and add it
+                self._box_pick_ongoing = False
+                self.add_box_pick(event.pos())
+                event.accept()
+            elif event.button() == QtCore.Qt.MouseButton.RightButton:
+                # remove pick
+                x, y = self.map_to_movie(event.pos())
+                self.remove_picks((x, y))
+                event.accept()
+            else:
+                event.ignore()
+        elif self._pick_shape == "Brush":
+            # finish painting the stroke and merge it into the picks
+            if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                self.add_brush_stroke(event.pos())
+                event.accept()
+            # undo the last stroke, like the polygon's last vertex
+            elif event.button() == QtCore.Qt.MouseButton.RightButton:
+                self.remove_last_brush_stroke()
+                event.accept()
+            else:
+                event.ignore()
 
     def _mouse_release_measure(self, event: QtCore.QEvent) -> None:
         """Add a measure point on left click. The first right click
@@ -10154,7 +10556,9 @@ class View(QtWidgets.QLabel):
         """Return the size of the pick in camera pixels. For circle this
         is the diameter. For square this is the side length. For
         rectangle this is the width (perpendicular to the drawing
-        direction). For polygon this is None (undefined)."""
+        direction). For polygon, box and brush this is None: they carry
+        their own extent. For the width of the next brush stroke, see
+        ``_brush_width``."""
         tools_dialog = self.window.tools_settings_dialog
         pixelsize = self.pixelsize
         if self._pick_shape == "Circle":
@@ -10166,6 +10570,16 @@ class View(QtWidgets.QLabel):
         else:
             pick_size = None
         return pick_size
+
+    @property
+    def _brush_width(self) -> float:
+        """Return the width of the next brush stroke in camera pixels.
+
+        Only new strokes use it: every stroke already painted keeps the
+        width it was drawn with, so this is not the size of any existing
+        pick (see ``_pick_size``, which is None for brush picks)."""
+        tools_dialog = self.window.tools_settings_dialog
+        return tools_dialog.brush_width.value() / self.pixelsize
 
     def _draw_pick_scatter(
         self,
@@ -10186,7 +10600,6 @@ class View(QtWidgets.QLabel):
             ax.scatter(locs["x"], locs["y"], color=colors[channel], s=2)
 
     @check_pick
-    @check_circular_picks
     def show_pick(self) -> None:
         """Let the user select picks based on their 2D scatter. Open
         ``self.pick_message_box`` to display information."""
@@ -10195,7 +10608,6 @@ class View(QtWidgets.QLabel):
         if channel is not None:
             n_channels = len(self.locs_paths)
             colors = lib.get_colors(n_channels)
-            r = self._pick_size / 2
             is_multi = channel is len(self.locs_paths)
             if is_multi:
                 all_picked_locs = [
@@ -10221,10 +10633,9 @@ class View(QtWidgets.QLabel):
                     self._draw_pick_scatter(
                         ax, all_picked_locs, i, colors, channel, is_multi
                     )
-                    x_min = pick[0] - r
-                    x_max = pick[0] + r
-                    y_min = pick[1] - r
-                    y_max = pick[1] + r
+                    x_min, x_max, y_min, y_max = lib.pick_bounds(
+                        pick, self._pick_shape, self._pick_size
+                    )
                     ax.set_xlabel("X [Px]")
                     ax.set_ylabel("Y [Px]")
                     ax.set_xlim([x_min, x_max])
@@ -10427,11 +10838,13 @@ class View(QtWidgets.QLabel):
         if path:
             saved_locs = pd.concat(saved_locs, ignore_index=True)
             if saved_locs is not None:
-                d = self._pick_size
                 pick_info = {
                     "Generated by:": f"Picasso v{__version__} Render",
-                    "Pick Diameter (nm):": d,
+                    "Pick Shape": self._pick_shape,
                 }
+                # writes the size entry the current shape actually has,
+                # in nm; polygons and boxes carry their own extent
+                self._add_shape_specific_info(pick_info)
                 io.save_locs(
                     path, saved_locs, self.infos[channel] + [pick_info]
                 )
@@ -10570,7 +10983,6 @@ class View(QtWidgets.QLabel):
         return removelist
 
     @check_picks
-    @check_circular_picks
     def filter_picks(self) -> None:
         """Filters picks by number of localizations."""
         channel = self.get_channel_all_seq(
@@ -10579,8 +10991,6 @@ class View(QtWidgets.QLabel):
         if channel is None:
             return
 
-        # assumes circular picks
-        r = self._pick_size / 2
         if channel is len(self.locs_paths):  # all channels
             channels = list(range(len(self.locs_paths)))
         else:
@@ -10588,7 +10998,7 @@ class View(QtWidgets.QLabel):
         # number of locs in each pick
         loccount = np.zeros((len(channels), len(self._picks)), dtype=int)
         for i, channel_ in enumerate(channels):
-            loccount[i] = self._count_locs_in_picks(channel_, r)
+            loccount[i] = self._count_locs_in_picks(channel_)
         loccount = np.array(loccount)  # shape (n_channels, n_picks)
 
         self._display_pick_count_histogram(loccount, channels)
@@ -10620,14 +11030,36 @@ class View(QtWidgets.QLabel):
                 self.update_pick_info_short()
         self.update_scene()
 
-    def _count_locs_in_picks(self, channel: int, r: float) -> list[int]:
+    def _count_locs_in_picks(self, channel: int) -> list[int]:
         """Count number of localizations for each pick in a given
-        channel."""
+        channel.
+
+        Circular picks take the indexed numba path, which only needs the
+        3x3 block neighborhood around each pick; every other shape is
+        counted through ``picked_locs``.
+        """
+        if self._pick_shape != "Circle":
+            picked_locs = self.picked_locs(channel, add_group=False)
+            if len(picked_locs) == len(self._picks):
+                return np.array([len(_) for _ in picked_locs], dtype=int)
+            # ``picked_locs`` skips polygons that are not closed yet;
+            # those hold no localizations
+            is_closed = np.array(
+                [
+                    lib.get_pick_polygon_corners(pick)[0] is not None
+                    for pick in self._picks
+                ]
+            )
+            loccount = np.zeros(len(self._picks), dtype=int)
+            loccount[is_closed] = [len(_) for _ in picked_locs]
+            return loccount
+
         progress = lib.ProgressDialog(
             "Counting in picks..", 0, len(self._picks) - 1, self
         )
         progress.set_value(0)
         progress.show()
+        r = self._pick_size / 2
         loccount = np.zeros(len(self._picks), dtype=int)
         # index locs in a grid
         index_blocks = self.get_index_blocks(channel)
@@ -10674,6 +11106,31 @@ class View(QtWidgets.QLabel):
         if self.index_blocks[channel] is None:
             self.index_locs(channel)
         return self.index_blocks[channel]
+
+    def invalidate_locs_index(self, channel: int | None = None) -> None:
+        """Drop the cached spatial indices of one or all channels.
+
+        Both ``index_blocks`` (pick lookups, see ``self.index_locs``)
+        and ``render_index`` (the viewport pyramid used when zoomed in,
+        see ``self._ensure_render_index``) store positions into
+        ``self.locs[channel]``, so both are invalidated by any change to
+        a channel's localizations -- moved coordinates as well as added,
+        removed or reordered rows. Call this whenever ``self.locs`` is
+        mutated; ``update_scene(resample_locs=True)`` does it for every
+        channel already.
+
+        Parameters
+        ----------
+        channel : int, optional
+            Channel to invalidate. If None, all channels are
+            invalidated. Default is None.
+        """
+        if channel is None:
+            self.index_blocks = [None] * len(self.locs)
+            self.render_index = [None] * len(self.locs)
+        else:
+            self.index_blocks[channel] = None
+            self.render_index[channel] = None
 
     @check_pick
     def pick_areas(self) -> FloatArray1D:
@@ -10828,7 +11285,7 @@ class View(QtWidgets.QLabel):
             df.to_csv(path, index=False)
 
     @check_picks
-    @check_pick_shapes("Circle", "Square", "Rectangle")
+    @check_pick_shapes("Circle", "Square", "Rectangle", "Box")
     def pick_similar(self) -> None:
         """Search picks similar to the current picks.
 
@@ -10837,18 +11294,20 @@ class View(QtWidgets.QLabel):
         additionally rotated onto the principal axis of the
         localizations they contain and all take the median length of the
         current picks; their similarity is judged by the RMSD along and
-        across that axis. Std is defined in ``ToolsSettingsDialog``.
+        across that axis. Box picks all take the median width and height
+        of the current picks. Std is defined in ``ToolsSettingsDialog``.
         """
         channel = self.get_channel("Pick similar")
         if channel is not None:
             std_range = (
                 self.window.tools_settings_dialog.pick_similar_range.value()
             )
-            # rectangular picks need index blocks of a size that depends
-            # on the pick length, so they are built in pick_similar
+            # rectangular and box picks need index blocks of a size
+            # that depends on the pick extent, so they are built in
+            # pick_similar
             index_blocks = (
                 None
-                if self._pick_shape == "Rectangle"
+                if self._pick_shape in ("Rectangle", "Box")
                 else self.get_index_blocks(channel)
             )
             status = lib.StatusDialog("Picking similar...", self.window)
@@ -11001,47 +11460,6 @@ class View(QtWidgets.QLabel):
             )
             return picked_locs
 
-    def _filter_circle_picks(
-        self, x: float, y: float, pick_diameter_2: float
-    ) -> list:
-        """Return picks not overlapping position (x, y) for circular picks."""
-        return [
-            (x_, y_)
-            for x_, y_ in self._picks
-            if (x - x_) ** 2 + (y - y_) ** 2 > pick_diameter_2
-        ]
-
-    def _filter_rectangle_picks(
-        self, x: float, y: float, width: float
-    ) -> list:
-        """Return picks not overlapping position (x, y) for rectangular
-        picks."""
-        xarr = np.array([x])
-        yarr = np.array([y])
-        new_picks = []
-        for pick in self._picks:
-            (start_x, start_y), (end_x, end_y) = pick
-            X, Y = lib.get_pick_rectangle_corners(
-                start_x, start_y, end_x, end_y, width
-            )
-            if not Y[0] == Y[1]:
-                if not lib.check_if_in_rectangle(
-                    xarr, yarr, np.array(X), np.array(Y)
-                )[0]:
-                    new_picks.append(pick)
-        return new_picks
-
-    def _filter_square_picks(self, x: float, y: float, side: float) -> list:
-        """Return picks not overlapping position (x, y) for square picks."""
-        return [
-            (x_, y_)
-            for x_, y_ in self._picks
-            if not (
-                (x_ - side / 2 <= x <= x_ + side / 2)
-                and (y_ - side / 2 <= y <= y_ + side / 2)
-            )
-        ]
-
     def remove_picks(self, position: tuple[float, float]) -> None:
         """Delete picks found at a given position.
 
@@ -11051,13 +11469,24 @@ class View(QtWidgets.QLabel):
             Specifies x and y coordinates.
         """
         x, y = position
-        new_picks = []
         if self._pick_shape == "Circle":
-            new_picks = self._filter_circle_picks(x, y, self._pick_size**2)
-        elif self._pick_shape == "Rectangle":
-            new_picks = self._filter_rectangle_picks(x, y, self._pick_size)
-        elif self._pick_shape == "Square":
-            new_picks = self._filter_square_picks(x, y, self._pick_size)
+            # circles are removed when clicked within one diameter of
+            # their center rather than strictly inside them, which keeps
+            # small picks clickable when zoomed out
+            d2 = self._pick_size**2
+            new_picks = [
+                pick
+                for pick in self._picks
+                if (x - pick[0]) ** 2 + (y - pick[1]) ** 2 > d2
+            ]
+        else:
+            new_picks = [
+                pick
+                for pick in self._picks
+                if not lib.point_in_pick(
+                    x, y, pick, self._pick_shape, self._pick_size
+                )
+            ]
 
         # delete picks and add new_picks
         self._picks = []
@@ -11444,7 +11873,8 @@ class View(QtWidgets.QLabel):
             pick_info["Pick Side Length (nm)"] = picksize_nm
         # if polygon pick and the last not closed, ignore the last pick
         if (
-            self._pick_shape == "Polygon"
+            "Number of picks" in pick_info
+            and self._pick_shape == "Polygon"
             and self._picks[-1][0] != self._picks[-1][-1]
         ):
             pick_info["Number of picks"] -= 1
@@ -11491,6 +11921,26 @@ class View(QtWidgets.QLabel):
             a = self._pick_size * pixelsize
             regions["Side Length (nm)"] = float(a)
             regions["Centers"] = [[float(_[0]), float(_[1])] for _ in picks]
+        elif self._pick_shape == "Box":
+            # each box carries its own extent, so no size is saved
+            regions["Corners"] = [
+                [
+                    [float(c0[0]), float(c0[1])],
+                    [float(c1[0]), float(c1[1])],
+                ]
+                for c0, c1 in picks
+            ]
+        elif self._pick_shape == "Brush":
+            # a flat, ordered stroke list: which strokes form one pick
+            # follows from their geometry and is re-derived on loading
+            regions["Strokes"] = [
+                {
+                    "Width (nm)": float(stroke[0] * pixelsize),
+                    "Path": [[float(x), float(y)] for x, y in stroke[1]],
+                }
+                for pick in picks
+                for stroke in pick
+            ]
         regions["Shape"] = self._pick_shape
         return regions
 
@@ -11843,6 +12293,9 @@ class View(QtWidgets.QLabel):
                 return
         self._pick_shape = current_text
         self._picks = []
+        # a stroke half-painted with the old shape must not survive
+        self._brush_stroke_ongoing = False
+        self._brush_stroke = []
         self.update_cursor()
         self.update_scene(picks_only=True)
         self.update_pick_info_short()
@@ -11955,8 +12408,7 @@ class View(QtWidgets.QLabel):
         locs = lib.ensure_sanity(locs, info)
         self.locs[channel] = locs
         self.infos[channel] = new_info
-        self.index_blocks[channel] = None
-        self.render_index[channel] = None
+        self.invalidate_locs_index(channel)
         self.add_drift(channel, drift)
         self.update_scene(resample_locs=True)
 
@@ -12014,8 +12466,7 @@ class View(QtWidgets.QLabel):
                 rcc_progress.set_value,
             )
             # sanity check and assign attributes
-            self.index_blocks[channel] = None
-            self.render_index[channel] = None
+            self.invalidate_locs_index(channel)
             self.add_drift(channel, drift)
             # ignore undrift_locs since we use _apply_drift to
             # assign attributes
@@ -12084,14 +12535,14 @@ class View(QtWidgets.QLabel):
             info=self.infos[channel],
             picks=self._picks,
             pick_size=pick_size,
+            pick_shape=self._pick_shape,
             undrift_z=undrift_z,
             index_blocks=index_blocks,
         )
         self.locs[channel] = undrifted_locs
         self.infos[channel] = new_info
         # Cleanup
-        self.index_blocks[channel] = None
-        self.render_index[channel] = None
+        self.invalidate_locs_index(channel)
         self.add_drift(channel, drift)
         status.close()
         self.update_scene(resample_locs=True)
@@ -12118,8 +12569,7 @@ class View(QtWidgets.QLabel):
         self.locs[channel] = postprocess.apply_drift(
             self.locs[channel], self.infos[channel], drift=drift
         )
-        self.index_blocks[channel] = None
-        self.render_index[channel] = None
+        self.invalidate_locs_index(channel)
         self.add_drift(channel, drift)
         self.update_scene(resample_locs=True)
 
@@ -12177,8 +12627,7 @@ class View(QtWidgets.QLabel):
         )
         self._drift[channel] = drift
         self.currentdrift[channel] = copy.copy(drift)
-        self.index_blocks[channel] = None
-        self.render_index[channel] = None
+        self.invalidate_locs_index(channel)
         self.update_scene(resample_locs=True)
 
     def sync_groups(self) -> None:
@@ -12202,12 +12651,8 @@ class View(QtWidgets.QLabel):
             )
             return
 
-        # automatically assign the group if circular picks are present
-        if (
-            "group" not in self.locs[0].columns
-            and len(self._picks)
-            and self._pick_shape == "Circle"
-        ):
+        # automatically assign the group if picks are present
+        if "group" not in self.locs[0].columns and len(self._picks):
             locs = self.picked_locs(0, add_group=True)
             locs = pd.concat(locs, ignore_index=True)
             self.locs[0] = locs
@@ -12261,13 +12706,17 @@ class View(QtWidgets.QLabel):
         self.update_scene(resample_locs=True)
         self.fit_in_view()
 
-    def _update_cursor_circle(self) -> None:
-        """Set circular cursor according to the diameter defined in
-        ``ToolsSettingsDialog``."""
+    def _update_cursor_circle(self, size: float) -> None:
+        """Set a circular cursor of the given size.
+
+        Parameters
+        ----------
+        size : float
+            Diameter of the cursor in camera pixels: the pick diameter
+            for circular picks, the stroke width for brush picks.
+        """
         diameter = int(
-            self.width()
-            * self._pick_size
-            / render.viewport_width(self.viewport)
+            self.width() * size / render.viewport_width(self.viewport)
         )
         # remote desktop crashes sometimes for high diameter
         if diameter < 100:
@@ -12339,18 +12788,25 @@ class View(QtWidgets.QLabel):
                 self.unsetCursor()
         elif self._mode == "Pick":
             if self._pick_shape == "Circle":  # circle
-                self._update_cursor_circle()
+                self._update_cursor_circle(self._pick_size)
             elif self._pick_shape == "Rectangle":
                 self.unsetCursor()
             elif self._pick_shape == "Polygon":
                 self._update_cursor_polygon()
             elif self._pick_shape == "Square":
                 self._update_cursor_square()
+            elif self._pick_shape == "Box":
+                # the box has no size until it is dragged out, so the
+                # cursor marks the corner rather than the pick
+                self.setCursor(QtCore.Qt.CursorShape.CrossCursor)
+            elif self._pick_shape == "Brush":
+                # the cursor is the brush tip, i.e., the width the next
+                # stroke will be painted with
+                self._update_cursor_circle(self._brush_width)
             else:
                 self.unsetCursor()
 
     @check_pick
-    @check_circular_picks
     def update_pick_info_long(self) -> None:
         """Evaluate pick statistics in ``InfoDialog``."""
         channel = self.get_channel("Calculate pick info")
@@ -12448,8 +12904,8 @@ class View(QtWidgets.QLabel):
     def _resample_fast_render(self) -> None:
         """Refresh ``self.fast_render_indices`` from the fractions stored
         on the fast-render dialog, refresh ``group_color`` if needed,
-        reset ``index_blocks``, and adjust contrast accordingly. Does not
-        redraw on its own — call ``update_scene`` for that."""
+        and adjust contrast accordingly. Does not redraw on its own —
+        call ``update_scene`` for that."""
         dlg = self.window.fast_render_dialog
         idx = dlg.channel.currentIndex()
         if idx == 0:  # all channels share the same fraction
@@ -12465,8 +12921,6 @@ class View(QtWidgets.QLabel):
             factor = np.mean(factors)  # to adjust contrast
         if len(dlg.fractions) == 2 and "group" in self.locs[0].columns:
             self.group_color = render.get_group_color(self.locs[0])
-        self.index_blocks = [None] * len(self.locs)
-        self.render_index = [None] * len(self.locs)
         self.window.display_settings_dlg.silent_maximum_update(
             factor * self.window.display_settings_dlg.maximum.value()
         )
@@ -12496,14 +12950,18 @@ class View(QtWidgets.QLabel):
             True if only picks and points are to be rendered. Default is
             False.
         resample_locs : bool, optional
-            True if the fast-render subsample should be refreshed before
-            redrawing. Use after operations that mutate ``self.locs``
-            (link, undrift, remove pick, etc.). Default is False.
+            True if ``self.locs`` changed: the cached spatial indices of
+            every channel are dropped (see
+            ``self.invalidate_locs_index``) and the fast-render
+            subsample is refreshed before redrawing. Use after
+            operations that mutate ``self.locs`` (link, undrift, remove
+            pick, etc.). Default is False.
         """
         # Clear slicer cache
         self.window.slicer_dialog.slicer_cache = {}
         if len(self.locs):
             if resample_locs:
+                self.invalidate_locs_index()
                 self._resample_fast_render()
             viewport = viewport or self.viewport
             self.draw_scene(
@@ -13773,7 +14231,7 @@ class Window(QtWidgets.QMainWindow):
             vars = self.view.locs[channel].columns.to_list()
             exec(cmd, {k: self.view.locs[channel][k] for k in vars})
         lib.ensure_sanity(self.view.locs[channel], self.view.infos[channel])
-        self.view.index_blocks[channel] = None
+        self.view.invalidate_locs_index(channel)
         self.view.update_scene()
 
     def open_file_dialog(self) -> None:
@@ -13821,8 +14279,24 @@ class Window(QtWidgets.QMainWindow):
         info = self.view.infos[0][-1]
         if "Pick" not in info:
             return
-        self.view._picks = [info["Pick"]]
         self.view._pick_shape = info["Pick shape"]
+        if self.view._pick_shape == "Brush":
+            # stored as stroke dicts with widths in nm, see
+            # ``RotationWindow.save_locs_rotated``
+            pixelsize = self.view.pixelsize
+            self.view._picks = [
+                [
+                    (stroke["Width (nm)"] / pixelsize, stroke["Path"])
+                    for stroke in info["Pick"]
+                ]
+            ]
+        else:
+            self.view._picks = [info["Pick"]]
+        # keep the shape selector in sync; assigning _pick_shape first
+        # makes ``on_pick_shape_changed`` a no-op, so the pick survives
+        self.tools_settings_dialog.pick_shape.setCurrentText(
+            self.view._pick_shape
+        )
         if self.view._pick_shape == "Circle":
             self.tools_settings_dialog.pick_diameter.setValue(
                 info["Pick size (nm)"]
@@ -14228,25 +14702,9 @@ class Window(QtWidgets.QMainWindow):
         resi_dialog.show()
 
 
-def main():
-    app = QtWidgets.QApplication(sys.argv)
-    window = Window()
-
-    # load plugins from ~/.picasso/plugins
-    from .plugins_loader import load_plugins, add_plugins_menu_actions
-
-    load_plugins(window, "render")
-    add_plugins_menu_actions(window, "render")
-
-    window.show()
-
-    from ..updater import setup_gui_update_check
-
-    setup_gui_update_check(window)
-
-    lib.install_excepthook(window)
-
-    sys.exit(app.exec())
+def main() -> None:
+    """Start Picasso: Render - see ``picasso.gui.app.run_gui``."""
+    sys.exit(run_gui(Window, "render"))
 
 
 if __name__ == "__main__":

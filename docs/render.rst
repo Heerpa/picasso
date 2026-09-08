@@ -9,7 +9,7 @@ render
 Opening Files
 -------------
 1. Rendering of the super-resolution image: In ``Picasso: Render``, open a movie file by dragging a localization file (ending with '.hdf5') into the window or by selecting ``File > Open``. The super-resolution image will be rendered automatically. A region of choice can be zoomed into by a rectangular selection using the left mouse button. The 'View' menu contains more options for zooming and panning.
-2. (Optional) Adjust rendering options by selecting ``View > Display Settings``. The field 'Display pixel size (nm)' defines the size of the rendered pixels of the super-resolution image. The contrast settings ``Min. Density`` and ``Max. Density`` define at which number of localizations per super-resolution pixel the minimum and maximum color of the colormap should be applied.
+2. (Optional) Adjust rendering options by selecting ``View > Display Settings``. The field 'Display pixel size (nm)' defines the size of the rendered pixels of the super-resolution image. The contrast settings ``Min. Density`` and ``Max. Density`` define at which number of localizations per super-resolution pixel the minimum and maximum color of the colormap should be applied. They can be typed in or dragged on the two-handle slider below them, whose track is logarithmic and spans the densities present in the rendered image.
 3. (Optional) For multiplexed image acquisition, open HDF5 localization files from other channels subsequently. Alternatively, drag and drop all HDF5 files to be displayed simultaneously.
 
 Drift Correction
@@ -45,16 +45,59 @@ Redundant cross-correlation drift correction
 Picking of regions of interest
 ------------------------------
 
+Pick shapes
+~~~~~~~~~~~
+
+``Picasso: Render`` offers six pick shapes, selected in ``Tools > Tools Settings``. They differ in how they are drawn and in whether all picks share one size or each pick carries its own extent:
+
+.. list-table::
+   :widths: 10 30 25 35
+   :header-rows: 1
+
+   * - Shape
+     - Drawn by
+     - Size
+     - Suited to
+   * - ``Circle``
+     - A single left click at its center.
+     - ``Diameter``, shared by all picks.
+     - The default. Compact, roughly round structures.
+   * - ``Square``
+     - A single left click at its center.
+     - ``Side length``, shared by all picks.
+     - The same use as the circle, where a square footprint is preferred.
+   * - ``Rectangle``
+     - Dragging from one end of its center axis to the other, so it can take any orientation and length.
+     - ``Width`` (across the axis) shared by all picks; the length is per pick.
+     - Elongated structures - filaments, nanorulers, edges - and the only shape that can be projected onto its own axes, see ``Plot pick profile`` below.
+   * - ``Polygon``
+     - One left click per vertex; click the first vertex again to close the outline. A right click removes the last vertex.
+     - None; each polygon carries its own extent.
+     - Irregular regions that no fixed shape follows, e.g., an outlined cell or organelle.
+   * - ``Box``
+     - Pressing the left mouse button at one corner, dragging to the opposite one and releasing. A green outline follows the cursor while you drag.
+     - None; each box carries its own extent.
+     - Quickly grabbing an arbitrary axis-aligned region, without first setting a size.
+   * - ``Brush``
+     - Painting freehand with the left mouse button held down. Keep painting to extend a region: strokes whose painted areas touch merge into a single pick.
+     - ``Stroke width``, kept per stroke. The setting applies to the next stroke only, so changing it never reshapes what is already painted.
+     - Irregular regions that are quicker to sweep over than to outline vertex by vertex.
+
+Clicking the right mouse button inside a pick removes that pick. Two shapes are drawn incrementally and undo their last step instead: ``Polygon`` removes the last vertex, and ``Brush`` removes the last stroke, wherever you click. Undoing a brush stroke that was joining two painted regions leaves them as two separate picks again. ``Tools > Clear picks`` (Ctrl+C) removes all of them. The shapes are not interchangeable, so changing the shape while picks exist asks for confirmation and then discards them; save them first (``File > Save pick regions``) if you want to keep them.
+
+Picking
+~~~~~~~
+
 1. Manual selection. Open ``Picasso: Render`` and load the localization HDF5 file to be processed.
-2. Switch the active tool by selecting ``Tools > Pick``. The mouse cursor will now change to a circle. Alternatively, open ``Tools > Tools Settings`` to change the shape into a rectangle. Lastly, choosing ``Polygon`` allows for drawing polygons of any shape.
-3. Set the size of the pick circle by adjusting the ``Diameter`` field in the tool settings dialog (``Tools > Tools Settings``). Alternatively, choose ``Width`` for a rectangular shape.
-4. Pick regions of interest using the circular mouse cursor by clicking the left mouse button. All localizations within the circle will be selected for further processing.
-5. (Optional) Automated region of interest selection. Select ``Tools > Pick similar`` to automatically detect and pick structures that have similar numbers of localizations and RMS deviation (RMSD) from their center of mass than already-picked structures. The upper and lower thresholds for these similarity measures are the respective standard deviations of already-picked regions, scaled by a tunable factor. This factor can be adjusted using the field ``Tools > Tools Settings > Pick similar ± range``. To display the mean and standard deviation of localization number and RMSD for currently picked regions, select ``View > Show info`` and click ``Calculate info below``. ``Pick similar`` works with circular, square and rectangular picks (not with polygons). Rectangular picks all take the median length of the already-picked regions and are automatically rotated onto the principal axis of the localizations they contain, so elongated structures are found at any orientation; for them the RMSD along and across that axis are used as two separate similarity measures.
+2. Switch the active tool by selecting ``Tools > Pick``. The mouse cursor will now change to a circle. Open ``Tools > Tools Settings`` to change to any of the other shapes described above.
+3. Set the size of the pick in the tool settings dialog (``Tools > Tools Settings``): ``Diameter`` for circles, ``Side length`` for squares, ``Width`` for rectangles or ``Stroke width`` for the brush. ``Polygon`` and ``Box`` picks need no size setting.
+4. Pick regions of interest by clicking or dragging, as listed in the table above. All localizations within the pick will be selected for further processing.
+5. (Optional, not applicable to ``Polygon`` or ``Brush``) Automated region of interest selection. Select ``Tools > Pick similar`` to automatically detect and pick structures that have similar numbers of localizations and RMS deviation (RMSD) from their center of mass than already-picked structures. The upper and lower thresholds for these similarity measures are the respective standard deviations of already-picked regions, scaled by a tunable factor. This factor can be adjusted using the field ``Tools > Tools Settings > Pick similar ± range``. To display the mean and standard deviation of localization number and RMSD for currently picked regions, select ``View > Show info`` and click ``Calculate info below``. ``Pick similar`` works with circular, square, rectangular and box picks (not with polygon or brush picks, which have no size or canonical form to replicate). Rectangular picks all take the median length of the already-picked regions and are automatically rotated onto the principal axis of the localizations they contain, so elongated structures are found at any orientation; for them the RMSD along and across that axis are used as two separate similarity measures. Box picks likewise all take the median width and height of the already-picked regions, while the regions you drew yourself are kept exactly as drawn.
 6. (Optional) Exporting of pick information. All localizations in picked regions can be saved by selecting ``File > Save picked localizations``. The resulting HDF5 file will contain a new integer column ``group`` indicating to which pick each localization is assigned.
 7. (Optional) Statistics about each pick region can be saved by selecting ``File > Save pick properties``. The resulting HDF5 file is not a localization file. Instead, it holds a data set called ``groups`` in which the rows show statistical values for each pick region.
 8. (Optional) The picked positions and diameter itself can be saved by selecting ``File > Save pick regions``. Such saved pick information can also be loaded into ``Picasso: Render`` by selecting ``File > Load pick regions``.
 
-**NOTE**: Rectangular picks can be used to generate the projections of localizations onto the rectangle's axes. To do so, select rectangular picks and save picked localizations (``File > Save picked localizations``). The resulting ``hdf5`` files will contain columns ``x_pick_rot`` and ``y_pick_rot``, which are the projections of localizations onto and against the "drawing" axis of the rectangle, respectively.
+*NOTE*: ``Plot pick profile`` (and the ``x_pick_rot``/``y_pick_rot`` columns it relies on) is available for rectangular picks only, since they are the only shape with an unambiguous long axis. ``Pick fiducials`` and ``Subtract pick regions`` are likewise restricted to circular picks.
 
 3D rotation window
 ------------------
@@ -207,7 +250,7 @@ Save the localizations that are currently loaded in render to an hdf5 file.
 
 Save picked localizations [Ctrl+Shift+S]
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Save the localizations that are within a picked region (yellow circle, rectangle or polygon). Each pick will get a different group number. To display the group number in Render, select ``Annotate picks`` in Tools/Tools Settings.
+Save the localizations that are within a picked region (yellow circle, square, rectangle, polygon, box or brushed area). Each pick will get a different group number. To display the group number in Render, select ``Annotate picks`` in Tools/Tools Settings.
 In case of rectangular picks, the saved localizations file will contain new columns `x_pick_rot` and `y_pick_rot`, which are localization coordinates into the coordinate system of the pick rectangle (coordinate (0,0) is where the rectangle was started to be drawn, and `y_pick_rot` is in the direction of the drawn line.)
 These columns can be used to plot density profiles of localizations along the rectangle dimensions easily (e.g., with "Filter").
 
@@ -219,7 +262,35 @@ Calculates the properties of each pick (i.e., mean frame, mean x mean y as well 
 
 Save pick regions
 ^^^^^^^^^^^^^^^^^
-Saves the positions of the picked regions (yellow circles) in a .yaml file. The file will contain the following: A list of center positions and the value of the diameter. It is possible to manually add center positions or copy from another pick regions file with a text editor.
+Saves the positions of the picked regions (yellow circles) in a .yaml file. It is possible to manually add regions or copy them from another pick regions file with a text editor. The file always carries a ``Shape`` key; the remaining keys depend on it. All coordinates are in camera pixels and all sizes in nm:
+
+- ``Circle``: ``Centers`` (a list of ``[x, y]``) and ``Diameter (nm)``.
+- ``Square``: ``Centers`` and ``Side Length (nm)``.
+- ``Rectangle``: ``Center-Axis-Points`` (a list of ``[[x_start, y_start], [x_end, y_end]]``) and ``Width (nm)``.
+- ``Polygon``: ``Vertices`` (a list of vertex lists, each closed by repeating its first vertex).
+- ``Box``: ``Corners`` (a list of ``[[x0, y0], [x1, y1]]``, two opposite corners). No size is stored, since each box has its own.
+- ``Brush``: ``Strokes``, a flat list in painting order, each with its own ``Width (nm)`` and the ``Path`` the cursor swept. Which strokes form one pick is not stored: it follows from their geometry and is worked out again when the file is loaded, so overlapping strokes always come back as a single pick.
+
+For example:
+
+.. code-block:: yaml
+
+    Shape: Box
+    Corners:
+    - [[12.5, 30.1], [40.2, 55.7]]
+    - [[80.0, 10.0], [95.5, 22.3]]
+
+.. code-block:: yaml
+
+    Shape: Brush
+    Strokes:
+    - Width (nm): 300.0
+      Path:
+      - [10.1, 20.4]
+      - [10.9, 21.2]
+    - Width (nm): 80.0
+      Path:
+      - [15.0, 25.0]
 
 Load pick regions
 ^^^^^^^^^^^^^^^^^

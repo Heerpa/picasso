@@ -358,7 +358,9 @@ def _spline_channel_jacobians(
     if stored is not None and len(stored) == n_channels:
         for c, t in enumerate(stored):
             transform = _tf.from_dict(t)
-            if transform.model != "affine":
+            # A translation is an AffineTransform too, and its Jacobian is
+            # the identity everywhere - both have one constant value.
+            if not isinstance(transform, _tf.AffineTransform):
                 raise ValueError(
                     "This calibration registers its channels with a "
                     f"{transform.model} transform, whose local Jacobian "
@@ -596,9 +598,11 @@ def _gauss_crlb(
 
         # Non-converged rows carry NaN parameters (hence NaN Fisher); set them to
         # the identity so the batched pinv stays well-defined, then mask below.
-        bad = ~finite[sl]
+        bad = ~finite[sl] | ~np.isfinite(fisher).all(axis=(1, 2))
         fisher[bad] = np.eye(n_params)
         with np.errstate(invalid="ignore", divide="ignore"):
+            _bad = ~np.isfinite(fisher).all(axis=(1, 2))
+            fisher[_bad] = np.eye(fisher.shape[-1])
             cov = np.linalg.pinv(fisher)
             var = np.diagonal(cov, axis1=1, axis2=2).copy()
         var[bad] = np.nan
@@ -1027,11 +1031,22 @@ def _gauss_crlb_multichannel(
         if do_callback:
             progress_callback(stop)
 
+    # Guard against LAPACK's batched SVD segfaulting on a non-finite
+    # information matrix (a pathological finite-theta spot can produce one).
+    bad = ~np.isfinite(bread).all(axis=(1, 2))
+    if not mle:
+        bad = bad | ~np.isfinite(meat).all(axis=(1, 2))
+    if bad.any():
+        bread[bad] = np.eye(bread.shape[-1])
+        meat[bad] = 0.0
     with np.errstate(invalid="ignore", divide="ignore"):
+        _bad = ~np.isfinite(bread).all(axis=(1, 2))
+        bread[_bad] = np.eye(bread.shape[-1])
         bread_inv = np.linalg.pinv(bread)
         cov = bread_inv if mle else bread_inv @ meat @ bread_inv
         crlb = np.diagonal(cov, axis1=1, axis2=2).copy()
     crlb[~finite] = np.nan
+    crlb[bad] = np.nan
     if em:
         crlb *= _EM_EXCESS_NOISE_FACTOR
     return np.where(crlb > 0.0, crlb, np.nan)
@@ -2713,10 +2728,22 @@ def _spline_link_xyz_crlb_cpu(
             bread,
             meat,
         )
+        # Guard against LAPACK's batched SVD segfaulting on a non-finite
+        # information matrix (a pathological finite-theta spot can produce one).
+        bad = ~np.isfinite(bread).all(axis=(1, 2))
+        if not mle:
+            bad = bad | ~np.isfinite(meat).all(axis=(1, 2))
+        if bad.any():
+            bread[bad] = np.eye(bread.shape[-1])
+            meat[bad] = 0.0
         with np.errstate(invalid="ignore", divide="ignore"):
+            _bad = ~np.isfinite(bread).all(axis=(1, 2))
+            bread[_bad] = np.eye(bread.shape[-1])
             bread_inv = np.linalg.pinv(bread)
             cov = bread_inv if mle else bread_inv @ meat @ bread_inv
-            crlb[sl] = np.diagonal(cov, axis1=1, axis2=2)
+            var = np.diagonal(cov, axis1=1, axis2=2).copy()
+        var[bad] = np.nan
+        crlb[sl] = var
         if do_callback:
             progress_callback(stop)
     return crlb
@@ -2942,6 +2969,17 @@ def _spline_crlb_cpu(
         if do_callback:
             progress_callback(stop)
 
+    # Guard: LAPACK's batched SVD (np.linalg.pinv) can SEGFAULT, not just
+    # warn, on a non-finite information matrix. A pathological spot (mu~0, or
+    # an overflowing amplitude) fills bread/meat with inf/nan even from a
+    # finite theta. Replace those with the identity so pinv is defined, then
+    # NaN their variances (the caller already NaN-masks skipped rows).
+    bad = ~np.isfinite(bread).all(axis=(1, 2))
+    if not mle:
+        bad = bad | ~np.isfinite(meat).all(axis=(1, 2))
+    if bad.any():
+        bread[bad] = np.eye(n_params)
+        meat[bad] = 0.0
     with np.errstate(invalid="ignore", divide="ignore"):
         bread_inv = np.linalg.pinv(bread)
         if mle:
@@ -2951,6 +2989,7 @@ def _spline_crlb_cpu(
             # cov = J⁻¹ M J⁻¹ (unweighted-least-squares sandwich).
             cov = bread_inv @ meat @ bread_inv
         crlb = np.diagonal(cov, axis1=1, axis2=2).copy()
+    crlb[bad] = np.nan
     return crlb[:n_locs]
 
 

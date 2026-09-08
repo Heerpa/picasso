@@ -13,7 +13,6 @@ Graphical user interface for three-dimensional averaging of particles
 
 import os.path
 import sys
-import traceback
 import colorsys
 
 import matplotlib.pyplot as plt
@@ -26,6 +25,7 @@ from scipy import signal
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .. import io, lib, render, __version__
+from .app import run_gui
 
 from cmath import rect, phase
 
@@ -2095,29 +2095,9 @@ class Window(QtWidgets.QMainWindow):
         return image
 
 
-def main():
-
-    app = QtWidgets.QApplication(sys.argv)
-    window = Window()
-
-    window.show()
-
-    from ..updater import setup_gui_update_check
-
-    setup_gui_update_check(window)
-
-    def excepthook(type, value, tback):
-        lib.cancel_dialogs()
-        message = "".join(traceback.format_exception(type, value, tback))
-        errorbox = QtWidgets.QMessageBox.critical(
-            window, "An error occured", message
-        )
-        errorbox.exec()
-        sys.__excepthook__(type, value, tback)
-
-    sys.excepthook = excepthook
-
-    sys.exit(app.exec())
+def main() -> None:
+    """Start Picasso: Average3 - see ``picasso.gui.app.run_gui``."""
+    sys.exit(run_gui(Window))
 
 
 if __name__ == "__main__":

@@ -89,6 +89,10 @@ lif = [
 formats = [
     "picassosr[czi,lif]",
 ]
+# Not for general use: the installer / installer_gpu extras exist only to
+# build the one-click installers, where every version is pinned exactly so
+# the frozen bundles stay reproducible and stable. Regular users should
+# install picassosr (optionally with [gpu] / [formats]) instead.
 installer = [
     "PyQt6==6.11.0",
     "numpy==2.4.4",

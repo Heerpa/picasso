@@ -45,6 +45,9 @@ class DisplaySettingsRotationDialog(lib.Dialog):
         Contains available localization blur methods.
     colormap : QComboBox
         Contains strings with available colormaps (single channel only).
+    contrast_slider : DensityContrastSlider(RangeSlider)
+        Log-scale two-handle slider mirroring the minimum and maximum
+        density spin boxes.
     dynamic_disp_px : QCheckBox
         Tick to automatically adjust to current window size when
         zooming.
@@ -129,12 +132,22 @@ class DisplaySettingsRotationDialog(lib.Dialog):
         self.maximum.setKeyboardTracking(False)
         self.maximum.valueChanged.connect(self.render_scene)
         contrast_grid.addWidget(self.maximum, 1, 1)
+        # log-scale slider mirroring the two spin boxes, for dragging the
+        # contrast instead of typing it
+        self.contrast_slider = lib.DensityContrastSlider(
+            self.minimum,
+            self.maximum,
+            image=lambda: getattr(
+                getattr(self.window, "view_rot", None), "image", None
+            ),
+        )
+        contrast_grid.addWidget(self.contrast_slider, 2, 0, 1, 2)
         c_label = QtWidgets.QLabel("Colormap:")
         c_label.setToolTip("Colormap used to render localizations.")
-        contrast_grid.addWidget(c_label, 2, 0)
+        contrast_grid.addWidget(c_label, 3, 0)
         self.colormap = QtWidgets.QComboBox()
         self.colormap.addItems(plt.colormaps())
-        contrast_grid.addWidget(self.colormap, 2, 1)
+        contrast_grid.addWidget(self.colormap, 3, 1)
         self.colormap.currentIndexChanged.connect(self.render_scene)
 
         # blur
@@ -263,12 +276,15 @@ class DisplaySettingsRotationDialog(lib.Dialog):
         self.minimum.blockSignals(True)
         self.minimum.setValue(value)
         self.minimum.blockSignals(False)
+        # the spin box' signals are blocked, so the slider is moved here
+        self.contrast_slider.sync()
 
     def silent_maximum_update(self, value: float) -> None:
         """Change the value of self.maximum in the background."""
         self.maximum.blockSignals(True)
         self.maximum.setValue(value)
         self.maximum.blockSignals(False)
+        self.contrast_slider.sync()
 
     def _uncheck_optimal_scalebar(self, *args) -> None:
         """Uncheck the automatic scale bar checkbox when the user
@@ -788,8 +804,9 @@ class ViewRotation(QtWidgets.QLabel):
         rotations beyond 180 degrees in animation segments.
     _last_mouse_x, _last_mouse_y : int
         Previous mouse position (Qt coords) during a trackball drag.
-    viewport : tuple
-        Defines current field of view.
+    viewport : tuple or None
+        Defines current field of view; None until localizations are
+        loaded.
     window : QMainWindow
         Instance of the rotation window.
     """
@@ -807,6 +824,12 @@ class ViewRotation(QtWidgets.QLabel):
         self.locs = []
         self.infos = []
         self.paths = []
+        self.viewport = None
+        # the pick this window shows, copied from the main window when
+        # it is opened (see ``_sync_from_main_window``); None until then
+        self.pick = None
+        self.pick_shape = None
+        self.pick_size = None
         self.group_color = []
         self.x_render_state = False
         self.x_locs = []
@@ -1406,38 +1429,15 @@ class ViewRotation(QtWidgets.QLabel):
         viewport : list or None
             ``[(y_min, x_min), (y_max, x_max)]`` bounding the pick. Only
             returned if ``get_viewport``; otherwise the scene is updated and
-            None is returned.
+            None is returned. None is also returned when no pick has been
+            copied from the main window yet, i.e. before this window has
+            been opened for the first time.
         """
-        if self.pick_shape == "Circle":
-            d = self.pick_size
-            r = d / 2
-            x, y = self.pick
-            x_min = x - r
-            x_max = x + r
-            y_min = y - r
-            y_max = y + r
-        elif self.pick_shape == "Rectangle":
-            w = self.pick_size
-            (xs, ys), (xe, ye) = self.pick
-            X, Y = lib.get_pick_rectangle_corners(xs, ys, xe, ye, w)
-            x_min = min(X)
-            x_max = max(X)
-            y_min = min(Y)
-            y_max = max(Y)
-        elif self.pick_shape == "Polygon":
-            X, Y = lib.get_pick_polygon_corners(self.pick)
-            x_min = min(X)
-            x_max = max(X)
-            y_min = min(Y)
-            y_max = max(Y)
-        elif self.pick_shape == "Square":
-            s = self.pick_size
-            x, y = self.pick
-            x_min = x - s / 2
-            x_max = x + s / 2
-            y_min = y - s / 2
-            y_max = y + s / 2
-
+        if self.pick_shape is None:  # never opened; nothing to fit to
+            return None
+        x_min, x_max, y_min, y_max = lib.pick_bounds(
+            self.pick, self.pick_shape, self.pick_size
+        )
         viewport = [(y_min, x_min), (y_max, x_max)]
         if get_viewport:
             return viewport
@@ -1477,21 +1477,40 @@ class ViewRotation(QtWidgets.QLabel):
         self._pan_z -= dz_w
         self.shift_viewport(dx_w, dy_w)
 
+    def _arrow_pan_relative(self, fx: float, fy: float) -> None:
+        """Arrow-key pan by fractions of the viewport width/height.
+
+        Does nothing if no localizations have been loaded yet, i.e. if
+        there is no viewport to pan.
+
+        Parameters
+        ----------
+        fx, fy : float
+            Shift in x and y as fractions of the viewport's width and
+            height.
+        """
+        if self.viewport is None:
+            return
+        self._arrow_pan(
+            fx * render.viewport_width(self.viewport),
+            fy * render.viewport_height(self.viewport),
+        )
+
     def to_left_rot(self) -> None:
         """Shift pick in the main window."""
-        self._arrow_pan(-SHIFT * render.viewport_width(self.viewport), 0.0)
+        self._arrow_pan_relative(-SHIFT, 0.0)
 
     def to_right_rot(self) -> None:
         """Shift pick in the main window."""
-        self._arrow_pan(SHIFT * render.viewport_width(self.viewport), 0.0)
+        self._arrow_pan_relative(SHIFT, 0.0)
 
     def to_up_rot(self) -> None:
         """Shift pick in the main window."""
-        self._arrow_pan(0.0, -SHIFT * render.viewport_height(self.viewport))
+        self._arrow_pan_relative(0.0, -SHIFT)
 
     def to_down_rot(self) -> None:
         """Shift pick in the main window."""
-        self._arrow_pan(0.0, SHIFT * render.viewport_height(self.viewport))
+        self._arrow_pan_relative(0.0, SHIFT)
 
     def set_optimal_scalebar(
         self, force: bool = False, silent: bool = False
@@ -2206,6 +2225,9 @@ class RotationWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(rotate_tool_action)
 
         self.menus = [file_menu, view_menu, tools_menu]
+        # the window is built here but shown only on demand; see
+        # ``hideEvent`` for why its shortcuts must stay inert
+        self.menu_bar.setEnabled(False)
         self.setMinimumSize(100, 100)
         self.move(20, 20)
 
@@ -2222,7 +2244,9 @@ class RotationWindow(QtWidgets.QMainWindow):
             y = self.window.view._picks[0][1]
             self.window.view._picks = [(x + dx, y + dy)]  # main window
             self.view_rot.pick = (x + dx, y + dy)  # view rotation
-        elif self.view_rot.pick_shape == "Rectangle":
+        elif self.view_rot.pick_shape in ["Rectangle", "Box"]:
+            # both are defined by two points: the ends of the center
+            # axis for a rectangle, two opposite corners for a box
             (xs, ys), (xe, ye) = self.window.view._picks[0]
             self.window.view._picks = [
                 (
@@ -2239,6 +2263,17 @@ class RotationWindow(QtWidgets.QMainWindow):
             for point in self.window.view._picks[0]:
                 new_pick.append((point[0] + dx, point[1] + dy))
             self.window.view._picks = [new_pick] + []  # main window
+            self.view_rot.pick = new_pick  # view rotation
+        elif self.view_rot.pick_shape == "Brush":
+            # shift every point of every stroke, keeping their widths
+            new_pick = [
+                (
+                    stroke[0],
+                    [(x + dx, y + dy) for x, y in stroke[1]],
+                )
+                for stroke in self.window.view._picks[0]
+            ]
+            self.window.view._picks = [new_pick]  # main window
             self.view_rot.pick = new_pick  # view rotation
 
         self.window.view.update_scene()  # update scene in main window
@@ -2258,17 +2293,30 @@ class RotationWindow(QtWidgets.QMainWindow):
             if self.view_rot.pick_shape in ["Circle", "Square"]:
                 x, y = self.view_rot.pick
                 pick = [float(x), float(y)]
-                size = self.view_rot.pick_size
-            else:  # rectangle
-                (ys, xs), (ye, xe) = self.view_rot.pick
-                pick = [[float(ys), float(xs)], [float(ye), float(xe)]]
-                size = self.view_rot.pick_size
+            elif self.view_rot.pick_shape in ["Rectangle", "Box"]:
+                (x0, y0), (x1, y1) = self.view_rot.pick
+                pick = [[float(x0), float(y0)], [float(x1), float(y1)]]
+            elif self.view_rot.pick_shape == "Brush":
+                # same stroke form as the picks file, widths in nm
+                pick = [
+                    {
+                        "Width (nm)": float(stroke[0] * pixelsize),
+                        "Path": [[float(x), float(y)] for x, y in stroke[1]],
+                    }
+                    for stroke in self.view_rot.pick
+                ]
+            else:  # polygon - an arbitrary number of vertices
+                pick = [[float(x), float(y)] for x, y in self.view_rot.pick]
+            size = self.view_rot.pick_size
             new_info = [
                 {
                     "Generated by": f"Picasso v{__version__} Render 3D",
                     "Pick": pick,
                     "Pick shape": self.view_rot.pick_shape,
-                    "Pick size (nm)": size * pixelsize,
+                    # polygons and boxes carry their own extent
+                    "Pick size (nm)": (
+                        size * pixelsize if size is not None else None
+                    ),
                     # accumulated rotation angles incl. full turns
                     # (radians, codebase convention); legacy keys
                     "angx": float(self.view_rot.angx),
@@ -2342,6 +2390,23 @@ class RotationWindow(QtWidgets.QMainWindow):
     def update_scene(self) -> None:
         """Update the scene in ViewRotation."""
         self.view_rot.update_scene()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        """Arm the menu bar when the window is shown, see ``hideEvent``."""
+        self.menu_bar.setEnabled(True)
+        QtWidgets.QMainWindow.showEvent(self, event)
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        """Disable the menu bar while the window is hidden.
+
+        This window is built together with the main Render window but
+        only shown on demand. macOS shares one native menu bar across
+        the application, so its shortcuts (Ctrl+W, Ctrl+S, ...) would
+        otherwise fire from the main window while this one has never
+        been opened - the shortcuts of a disabled menu do not.
+        """
+        self.menu_bar.setEnabled(False)
+        QtWidgets.QMainWindow.hideEvent(self, event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         """Close all children dialogs and self."""

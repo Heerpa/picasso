@@ -29,7 +29,7 @@ Fitting can run on a CUDA-capable GPU (see `GPU fitting`_ below). The kernels ar
 - Leica ``.lif`` (requires ``pip install picassosr[lif]``, Python ≥ 3.12; available in the one-click installer),
 - ``.raw``,
 - ``.ims`` (supported only on Windows),
-- ``.nd2``,
+- ``.nd2`` (either time series or a z-stack; ``T`` or ``Z`` axis),
 - ``.stk``.
 
 TIFF-family files (``.tif``, ``.tiff``, ``.ome.tif``, ``.btf``, ``.tf8``, ``.tf2``, ``.lsm``) are read via the `tifffile <https://github.com/cgohlke/tifffile>`_ library. **Picasso expects grayscale image stacks with one frame per TIFF page; multi-channel, RGB or tiled whole-slide TIFF variants are not supported.** ImageJ "contiguous stack" files — where ImageJ stores the whole stack as a single TIFF page followed by all planes' pixel data (as its "Save As > Tiff" does for large stacks, e.g. when re-saving a folder of separate images as one ``.tiff``) — are also read correctly, with every plane detected as a frame.
@@ -117,6 +117,8 @@ By default, Picasso analyzes the whole frame. If you are only interested in cert
 
 To go back to analyzing the whole frame, simply remove all ROIs (double-click them, empty the single-ROI field, or use ``Clear`` in the ``Edit ROIs...`` dialog). If ROIs overlap, Picasso automatically trims them so that no spot is detected twice, so you do not need to draw them precisely. As with the rest of the identification settings, turn on ``Preview`` to check which spots fall inside your ROIs before running the full analysis.
 
+All ROIs are fitted together into one localization file. To keep them apart afterwards, the saved file carries an extra ``roi_id`` column holding the index of the ROI each localization was found in — 0 for the first ROI, 1 for the second, and so on, in the order the ``ROI`` entry of the metadata lists them (-1 marks a localization inside none of them, which a fitted position right at an ROI's edge can be). The ids are computed before drift correction, so they still name the ROI a localization was detected in even after the coordinates have been shifted. Split-FOV mode (``Regions = channels``) adds no ``roi_id``: there each region is a channel of its own and is saved to its own file anyway. The command line and ``picasso.localize.localize`` behave the same way.
+
 Extra features
 --------------
 
@@ -155,9 +157,25 @@ Two acquisitions feed it:
 
 The maps are stored raw and camera-native — offset in ADU, variance in ADU², gain in ADU per photoelectron — in a single HDF5 file, so a calibration does not depend on any Picasso setting.
 
-Alongside the ``.hdf5`` Picasso writes a ``*_maps.png`` showing each map next to its histogram, as in Supplementary Fig. 1 of Huang et al., from both the GUI and the command line.
-
 Make sure the camera's offset is high enough that readout noise never drives a pixel below zero ADU. That is what the offset is engineered for, but with an unusually noisy pixel and a low offset the raw counts can clip or wrap, and the measured variance for that pixel then becomes meaningless.
+
+Optionally, record the illumination each bright movie was taken at — the laser power, the exposure time, whatever was varied — in the dialog's ``Illumination`` column, or with one ``-p`` per ``-l`` on the command line::
+
+    picasso camera-calibrate dark.raw -l light_01.raw -p 0.1 -l light_02.raw -p 1 -l light_03.raw -p 10 --power-unit mW -o mycam_scmos_calib.hdf5
+
+Nothing in the gain fit uses these numbers; they only label the x-axis of the linearity plot described below, which is what makes that plot readable when the levels are not evenly spaced. Give one per bright movie or none at all.
+
+Reading the sCMOS calibration plot
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Alongside the ``.hdf5`` Picasso writes a ``*_maps.png``, from both the GUI and the command line. Each map appears next to its own histogram showing the distribution, as in Supplementary Fig. 1 of Huang et al. Readout variance, offset and gain are shown.
+
+A bright series of more than one level adds a fourth row, asking whether the sensor responded linearly over the range the gain was fitted on. Both panels are chip medians, one point per illumination level:
+
+- **Linearity** — the median signal (per-pixel temporal mean, minus the offset map) against the illumination it was recorded at, or against the level index when none was given. The points should lie on a straight line; the fitted line is drawn and the title reports the worst point's deviation as a percentage of the span. Levels that flatten off at the top are saturating, and every level above that knee biases the gain fit without making it fail. A nonzero intercept is not a nonlinearity — it usually means stray light or background — and the fit absorbs it. When no illumination was recorded the axis says so, the points are only joined by a guide line, and no deviation is quoted, because equal steps on the axis then stand for unknown steps in illumination.
+- **Photon transfer curve** — the median excess variance (per-pixel temporal variance, minus the readout-variance map) against that same median signal, with the median of the fitted gain map drawn through the origin as a line. Since the signal is ``g·u`` and the excess variance ``g²·u``, the points lie on a line of slope ``g`` whatever the illumination levels were, which makes this the panel to read when they were uneven or unknown. Curving *down* at the bright end is saturation; curving *up* is can be an unstable laser, whose frame-to-frame intensity fluctuation adds a variance term growing as ``u²``; missing the origin means the dark movie does not describe these movies, through a changed camera setting, a temperature drift, or light leaking into the dark acquisition.
+
+The two fail separately: a linear camera behind a nonlinear laser gives a straight transfer curve and a bent linearity panel, which says to fix the power calibration rather than the camera.
 
 Using the maps
 ~~~~~~~~~~~~~~
@@ -368,6 +386,7 @@ Beads are detected with the current ``Box side length`` and ``Min. net gradient`
 
 ``Transform model`` chooses how the two frames are related:
 
+- **Translation** (2 DOF, at least 1 bead pair) — a shift in x and y and nothing else. The right choice when the two frames are known to differ only by an offset: with one free parameter per axis it is the least noise-prone of the models, and a rotation or scale it cannot absorb shows up in the residual instead of being fitted away.
 - **Affine** (6 DOF, at least 3 bead pairs) — translation, rotation, scale and shear. The default, and what a well-aligned optical path does to first order.
 - **Projective** (8 DOF, at least 4 pairs) — adds the perspective (keystone) term that a tilted dichroic or an unequal path length introduces. The residual an affine leaves grows towards the edges of the field, which is exactly what this removes.
 - **Polynomial2 / Polynomial3** (at least 6 / 10 pairs) — a smooth warp of that degree that follows genuine field distortion. This is not an optical model, and it extrapolates badly outside the region the beads span, so use it only with many, well-spread beads. Its reverse map is fitted independently rather than inverted algebraically, so round-tripping a coordinate is accurate only to the round-trip RMS reported with the calibration; no fitted coordinate depends on that reverse map.
@@ -379,19 +398,36 @@ After the fit, the bead pairing is drawn in the main window as color-coded ident
 The transform is stored as one entry of an ordered ``Lateral transforms`` list in the calibration file you select, which can be:
 
 - an existing Gaussian 3D calibration (``.yaml``) or spline PSF calibration (``.hdf5``) — the transform is appended to it and applied automatically whenever that calibration is used to fit, whether the fit is Gaussian astigmatism or cubic spline;
-- a standalone lateral calibration (``New``, a ``.yaml`` holding only lateral corrections) — for 2D data, where there is no 3D calibration to append to.
+- a standalone lateral calibration (``New``, a ``.yaml`` holding only lateral corrections) — loaded separately at fit time, and the only route for 2D data, where there is no 3D calibration to append to.
 
 Corrections accumulate: calibrating both an astigmatism and a chromatic transform into the same file stores them as a list, and they are applied one after another in that order. Re-running a calibration of the same type replaces its entry rather than adding a second copy.
 
-For **3D data there is nothing to load**: the correction lives in the 3D or spline calibration and is applied automatically whenever that calibration is used to fit.
+Appending or loading separately
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-For **2D data** there is no such calibration to attach it to, so the standalone file is loaded through the ``2D lateral correction (x, y)`` box in the ``Parameters`` dialog: ``Load 2D correction`` takes one or more files (applied in the order listed) and ``Clear`` drops them. The setting belongs to the loaded movie, so several movies opened side by side can each carry their own correction.
+Both routes give the **same coordinates**, so which one to use is a matter of bookkeeping:
 
-A correction is never applied twice. Loading a file whose transform the currently loaded 3D or spline calibration already carries is refused by Picasso.
+- **Appended to the 3D or spline calibration** (recommended) — the correction travels with the calibration it belongs to and is applied automatically whenever that calibration is used to fit. There is nothing to load and nothing to forget.
+- **Loaded separately** — the standalone ``.yaml`` is loaded through the ``Lateral correction (x, y)`` box in the ``Parameters`` dialog: ``Load correction`` takes one or more files (applied in the order listed) and ``Clear`` drops them. The setting belongs to the loaded movie, so several movies opened side by side can each carry their own correction.
 
-**Lateral corrections apply to single-channel data only.** They correct one movie into a reference frame, which is what a 2D or astigmatic 3D measurement of a single channel needs. The multichannel (global) spline fit is a different mechanism: it fits all channels jointly and registers them itself from the per-channel transforms in its own calibration, so a lateral correction on top of that would be applied twice. Picasso therefore refuses to append a lateral transform to a multichannel spline calibration, and ignores loaded lateral corrections when a multichannel fit runs.
+The two mix. With astigmatic 3D fitting, the separately loaded corrections are applied after the z fit, on top of whatever the 3D calibration carries — so a 3D calibration holding the astigmatism correction plus a separately loaded chromatic one applies the astigmatism first and the chromatic second, exactly as if both had been appended to the same file.
 
-On the command line, ``picasso localize`` takes ``--affine-calibration <file>`` (repeat the flag to chain several); whichever model the file stores is used as saved.
+The same correction is never applied twice. A file whose transform the loaded 3D or spline calibration already carries is refused at load time, and one that slips through as a copy saved under another name is skipped at fit time — the transforms themselves are compared, not the file names. Every correction that *was* applied is named in the saved metadata under ``Lateral corrections applied``.
+
+**Lateral corrections apply to single-channel data only.** The multichannel (global) spline fit is a different mechanism: it fits all channels jointly and registers them itself from the per-channel transforms in its own calibration, so a lateral correction on top of that would be applied twice. Picasso therefore refuses to append a lateral transform to a multichannel spline calibration, and ignores loaded lateral corrections when a multichannel fit runs.
+
+On the command line, ``picasso localize`` takes ``--affine-calibration <file>`` (repeat the flag to chain several); whichever model the file stores is used as saved. It combines with ``--zc`` the same way the GUI does::
+
+    picasso localize movie.tif -zc astig_3d_calib.yaml -ac chromatic.yaml
+
+From Python, ``localize.localize`` takes ``affine_calibration`` alongside ``calibration_3d``, and ``zfit.zfit`` takes ``lateral_transforms`` for localizations that are already fitted; both accept a calibration dictionary, a list of entries or a path, and both skip (with a ``DuplicateLateralTransformWarning``) a correction the 3D calibration already carries::
+
+    locs, info = zfit.zfit(
+        locs,
+        info,
+        calibration=z_calibration,
+        lateral_transforms="chromatic.yaml",
+    )
 
 Incorporating calibrations in config file
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -485,14 +521,14 @@ Fitting with the spline PSF
 2. In the **Experimental PSF (spline)** box, click ``Load calibration`` and choose your ``.hdf5``. The last-used calibration is remembered between sessions, and calibrations can be loaded automatically per camera and emission wavelength via the ``spline-calibrations`` config field described above.
 3. Choose the **Optimizer**: ``Least squares`` or ``MLE`` (Poisson maximum likelihood). ``MLE`` is recommended.
 4. Tick **Use GPU** to run the fit on the GPU; leave it unticked to fit on the CPU. The checkbox is only available when a CUDA GPU is detected.
-6. Run ``Analyze`` > ``Localize (Identify & Fit)`` (or ``Fit`` for already-identified spots).
+5. Run ``Analyze`` > ``Localize (Identify & Fit)`` (or ``Fit`` for already-identified spots).
 
 In addition to the usual columns, spline fits report per-localization precisions (``lpx``, ``lpy``, and ``lpz`` for 3D, in nm), ``photons`` and ``bg`` with their uncertainties (``photons_unc``, ``bg_unc``), and, for MLE, ``log_likelihood`` and ``iterations``. A 3D calibration adds the recovered ``z`` (and ``lpz``). The accompanying ``_locs.yaml`` records the spline calibration model and file path used, and which device performed the fit.
 
 Multichannel spline PSF (e.g. biplane)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Several spatially-registered channels (e.g. biplane setups) can be fit simultaneously, sharing one ``x``, ``y`` and ``z`` per molecule. The calibration needs one bead z-stack per channel, all scanned over the same z range with the same number of frames.
+Several spatially-registered channels (e.g. biplane setups) can be fit simultaneously, sharing one ``x``, ``y`` and ``z`` per molecule. (To fit the channels one at a time instead, each with its own PSF, see `Analyzing each channel on its own`_ below.) The calibration needs one bead z-stack per channel, all scanned over the same z range with the same number of frames.
 
 This implements the global-fitting (globLoc) approach of `Li et al., Nature Communications 13, 3133 (2022) <https://doi.org/10.1038/s41467-022-30719-4>`_ — one experimental PSF per channel, the channels registered to a reference channel, and all channels fitted jointly with linked parameters. Please cite that work when using multichannel spline fitting.
 
@@ -512,7 +548,7 @@ If photon counts are not linked, the resulting localizations contain per-channel
 - ``photons_ch<c>`` and ``bg_ch<c>`` — that channel's photon count and background. ``photons`` and ``bg`` are their sums.
 - ``rel_photons_ch<c>`` — that channel's share of the total photons, so the values sum to 1 per localization.
 
-Picasso builds a PSF for every channel and registers each non-reference channel to the reference by a transform estimated from matching beads; the per-channel PSFs and transforms are stored in one calibration ``.hdf5``. ``Channel registration`` in the calibration dialog chooses the model — ``affine`` (the default), ``projective``, ``polynomial2`` or ``polynomial3`` — with the same trade-offs as the lateral corrections above; the choice is recorded in the calibration and used automatically at fit time, where each spot is linearized about its own position. Alongside the usual diagnostic plot, a ``<base>_registration.png`` is written showing how well the channels align (residuals and the decomposed shift / rotation / scale / mirror) — check it before fitting.
+Picasso builds a PSF for every channel and registers each non-reference channel to the reference by a transform estimated from matching beads; the per-channel PSFs and transforms are stored in one calibration ``.hdf5``. ``Channel registration`` in the calibration dialog chooses the model — ``translation`` (a pure xy shift), ``affine`` (the default), ``projective``, ``polynomial2`` or ``polynomial3`` — with the same trade-offs as the lateral corrections above; the choice is recorded in the calibration and used automatically at fit time, where each spot is linearized about its own position. Alongside the usual diagnostic plot, a ``<base>_registration.png`` is written showing how well the channels align (residuals and the decomposed shift / rotation / scale / mirror) — check it before fitting.
 
 The registration is only as good as the bead stack it comes from: image **sparse beads** (so that a bead can only be paired with its own image in the other channel) over **several fields of view**, so that the correspondences cover the whole sensor rather than one part of it, and acquire the stack **on the same day as the measurement**, ideally directly before or after it to minimize the effect of drift.
 
@@ -575,7 +611,7 @@ Then build a registration with ``Calibration`` > ``Register channels (2D)``, whi
 
   This route both **builds** a registration from scratch and **re-aligns** one that has drifted: when a registration is already loaded it seeds the pairing, otherwise the pairing is bootstrapped from the data alone.
 
-``Transform model`` chooses how the channels are related — ``affine`` (the default), ``projective``, ``polynomial2`` or ``polynomial3`` — with the same trade-offs as described under *Lateral corrections of x and y* above.
+``Transform model`` chooses how the channels are related — ``translation`` (a pure xy shift), ``affine`` (the default), ``projective``, ``polynomial2`` or ``polynomial3`` — with the same trade-offs as described under *Lateral corrections of x and y* above.
 
 The registration is saved as a small ``.yaml`` (by default ``<movie>_channel_reg.yaml``) and loaded straight away. Picasso reports, per channel, how many correspondences were paired and the residual RMS in camera pixels — check those before fitting: a registration built from too few pairs, or with an RMS approaching a pixel, will hold the channels together at the wrong place.
 
@@ -591,7 +627,7 @@ Fitting
 
 Only molecules detected in *every* channel are fitted, so identify each channel first — with several channels loaded, ``Identify`` (Ctrl+I) analyzes all of them in turn. In split-FOV mode the whole movie is identified at once and the detections are split by region, so nothing extra is needed; they are confined to the reference region automatically, and one localization comes out per molecule. When one channel is much dimmer than the others, identify on the channel sum instead; see `Identifying on the sum of the channels`_ above, which works from a loaded channel registration exactly as it does from a spline calibration.
 
-**With no registration loaded, nothing changes:** the spherical Gaussian fits the active channel alone, as before. The joint fit runs only when a registration is loaded *and* the data actually has several channels — either several movies open, or ``Regions = channels`` with a split-FOV registration.
+**With no registration loaded, nothing changes:** the spherical Gaussian fits the active channel alone, as before. The joint fit runs only when a registration is loaded *and* the data actually has several channels — either several movies open, or ``Regions = channels`` with a split-FOV registration. To fit every channel on its own instead — with any model, and without a registration — set ``Fit`` to ``Each channel separately``; see `Analyzing each channel on its own`_ below.
 
 Linking the photon counts
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -612,3 +648,68 @@ So, unless the channels are known to be balanced:
 - **Linked** — one photon count and background shared across the channels.
 
 In both modes ``photons`` and ``bg`` are the **totals across all channels**, so the two are directly comparable with each other and with the spline fit.
+
+Analyzing each channel on its own
+---------------------------------
+
+The two multichannel fits above tie the channels together: they need a registration (or a measured multichannel PSF), they fit one shared position per molecule, they keep only the molecules detected in *every* channel, and they exist for the spherical Gaussian and the spline PSF only. This section describes how to fit each channel independently of one another.
+
+The ``Fit`` setting in the ``Parameters`` dialog chooses between the two:
+
+- **Jointly (registered channels)** — the default: a loaded multichannel spline calibration or channel registration runs the global fit described above, and with none loaded the active channel is fitted by itself.
+- **Each channel separately** — every loaded channel (or every split-FOV region) is fitted on its own, one after another, with **its own** fitting model, optimizer and calibrations, and each is saved to its own file. No registration is needed, nothing is dropped, and the channels come out independent.
+
+*This feature is experimental — please report any unexpected behavior on our* `GitHub issues page <https://github.com/jungmannlab/picasso/issues>`_.
+
+Running it
+~~~~~~~~~~
+
+1. Load the channels, in either layout: ``File`` > ``Open channels from several movies`` (or ``Open one multichannel movie``), or — for channels imaged side by side on one sensor — load the single movie, tick **Regions = channels** in the ``Parameters`` dialog and drag one ROI onto each channel, as described above for multichannel fitting.
+2. Open ``Analyze`` > ``Parameters`` and set **Fit** to ``Each channel separately``.
+3. Set up each channel: select it (the channel selector below the image, or the region in the image) and choose its ``Model``, ``Optimizer``, ``Min. net gradient`` and calibrations. See *What each channel carries* below.
+4. Run ``Analyze`` > ``Identify`` (Ctrl+I), which analyzes every channel in turn, and then ``Analyze`` > ``Fit`` — or ``Localize (Identify & Fit)`` for both at once.
+5. The status bar reports each channel as it is fitted and, at the end, how many spots were fitted in how many channels. ``Analyze`` > ``Abort`` stops the whole batch.
+
+What each channel carries
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Fitted separately, a channel is a dataset of its own, so these settings are kept per channel and swapped in when the channel is selected:
+
+- **Model and optimizer** — every model is available, together with its convergence criterion, maximum iterations and the ``Use GPU`` choice.
+- **Min. net gradient** — as before: per channel for separate movies, and per region in split-FOV mode (select a region and the slider tunes that region alone).
+- **Experimental PSF (spline) calibration** — the PSF is measured per channel, so each channel usually needs its own. For separate movies, untick **PSF calibration** under ``Same settings across channels`` and load one calibration per channel; ticked (the default) one calibration is shared, which is what the joint fit needs. In split-FOV mode each region always keeps its own.
+- **3D via astigmatism** — the z calibration and the ``Fit Z`` checkbox, likewise per channel: astigmatism is calibrated per optical path.
+- **Camera settings** — baseline, sensitivity, gain and pixel size, unless ``Camera settings`` is ticked under ``Same settings across channels``.
+
+The box size, the frame range and the identification filters (temporal median, Gaussian filter) stay shared: they describe the acquisition rather than the channel. In split-FOV mode the ``Edit ROIs...`` table lists each region's model and PSF calibration alongside its coordinates and threshold, so the whole setup can be checked at a glance.
+
+A **multichannel** spline calibration cannot be used here. Picasso refuses it and asks for one single-channel calibration per channel rather than silently fitting every channel with the reference channel's PSF.
+
+The resulting file
+~~~~~~~~~~~~~~~~~~
+
+One file per channel, saved next to its movie exactly as a single-channel run saves its own:
+
+- **Separate movies** — ``<movie>_locs.hdf5`` per channel; when several channels come from one file, the channel name is appended (``<movie>_<channel>_locs.hdf5``).
+- **Split field of view** — ``<movie>_ref_locs.hdf5``, ``<movie>_ch1_locs.hdf5``, ... , one per region, named after the labels drawn beside the regions.
+
+Each split-FOV file holds **that region's own coordinates**: the region's top-left corner is subtracted from ``x`` and ``y``, and the metadata gives the region's width and height (with the region's position on the sensor recorded under ``Region``). A region is therefore a stand-alone channel, and loading the files side by side in Picasso: Render overlays them, rather than placing them next to each other as they sat on the camera. The metadata also records ``Fit mode: Each channel separately`` and which channel or region the file came from, so a file from this mode can always be told from one the joint fit produced.
+
+Everything a single-channel run does afterwards is done per channel: the astigmatic z fit when ``Fit Z`` is ticked, and the drift correction when ``AIM`` or the fiducial-based correction is selected — each channel writing its own ``_locs_undrifted.hdf5`` and drift file.
+
+From the command line
+~~~~~~~~~~~~~~~~~~~~~
+
+Separate movies are already independent runs — ``picasso localize`` processes each file on its own. For a split field of view, add ``--regions-separately`` (``-rs``) to a run with several ``--roi`` regions::
+
+    picasso localize movie.tif -b 7 --regions-separately \
+        --roi 0 0 256 256 --gradient 5000 --fit-method lq \
+        --roi 0 256 256 512 --gradient 2000 --fit-method spline \
+        --spline-calibration ref_psf.hdf5 --spline-calibration ch1_psf.hdf5
+
+Each region is fitted on its own and written to ``movie_ref_locs.hdf5``, ``movie_ch1_locs.hdf5``, ... in that region's own coordinates. ``--gradient``, ``--fit-method`` and ``--spline-calibration`` may be given once per ``--roi`` (in the same order as the regions) or once for all of them; ``--gradient`` accepts per-region values in an ordinary run too, since regions imaged through different optics need not share a brightness scale.
+
+From a script
+~~~~~~~~~~~~~
+
+The same is available from Python: :func:`picasso.localize.fit_independent` fits one set of detections per movie, and :func:`picasso.localize.fit_split_fov_independent` fits the regions of one movie, returning each region's localizations in its own coordinates together with its metadata. Both take the fitting method, the convergence settings and the spline calibration either once for all channels or once per channel. :func:`picasso.localize.split_locs_by_region` splits an existing set of localizations by region in the same way.

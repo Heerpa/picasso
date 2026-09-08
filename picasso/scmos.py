@@ -290,6 +290,8 @@ def calibrate_scmos(
     abort_callback: Callable[[], bool] | None = None,
     dark_path: str | None = None,
     bright_paths: Sequence[str] | None = None,
+    bright_levels: Sequence[float] | None = None,
+    level_unit: str = "",
 ) -> dict | None:
     """Characterize an sCMOS camera from a dark movie and an optional
     bright series.
@@ -314,21 +316,45 @@ def calibrate_scmos(
         returns None.
     dark_path, bright_paths : str or sequence of str, optional
         Recorded in the metadata so a calibration says where it came from.
+    bright_levels : sequence of float, optional
+        The illumination each bright movie was recorded at - laser power,
+        exposure time, whatever was varied - one per movie, in the same
+        order. Nothing in the gain fit needs them: the photon-transfer curve
+        is traced by the measured signal itself. They are recorded so the
+        diagnostic plot can show the response against the quantity that was
+        actually set, which is the only way to see linearity when the levels
+        are not evenly spaced.
+    level_unit : str, optional
+        Unit of ``bright_levels``, for the axis label (e.g. ``"mW"``).
 
     Returns
     -------
     calibration : dict or None
         Maps under ``"offset"`` (ADU), ``"variance"`` (ADU squared) and, when a
         bright series was given, ``"gain"`` (ADU per photoelectron), plus
-        metadata. None if the calibration was aborted.
+        metadata. A bright series also adds one entry per illumination level
+        to ``"Level median signal (ADU)"``, ``"Level median variance
+        (ADU^2)"`` and ``"Level frames"`` - the chip medians of
+        ``mean_k - offset`` and ``variance_k - variance``, in the order the
+        movies were given, plus ``"Level illumination"`` and ``"Level unit"``
+        when ``bright_levels`` was given, which is what
+        :func:`save_calibration_plot` draws its linearity panel from. None if
+        the calibration was aborted.
 
     Raises
     ------
     ValueError
-        If the dark movie is too short, or if a bright movie's frame size does
-        not match the dark movie's.
+        If the dark movie is too short, if a bright movie's frame size does
+        not match the dark movie's, or if ``bright_levels`` has a different
+        length than ``bright_movies``.
     """
     bright_movies = list(bright_movies) if bright_movies is not None else []
+    if bright_levels is not None and len(bright_levels) != len(bright_movies):
+        raise ValueError(
+            f"Got {len(bright_levels)} illumination levels for "
+            f"{len(bright_movies)} bright movies. Pass one level per movie, "
+            "in the same order, or none at all."
+        )
     total_frames = int(len(dark_movie)) + sum(
         int(len(m)) for m in bright_movies
     )
@@ -379,6 +405,7 @@ def calibrate_scmos(
 
     if bright_movies:
         means, variances, n_bright = [], [], 0
+        level_signal, level_variance, level_frames = [], [], []
         done = n_dark
         for index, movie in enumerate(bright_movies):
             moments = _streaming_moments(
@@ -400,6 +427,13 @@ def calibrate_scmos(
                 )
             means.append(mean_k)
             variances.append(var_k)
+            # The medians of this level, kept before the maps are collapsed
+            # into a single slope. They are the only record of *how* the
+            # sensor responded level by level, and the linearity panel of the
+            # diagnostic plot is drawn from them.
+            level_signal.append(float(np.median(mean_k - offset)))
+            level_variance.append(float(np.median(var_k - variance)))
+            level_frames.append(int(n_k))
             n_bright += n_k
             done += n_k
         if len(means) < 2:
@@ -419,6 +453,15 @@ def calibrate_scmos(
         calibration["Light movies"] = [
             os.path.basename(p) for p in (bright_paths or [])
         ]
+        calibration["Level median signal (ADU)"] = level_signal
+        calibration["Level median variance (ADU^2)"] = level_variance
+        calibration["Level frames"] = level_frames
+        calibration["Level illumination"] = (
+            [float(value) for value in bright_levels]
+            if bright_levels is not None
+            else []
+        )
+        calibration["Level unit"] = level_unit
 
     calibration.update(_summary(calibration))
     return calibration
@@ -563,6 +606,100 @@ def _plot_histogram(ax, values, title, unit) -> None:
     ax.set_title(f"{title} distribution")
 
 
+def _plot_linearity(
+    ax,
+    signal: list[float],
+    frames: list[int],
+    illumination: list[float] | None = None,
+    unit: str = "",
+) -> None:
+    """Median signal against illumination.
+
+    The gain fit assumes every pixel responds linearly over the range the
+    bright series covers; a level that saturates, or a laser that is not
+    linear in its setting, breaks that assumption and biases the slope
+    without making the fit fail.
+
+    Plotted against the illumination that was actually set, when the caller
+    recorded it. Without it there is only the order the movies were given, and
+    an index axis silently assumes the levels were evenly spaced - a series at
+    0.1, 1, 5 and 10 mW then bends into a curve that says nothing about the
+    camera. The axis label says which of the two is being shown, and the
+    straight-line fit is only quoted for the first.
+    """
+    values = np.asarray(signal, dtype=np.float64)
+    spaced = illumination is not None and len(illumination) == len(values)
+    if spaced:
+        x = np.asarray(illumination, dtype=np.float64)
+        order = np.argsort(x)
+        x, values = x[order], values[order]
+        ax.set_xlabel(f"Illumination ({unit})" if unit else "Illumination")
+    else:
+        x = np.arange(1, len(values) + 1, dtype=np.float64)
+        ax.set_xlabel("Illumination level (spacing unknown)")
+        ax.set_xticks(x)
+    ax.plot(x, values, "o", color="k", markersize=4)
+
+    if spaced and len(values) > 2 and np.ptp(x) > 0:
+        # A free line rather than one through the origin: a bright series
+        # often carries some stray background, and an intercept is not a
+        # nonlinearity.
+        slope, intercept = np.polyfit(x, values, 1)
+        fitted = slope * x + intercept
+        ax.plot(x, fitted, "--", color="tab:red", linewidth=1)
+        span = float(np.ptp(values))
+        if span > 0:
+            worst = 100 * float(np.abs(values - fitted).max()) / span
+            ax.set_title(f"Linearity (max {worst:.1f}% off the fit)")
+        else:
+            ax.set_title("Linearity")
+    else:
+        # Joining the points is a reading aid, not a claim about the spacing.
+        ax.plot(x, values, "-", color="0.6", linewidth=1)
+        ax.set_title("Response per level")
+    ax.set_ylabel("Median signal, mean $-$ offset (ADU)")
+    if frames:
+        ax.text(
+            0.02,
+            0.98,
+            f"{min(frames)}-{max(frames)} frames per level",
+            transform=ax.transAxes,
+            va="top",
+            fontsize=8,
+            color="0.4",
+        )
+
+
+def _plot_transfer(
+    ax, signal: list[float], variance: list[float], gain: float
+) -> None:
+    """The photon-transfer curve the gain is the slope of.
+
+    Signal and excess variance are both linear in the number of
+    photoelectrons, so the median points lie on a line through the origin of
+    slope ``gain`` whatever the illumination levels were - unlike the
+    linearity panel, this one needs no assumption about their spacing.
+    """
+    x = np.asarray(signal, dtype=np.float64)
+    y = np.asarray(variance, dtype=np.float64)
+    ax.plot(x, y, "o", color="k", markersize=4)
+    upper = float(max(x.max(), 0.0))
+    if upper > 0:
+        line = np.array([0.0, upper])
+        ax.plot(
+            line,
+            gain * line,
+            "-",
+            color="tab:red",
+            linewidth=1,
+            label=f"median gain {gain:.3f} ADU/e$^-$",
+        )
+        ax.legend(fontsize=8, frameon=False)
+    ax.set_xlabel("Median signal (ADU)")
+    ax.set_ylabel("Median excess variance (ADU$^2$)")
+    ax.set_title("Photon transfer curve")
+
+
 def plot_path(calibration_path: str) -> str:
     """Where the diagnostic plot of a calibration file belongs.
 
@@ -591,6 +728,15 @@ def save_calibration_plot(calibration: dict, path: str) -> str:
     *distribution*, in particular the tail of high-variance pixels the noise
     model exists for, which a map on a linear color scale cannot resolve
     against its own outliers.
+
+    A bright series of more than one level adds a third question, and a row
+    for it: whether the sensor's response was linear over the range the gain
+    was fitted on. The left panel plots the chip median signal against the
+    illumination it was recorded at, when the calibration knows it, and
+    otherwise level by level. The right one plots the photon-transfer curve
+    those levels trace, with the median gain as its slope; because it has the
+    measured signal on both axes it is straight whatever the illumination
+    levels were, and is the panel to read when they were not evenly spaced.
 
     Parameters
     ----------
@@ -621,11 +767,35 @@ def save_calibration_plot(calibration: dict, path: str) -> str:
     if calibration.get("gain") is not None:
         panels.append(("gain", "Gain", "ADU/e$^-$"))
 
-    figure = Figure(figsize=(9, 3 * len(panels)), tight_layout=True)
-    axes = figure.subplots(len(panels), 2, squeeze=False)
+    signal = list(calibration.get("Level median signal (ADU)") or [])
+    level_variance = list(
+        calibration.get("Level median variance (ADU^2)") or []
+    )
+    # One level is a point, not a curve; there is nothing to show about how
+    # the sensor responds across illumination.
+    with_levels = len(signal) > 1 and len(level_variance) == len(signal)
+
+    rows = len(panels) + (1 if with_levels else 0)
+    figure = Figure(figsize=(9, 3 * rows), tight_layout=True)
+    axes = figure.subplots(rows, 2, squeeze=False)
     for row, (key, title, unit) in enumerate(panels):
         values = np.asarray(calibration[key], dtype=np.float64)
         _plot_map(figure, axes[row, 0], values, key, title, unit)
         _plot_histogram(axes[row, 1], values, title, unit)
+    if with_levels:
+        gain = calibration.get("gain")
+        median_gain = (
+            float(np.median(np.asarray(gain, dtype=np.float64)))
+            if gain is not None
+            else 0.0
+        )
+        _plot_linearity(
+            axes[-1, 0],
+            signal,
+            list(calibration.get("Level frames") or []),
+            list(calibration.get("Level illumination") or []) or None,
+            str(calibration.get("Level unit") or ""),
+        )
+        _plot_transfer(axes[-1, 1], signal, level_variance, median_gain)
     figure.savefig(path, dpi=150)
     return path
